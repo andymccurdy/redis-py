@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 
 from redis.connection import Connection
-from redis.exceptions import AuthenticationError, ResponseError
+from redis.exceptions import ResponseError
 
 
 class TestHelloFallback:
@@ -17,7 +17,9 @@ class TestHelloFallback:
 
     def _make_connection(self, protocol=None, password="secret", **kwargs):
         """Create a Connection with mocked I/O."""
-        conn = Connection(password=password, protocol=protocol, **kwargs)
+        conn = Connection(
+            password=password, protocol=protocol, driver_info=None, **kwargs
+        )
         conn._parser.on_connect = mock.Mock()
         conn.send_command = mock.Mock()
         return conn
@@ -194,3 +196,29 @@ class TestHelloFallback:
         assert all(c[0][0] != "HELLO" for c in calls)
         # Should have sent single-arg AUTH (no default injection for RESP2)
         assert calls[0][0] == ("AUTH", "secret")
+
+    def test_handshake_metadata_assigned_on_success(self):
+        """On HELLO success, handshake_metadata should be assigned the
+        response dict (not left as None). Regression test for async parity."""
+        conn = self._make_connection(protocol=None, password="secret")
+
+        hello_response = {b"server": b"redis", b"version": b"7.0.0", b"proto": 3}
+        conn.read_response = mock.Mock(return_value=hello_response)
+
+        conn.on_connect_check_health()
+
+        assert conn.handshake_metadata is hello_response
+        assert conn.handshake_metadata.get(b"proto") == 3
+
+    def test_handshake_metadata_assigned_no_auth_success(self):
+        """Branch 3 (RESP3 + no credentials): on HELLO success,
+        handshake_metadata should be the response dict."""
+        conn = self._make_connection(protocol=None, password=None)
+
+        hello_response = {b"server": b"redis", b"version": b"7.4.0", b"proto": 3}
+        conn.read_response = mock.Mock(return_value=hello_response)
+
+        conn.on_connect_check_health()
+
+        assert conn.handshake_metadata is hello_response
+        assert conn.protocol == 3

@@ -1489,6 +1489,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             )
             try:
                 self.handshake_metadata = self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
             except ResponseError as e:
                 self._fallback_to_resp2(e, parser, cred_provider=cred_provider)
         elif auth_args:

@@ -873,6 +873,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             if p < 2 or p > 3:
                 raise ConnectionError("protocol must be either 2 or 3")
         self.protocol = p
+        self.handshake_metadata = None
         self.legacy_responses = legacy_responses
         if parser_class != _AsyncHiredisParser:
             # The Python parsers are protocol-specific; hiredis supports both.
@@ -1292,10 +1293,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 "HELLO", self.protocol, "AUTH", *auth_args, check_health=False
             )
             try:
-                response = await self.read_response()
-                if response.get(b"proto") != int(self.protocol) and response.get(
-                    "proto"
-                ) != int(self.protocol):
+                self.handshake_metadata = await self.read_response()
+                if self.handshake_metadata.get(b"proto") != int(
+                    self.protocol
+                ) and self.handshake_metadata.get("proto") != int(self.protocol):
                     raise ConnectionError("Invalid RESP version")
             except ResponseError as e:
                 await self._fallback_to_resp2(e, parser, cred_provider=cred_provider)
@@ -1313,7 +1314,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 self._parser.on_connect(self)
             await self.send_command("HELLO", self.protocol, check_health=check_health)
             try:
-                response = await self.read_response()
+                self.handshake_metadata = await self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
             except ResponseError as e:
                 await self._fallback_to_resp2(e, parser)
 

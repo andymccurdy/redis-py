@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 import time
+from functools import lru_cache
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -161,6 +162,34 @@ class CaseInsensitiveDict(dict):
     def update(self, data):
         data = CaseInsensitiveDict(data)
         super().update(data)
+
+    def copy(self) -> "CaseInsensitiveDict":
+        # Keys are already upper-cased; bypass __init__/__setitem__ so we don't
+        # re-run ``str.upper`` on every entry when copying (see #3624).
+        new = CaseInsensitiveDict.__new__(CaseInsensitiveDict)
+        dict.update(new, self)
+        return new
+
+
+@lru_cache(maxsize=None)
+def _get_default_response_callbacks(
+    user_protocol: Optional[Union[int, str]],
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Build the canonical response-callback table for a given
+    ``(protocol, legacy_responses)`` combination exactly once.
+
+    The returned mapping is shared and MUST NOT be mutated; callers take a cheap
+    :meth:`CaseInsensitiveDict.copy` so each client owns an independent, mutable
+    mapping. This avoids rebuilding and re-upper-casing the ~165-entry callback
+    table on every client construction (see #3624).
+    """
+    return CaseInsensitiveDict(
+        get_response_callbacks(
+            user_protocol=user_protocol,
+            legacy_responses=legacy_responses,
+        )
+    )
 
 
 class AbstractRedis:
@@ -574,12 +603,10 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             )
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
-        )
+        self.response_callbacks = _get_default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
+        ).copy()
 
     def __repr__(self) -> str:
         return (

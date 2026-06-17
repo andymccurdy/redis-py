@@ -38,7 +38,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_READ_SIZE,
     DEFAULT_SOCKET_TIMEOUT,
 )
-from redis._parsers.helpers import bool_ok, decode_info, get_response_callbacks
+from redis._parsers.helpers import bool_ok, decode_info
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -59,7 +59,7 @@ from redis.client import (
     EMPTY_RESPONSE,
     NEVER_DECODE,
     AbstractRedis,
-    CaseInsensitiveDict,
+    _get_default_response_callbacks,
 )
 from redis.commands import (
     AsyncCoreCommands,
@@ -526,12 +526,10 @@ class Redis(
         self.connection: Optional[Connection] = None
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
-        )
+        self.response_callbacks = _get_default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
+        ).copy()
 
         # If using a single connection client, we need to lock creation-of and use-of
         # the client in order to avoid race conditions such as using asyncio.gather

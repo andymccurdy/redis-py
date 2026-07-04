@@ -8,7 +8,7 @@ import ssl
 import types
 import weakref
 from unittest import mock
-from errno import ECONNREFUSED, ETIMEDOUT
+from errno import ECONNREFUSED, ENOENT, ETIMEDOUT
 from unittest.mock import patch
 
 import pytest
@@ -733,6 +733,37 @@ async def test_connect_timeout_error_without_retry():
     with pytest.raises(TimeoutError, match="Timeout connecting to server"):
         await conn.connect()
     assert conn._connect.call_count == 1
+
+
+@pytest.mark.fixed_client
+async def test_connect_without_retry_on_unrecoverable_oserror():
+    """A connect error that can never succeed on retry (e.g. a missing Unix
+    socket path, ENOENT) fails fast instead of consuming the retry budget."""
+    conn = Connection(retry=Retry(NoBackoff(), 3))
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ENOENT, "No such file or directory")
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.connect()
+    # no retries: _connect is called exactly once
+    assert conn._connect.call_count == 1
+    # the original OSError is preserved as the cause for classification
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert excinfo.value.__cause__.errno == ENOENT
+
+
+@pytest.mark.fixed_client
+async def test_connect_retries_on_transient_oserror():
+    """A transient socket error such as ECONNREFUSED (server not up yet)
+    stays retryable, so the whole connect flow is retried as before."""
+    conn = Connection(retry=Retry(NoBackoff(), 2))
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ECONNREFUSED, "Connection refused")
+
+    with pytest.raises(ConnectionError):
+        await conn.connect()
+    # 2 retries --> 3 attempts
+    assert conn._connect.call_count == 3
 
 
 @pytest.mark.onlynoncluster

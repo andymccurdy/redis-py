@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import errno
 import inspect
 import logging
 import math
@@ -1036,6 +1037,25 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             f"notification_hash: {self.maintenance_notification_hash}"
         )
 
+    # OS-level errno values for which reconnecting can never succeed, so
+    # there is no point spending the retry/backoff budget on them.
+    _UNRETRYABLE_CONNECT_ERRNOS = frozenset({errno.ENOENT})
+
+    @classmethod
+    def _is_retryable_connect_error(cls, error: BaseException) -> bool:
+        """Whether a failed connection attempt is worth retrying.
+
+        Returns ``False`` for definitively unrecoverable socket errors (e.g. a
+        Unix socket path that does not exist, ``ENOENT``) so that ``connect()``
+        fails fast instead of backing off for every retry. Transient errors
+        such as ``ECONNREFUSED`` during server startup stay retryable.
+        """
+        cause = error.__cause__
+        return not (
+            isinstance(cause, OSError)
+            and cause.errno in cls._UNRETRYABLE_CONNECT_ERRNOS
+        )
+
     async def connect(self):
         """Connects to the Redis server if not already connected"""
         # try once the socket connect with the handshake, retry the whole
@@ -1047,6 +1067,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             lambda error, failure_count: self.disconnect(
                 error=error, failure_count=failure_count
             ),
+            is_retryable=self._is_retryable_connect_error,
             with_failure_count=True,
         )
 
@@ -1087,17 +1108,19 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             )
             raise e
         except OSError as e:
-            e = ConnectionError(self._error_message(e))
+            conn_error = ConnectionError(self._error_message(e))
             await record_error_count(
                 server_address=getattr(self, "host", None),
                 server_port=getattr(self, "port", None),
                 network_peer_address=getattr(self, "host", None),
                 network_peer_port=getattr(self, "port", None),
-                error_type=e,
+                error_type=conn_error,
                 retry_attempts=actual_retry_attempts,
                 is_internal=False,
             )
-            raise e
+            # Preserve the original OSError (with its errno) as the cause so
+            # the retry policy can tell unrecoverable failures apart.
+            raise conn_error from e
         except Exception as exc:
             raise ConnectionError(exc) from exc
 

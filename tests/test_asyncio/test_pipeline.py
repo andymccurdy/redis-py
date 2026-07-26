@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest import mock
 
 import pytest
@@ -17,6 +18,65 @@ from redis.observability.metrics import RedisMetricsCollector
 
 
 class TestPipeline:
+    @pytest.mark.parametrize("transaction", (False, True))
+    async def test_pipeline_packing_does_not_block_event_loop(self, transaction):
+        pipeline = Pipeline(
+            connection_pool=mock.MagicMock(),
+            response_callbacks={},
+            transaction=transaction,
+            shard_hint=None,
+        )
+        connection = mock.MagicMock()
+        packing_started = threading.Event()
+        release_packing = threading.Event()
+        packing_finished = threading.Event()
+        event_loop_ticks_during_packing = 0
+
+        def pack_commands(_commands):
+            packing_started.set()
+            release_packing.wait(timeout=1)
+            packing_finished.set()
+            return []
+
+        connection.pack_commands.side_effect = pack_commands
+        connection.send_packed_command = mock.AsyncMock()
+        pipeline.parse_response = mock.AsyncMock(
+            side_effect=[None, None, [True]] if transaction else [True]
+        )
+
+        async def observe_event_loop():
+            nonlocal event_loop_ticks_during_packing
+            while not packing_finished.is_set():
+                await asyncio.sleep(0)
+                if packing_started.is_set() and not packing_finished.is_set():
+                    event_loop_ticks_during_packing += 1
+
+        observer = asyncio.create_task(observe_event_loop())
+        await asyncio.sleep(0)
+        timer = threading.Timer(0.05, release_packing.set)
+        timer.start()
+
+        try:
+            if transaction:
+                result = await asyncio.wait_for(
+                    pipeline._execute_transaction(connection, [(("PING",), {})], True),
+                    timeout=1,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    pipeline._execute_pipeline(connection, [(("PING",), {})], True),
+                    timeout=1,
+                )
+        finally:
+            release_packing.set()
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
+            timer.cancel()
+
+        assert packing_started.is_set()
+        assert result == [True]
+        assert event_loop_ticks_during_packing > 0
+
     async def test_pipeline_is_true(self, r):
         """Ensure pipeline instances are not false-y"""
         async with r.pipeline() as pipe:

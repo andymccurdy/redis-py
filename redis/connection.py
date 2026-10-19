@@ -1163,6 +1163,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.redis_connect_func = redis_connect_func
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self.handshake_metadata = None
+        self._client_side_caching = False
         self._sock = None
         self._socket_read_size = socket_read_size
         self._connect_callbacks = []
@@ -1383,20 +1384,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
     def on_connect(self):
         self.on_connect_check_health(check_health=True)
 
-    def _do_resp2_auth(self, cred_provider, auth_args=None):
-        """Authenticate via standalone AUTH (RESP2 path).
-
-        If auth_args is provided, uses them directly (avoids redundant
-        credential fetching for the straight RESP2 path where credentials
-        were never mutated). If not provided, fetches fresh credentials
-        from the provider (used by the HELLO fallback path to avoid
-        using HELLO-mutated credentials with injected "default").
-        Falls back to single-arg AUTH if the server is Redis < 6.0
-        and rejects two-arg AUTH with "wrong number of arguments".
-        See https://github.com/andymccurdy/redis-py/issues/1274
-        """
-        if auth_args is None:
-            auth_args = cred_provider.get_credentials()
+    def _do_resp2_auth(self, auth_args) -> None:
+        """Authenticate with the original credentials, retrying pre-6.0 AUTH."""
         # avoid checking health here -- PING will fail if we try
         # to check the health prior to the AUTH
         self.send_command("AUTH", *auth_args, check_health=False)
@@ -1412,7 +1401,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         if str_if_bytes(auth_response) != "OK":
             raise AuthenticationError("Invalid Username or Password")
 
-    def _fallback_to_resp2(self, error, parser, cred_provider=None):
+    def _fallback_to_resp2(self, error: ResponseError, parser, auth_args=None) -> None:
         """Handle HELLO failure by falling back to RESP2.
 
         Validates the error is a recoverable "unknown command" or "NOPROTO",
@@ -1423,22 +1412,27 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         Args:
             error: The ResponseError from the failed HELLO command.
             parser: The original parser (for preserving EXCEPTION_CLASSES).
-            cred_provider: If provided, re-authenticate after downgrade
-                using fresh credentials from this provider.
+            auth_args: Original credentials to authenticate after downgrade.
 
         Raises:
             ResponseError: If the error is not recoverable or fallback
                 is not permitted.
         """
-        err_msg = str(error).lower()
-        if "unknown" not in err_msg and "noproto" not in err_msg:
+        err_msg = str(error).lower().removeprefix("err ")
+        if not (
+            err_msg in ("unknown command", "noproto")
+            or err_msg.startswith(("unknown command ", "noproto "))
+        ):
             raise error
         if self._protocol_specified_explicitly or (
             self.maint_notifications_config
             and self.maint_notifications_config.enabled is True
         ):
             raise error
-        logger = logging.getLogger(__name__)
+        if self._client_side_caching:
+            raise ResponseError(
+                "Client-side caching requires RESP3; cannot fall back to RESP2"
+            ) from error
         logger.warning(
             "Server/proxy at %s does not support HELLO (RESP%s). "
             "Falling back to RESP2. To silence this warning, "
@@ -1453,8 +1447,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self._parser.on_connect(self)
         self.protocol = 2
         self.handshake_metadata = {}
-        if cred_provider is not None:
-            self._do_resp2_auth(cred_provider)
+        if auth_args:
+            self._do_resp2_auth(auth_args)
 
     def on_connect_check_health(self, check_health: bool = True):
         "Initialize the connection, authenticate and select a database"
@@ -1480,12 +1474,13 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # update cluster exception classes
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
+            hello_auth_args = auth_args
             if len(auth_args) == 1:
-                auth_args = ["default", auth_args[0]]
+                hello_auth_args = ("default", auth_args[0])
             # avoid checking health here -- PING will fail if we try
             # to check the health prior to the AUTH
             self.send_command(
-                "HELLO", self.protocol, "AUTH", *auth_args, check_health=False
+                "HELLO", self.protocol, "AUTH", *hello_auth_args, check_health=False
             )
             try:
                 self.handshake_metadata = self.read_response()
@@ -1495,9 +1490,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 ):
                     raise ConnectionError("Invalid RESP version")
             except ResponseError as e:
-                self._fallback_to_resp2(e, parser, cred_provider=cred_provider)
+                self._fallback_to_resp2(e, parser, auth_args=auth_args)
         elif auth_args:
-            self._do_resp2_auth(cred_provider, auth_args=auth_args)
+            self._do_resp2_auth(auth_args)
 
         # if resp version is specified, switch to it
         elif check_protocol_version(self.protocol, 3):
@@ -2149,6 +2144,8 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     ):
         self.pid = os.getpid()
         self._conn = conn
+        if isinstance(conn, AbstractConnection):
+            conn._client_side_caching = True
         self.retry = self._conn.retry
         self.host = self._conn.host
         # A UnixDomainSocketConnection has no port

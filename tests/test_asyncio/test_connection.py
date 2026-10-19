@@ -1038,7 +1038,9 @@ async def test_connection_disconect_race(parser_class, connect_args):
     with patch.object(asyncio, "open_connection", open_connection):
         # disable the initial version handshake
         with patch.multiple(
-            conn, send_command=dummy_method, read_response=dummy_method
+            conn,
+            send_command=dummy_method,
+            read_response=mock.AsyncMock(return_value={b"proto": 3}),
         ):
             await conn.connect()
 

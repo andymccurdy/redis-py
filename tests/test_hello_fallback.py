@@ -7,9 +7,46 @@ import logging
 from unittest import mock
 
 import pytest
+import redis
 
-from redis.connection import Connection
-from redis.exceptions import ResponseError
+from redis._parsers import _HiredisParser, _RESP2Parser, _RESP3Parser
+from redis._parsers.response_callbacks import (
+    _get_response_callback,
+    get_response_callbacks,
+)
+from redis.cache import CacheConfig
+from redis.client import CaseInsensitiveDict
+from redis.cluster import PipelineCommand, TransactionStrategy
+from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
+from redis.credentials import CredentialProvider
+from redis.exceptions import AuthenticationError, ResponseError
+from redis.maint_notifications import MaintNotificationsConfig
+from redis.utils import HIREDIS_AVAILABLE
+
+
+PARSERS = [
+    _RESP3Parser,
+    pytest.param(
+        _HiredisParser,
+        marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="hiredis not installed"),
+    ),
+]
+
+
+class HelloRejectingConnection(Connection):
+    """Reject HELLO locally and send subsequent commands to the RESP2 server."""
+
+    def send_command(self, *args, **kwargs):
+        if args[0] == "HELLO":
+            self._reject_hello = True
+            return
+        return super().send_command(*args, **kwargs)
+
+    def read_response(self, **kwargs):
+        if getattr(self, "_reject_hello", False):
+            self._reject_hello = False
+            raise ResponseError("unknown command 'HELLO'")
+        return super().read_response(**kwargs)
 
 
 class TestHelloFallback:
@@ -222,3 +259,205 @@ class TestHelloFallback:
 
         assert conn.handshake_metadata is hello_response
         assert conn.protocol == 3
+
+    @pytest.mark.parametrize("parser_class", PARSERS)
+    @pytest.mark.parametrize("password", [None, "secret"])
+    @pytest.mark.parametrize("enabled", [False, "auto"])
+    def test_parser_and_maintenance_after_fallback(
+        self, parser_class, password, enabled
+    ):
+        conn = self._make_connection(
+            parser_class=parser_class,
+            password=password,
+            maint_notifications_config=MaintNotificationsConfig(enabled=enabled),
+        )
+        parser = conn._parser
+        exceptions = dict(parser.EXCEPTION_CLASSES)
+        parser.EXCEPTION_CLASSES = exceptions
+        conn.read_response = mock.Mock(
+            side_effect=[ResponseError("unknown command 'HELLO'"), b"OK"]
+        )
+        with mock.patch.object(_RESP2Parser, "on_connect"):
+            conn.on_connect_check_health()
+        if parser_class is _HiredisParser:
+            assert conn._parser is parser
+        else:
+            assert isinstance(conn._parser, _RESP2Parser)
+        assert conn._parser.EXCEPTION_CLASSES is exceptions
+        assert conn.get_protocol() == 2
+        assert not any(
+            c.args[:2] == ("CLIENT", "MAINT_NOTIFICATIONS")
+            for c in conn.send_command.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ERR unknown user",
+            "ERR unknown subcommand 'AUTH'",
+            "ERR failure NOPROTO",
+            "NOAUTH Authentication required",
+        ],
+    )
+    def test_unrelated_errors_do_not_fall_back(self, message):
+        conn = self._make_connection()
+        error = ResponseError(message)
+        conn.read_response = mock.Mock(side_effect=error)
+        with pytest.raises(ResponseError) as exc:
+            conn.on_connect_check_health()
+        assert exc.value is error
+        assert conn.get_protocol() == 3
+
+    @pytest.mark.parametrize("protocol", [None, 2])
+    def test_credentials_are_fetched_once(self, protocol):
+        provider = mock.Mock(spec=CredentialProvider)
+        provider.get_credentials.return_value = ("secret",)
+        conn = self._make_connection(
+            protocol=protocol, password=None, credential_provider=provider
+        )
+        responses = [b"OK"]
+        if protocol is None:
+            responses.insert(0, ResponseError("NOPROTO unsupported protocol version"))
+        conn.read_response = mock.Mock(side_effect=responses)
+        conn.on_connect_check_health()
+        provider.get_credentials.assert_called_once_with()
+        assert conn.send_command.call_args.args == ("AUTH", "secret")
+
+    def test_invalid_fallback_auth_fails(self):
+        conn = self._make_connection()
+        conn.read_response = mock.Mock(
+            side_effect=[ResponseError("unknown command 'HELLO'"), b"invalid"]
+        )
+        with pytest.raises(AuthenticationError):
+            conn.on_connect_check_health()
+
+    def test_noproto_preserves_username(self):
+        conn = self._make_connection(username="user", password="secret")
+        conn.read_response = mock.Mock(
+            side_effect=[ResponseError("NOPROTO unsupported protocol version"), b"OK"]
+        )
+        conn.on_connect_check_health()
+        assert conn.send_command.call_args.args == ("AUTH", "user", "secret")
+
+    @pytest.mark.parametrize("message", ["ERR unknown command", "NOPROTO"])
+    def test_proxy_errors_without_details_allow_fallback(self, message):
+        conn = self._make_connection(password=None)
+        conn.read_response = mock.Mock(side_effect=ResponseError(message))
+        conn.on_connect_check_health()
+        assert conn.get_protocol() == 2
+
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    @pytest.mark.parametrize("parser_class", PARSERS)
+    def test_caching_rejects_fallback(self, pool_class, parser_class):
+        pool = pool_class(
+            cache_config=CacheConfig(), parser_class=parser_class, driver_info=None
+        )
+        proxy = pool.make_connection()
+        conn = proxy._conn
+        parser = conn._parser
+        parser.on_connect = mock.Mock()
+        conn.send_command = mock.Mock()
+        conn.read_response = mock.Mock(
+            side_effect=ResponseError("unknown command 'HELLO'")
+        )
+        try:
+            with pytest.raises(
+                ResponseError, match="Client-side caching requires RESP3"
+            ):
+                conn.on_connect_check_health()
+            assert conn.get_protocol() == 3
+            assert conn._parser is parser
+            assert conn.handshake_metadata is None
+            assert conn.send_command.call_count == 1
+        finally:
+            pool.disconnect()
+
+
+@pytest.mark.parametrize("legacy_responses", [True, False])
+def test_callbacks_are_selected_per_connection(legacy_responses):
+    client = redis.Redis(legacy_responses=legacy_responses)
+    conn = Connection(protocol=None, legacy_responses=legacy_responses)
+    callbacks = client.response_callbacks.copy()
+    conn.protocol = 2
+    callback = _get_response_callback(client.response_callbacks, "hgetall", conn)
+    assert callback([b"field", b"value"]) == {b"field": b"value"}
+    conn.protocol = 3
+    assert _get_response_callback(
+        client.response_callbacks, "hgetall", conn
+    ) is callbacks.get("HGETALL")
+    assert client.response_callbacks == callbacks
+
+    custom = mock.Mock(return_value="custom")
+    client.set_response_callback("HGETALL", custom)
+    conn.protocol = 2
+    assert _get_response_callback(client.response_callbacks, "hgetall", conn) is custom
+
+    # RESP2 adds callbacks for commands that return native types on RESP3.
+    callbacks = CaseInsensitiveDict(get_response_callbacks(None, legacy_responses))
+    explicit = get_response_callbacks(2, legacy_responses)
+    for command, callback in explicit.items():
+        assert _get_response_callback(callbacks, command, conn) is callback
+
+
+@pytest.mark.parametrize("legacy_responses", [True, False])
+def test_cluster_transaction_uses_negotiated_callbacks(legacy_responses):
+    conn = Connection(legacy_responses=legacy_responses)
+    conn.protocol = 2
+    conn.send_packed_command = mock.Mock()
+    conn.read_response = mock.Mock(
+        side_effect=[b"OK", b"QUEUED", [[b"field", b"value"]]]
+    )
+    node = redis.Redis(legacy_responses=legacy_responses)
+    strategy = object.__new__(TransactionStrategy)
+    strategy._pipeline_slots = {0}
+    strategy._pipe = mock.Mock(cluster_response_callbacks={})
+    strategy._command_queue = [PipelineCommand(("HGETALL", "key"), {"keys": ["key"]})]
+    strategy._get_client_and_connection_for_transaction = mock.Mock(
+        return_value=(node, conn)
+    )
+    strategy._himport_prepare_pipeline = mock.Mock()
+    strategy._raise_first_error = mock.Mock()
+    assert strategy._execute_transaction(strategy._command_queue, True) == [
+        {b"field": b"value"}
+    ]
+
+
+@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("legacy_responses", [True, False])
+@pytest.mark.parametrize("transaction", [None, False, True])
+def test_fallback_client_and_pipeline(
+    request, parser_class, legacy_responses, transaction
+):
+    url = request.config.getoption("--redis-url")
+    pool = ConnectionPool.from_url(
+        url,
+        connection_class=HelloRejectingConnection,
+        parser_class=parser_class,
+        legacy_responses=legacy_responses,
+        driver_info=None,
+    )
+    client = redis.Redis(connection_pool=pool)
+    control = redis.Redis.from_url(url, protocol=2, legacy_responses=legacy_responses)
+    key = "hello-fallback-hash"
+    try:
+        control.delete(key)
+        control.hset(key, mapping={"field": "value"})
+        expected = [{b"field": b"value"}, control.config_get("timeout")]
+        if transaction is None:
+            assert [client.hgetall(key), client.config_get("timeout")] == expected
+        else:
+            with client.pipeline(transaction=transaction) as pipe:
+                assert pipe.hgetall(key).config_get("timeout").execute() == expected
+        assert pool._available_connections[-1].get_protocol() == 2
+        pool.disconnect()
+        assert client.hgetall(key) == expected[0]
+        client.set_response_callback("HGETALL", tuple)
+        with client.pipeline(transaction=bool(transaction)) as pipe:
+            assert pipe.hgetall(key).execute() == [(b"field", b"value")]
+    finally:
+        control.delete(key)
+        control.close()
+        client.close()
+        pool.disconnect()

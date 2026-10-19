@@ -2477,10 +2477,16 @@ class TestRedisClusterObj:
         for node in rc.get_nodes():
             assert node.max_connections == 10
 
-        with mock.patch.object(Connection, "read_response") as read_response:
+        with mock.patch.object(
+            Connection, "read_response", autospec=True
+        ) as read_response:
 
-            async def read_response_mocked(*args: Any, **kwargs: Any) -> None:
+            async def read_response_mocked(
+                connection: Connection, *args: Any, **kwargs: Any
+            ) -> Any:
                 await asyncio.sleep(0.1)
+                if connection.protocol == 3 and connection.handshake_metadata is None:
+                    return {b"proto": 3}
 
             read_response.side_effect = read_response_mocked
 

@@ -36,6 +36,7 @@ from redis import _himport_exec
 from redis._defaults import DEFAULT_RETRY_BASE, DEFAULT_RETRY_CAP, DEFAULT_RETRY_COUNT
 from redis._parsers import CommandsParser, Encoder
 from redis._parsers.helpers import parse_scan
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
 from redis.cache import CacheConfig, CacheFactory, CacheFactoryInterface, CacheInterface
 from redis.client import EMPTY_RESPONSE, CaseInsensitiveDict, PubSub, Redis
@@ -7335,6 +7336,18 @@ class TransactionStrategy(AbstractStrategy):
         for r, cmd in zip(response, self._command_queue):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
+                if (
+                    getattr(connection, "_protocol_specified_explicitly", None) is False
+                    and connection.get_protocol() == 2
+                ):
+                    # EXEC replies bypass Redis.parse_response, so apply the
+                    # negotiated RESP2 callbacks here after a HELLO fallback.
+                    callback = _get_response_callback(
+                        redis_node.response_callbacks, command_name, connection
+                    )
+                    if callback is not None:
+                        cmd.options.pop("keys", None)
+                        r = callback(r, **cmd.options)
                 if command_name in self._pipe.cluster_response_callbacks:
                     r = self._pipe.cluster_response_callbacks[command_name](
                         r, **cmd.options

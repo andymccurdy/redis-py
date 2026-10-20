@@ -396,7 +396,50 @@ def test_callbacks_are_selected_per_connection(legacy_responses):
     callbacks = CaseInsensitiveDict(get_response_callbacks(None, legacy_responses))
     explicit = get_response_callbacks(2, legacy_responses)
     for command, callback in explicit.items():
-        assert _get_response_callback(callbacks, command, conn) is callback
+        for name in (
+            command,
+            command.lower(),
+            command.encode(),
+            command.lower().encode(),
+        ):
+            assert _get_response_callback(callbacks, name, conn) is callback
+
+
+@pytest.mark.parametrize("legacy_responses", [True, False])
+@pytest.mark.parametrize("as_bytes", [True, False])
+@pytest.mark.parametrize("command", ["CONFIG GET", "XREAD"])
+def test_fallback_command_names_and_custom_callbacks(
+    legacy_responses, as_bytes, command
+):
+    conn = Connection(legacy_responses=legacy_responses)
+    conn.protocol = 2
+    client = redis.Redis(legacy_responses=legacy_responses)
+    if command == "CONFIG GET":
+        wire = [b"timeout", b"0"]
+        expected = {"timeout": "0"}
+    else:
+        wire = [[b"stream", [[b"1-0", [b"field", b"value"]]]]]
+        entries = [(b"1-0", {b"field": b"value"})]
+        expected = [[b"stream", entries]] if legacy_responses else {b"stream": entries}
+    conn.read_response = mock.Mock(return_value=wire)
+    for name in (command, command.lower()):
+        name = name.encode() if as_bytes else name
+        assert client.parse_response(conn, name) == expected
+    custom = mock.Mock(return_value="custom")
+    client.set_response_callback(command, custom)
+    assert client.parse_response(conn, name) == "custom"
+    custom.assert_called_once_with(wire)
+
+
+@pytest.mark.parametrize("mapping_type", [dict, CaseInsensitiveDict])
+def test_original_callback_keys_are_preserved(mapping_type):
+    conn = Connection()
+    conn.protocol = 2
+    for name in ("config get", b"CONFIG GET"):
+        callbacks = mapping_type(get_response_callbacks(None, True))
+        custom = mock.Mock()
+        callbacks[name] = custom
+        assert _get_response_callback(callbacks, name, conn) is custom
 
 
 @pytest.mark.parametrize("legacy_responses", [True, False])
@@ -445,11 +488,22 @@ def test_fallback_client_and_pipeline(
         control.delete(key)
         control.hset(key, mapping={"field": "value"})
         expected = [{b"field": b"value"}, control.config_get("timeout")]
+        expected.append(expected[1])
         if transaction is None:
-            assert [client.hgetall(key), client.config_get("timeout")] == expected
+            assert [
+                client.hgetall(key),
+                client.config_get("timeout"),
+                client.execute_command(b"CONFIG GET", "timeout"),
+            ] == expected
         else:
             with client.pipeline(transaction=transaction) as pipe:
-                assert pipe.hgetall(key).config_get("timeout").execute() == expected
+                assert (
+                    pipe.hgetall(key)
+                    .config_get("timeout")
+                    .execute_command(b"CONFIG GET", "timeout")
+                    .execute()
+                    == expected
+                )
         assert pool._available_connections[-1].get_protocol() == 2
         pool.disconnect()
         assert client.hgetall(key) == expected[0]

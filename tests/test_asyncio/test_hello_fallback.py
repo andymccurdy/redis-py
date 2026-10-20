@@ -1,5 +1,6 @@
 """Async HELLO fallback, negotiated response shapes, and pipeline regressions."""
 
+import asyncio
 from unittest import mock
 
 import pytest
@@ -45,7 +46,7 @@ class HelloRejectingConnection(Connection):
 class TestHelloFallback:
     def _make_connection(self, **kwargs):
         conn = Connection(driver_info=None, **kwargs)
-        conn._parser.on_connect = mock.Mock()
+        conn._reader = mock.Mock(spec=asyncio.StreamReader)
         conn.send_command = mock.AsyncMock()
         return conn
 
@@ -66,13 +67,13 @@ class TestHelloFallback:
         conn.read_response = mock.AsyncMock(
             side_effect=[ResponseError("unknown command 'HELLO'"), b"OK"]
         )
-        with mock.patch.object(_AsyncRESP2Parser, "on_connect"):
-            await conn.on_connect_check_health()
+        await conn.on_connect_check_health()
         if parser_class is _AsyncHiredisParser:
             assert conn._parser is parser
         else:
             assert isinstance(conn._parser, _AsyncRESP2Parser)
         assert conn._parser.EXCEPTION_CLASSES is exceptions
+        assert conn._parser._stream is conn._reader
         assert conn.get_protocol() == 2
         assert conn.handshake_metadata == {}
         assert not any(
@@ -185,6 +186,35 @@ class TestHelloFallback:
             response_callbacks=get_response_callbacks(None, legacy_responses),
         )
         assert await node.parse_response(conn, "HGETALL") == {b"field": b"value"}
+        conn.read_response.return_value = [b"timeout", b"0"]
+        assert await node.parse_response(conn, b"config get") == {"timeout": "0"}
+
+    @pytest.mark.parametrize("legacy_responses", [True, False])
+    @pytest.mark.parametrize("as_bytes", [True, False])
+    @pytest.mark.parametrize("command", ["CONFIG GET", "XREAD"])
+    async def test_fallback_command_names_and_custom_callbacks(
+        self, legacy_responses, as_bytes, command
+    ):
+        conn = self._make_connection(legacy_responses=legacy_responses)
+        conn.protocol = 2
+        client = redis.Redis(legacy_responses=legacy_responses)
+        if command == "CONFIG GET":
+            wire = [b"timeout", b"0"]
+            expected = {"timeout": "0"}
+        else:
+            wire = [[b"stream", [[b"1-0", [b"field", b"value"]]]]]
+            entries = [(b"1-0", {b"field": b"value"})]
+            expected = (
+                [[b"stream", entries]] if legacy_responses else {b"stream": entries}
+            )
+        conn.read_response = mock.AsyncMock(return_value=wire)
+        for name in (command, command.lower()):
+            name = name.encode() if as_bytes else name
+            assert await client.parse_response(conn, name) == expected
+        custom = mock.AsyncMock(return_value="custom")
+        client.set_response_callback(command, custom)
+        assert await client.parse_response(conn, name) == "custom"
+        custom.assert_awaited_once_with(wire)
 
     @pytest.mark.parametrize("legacy_responses", [True, False])
     async def test_cluster_transaction_uses_negotiated_callbacks(
@@ -239,15 +269,21 @@ async def test_fallback_client_and_pipeline(
         await control.delete(key)
         await control.hset(key, mapping={"field": "value"})
         expected = [{b"field": b"value"}, await control.config_get("timeout")]
+        expected.append(expected[1])
         if transaction is None:
             assert [
                 await client.hgetall(key),
                 await client.config_get("timeout"),
+                await client.execute_command(b"CONFIG GET", "timeout"),
             ] == expected
         else:
             async with client.pipeline(transaction=transaction) as pipe:
                 assert (
-                    await pipe.hgetall(key).config_get("timeout").execute() == expected
+                    await pipe.hgetall(key)
+                    .config_get("timeout")
+                    .execute_command(b"CONFIG GET", "timeout")
+                    .execute()
+                    == expected
                 )
         assert pool._available_connections[-1].get_protocol() == 2
         await pool.disconnect()

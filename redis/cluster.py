@@ -7336,10 +7336,7 @@ class TransactionStrategy(AbstractStrategy):
         for r, cmd in zip(response, self._command_queue):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
-                if (
-                    getattr(connection, "_protocol_specified_explicitly", None) is False
-                    and connection.get_protocol() == 2
-                ):
+                if getattr(connection, "_resp2_fallback", False):
                     # EXEC replies bypass Redis.parse_response, so apply the
                     # negotiated RESP2 callbacks here after a HELLO fallback.
                     callback = _get_response_callback(

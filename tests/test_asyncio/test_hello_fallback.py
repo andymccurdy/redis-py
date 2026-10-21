@@ -1,6 +1,7 @@
 """Async HELLO fallback, negotiated response shapes, and pipeline regressions."""
 
 import asyncio
+import logging
 from unittest import mock
 
 import pytest
@@ -75,6 +76,7 @@ class TestHelloFallback:
         assert conn._parser.EXCEPTION_CLASSES is exceptions
         assert conn._parser._stream is conn._reader
         assert conn.get_protocol() == 2
+        assert conn._resp2_fallback is True
         assert conn.handshake_metadata == {}
         assert not any(
             c.args[:2] == ("CLIENT", "MAINT_NOTIFICATIONS")
@@ -95,6 +97,18 @@ class TestHelloFallback:
             await conn.on_connect_check_health()
         assert exc.value is error
         assert conn.get_protocol() == 3
+        assert conn._resp2_fallback is False
+
+    async def test_fallback_warning_documents_module_limitation(self, caplog):
+        conn = self._make_connection()
+        conn.read_response = mock.AsyncMock(
+            side_effect=ResponseError("unknown command 'HELLO'")
+        )
+        with caplog.at_level(logging.WARNING, logger="redis.asyncio.connection"):
+            await conn.on_connect_check_health()
+        assert "Module commands" in caplog.text
+        assert "do not adapt their response parsers" in caplog.text
+        assert "protocol=2" in caplog.text
 
     @pytest.mark.parametrize(
         "error",
@@ -176,9 +190,29 @@ class TestHelloFallback:
         assert conn.get_protocol() == 3
 
     @pytest.mark.parametrize("legacy_responses", [True, False])
+    @pytest.mark.parametrize("protocol", [None, 2, 3])
+    async def test_bytes_commands_without_fallback_keep_raw_replies(
+        self, protocol, legacy_responses
+    ):
+        conn = self._make_connection(
+            protocol=protocol, legacy_responses=legacy_responses
+        )
+        client = redis.Redis(protocol=protocol, legacy_responses=legacy_responses)
+        assert conn._resp2_fallback is False
+        wire = [b"field", b"value"]
+        conn.read_response = mock.AsyncMock(return_value=wire)
+        for command in (b"HGETALL", b"hgetall", b"CONFIG GET", b"XREAD"):
+            assert await client.parse_response(conn, command) is wire
+        custom = mock.AsyncMock(return_value="custom")
+        client.set_response_callback(b"HGETALL", custom)
+        assert await client.parse_response(conn, b"HGETALL") == "custom"
+        custom.assert_awaited_once_with(wire)
+
+    @pytest.mark.parametrize("legacy_responses", [True, False])
     async def test_cluster_node_uses_negotiated_callbacks(self, legacy_responses):
         conn = self._make_connection(legacy_responses=legacy_responses)
         conn.protocol = 2
+        conn._resp2_fallback = True
         conn.read_response = mock.AsyncMock(return_value=[b"field", b"value"])
         node = ClusterNode(
             "127.0.0.1",
@@ -197,6 +231,7 @@ class TestHelloFallback:
     ):
         conn = self._make_connection(legacy_responses=legacy_responses)
         conn.protocol = 2
+        conn._resp2_fallback = True
         client = redis.Redis(legacy_responses=legacy_responses)
         if command == "CONFIG GET":
             wire = [b"timeout", b"0"]
@@ -222,6 +257,7 @@ class TestHelloFallback:
     ):
         conn = self._make_connection(legacy_responses=legacy_responses)
         conn.protocol = 2
+        conn._resp2_fallback = True
         conn.send_packed_command = mock.AsyncMock()
         node = mock.Mock(spec=ClusterNode)
         node.parse_response = mock.AsyncMock(

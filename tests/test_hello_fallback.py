@@ -143,6 +143,7 @@ class TestHelloFallback:
 
         with pytest.raises(ResponseError, match="unknown command"):
             conn.on_connect_check_health()
+        assert conn._resp2_fallback is False
 
     def test_no_fallback_on_wrongpass(self):
         """WRONGPASS errors should never be swallowed, even with default protocol."""
@@ -188,6 +189,8 @@ class TestHelloFallback:
         assert "does not support HELLO" in caplog.text
         assert "RESP3" in caplog.text or "RESP" in caplog.text
         assert "protocol=2" in caplog.text
+        assert "Module commands" in caplog.text
+        assert "do not adapt their response parsers" in caplog.text
 
     def test_handshake_metadata_is_dict_after_fallback(self):
         """handshake_metadata should be {} (not None) after fallback to
@@ -285,6 +288,7 @@ class TestHelloFallback:
             assert isinstance(conn._parser, _RESP2Parser)
         assert conn._parser.EXCEPTION_CLASSES is exceptions
         assert conn.get_protocol() == 2
+        assert conn._resp2_fallback is True
         assert not any(
             c.args[:2] == ("CLIENT", "MAINT_NOTIFICATIONS")
             for c in conn.send_command.call_args_list
@@ -373,15 +377,49 @@ class TestHelloFallback:
             pool.disconnect()
 
 
+@pytest.mark.parametrize("protocol", [None, 2, 3])
+@pytest.mark.parametrize("legacy_responses", [True, False])
+def test_bytes_commands_without_fallback_keep_raw_replies(protocol, legacy_responses):
+    client = redis.Redis(protocol=protocol, legacy_responses=legacy_responses)
+    conn = Connection(protocol=protocol, legacy_responses=legacy_responses)
+    assert conn._resp2_fallback is False
+    wire = [b"field", b"value"]
+    conn.read_response = mock.Mock(return_value=wire)
+    for command in (b"HGETALL", b"hgetall", b"CONFIG GET", b"XREAD"):
+        assert client.parse_response(conn, command) is wire
+    custom = mock.Mock(return_value="custom")
+    client.set_response_callback(b"HGETALL", custom)
+    assert client.parse_response(conn, b"HGETALL") == "custom"
+    custom.assert_called_once_with(wire)
+
+
+def test_normal_callback_path_only_checks_fallback_flag():
+    conn = Connection()
+    conn.get_protocol = mock.Mock(
+        side_effect=AssertionError("unexpected protocol lookup")
+    )
+    callback = mock.Mock()
+    callbacks = {"hgetall": callback}
+    with mock.patch(
+        "redis._parsers.response_callbacks.str_if_bytes",
+        side_effect=AssertionError("unexpected normalization"),
+    ):
+        assert _get_response_callback(callbacks, "hgetall", conn) is callback
+        assert _get_response_callback(callbacks, "HGETALL", conn) is None
+        assert _get_response_callback(callbacks, b"hgetall", conn) is None
+
+
 @pytest.mark.parametrize("legacy_responses", [True, False])
 def test_callbacks_are_selected_per_connection(legacy_responses):
     client = redis.Redis(legacy_responses=legacy_responses)
     conn = Connection(protocol=None, legacy_responses=legacy_responses)
     callbacks = client.response_callbacks.copy()
     conn.protocol = 2
+    conn._resp2_fallback = True
     callback = _get_response_callback(client.response_callbacks, "hgetall", conn)
     assert callback([b"field", b"value"]) == {b"field": b"value"}
     conn.protocol = 3
+    conn._resp2_fallback = False
     assert _get_response_callback(
         client.response_callbacks, "hgetall", conn
     ) is callbacks.get("HGETALL")
@@ -390,6 +428,7 @@ def test_callbacks_are_selected_per_connection(legacy_responses):
     custom = mock.Mock(return_value="custom")
     client.set_response_callback("HGETALL", custom)
     conn.protocol = 2
+    conn._resp2_fallback = True
     assert _get_response_callback(client.response_callbacks, "hgetall", conn) is custom
 
     # RESP2 adds callbacks for commands that return native types on RESP3.
@@ -413,6 +452,7 @@ def test_fallback_command_names_and_custom_callbacks(
 ):
     conn = Connection(legacy_responses=legacy_responses)
     conn.protocol = 2
+    conn._resp2_fallback = True
     client = redis.Redis(legacy_responses=legacy_responses)
     if command == "CONFIG GET":
         wire = [b"timeout", b"0"]
@@ -435,6 +475,7 @@ def test_fallback_command_names_and_custom_callbacks(
 def test_original_callback_keys_are_preserved(mapping_type):
     conn = Connection()
     conn.protocol = 2
+    conn._resp2_fallback = True
     for name in ("config get", b"CONFIG GET"):
         callbacks = mapping_type(get_response_callbacks(None, True))
         custom = mock.Mock()
@@ -446,6 +487,7 @@ def test_original_callback_keys_are_preserved(mapping_type):
 def test_cluster_transaction_uses_negotiated_callbacks(legacy_responses):
     conn = Connection(legacy_responses=legacy_responses)
     conn.protocol = 2
+    conn._resp2_fallback = True
     conn.send_packed_command = mock.Mock()
     conn.read_response = mock.Mock(
         side_effect=[b"OK", b"QUEUED", [[b"field", b"value"]]]

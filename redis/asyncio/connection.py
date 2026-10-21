@@ -874,6 +874,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 raise ConnectionError("protocol must be either 2 or 3")
         self.protocol = p
         self.handshake_metadata = None
+        self._resp2_fallback = False
         self.legacy_responses = legacy_responses
         if parser_class != _AsyncHiredisParser:
             # The Python parsers are protocol-specific; hiredis supports both.
@@ -1240,7 +1241,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             "Server/proxy at %s does not support HELLO (RESP%s). "
             "Falling back to RESP2. To silence this warning, "
             "set protocol=2 explicitly or upgrade your "
-            "server/proxy.",
+            "server/proxy. Module commands (JSON, Search, TimeSeries, Bloom, "
+            "vector sets) do not adapt their response parsers after automatic "
+            "fallback; set protocol=2 explicitly before using them.",
             self._host_error(),
             self.protocol,
         )
@@ -1249,6 +1252,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
             self._parser.on_connect(self)
         self.protocol = 2
+        self._resp2_fallback = True
         self.handshake_metadata = {}
         if auth_args:
             await self._do_resp2_auth(auth_args)

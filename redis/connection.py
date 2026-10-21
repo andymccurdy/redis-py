@@ -1163,6 +1163,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.redis_connect_func = redis_connect_func
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self.handshake_metadata = None
+        self._resp2_fallback = False
         self._client_side_caching = False
         self._sock = None
         self._socket_read_size = socket_read_size
@@ -1437,7 +1438,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             "Server/proxy at %s does not support HELLO (RESP%s). "
             "Falling back to RESP2. To silence this warning, "
             "set protocol=2 explicitly or upgrade your "
-            "server/proxy.",
+            "server/proxy. Module commands (JSON, Search, TimeSeries, Bloom, "
+            "vector sets) do not adapt their response parsers after automatic "
+            "fallback; set protocol=2 explicitly before using them.",
             self._host_error(),
             self.protocol,
         )
@@ -1446,6 +1449,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
             self._parser.on_connect(self)
         self.protocol = 2
+        self._resp2_fallback = True
         self.handshake_metadata = {}
         if auth_args:
             self._do_resp2_auth(auth_args)

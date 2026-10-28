@@ -82,7 +82,9 @@ class TSInfo:
         if isinstance(args, dict):
             # RESP3 wire: response is a native map (bytes keys when not decoded).
             response = {nativestr(k): v for k, v in args.items()}
-            self.rules = response.get("rules") or {}
+            rules = response.get("rules") or {}
+            # Match the RESP2 list of [dest_key, bucket, aggregator, alignment].
+            self.rules = [[key, *rule] for key, rule in rules.items()]
             labels = response.get("labels") or {}
             self.labels = {str_if_bytes(k): str_if_bytes(v) for k, v in labels.items()}
         else:

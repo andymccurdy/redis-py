@@ -12,6 +12,7 @@ from .conftest import (
     assert_resp_response,
     expected_response_shape,
     expects_resp2_shape,
+    expects_resp3_shape,
     is_resp2_connection,
     skip_if_server_version_gte,
     skip_if_server_version_lt,
@@ -234,10 +235,10 @@ def test_create_and_delete_rule(client):
     client.ts().add(1, time * 2, 1.5)
     assert round(client.ts().get(2)[1], 5) == 1.5
     info = client.ts().info(1)
-    if is_resp2_connection(client):
-        assert info.rules[0][1] == 100
-    else:
+    if expects_resp3_shape(client):
         assert info["rules"]["2"][0] == 100
+    else:
+        assert info.rules[0][:2] == ["2", 100]
 
     # test rule deletion
     client.ts().deleterule(1, 2)
@@ -1311,6 +1312,16 @@ def test_info_resp3_bytes_keys():
         assert info.chunk_size == 4096
         assert info.duplicate_policy == "block"
         assert info.labels == {"currentLabel": "currentData"}
+
+
+@pytest.mark.fixed_client
+def test_info_resp3_rules():
+    # Server-free: the RESP3 rules map must parse like the RESP2 list.
+    resp2 = TSInfo([b"rules", [[b"dst", 100, b"AVG", 0]], b"labels", []])
+    resp3 = TSInfo({b"rules": {b"dst": [100, b"AVG", 0]}, b"labels": {}})
+    for info in (resp2, resp3):
+        assert info.rules == [[b"dst", 100, b"AVG", 0]]
+    assert TSInfo({b"rules": {}, b"labels": {}}).rules == []
 
 
 @pytest.mark.fixed_client

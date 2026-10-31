@@ -17,6 +17,43 @@ from redis.exceptions import ConnectionError, NoPermissionError, RedisError
 
 
 @pytest.mark.fixed_client
+async def test_async_monitor_retry_after_cancelled_entry_reserves_connection(
+    monkeypatch,
+):
+    monkeypatch.setattr(AsyncConnection, "connect", AsyncMock())
+    monkeypatch.setattr(AsyncConnection, "can_read", AsyncMock(return_value=False))
+    monkeypatch.setattr(AsyncConnection, "send_command", AsyncMock())
+    reading = asyncio.Event()
+
+    async def read_response(*args, **kwargs):
+        if not reading.is_set():
+            reading.set()
+            await asyncio.Event().wait()
+        return b"OK"
+
+    monkeypatch.setattr(AsyncConnection, "read_response", read_response)
+    pool = aioredis.ConnectionPool(max_connections=1)
+    monitor = aioredis.Redis(connection_pool=pool).monitor()
+
+    async def enter():
+        async with monitor:
+            pytest.fail("cancelled MONITOR entered its context")
+
+    task = asyncio.create_task(enter())
+    await asyncio.wait_for(reading.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with monitor:
+        with pytest.raises(redis.MaxConnectionsError):
+            await pool.get_connection()
+    connection = await pool.get_connection()
+    await pool.release(connection)
+    await pool.aclose()
+
+
+@pytest.mark.fixed_client
 @pytest.mark.parametrize("failure_stage", ["send", "read", "response"])
 def test_monitor_failed_entry_releases_connection(monkeypatch, failure_stage):
     monkeypatch.setattr(Connection, "connect", Mock())
@@ -141,6 +178,132 @@ async def test_async_monitor_failed_entry_releases_connection(
             pytest.fail("failed MONITOR must not enter its context")
 
     connection = await pool.get_connection()
+    await pool.release(connection)
+    await pool.aclose()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("failures", [1, 2])
+def test_monitor_retry_reserves_connection(monkeypatch, failures):
+    monkeypatch.setattr(Connection, "connect", Mock())
+    monkeypatch.setattr(Connection, "can_read", Mock(return_value=False))
+    monkeypatch.setattr(Connection, "send_command", Mock())
+    monkeypatch.setattr(
+        Connection,
+        "read_response",
+        Mock(side_effect=[NoPermissionError("MONITOR denied")] * failures + [b"OK"]),
+    )
+    pool = redis.ConnectionPool(max_connections=1)
+    monitor = redis.Redis(connection_pool=pool).monitor()
+    for _ in range(failures):
+        with pytest.raises(NoPermissionError):
+            with monitor:
+                pytest.fail("failed MONITOR entered its context")
+    with monitor:
+        with pytest.raises(redis.MaxConnectionsError):
+            pool.get_connection()
+    # A second exit must not return or disconnect a different borrower's lease.
+    connection = pool.get_connection()
+    disconnect = Mock()
+    monkeypatch.setattr(connection, "disconnect", disconnect)
+    monitor.__exit__()
+    disconnect.assert_not_called()
+    with pytest.raises(redis.MaxConnectionsError):
+        pool.get_connection()
+    pool.release(connection)
+    pool.disconnect()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("failures", [1, 2])
+async def test_async_monitor_retry_reserves_connection(monkeypatch, failures):
+    monkeypatch.setattr(AsyncConnection, "connect", AsyncMock())
+    monkeypatch.setattr(AsyncConnection, "can_read", AsyncMock(return_value=False))
+    monkeypatch.setattr(AsyncConnection, "send_command", AsyncMock())
+    monkeypatch.setattr(
+        AsyncConnection,
+        "read_response",
+        AsyncMock(
+            side_effect=[NoPermissionError("MONITOR denied")] * failures + [b"OK"]
+        ),
+    )
+    pool = aioredis.ConnectionPool(max_connections=1)
+    monitor = aioredis.Redis(connection_pool=pool).monitor()
+    for _ in range(failures):
+        with pytest.raises(NoPermissionError):
+            async with monitor:
+                pytest.fail("failed MONITOR entered its context")
+    async with monitor:
+        with pytest.raises(redis.MaxConnectionsError):
+            await pool.get_connection()
+    connection = await pool.get_connection()
+    disconnect = AsyncMock()
+    monkeypatch.setattr(connection, "disconnect", disconnect)
+    await monitor.__aexit__()
+    disconnect.assert_not_awaited()
+    with pytest.raises(redis.MaxConnectionsError):
+        await pool.get_connection()
+    await pool.release(connection)
+    await pool.aclose()
+
+
+@pytest.mark.fixed_client
+def test_monitor_retry_checkout_failure_does_not_touch_other_borrower(monkeypatch):
+    monkeypatch.setattr(Connection, "connect", Mock())
+    monkeypatch.setattr(Connection, "can_read", Mock(return_value=False))
+    send = Mock()
+    monkeypatch.setattr(Connection, "send_command", send)
+    read = Mock(side_effect=NoPermissionError("MONITOR denied"))
+    monkeypatch.setattr(Connection, "read_response", read)
+    pool = redis.ConnectionPool(max_connections=1)
+    monitor = redis.Redis(connection_pool=pool).monitor()
+    with pytest.raises(NoPermissionError):
+        with monitor:
+            pytest.fail("failed MONITOR entered its context")
+    connection = pool.get_connection()
+    disconnect = Mock()
+    monkeypatch.setattr(connection, "disconnect", disconnect)
+    send.reset_mock()
+    with pytest.raises(redis.MaxConnectionsError):
+        with monitor:
+            pytest.fail("MONITOR entered without acquiring a connection")
+    send.assert_not_called()
+    disconnect.assert_not_called()
+    with pytest.raises(redis.MaxConnectionsError):
+        pool.get_connection()
+    pool.release(connection)
+    pool.disconnect()
+
+
+@pytest.mark.fixed_client
+async def test_async_monitor_retry_checkout_failure_does_not_touch_other_borrower(
+    monkeypatch,
+):
+    monkeypatch.setattr(AsyncConnection, "connect", AsyncMock())
+    monkeypatch.setattr(AsyncConnection, "can_read", AsyncMock(return_value=False))
+    send = AsyncMock()
+    monkeypatch.setattr(AsyncConnection, "send_command", send)
+    monkeypatch.setattr(
+        AsyncConnection,
+        "read_response",
+        AsyncMock(side_effect=NoPermissionError("MONITOR denied")),
+    )
+    pool = aioredis.ConnectionPool(max_connections=1)
+    monitor = aioredis.Redis(connection_pool=pool).monitor()
+    with pytest.raises(NoPermissionError):
+        async with monitor:
+            pytest.fail("failed MONITOR entered its context")
+    connection = await pool.get_connection()
+    disconnect = AsyncMock()
+    monkeypatch.setattr(connection, "disconnect", disconnect)
+    send.reset_mock()
+    with pytest.raises(redis.MaxConnectionsError):
+        async with monitor:
+            pytest.fail("MONITOR entered without acquiring a connection")
+    send.assert_not_awaited()
+    disconnect.assert_not_awaited()
+    with pytest.raises(redis.MaxConnectionsError):
+        await pool.get_connection()
     await pool.release(connection)
     await pool.aclose()
 

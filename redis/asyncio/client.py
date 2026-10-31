@@ -1143,16 +1143,19 @@ class Monitor:
         return self
 
     async def __aexit__(self, *args):
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
         try:
-            await self.connection.disconnect()
+            await connection.disconnect()
         except BaseException:
             try:
-                await asyncio.shield(self.connection_pool.release(self.connection))
+                await asyncio.shield(self.connection_pool.release(connection))
             except Exception:
                 pass
             raise
         else:
-            await asyncio.shield(self.connection_pool.release(self.connection))
+            await asyncio.shield(self.connection_pool.release(connection))
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""

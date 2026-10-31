@@ -1128,16 +1128,24 @@ class Monitor:
 
     async def __aenter__(self):
         await self.connect()
-        await self.connection.send_command("MONITOR")
-        # check that monitor returns 'OK', but don't return it to user
-        response = await self.connection.read_response()
-        if not bool_ok(response):
-            raise RedisError(f"MONITOR failed: {response}")
+        try:
+            await self.connection.send_command("MONITOR")
+            # check that monitor returns 'OK', but don't return it to user
+            response = await self.connection.read_response()
+            if not bool_ok(response):
+                raise RedisError(f"MONITOR failed: {response}")
+        except BaseException as error:
+            try:
+                await self.__aexit__()
+            finally:
+                raise error
         return self
 
     async def __aexit__(self, *args):
-        await self.connection.disconnect()
-        await self.connection_pool.release(self.connection)
+        try:
+            await self.connection.disconnect()
+        finally:
+            await self.connection_pool.release(self.connection)
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""

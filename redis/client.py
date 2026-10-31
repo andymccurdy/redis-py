@@ -1070,12 +1070,20 @@ class Monitor:
         self.connection = self.connection_pool.get_connection()
 
     def __enter__(self):
-        self._start_monitor()
+        try:
+            self._start_monitor()
+        except BaseException as error:
+            try:
+                self.__exit__()
+            finally:
+                raise error
         return self
 
     def __exit__(self, *args):
-        self.connection.disconnect()
-        self.connection_pool.release(self.connection)
+        try:
+            self.connection.disconnect()
+        finally:
+            self.connection_pool.release(self.connection)
 
     def next_command(self):
         """Parse the response from a monitor command"""

@@ -1134,18 +1134,25 @@ class Monitor:
             response = await self.connection.read_response()
             if not bool_ok(response):
                 raise RedisError(f"MONITOR failed: {response}")
-        except BaseException as error:
+        except BaseException:
             try:
                 await self.__aexit__()
-            finally:
-                raise error
+            except Exception:
+                pass
+            raise
         return self
 
     async def __aexit__(self, *args):
         try:
             await self.connection.disconnect()
-        finally:
-            await self.connection_pool.release(self.connection)
+        except BaseException:
+            try:
+                await asyncio.shield(self.connection_pool.release(self.connection))
+            except Exception:
+                pass
+            raise
+        else:
+            await asyncio.shield(self.connection_pool.release(self.connection))
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""

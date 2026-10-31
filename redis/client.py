@@ -1072,17 +1072,24 @@ class Monitor:
     def __enter__(self):
         try:
             self._start_monitor()
-        except BaseException as error:
+        except BaseException:
             try:
                 self.__exit__()
-            finally:
-                raise error
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):
         try:
             self.connection.disconnect()
-        finally:
+        except BaseException:
+            try:
+                self.connection_pool.release(self.connection)
+            except Exception:
+                pass
+            raise
+        else:
             self.connection_pool.release(self.connection)
 
     def next_command(self):

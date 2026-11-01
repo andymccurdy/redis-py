@@ -2041,8 +2041,10 @@ URL_QUERY_ARGUMENT_PARSERS: Mapping[str, Callable[..., object]] = MappingProxyTy
         "max_connections": int,
         "health_check_interval": int,
         "ssl_check_hostname": to_bool,
-        "ssl_validate_ocsp": to_bool,
-        "ssl_validate_ocsp_stapled": to_bool,
+        # ssl_validate_ocsp and ssl_validate_ocsp_stapled are deliberately not
+        # listed here: the asyncio SSL stack does not implement OCSP validation,
+        # so casting them would only turn them into bools that SSLConnection then
+        # rejects with "unexpected keyword argument" when the first command runs.
         "ssl_include_verify_flags": parse_ssl_verify_flags,
         "ssl_exclude_verify_flags": parse_ssl_verify_flags,
         "ssl_min_version": int,

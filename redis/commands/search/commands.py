@@ -1867,6 +1867,16 @@ class SearchCommands:
 
 
 class AsyncSearchCommands(SearchCommands):
+    def syndump(self):
+        """Dump synonym groups; await direct calls, queue pipeline calls immediately."""
+        if isinstance(self.client, _PIPELINE_TYPES):
+            return super().syndump()
+        return self._syndump()
+
+    async def _syndump(self):
+        res = await self.execute_command(SYNDUMP_CMD, self.index_name)
+        return self._parse_results(SYNDUMP_CMD, res)
+
     def profile(
         self,
         query: Union[Query, AggregateRequest],

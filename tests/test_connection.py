@@ -24,6 +24,7 @@ import pytest
 import redis
 from packaging.version import Version
 from redis import ConnectionPool, Redis
+from redis.asyncio import Redis as AsyncRedis
 from redis._parsers import _HiredisParser, _RESP2Parser, _RESP3Parser
 from redis._parsers.hiredis import NOT_ENOUGH_DATA, _socket_can_read, _socket_is_closed
 from redis._parsers.socket import SocketBuffer
@@ -3942,6 +3943,29 @@ class TestBlockingConnectionPoolGetConnectionCount:
 
 
 @pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("true", True), ("True", True), ("1", True), ("yes", True),
+        ("false", False), ("False", False), ("0", False), ("no", False),
+    ),
+)
+def test_parse_url_casts_decode_responses_to_bool(value, expected):
+    kw = parse_url(f"redis://localhost:6379/?decode_responses={value}")
+
+    assert kw["decode_responses"] is expected
+
+
+@pytest.mark.parametrize("value", ("false", "False", "0", "no"))
+def test_from_url_does_not_decode_when_decode_responses_is_false(value):
+    client = Redis.from_url(f"redis://localhost:6379/0?decode_responses={value}")
+    encoder = client.get_encoder()
+    client.close()
+
+    assert encoder.decode_responses is False
+    assert encoder.decode(b"x") == b"x"
+
+
 def test_parse_url_retry_on_error_resolves_exception_names():
     kw = parse_url("redis://localhost:6379/?retry_on_error=ConnectionError")
     assert kw["retry_on_error"] == [ConnectionError]

@@ -3133,6 +3133,7 @@ URL_QUERY_ARGUMENT_PARSERS = {
     "socket_connect_timeout": float,
     "socket_read_size": int,
     "socket_keepalive": to_bool,
+    "decode_responses": to_bool,
     "retry_on_timeout": to_bool,
     "retry_on_error": parse_retry_on_error,
     "max_connections": int,

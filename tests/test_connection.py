@@ -3975,24 +3975,31 @@ def test_async_from_url_does_not_decode_when_decode_responses_is_false(value):
     assert encoder.decode(b"x") == b"x"
 
 
-@pytest.mark.parametrize("value", ("true", "1", "yes"))
-def test_async_from_url_keeps_ocsp_options_as_bools(value):
-    client = AsyncRedis.from_url(
-        f"rediss://localhost:6379?ssl_validate_ocsp={value}"
-        "&ssl_validate_ocsp_stapled=False"
-    )
-    kwargs = client.connection_pool.connection_kwargs
+# URL arguments the asyncio driver does not implement: the shared parser
+# table must not advertise them, otherwise from_url() accepts the option and the
+# first command fails inside SSLConnection with an unexpected keyword argument.
+ASYNC_UNSUPPORTED_URL_ARGS = frozenset(
+    {"ssl_validate_ocsp", "ssl_validate_ocsp_stapled"}
+)
 
-    assert kwargs["ssl_validate_ocsp"] is True
-    assert kwargs["ssl_validate_ocsp_stapled"] is False
+
+def test_async_url_parsers_do_not_advertise_unsupported_ocsp_options():
+    from redis import connection as sync_connection
+    from redis.asyncio import connection as async_connection
+
+    # The sync client implements OCSP validation, the asyncio one does not yet.
+    assert ASYNC_UNSUPPORTED_URL_ARGS <= set(sync_connection.URL_QUERY_ARGUMENT_PARSERS)
+    assert not (
+        ASYNC_UNSUPPORTED_URL_ARGS & set(async_connection.URL_QUERY_ARGUMENT_PARSERS)
+    )
 
 
 def test_sync_and_async_url_parsers_cover_the_same_arguments():
     from redis import connection as sync_connection
     from redis.asyncio import connection as async_connection
 
-    assert set(async_connection.URL_QUERY_ARGUMENT_PARSERS) == set(
-        sync_connection.URL_QUERY_ARGUMENT_PARSERS
+    assert set(async_connection.URL_QUERY_ARGUMENT_PARSERS) == (
+        set(sync_connection.URL_QUERY_ARGUMENT_PARSERS) - ASYNC_UNSUPPORTED_URL_ARGS
     )
 
 

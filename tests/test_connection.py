@@ -3966,6 +3966,36 @@ def test_from_url_does_not_decode_when_decode_responses_is_false(value):
     assert encoder.decode(b"x") == b"x"
 
 
+@pytest.mark.parametrize("value", ("false", "0", "no"))
+def test_async_from_url_does_not_decode_when_decode_responses_is_false(value):
+    client = AsyncRedis.from_url(f"redis://localhost:6379/0?decode_responses={value}")
+    encoder = client.get_encoder()
+
+    assert encoder.decode_responses is False
+    assert encoder.decode(b"x") == b"x"
+
+
+@pytest.mark.parametrize("value", ("true", "1", "yes"))
+def test_async_from_url_keeps_ocsp_options_as_bools(value):
+    client = AsyncRedis.from_url(
+        f"rediss://localhost:6379?ssl_validate_ocsp={value}"
+        "&ssl_validate_ocsp_stapled=False"
+    )
+    kwargs = client.connection_pool.connection_kwargs
+
+    assert kwargs["ssl_validate_ocsp"] is True
+    assert kwargs["ssl_validate_ocsp_stapled"] is False
+
+
+def test_sync_and_async_url_parsers_cover_the_same_arguments():
+    from redis import connection as sync_connection
+    from redis.asyncio import connection as async_connection
+
+    assert set(async_connection.URL_QUERY_ARGUMENT_PARSERS) == set(
+        sync_connection.URL_QUERY_ARGUMENT_PARSERS
+    )
+
+
 def test_parse_url_retry_on_error_resolves_exception_names():
     kw = parse_url("redis://localhost:6379/?retry_on_error=ConnectionError")
     assert kw["retry_on_error"] == [ConnectionError]

@@ -37,6 +37,7 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+from redis.retry import is_retryable_connect_error
 from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.utils import HIREDIS_AVAILABLE
 from tests.conftest import skip_if_server_version_lt
@@ -738,8 +739,11 @@ async def test_connect_timeout_error_without_retry():
 @pytest.mark.fixed_client
 async def test_connect_without_retry_on_unrecoverable_oserror():
     """A connect error that can never succeed on retry (e.g. a missing Unix
-    socket path, ENOENT) fails fast instead of consuming the retry budget."""
-    conn = Connection(retry=Retry(NoBackoff(), 3))
+    socket path, ENOENT) fails fast when the Retry object is configured with
+    the opt-in checker."""
+    conn = Connection(
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error)
+    )
     conn._connect = mock.AsyncMock()
     conn._connect.side_effect = OSError(ENOENT, "No such file or directory")
 
@@ -750,6 +754,125 @@ async def test_connect_without_retry_on_unrecoverable_oserror():
     # the original OSError is preserved as the cause for classification
     assert isinstance(excinfo.value.__cause__, OSError)
     assert excinfo.value.__cause__.errno == ENOENT
+
+
+@pytest.mark.fixed_client
+async def test_connect_retries_on_unrecoverable_oserror_without_checker():
+    """The ENOENT classification is opt-in: without the checker the default
+    retry behavior is unchanged."""
+    conn = Connection(retry=Retry(NoBackoff(), 3))
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ENOENT, "No such file or directory")
+
+    with pytest.raises(ConnectionError):
+        await conn.connect()
+    # 3 retries --> 4 attempts
+    assert conn._connect.call_count == 4
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Unix domain sockets are not available on Windows",
+)
+async def test_connect_missing_unix_socket_fails_fast_with_checker(tmp_path):
+    """Real missing-socket path: the opt-in checker stops after one attempt."""
+    conn = UnixDomainSocketConnection(
+        path=str(tmp_path / "missing.sock"),
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error),
+    )
+    with mock.patch.object(conn, "_connect", wraps=conn._connect) as connect:
+        with pytest.raises(ConnectionError) as excinfo:
+            await conn.connect()
+    assert connect.call_count == 1
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert excinfo.value.__cause__.errno == ENOENT
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Unix domain sockets are not available on Windows",
+)
+async def test_connect_missing_unix_socket_retries_without_checker(tmp_path):
+    """Real missing-socket path: without the checker the default retry policy
+    still spends the full retry budget."""
+    conn = UnixDomainSocketConnection(
+        path=str(tmp_path / "missing.sock"),
+        retry=Retry(NoBackoff(), 3),
+    )
+    with mock.patch.object(conn, "_connect", wraps=conn._connect) as connect:
+        with pytest.raises(ConnectionError):
+            await conn.connect()
+    assert connect.call_count == 4
+
+
+@pytest.mark.fixed_client
+async def test_lazy_reconnect_uses_retry_checker():
+    """The checker lives on the Retry object, so it also applies to the lazy
+    reconnect retry inside connect_check_health, not just connect()."""
+
+    async def connect_error():
+        try:
+            raise ConnectionError("connect failed") from OSError(
+                ENOENT, "No such file or directory"
+            )
+        except ConnectionError as exc:
+            raise exc
+
+    conn = Connection(
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error)
+    )
+    conn._connect = mock.AsyncMock(side_effect=connect_error)
+
+    with pytest.raises(ConnectionError):
+        await conn.send_packed_command(b"PING", check_health=False)
+
+    assert conn._connect.call_count == 1
+
+
+@pytest.mark.fixed_client
+async def test_send_packed_command_preserves_oserror_cause():
+    """The write wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._reader = mock.Mock()
+    conn._writer = mock.Mock()
+    conn._writer.transport.is_closing.return_value = False
+    error = OSError(ENOENT, "No such file or directory")
+    conn._writer.writelines.side_effect = error
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.send_packed_command(b"PING", check_health=False)
+
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.fixed_client
+async def test_read_response_preserves_oserror_cause():
+    """The read wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._parser = mock.Mock()
+    error = OSError(ENOENT, "No such file or directory")
+    conn._parser.read_response = mock.AsyncMock(side_effect=error)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.read_response()
+
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.fixed_client
+async def test_can_read_preserves_oserror_cause():
+    """The can_read wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._parser = mock.Mock()
+    error = OSError(ENOENT, "No such file or directory")
+    conn._parser.can_read = mock.AsyncMock(side_effect=error)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.can_read()
+
+    assert excinfo.value.__cause__ is error
 
 
 @pytest.mark.fixed_client

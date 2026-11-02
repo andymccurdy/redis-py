@@ -1,6 +1,5 @@
 import asyncio
 import copy
-import errno
 import inspect
 import logging
 import math
@@ -1037,25 +1036,6 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             f"notification_hash: {self.maintenance_notification_hash}"
         )
 
-    # OS-level errno values for which reconnecting can never succeed, so
-    # there is no point spending the retry/backoff budget on them.
-    _UNRETRYABLE_CONNECT_ERRNOS = frozenset({errno.ENOENT})
-
-    @classmethod
-    def _is_retryable_connect_error(cls, error: BaseException) -> bool:
-        """Whether a failed connection attempt is worth retrying.
-
-        Returns ``False`` for definitively unrecoverable socket errors (e.g. a
-        Unix socket path that does not exist, ``ENOENT``) so that ``connect()``
-        fails fast instead of backing off for every retry. Transient errors
-        such as ``ECONNREFUSED`` during server startup stay retryable.
-        """
-        cause = error.__cause__
-        return not (
-            isinstance(cause, OSError)
-            and cause.errno in cls._UNRETRYABLE_CONNECT_ERRNOS
-        )
-
     async def connect(self):
         """Connects to the Redis server if not already connected"""
         # try once the socket connect with the handshake, retry the whole
@@ -1067,7 +1047,6 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             lambda error, failure_count: self.disconnect(
                 error=error, failure_count=failure_count
             ),
-            is_retryable=self._is_retryable_connect_error,
             with_failure_count=True,
         )
 
@@ -1491,7 +1470,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def can_read(self) -> bool:
         """Check the socket to see if there's data loaded in the buffer."""
@@ -1502,7 +1483,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def read_response(
         self,
@@ -1576,7 +1559,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                     await self.disconnect(nowait=True)
                 raise ConnectionError(
                     f"Error while reading from {host_error} : {e.args}"
-                )
+                ) from e
             if timeout is not None:
                 # user requested timeout, return None. Operation can be retried
                 return None
@@ -1589,7 +1572,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # See the sync Connection.read_response and #4291. The async parser
             # re-parses from self._pos = 0 rather than rewinding a socket

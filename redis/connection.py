@@ -1,5 +1,4 @@
 import copy
-import errno
 import functools
 import ipaddress
 import logging
@@ -1273,25 +1272,6 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
     def _get_parser(self) -> Union[_HiredisParser, _RESP3Parser, _RESP2Parser]:
         return self._parser
 
-    # OS-level errno values for which reconnecting can never succeed, so
-    # there is no point spending the retry/backoff budget on them.
-    _UNRETRYABLE_CONNECT_ERRNOS = frozenset({errno.ENOENT})
-
-    @classmethod
-    def _is_retryable_connect_error(cls, error: BaseException) -> bool:
-        """Whether a failed connection attempt is worth retrying.
-
-        Returns ``False`` for definitively unrecoverable socket errors (e.g. a
-        Unix socket path that does not exist, ``ENOENT``) so that ``connect()``
-        fails fast instead of backing off for every retry. Transient errors
-        such as ``ECONNREFUSED`` during server startup stay retryable.
-        """
-        cause = error.__cause__
-        return not (
-            isinstance(cause, OSError)
-            and cause.errno in cls._UNRETRYABLE_CONNECT_ERRNOS
-        )
-
     def connect(self):
         "Connects to the Redis server if not already connected"
         # try once the socket connect with the handshake, retry the whole
@@ -1301,7 +1281,6 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 check_health=True, retry_socket_connect=False
             ),
             lambda error: self.disconnect(error),
-            is_retryable=self._is_retryable_connect_error,
         )
 
     def connect_check_health(
@@ -1649,7 +1628,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 errno = e.args[0]
                 errmsg = e.args[1]
-            raise ConnectionError(f"Error {errno} while writing to socket. {errmsg}.")
+            raise ConnectionError(
+                f"Error {errno} while writing to socket. {errmsg}."
+            ) from e
         except BaseException as e:
             # BaseExceptions can be raised when a socket send operation is not
             # finished, e.g. due to a timeout.  Ideally, a caller could then re-try
@@ -1681,7 +1662,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
         except OSError as e:
             self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     def read_response(
         self,
@@ -1724,7 +1707,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # The parser failed partway through a reply, after the read cursor
             # had already passed bytes it cannot re-interpret. The rewind and

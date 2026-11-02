@@ -130,7 +130,7 @@ class TestConnectionAttributesWithoutHostPort:
             db=0,
         )
 
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
+        with patch.object(recorder, "_metrics_collector", collector):
             client = Redis(connection_pool=pool)
             yield client, pool
 

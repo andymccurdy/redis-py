@@ -7723,10 +7723,7 @@ class TestClusterMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
-            # Also set the collector directly to ensure it's used
-            recorder._metrics_collector = collector
-
+        with patch.object(recorder, "_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher
@@ -7936,10 +7933,7 @@ class TestClusterPipelineMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
-            # Also set the collector directly to ensure it's used
-            recorder._metrics_collector = collector
-
+        with patch.object(recorder, "_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher

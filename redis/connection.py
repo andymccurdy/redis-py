@@ -1335,8 +1335,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 # Use the passed function redis_connect_func
                 self.redis_connect_func(self)
-        except RedisError:
-            # clean up after any error in on_connect
+        except BaseException:
+            # clean up after any error in on_connect, which includes whatever a
+            # credential provider raises. A socket left in place reads as
+            # connected, so the next command would run without AUTH and SELECT.
             self.disconnect()
             raise
 

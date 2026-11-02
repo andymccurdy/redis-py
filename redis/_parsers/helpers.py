@@ -33,7 +33,15 @@ def parse_debug_object(response):
     return response
 
 
-def parse_info(response):
+def decode_info(response, encoder):
+    """Decode a raw INFO reply, replacing any bytes the encoder can't decode"""
+    try:
+        return encoder.decode(response)
+    except UnicodeDecodeError:
+        return response.decode(encoder.encoding, errors="replace")
+
+
+def parse_info(response, **options):
     """Parse the result of Redis's INFO command into a Python dict"""
     info = {}
     response = str_if_bytes(response)

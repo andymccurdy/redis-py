@@ -38,7 +38,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_READ_SIZE,
     DEFAULT_SOCKET_TIMEOUT,
 )
-from redis._parsers.helpers import bool_ok, get_response_callbacks
+from redis._parsers.helpers import bool_ok, decode_info
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -59,7 +59,7 @@ from redis.client import (
     EMPTY_RESPONSE,
     NEVER_DECODE,
     AbstractRedis,
-    CaseInsensitiveDict,
+    default_response_callbacks,
 )
 from redis.commands import (
     AsyncCoreCommands,
@@ -526,11 +526,9 @@ class Redis(
         self.connection: Optional[Connection] = None
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
+        self.response_callbacks = default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
         )
 
         # If using a single connection client, we need to lock creation-of and use-of
@@ -1031,6 +1029,8 @@ class Redis(
             if NEVER_DECODE in options:
                 response = await connection.read_response(disable_decoding=True)
                 options.pop(NEVER_DECODE)
+                if command_name == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = await connection.read_response()
         except ResponseError:

@@ -1752,6 +1752,39 @@ def collect_groups(client, res, alias, group_field="color"):
 
 
 class TestAggregations(AsyncSearchTestsBase):
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    async def test_aggregation_zero_limit(self, decoded_r: redis.Redis):
+        await decoded_r.ft().create_index((TextField("title"),))
+        for i in range(3):
+            await decoded_r.hset(f"doc:{i}", mapping={"title": "redis"})
+        await self.waitForIndex(decoded_r, "idx")
+
+        res = await decoded_r.ft().aggregate(
+            aggregations.AggregateRequest("redis").limit(0, 0)
+        )
+
+        if expects_resp3_shape(decoded_r):
+            assert res["results"] == []
+            assert res["total_results"] == 3
+        else:
+            assert res.rows == []
+            expected_total = 3 if int(get_protocol_version(decoded_r)) == 3 else 0
+            assert res.total == expected_total
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.4")
+    async def test_aggregation_invalid_zero_limit(self, decoded_r: redis.Redis):
+        await decoded_r.ft().create_index((TextField("title"),))
+        await decoded_r.hset("doc:0", mapping={"title": "redis"})
+        await self.waitForIndex(decoded_r, "idx")
+
+        with pytest.raises(ResponseError):
+            await decoded_r.ft().aggregate(
+                aggregations.AggregateRequest("redis").limit(5, 0)
+            )
+
     @pytest_asyncio.fixture
     async def collect_index(self, decoded_r):
         """Enable the preview feature and index the shared fruit documents.
@@ -4114,6 +4147,43 @@ class TestHybridSearch(AsyncSearchTestsBase):
                 }
                 assert item["color"] == item["description"].split()[0]
                 assert item["price_discount"] == expected_discounts[item["price"]]
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.3.224")
+    async def test_hybrid_search_query_with_zero_limit(self, decoded_r):
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r)
+
+        hybrid_query = HybridQuery(
+            HybridSearchQuery("@color:{red|green|orange|black}"),
+            HybridVsimQuery(
+                vector_field_name="@embedding",
+                vector_data="$vec",
+                vsim_search_method=VectorSearchMethods.KNN,
+                vsim_search_method_params={"K": 5},
+            ),
+        )
+        params = {"vec": np.array([1, 2, 7, 6], dtype=np.float32).tobytes()}
+
+        res = await decoded_r.ft().hybrid_search(
+            query=hybrid_query,
+            post_processing=HybridPostProcessingConfig().limit(0, 0),
+            params_substitution=params,
+        )
+
+        if expects_resp3_shape(decoded_r):
+            assert res["results"] == []
+            assert res["total_results"] == 5
+        else:
+            assert res.results == []
+            assert res.total_results == 5
+
+        with pytest.raises(ResponseError):
+            await decoded_r.ft().hybrid_search(
+                query=hybrid_query,
+                post_processing=HybridPostProcessingConfig().limit(5, 0),
+                params_substitution=params,
+            )
 
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")

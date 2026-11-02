@@ -29,9 +29,9 @@ env:
   COVERAGE_CORE: sysmon
   # patch releases get included in the base version image when they are published
   # for example after 8.2.1 is published, 8.2 image contains 8.2.1 content
-  CURRENT_REDIS_VERSION: '8.10.2'
+  CURRENT_REDIS_VERSION: '8.10.3'
   REDIS_VERSION_CUSTOM_MAP: >-
-    8.12.0:8.12-m02-int
+    8.12.0:custom-40894365660-debian
 
 jobs:
   dependency-audit:
@@ -84,8 +84,8 @@ jobs:
         # Pushes and the nightly build test every supported version.
         redis-version: >-
           ${{ fromJSON(github.event_name == 'pull_request'
-          && format('["8.12.0", "{0}", "8.8.3", "8.6.7", "7.2.14"]', needs.redis_version.outputs.CURRENT)
-          || format('["8.12.0", "{0}", "8.8.3", "8.6.7", "8.4.7", "8.2.10", "8.0.6", "7.4.9", "7.2.14"]', needs.redis_version.outputs.CURRENT)) }}
+          && format('["8.12.0", "{0}", "8.8.4", "8.6.8", "7.2.14"]', needs.redis_version.outputs.CURRENT)
+          || format('["8.12.0", "{0}", "8.8.4", "8.6.8", "8.4.8", "8.2.11", "8.0.6", "7.4.9", "7.2.14"]', needs.redis_version.outputs.CURRENT)) }}
         python-version: ['3.11', '3.15']
         parser-backend: ['plain']
         event-loop: ['asyncio']

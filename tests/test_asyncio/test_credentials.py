@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import random
 import string
@@ -106,6 +107,24 @@ async def r_required_pass_teardown(r: redis.Redis):
 class NoPassCredProvider(CredentialProvider):
     def get_credentials(self) -> Union[Tuple[str], Tuple[str, str]]:
         return "username", ""
+
+
+class FlakyCredProvider(CredentialProvider):
+    """Fails, or stalls until cancelled, on the first fetch only."""
+
+    def __init__(self, stall: bool = False):
+        self.stall = stall
+        self.calls = 0
+        self.fetching = asyncio.Event()
+
+    async def get_credentials_async(self) -> Union[Tuple[str], Tuple[str, str]]:
+        self.calls += 1
+        if self.calls == 1:
+            self.fetching.set()
+            if self.stall:
+                await asyncio.Event().wait()
+            raise RequestTokenErr("token endpoint unavailable")
+        return "username", "password"
 
 
 class AsyncRandomAuthCredProvider(CredentialProvider):
@@ -257,6 +276,47 @@ class TestCredentialsProvider:
             )
         assert e.match("invalid username-password")
         assert await r.acl_deluser(username)
+
+    @pytest.mark.onlynoncluster
+    @pytest.mark.parametrize("create_redis", [(False,)], ids=["pool"], indirect=True)
+    async def test_credential_provider_error_does_not_skip_authentication(
+        self, r_acl_teardown, create_redis
+    ):
+        username = "username"
+        r = r_acl_teardown(username)
+        await init_acl_user(r, username, "password")
+        provider = FlakyCredProvider()
+        r2 = await create_redis(flushdb=False, credential_provider=provider)
+
+        with pytest.raises(RequestTokenErr):
+            await r2.ping()
+
+        # The failed connection must not be reused as if the handshake had run
+        assert await r2.ping() is True
+        assert provider.calls == 2
+        assert username in [client["user"] for client in await r.client_list()]
+
+    @pytest.mark.onlynoncluster
+    @pytest.mark.parametrize("create_redis", [(False,)], ids=["pool"], indirect=True)
+    async def test_cancelled_credential_fetch_does_not_skip_authentication(
+        self, r_acl_teardown, create_redis
+    ):
+        username = "username"
+        r = r_acl_teardown(username)
+        await init_acl_user(r, username, "password")
+        provider = FlakyCredProvider(stall=True)
+        r2 = await create_redis(flushdb=False, credential_provider=provider)
+
+        ping = asyncio.create_task(r2.ping())
+        await provider.fetching.wait()
+        ping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ping
+
+        # The failed connection must not be reused as if the handshake had run
+        assert await r2.ping() is True
+        assert provider.calls == 2
+        assert username in [client["user"] for client in await r.client_list()]
 
     @pytest.mark.onlynoncluster
     async def test_password_and_username_together_with_cred_provider_raise_error(

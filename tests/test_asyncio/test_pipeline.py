@@ -66,6 +66,21 @@ class TestPipeline:
             assert await r.get("c") == b"c1"
 
     @pytest.mark.onlynoncluster
+    async def test_info_in_transaction(self, decoded_r):
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version" in info
+
+    @pytest.mark.onlynoncluster
+    async def test_info_in_transaction_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response, **options: response)
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version:" in info
+
+    @pytest.mark.onlynoncluster
     async def test_pipeline_no_transaction_watch(self, r):
         await r.set("a", 0)
 

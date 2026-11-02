@@ -2416,6 +2416,35 @@ def collect_groups(client, res, alias, group_field="color"):
 
 
 class TestAggregations(SearchTestsBase):
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    def test_aggregation_zero_limit(self, client):
+        client.ft().create_index((TextField("title"),))
+        for i in range(3):
+            client.hset(f"doc:{i}", mapping={"title": "redis"})
+        self.waitForIndex(client, getattr(client.ft(), "index_name", "idx"))
+
+        res = client.ft().aggregate(aggregations.AggregateRequest("redis").limit(0, 0))
+
+        if expects_resp3_shape(client):
+            assert res["results"] == []
+            assert res["total_results"] == 3
+        else:
+            assert res.rows == []
+            expected_total = 3 if int(get_protocol_version(client)) == 3 else 0
+            assert res.total == expected_total
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.4")
+    def test_aggregation_invalid_zero_limit(self, client):
+        client.ft().create_index((TextField("title"),))
+        client.hset("doc:0", mapping={"title": "redis"})
+        self.waitForIndex(client, "idx")
+
+        with pytest.raises(ResponseError):
+            client.ft().aggregate(aggregations.AggregateRequest("redis").limit(5, 0))
+
     @pytest.fixture
     def collect_index(self, client):
         """Enable the preview feature and index the shared fruit documents.
@@ -6195,6 +6224,43 @@ class TestHybridSearch(SearchTestsBase):
                 }
                 assert item["color"] == item["description"].split()[0]
                 assert item["price_discount"] == expected_discounts[item["price"]]
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.3.224")
+    def test_hybrid_search_query_with_zero_limit(self, client):
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client)
+
+        hybrid_query = HybridQuery(
+            HybridSearchQuery("@color:{red|green|orange|black}"),
+            HybridVsimQuery(
+                vector_field_name="@embedding",
+                vector_data="$vec",
+                vsim_search_method=VectorSearchMethods.KNN,
+                vsim_search_method_params={"K": 5},
+            ),
+        )
+        params = {"vec": np.array([1, 2, 7, 6], dtype=np.float32).tobytes()}
+
+        res = client.ft().hybrid_search(
+            query=hybrid_query,
+            post_processing=HybridPostProcessingConfig().limit(0, 0),
+            params_substitution=params,
+        )
+
+        if expects_resp3_shape(client):
+            assert res["results"] == []
+            assert res["total_results"] == 5
+        else:
+            assert res.results == []
+            assert res.total_results == 5
+
+        with pytest.raises(ResponseError):
+            client.ft().hybrid_search(
+                query=hybrid_query,
+                post_processing=HybridPostProcessingConfig().limit(5, 0),
+                params_substitution=params,
+            )
 
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")

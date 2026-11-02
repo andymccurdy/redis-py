@@ -1288,9 +1288,11 @@ _DONT_CACHE_WRITE_KEYED = replace(_WRITE_KEYED, is_dont_cache=True)
 # Every entry below was validated against a live ``COMMAND`` reply from Redis 8.10.0 with
 # search, timeseries, ReJSON, bf and vectorset loaded (the ``redislabs/client-libs-test``
 # stack image), with the core entries also compared against 7.4.2 to ensure the minimum
-# supported version does not disagree on the fields that decide cacheability. The one
-# exception is the ``bless`` container, which first ships in 8.11 and was validated against
-# that release's ``COMMAND INFO`` reply.
+# supported version does not disagree on the fields that decide cacheability. The
+# exceptions are the ``bless`` container, which first ships in 8.11 and was validated against
+# that release's ``COMMAND INFO`` reply, and the set member expiration reads (``sexpiretime``,
+# ``spexpiretime``, ``sttl``, ``spttl``), which first ship in 8.12 and were validated against
+# the ``COMMAND INFO`` reply of an 8.11.240 build.
 #
 # The table is not exhaustive: on 8.10.0 the server reports 127 cacheable commands and this
 # covers 80 of them. The count is version-qualified because it moves between releases - a
@@ -1425,6 +1427,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "scard": _CACHEABLE_KEYED,
                 "sdiff": _CACHEABLE_KEYED,
                 "sdiffcard": _CACHEABLE_MOVABLE_KEYS,
+                "sexpiretime": _CACHEABLE_KEYED,
                 "sinter": _CACHEABLE_KEYED,
                 "sintercard": _CACHEABLE_MOVABLE_KEYS,
                 "sismember": _CACHEABLE_KEYED,
@@ -1436,9 +1439,12 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 # just as ineffectively.
                 # TODO: drop this note once the command method sends its own name.
                 "sort_ro": _CACHEABLE_KEYED,
+                "spexpiretime": _CACHEABLE_KEYED,
+                "spttl": _NONDETERMINISTIC_KEYED,
                 "srandmember": _NONDETERMINISTIC_KEYED,
                 "sscan": _NONDETERMINISTIC_KEYED,
                 "strlen": _CACHEABLE_KEYED,
+                "sttl": _NONDETERMINISTIC_KEYED,
                 "substr": _CACHEABLE_KEYED,
                 "sunion": _CACHEABLE_KEYED,
                 "sunioncard": _CACHEABLE_MOVABLE_KEYS,

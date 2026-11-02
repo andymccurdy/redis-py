@@ -1587,6 +1587,13 @@ class TestClusterRedisCommands:
         assert isinstance(myshardid, str)
         assert len(myshardid) > 0
 
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    def test_cluster_myshardid_decoded(self, decoded_r):
+        myshardid = decoded_r.cluster_myshardid()
+        assert isinstance(myshardid, str)
+        assert len(myshardid) == 40
+
     @skip_if_redis_enterprise()
     def test_cluster_addslots(self, r):
         node = r.get_random_node()

@@ -3357,6 +3357,14 @@ class TestClusterRedisCommands:
         myshardid = await r.cluster_myshardid(node)
         assert len(myshardid) == 40
 
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    async def test_cluster_myshardid_decoded(self, decoded_r: RedisCluster) -> None:
+        node = decoded_r.get_random_node()
+        myshardid = await decoded_r.cluster_myshardid(node)
+        assert isinstance(myshardid, str)
+        assert len(myshardid) == 40
+
     @skip_if_redis_enterprise()
     async def test_cluster_slots(self, r: RedisCluster) -> None:
         mock_all_nodes_resp(r, default_cluster_slots)

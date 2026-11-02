@@ -2284,9 +2284,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                 self._conn.send_command(*args, **kwargs)
             return
 
-        # Creates cache key.
+        # Creates cache key. An invalidation names a key by the bytes it was sent as,
+        # which ``DefaultCache.delete_by_redis_keys`` matches to a ``str`` or ``bytes``
+        # key but never to a number, so a numeric key is indexed by its encoded form.
+        redis_keys = keys
+        for key in keys:
+            if isinstance(key, (int, float)):
+                encode = self._conn.encoder.encode
+                redis_keys = tuple(
+                    encode(k) if isinstance(k, (int, float)) else k for k in keys
+                )
+                break
         self._current_command_cache_key = CacheKey(
-            command=command, redis_keys=keys, redis_args=args
+            command=command, redis_keys=redis_keys, redis_args=args
         )
 
         is_hit = False

@@ -361,6 +361,24 @@ class TestKeyNotification:
         assert notification is not None
         assert notification.key == key
 
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize(
+        ("channel", "data", "subkeys"),
+        [
+            ("__keyspace@0__:", "set", []),
+            ("__subkeyspace@0__:", "hset|5:field", ["field"]),
+        ],
+    )
+    def test_empty_keyspace_key(self, channel, data, subkeys, as_bytes):
+        notification = KeyNotification.try_parse(
+            channel.encode() if as_bytes else channel,
+            data.encode() if as_bytes else data,
+        )
+        assert notification is not None
+        assert notification.key == ""
+        assert notification.subkeys == subkeys
+        assert notification.is_keyspace is True
+
     def test_keyspace_key_with_trailing_newline_and_prefix(self):
         notification = KeyNotification.try_parse(
             "__keyspace@0__:user:alice\n", "set", key_prefix="user:"

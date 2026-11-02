@@ -1587,6 +1587,13 @@ class TestClusterRedisCommands:
         assert isinstance(myshardid, str)
         assert len(myshardid) > 0
 
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    def test_cluster_myshardid_decoded(self, decoded_r):
+        myshardid = decoded_r.cluster_myshardid()
+        assert isinstance(myshardid, str)
+        assert len(myshardid) == 40
+
     @skip_if_redis_enterprise()
     def test_cluster_addslots(self, r):
         node = r.get_random_node()
@@ -7716,10 +7723,7 @@ class TestClusterMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
-            # Also set the collector directly to ensure it's used
-            recorder._metrics_collector = collector
-
+        with patch.object(recorder, "_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher
@@ -7929,10 +7933,7 @@ class TestClusterPipelineMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
-            # Also set the collector directly to ensure it's used
-            recorder._metrics_collector = collector
-
+        with patch.object(recorder, "_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher

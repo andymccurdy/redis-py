@@ -1514,6 +1514,15 @@ class RedisCluster(
             that simulating pipelines will work correctly. Each
             command will be called directly when used and
             when calling execute() will only return the result stack.
+
+            Note: replies of a transactional pipeline (``transaction=True``)
+            are returned with the same Python types as outside a transaction,
+            as each of them runs through the response callbacks of the node
+            that executed it: ``SET`` returns ``True`` instead of ``b"OK"``
+            and, on a RESP2 connection, ``HGETALL`` returns a ``dict``
+            instead of a flat list. Earlier releases returned those raw
+            replies for sync cluster transactions, so code that compared
+            them must be updated.
         """
         if shard_hint:
             raise RedisClusterException("shard_hint is deprecated in cluster mode")

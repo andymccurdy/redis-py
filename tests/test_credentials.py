@@ -82,6 +82,19 @@ class NoPassCredProvider(CredentialProvider):
         return "username", ""
 
 
+class FlakyCredProvider(CredentialProvider):
+    """Fails on the first fetch only, as a token or secrets backend can."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_credentials(self) -> Union[Tuple[str], Tuple[str, str]]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RequestTokenErr("token endpoint unavailable")
+        return "username", "password"
+
+
 class RandomAuthCredProvider(CredentialProvider):
     def __init__(self, user: Optional[str], endpoint: str):
         self.user = user
@@ -234,6 +247,26 @@ class TestCredentialsProvider:
                 credential_provider=NoPassCredProvider(),
             )
         assert e.match("invalid username-password")
+
+    @pytest.mark.onlynoncluster
+    def test_credential_provider_error_does_not_skip_authentication(self, r, request):
+        init_acl_user(r, request, "username", "password")
+        provider = FlakyCredProvider()
+        r2 = _get_client(
+            redis.Redis,
+            request,
+            flushdb=False,
+            single_connection_client=False,
+            credential_provider=provider,
+        )
+
+        with pytest.raises(RequestTokenErr):
+            r2.ping()
+
+        # The failed connection must not be reused as if the handshake had run
+        assert r2.ping() is True
+        assert provider.calls == 2
+        assert "username" in [client["user"] for client in r.client_list()]
 
     @pytest.mark.onlynoncluster
     def test_password_and_username_together_with_cred_provider_raise_error(

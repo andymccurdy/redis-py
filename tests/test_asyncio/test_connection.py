@@ -1852,8 +1852,46 @@ def test_ssl_context_is_released_with_its_last_connection():
 
 
 @pytest.mark.fixed_client
-def test_ssl_context_with_unhashable_ca_data_is_not_shared():
-    settings = {"ssl_cert_reqs": "none", "ssl_ca_data": bytearray(b"ca")}
+def test_ssl_context_keeps_certificate_file_roles_apart(tmp_path):
+    pem = tmp_path / "combined.pem"
+    pem.write_text("pem")
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "load_verify_locations"):
+            client_cert = SSLConnection(
+                ssl_cert_reqs="none", ssl_certfile=str(pem)
+            ).ssl_context.get()
+            ca_certs = SSLConnection(
+                ssl_cert_reqs="none", ssl_ca_certs=str(pem)
+            ).ssl_context.get()
+
+    assert client_cert is not ca_certs
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_build_can_open_a_connection():
+    nested = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile="client.crt")
+
+    def load_cert_chain(*args, **kwargs):
+        # As an ssl_password callback fetching the password from Redis would
+        nested.ssl_context.get()
+
+    def get_context():
+        with patch.object(ssl.SSLContext, "load_cert_chain", load_cert_chain):
+            conn.ssl_context.get()
+
+    thread = threading.Thread(target=get_context, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("ca_data", [bytearray(b"ca"), memoryview(bytearray(b"ca"))])
+def test_ssl_context_with_unhashable_ca_data_is_not_shared(ca_data):
+    settings = {"ssl_cert_reqs": "none", "ssl_ca_data": ca_data}
 
     with patch.object(ssl.SSLContext, "load_verify_locations"):
         context = SSLConnection(**settings).ssl_context.get()

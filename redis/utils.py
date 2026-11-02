@@ -56,14 +56,15 @@ SENTINEL = object()
 _SHARED_SSL_CONTEXTS: "weakref.WeakValueDictionary[Any, ssl.SSLContext]" = (
     weakref.WeakValueDictionary()
 )
-_SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+# Reentrant: an ssl_password callback runs during the build and can open a connection.
+_SHARED_SSL_CONTEXTS_LOCK = threading.RLock()
 
 
 def _reset_shared_ssl_contexts_lock() -> None:
     # A fork while another thread builds a context would leave the child with a lock
     # that nothing can release.
     global _SHARED_SSL_CONTEXTS_LOCK
-    _SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+    _SHARED_SSL_CONTEXTS_LOCK = threading.RLock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -102,12 +103,13 @@ def get_shared_ssl_context(
     key = (
         settings,
         os.environ.get("SSLKEYLOGFILE"),
-        tuple((path, _file_signature(path)) for path in paths if path),
+        tuple((path, _file_signature(path)) for path in paths),
     )
     try:
         hash(key)
-    except TypeError:
-        # An unhashable setting, such as ssl_ca_data given as a bytearray
+    except (TypeError, ValueError):
+        # An unhashable setting, such as ssl_ca_data given as a bytearray or a
+        # writable memoryview
         return build()
     # Held across the build: a socket keeps the context it was wrapped with, so a
     # second build for the same key would stay in memory as long as that socket.

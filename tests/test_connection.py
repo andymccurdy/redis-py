@@ -4791,13 +4791,45 @@ def test_ssl_context_is_built_once_by_concurrent_connections():
 
 
 @pytest.mark.fixed_client
+def test_ssl_context_build_can_open_a_connection():
+    nested = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile="client.crt")
+
+    def load_cert_chain(*args, **kwargs):
+        # As an ssl_password callback fetching the password from Redis would
+        _wrapped_ssl_context(nested)
+
+    def connect():
+        with patch.object(ssl.SSLContext, "load_cert_chain", load_cert_chain):
+            _wrapped_ssl_context(conn)
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+@pytest.mark.fixed_client
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="Requires os.fork")
 def test_ssl_context_lock_is_usable_in_a_forked_child():
-    with redis.utils._SHARED_SSL_CONTEXTS_LOCK:
-        pid = os.fork()
-        if pid == 0:
-            usable = redis.utils._SHARED_SSL_CONTEXTS_LOCK.acquire(timeout=5)
-            os._exit(0 if usable else 1)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with redis.utils._SHARED_SSL_CONTEXTS_LOCK:
+            held.set()
+            release.wait()
+
+    thread = threading.Thread(target=hold_lock, daemon=True)
+    thread.start()
+    assert held.wait(timeout=5)
+    pid = os.fork()
+    if pid == 0:
+        usable = redis.utils._SHARED_SSL_CONTEXTS_LOCK.acquire(timeout=5)
+        os._exit(0 if usable else 1)
+    release.set()
+    thread.join()
 
     assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
 
@@ -4820,8 +4852,26 @@ def test_ssl_context_is_released_with_its_last_connection():
 
 
 @pytest.mark.fixed_client
-def test_ssl_context_with_unhashable_ca_data_is_not_shared():
-    conn = SSLConnection(ssl_cert_reqs="none", ssl_ca_data=bytearray(b"ca"))
+def test_ssl_context_keeps_certificate_file_roles_apart(tmp_path):
+    pem = tmp_path / "combined.pem"
+    pem.write_text("pem")
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "load_verify_locations"):
+            client_cert = _wrapped_ssl_context(
+                SSLConnection(ssl_cert_reqs="none", ssl_certfile=str(pem))
+            )
+            ca_certs = _wrapped_ssl_context(
+                SSLConnection(ssl_cert_reqs="none", ssl_ca_certs=str(pem))
+            )
+
+    assert client_cert is not ca_certs
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("ca_data", [bytearray(b"ca"), memoryview(bytearray(b"ca"))])
+def test_ssl_context_with_unhashable_ca_data_is_not_shared(ca_data):
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_ca_data=ca_data)
 
     with patch.object(ssl.SSLContext, "load_verify_locations"):
         assert _wrapped_ssl_context(conn) is not _wrapped_ssl_context(conn)

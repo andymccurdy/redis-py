@@ -184,7 +184,9 @@ def test_discover_master_sentinel_response_error(cluster, sentinel, master_ip):
 @pytest.mark.onlynoncluster
 def test_discover_master_error_names_response_error(cluster, sentinel):
     cluster.nodes_response_error.update({("foo", 26379), ("bar", 26379)})
-    with pytest.raises(MasterNotFoundError, match="ResponseError"):
+    with pytest.raises(
+        MasterNotFoundError, match="ResponseError: unknown command 'SENTINEL'"
+    ):
         sentinel.discover_master("mymaster")
 
 

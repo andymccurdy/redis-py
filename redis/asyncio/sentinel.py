@@ -334,7 +334,11 @@ class Sentinel(AsyncSentinelCommands):
             try:
                 masters = await sentinel.sentinel_masters()
             except (ConnectionError, ResponseError, TimeoutError) as e:
-                collected_errors.append(f"{sentinel} - {e!r}")
+                # repr() names only the class; str() keeps the reply text
+                error = f"{sentinel} - {e!r}"
+                if str(e):
+                    error += f": {e}"
+                collected_errors.append(error)
                 continue
             state = masters.get(service_name)
             if state and self.check_master_state(state, service_name):

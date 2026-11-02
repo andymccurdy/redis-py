@@ -2442,6 +2442,8 @@ class TestPubSubAcloseCancellation:
         task.cancel()
         if unblock is not None:
             await asyncio.sleep(0.01)
+            task.cancel()  # again, as a level-triggered scope would
+            await asyncio.sleep(0.01)
             try:
                 # aclose() must not return before its teardown has finished.
                 assert not task.done()

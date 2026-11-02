@@ -1261,7 +1261,11 @@ class PubSub:
             await asyncio.shield(teardown)
         except asyncio.CancelledError:
             # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
-            await asyncio.wait({teardown})
+            while not teardown.done():
+                try:
+                    await asyncio.wait({teardown})
+                except asyncio.CancelledError:
+                    pass  # e.g. anyio re-cancels on every await
             if not teardown.cancelled():
                 teardown.exception()
             raise

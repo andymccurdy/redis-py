@@ -2437,17 +2437,18 @@ class TestPubSubAcloseCancellation:
     """
 
     @staticmethod
-    async def _cancel(task: asyncio.Task, started: asyncio.Event) -> None:
+    async def _cancel(task: asyncio.Task, started: asyncio.Event, unblock=None):
         await started.wait()
         task.cancel()
+        if unblock is not None:
+            await asyncio.sleep(0.01)
+            try:
+                # aclose() must not return before its teardown has finished.
+                assert not task.done()
+            finally:
+                unblock()
         with pytest.raises(asyncio.CancelledError):
             await task
-
-    @staticmethod
-    async def _wait_until_released(pool, connection) -> None:
-        async with async_timeout(2):
-            while connection in pool._in_use_connections:
-                await asyncio.sleep(0.01)
 
     @staticmethod
     def _blocking_disconnect(connection, started, resume):
@@ -2473,9 +2474,7 @@ class TestPubSubAcloseCancellation:
         started = asyncio.Event()
         resume = asyncio.Event()
         with self._blocking_disconnect(leased, started, resume):
-            await self._cancel(asyncio.ensure_future(p.aclose()), started)
-            resume.set()
-            await self._wait_until_released(pool, leased)
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
 
         assert p.connection is None
         assert not leased.is_connected
@@ -2497,14 +2496,9 @@ class TestPubSubAcloseCancellation:
 
         started = asyncio.Event()
         await p._lock.acquire()
-        try:
-            task = asyncio.ensure_future(p.aclose())
-            asyncio.get_running_loop().call_soon(started.set)
-            await self._cancel(task, started)
-            assert leased in pool._in_use_connections
-        finally:
-            p._lock.release()
-        await self._wait_until_released(pool, leased)
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, p._lock.release)
 
         assert p.connection is None
         assert not leased.is_connected
@@ -2524,13 +2518,9 @@ class TestPubSubAcloseCancellation:
 
         started = asyncio.Event()
         await pool._lock.acquire()
-        try:
-            task = asyncio.ensure_future(p.aclose())
-            asyncio.get_running_loop().call_soon(started.set)
-            await self._cancel(task, started)
-        finally:
-            pool._lock.release()
-        await self._wait_until_released(pool, leased)
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, pool._lock.release)
 
         assert p.connection is None
         assert leased in pool._available_connections
@@ -2562,9 +2552,7 @@ class TestPubSubAcloseCancellation:
         started = asyncio.Event()
         resume = asyncio.Event()
         with self._blocking_disconnect(leased, started, resume):
-            await self._cancel(asyncio.ensure_future(p.aclose()), started)
-            resume.set()
-            await self._wait_until_released(pool, leased)
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
 
         assert p.connection is None
         assert not leased.is_connected

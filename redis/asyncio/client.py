@@ -1256,7 +1256,15 @@ class PubSub:
         # stop it while it waits for the lock, disconnects, or releases: the
         # connection would otherwise never be returned to the pool. The caller
         # still sees the CancelledError.
-        await asyncio.shield(self._aclose())
+        teardown = asyncio.ensure_future(self._aclose())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
+            await asyncio.wait({teardown})
+            if not teardown.cancelled():
+                teardown.exception()
+            raise
 
     async def _aclose(self) -> None:
         async with self._lock:

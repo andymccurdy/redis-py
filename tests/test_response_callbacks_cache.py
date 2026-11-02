@@ -1,13 +1,11 @@
-"""Tests for the cached canonical response-callback table (issue #3624).
+"""Tests for the cached default response-callback table.
 
-``Redis.__init__`` and ``redis.asyncio.Redis.__init__`` no longer rebuild and
-re-upper-case the ~165-entry response-callback table on every construction.
-Instead the canonical ``CaseInsensitiveDict`` is memoized once per
-``(protocol, legacy_responses)`` combination via ``lru_cache`` and each client
-receives a cheap ``CaseInsensitiveDict.copy()``.
+``Redis.__init__`` and ``redis.asyncio.Redis.__init__`` get their callback table
+from ``default_response_callbacks``, which copies a canonical
+``CaseInsensitiveDict`` memoized once per ``(protocol, legacy_responses)``
+combination by ``_cached_default_response_callbacks``.
 
-These tests assert the correctness invariants that the refactor must preserve.
-They are offline: clients are constructed with no Redis server
+These tests are offline: clients are constructed with no Redis server
 (``single_connection_client`` is left at its default ``False`` so no connection
 is opened) and are closed in ``finally``.
 """
@@ -19,7 +17,8 @@ import redis.asyncio
 from redis._parsers.helpers import get_response_callbacks
 from redis.client import (
     CaseInsensitiveDict,
-    _get_default_response_callbacks,
+    _cached_default_response_callbacks,
+    default_response_callbacks,
 )
 
 # ``None`` represents the "default" case where the caller does not pass
@@ -43,14 +42,14 @@ def _make_client_kwargs(protocol, legacy_responses):
     return kwargs
 
 
-# Invariant 1: identical contents (value-by-identity) against the pre-refactor
+# Invariant 1: identical contents (value-by-identity) against the uncached
 # construction ``CaseInsensitiveDict(get_response_callbacks(...))``, across the
 # full protocol x legacy matrix.
 @pytest.mark.fixed_client
 @pytest.mark.parametrize("legacy_responses", _LEGACY_VARIANTS)
 @pytest.mark.parametrize("protocol", _PROTOCOL_VARIANTS)
 def test_contents_match_old_construction_by_identity(protocol, legacy_responses):
-    # Arrange: reconstruct the table the old code path produced.
+    # Arrange: build the table without the cache.
     expected = CaseInsensitiveDict(
         get_response_callbacks(
             user_protocol=protocol,
@@ -117,7 +116,7 @@ def test_mutation_isolation_between_clients_and_canonical():
         assert rc1 is not rc2
 
         # The shared canonical for the same (protocol=None, legacy=True) combo.
-        canonical = _get_default_response_callbacks(None, True)
+        canonical = _cached_default_response_callbacks(None, True)
         assert rc1 is not canonical
         assert rc2 is not canonical
         canonical_len_before = len(canonical)
@@ -141,7 +140,7 @@ def test_mutation_isolation_between_clients_and_canonical():
 # and is independent of the source.
 @pytest.mark.fixed_client
 def test_copy_returns_caseinsensitivedict_and_is_independent():
-    canonical = _get_default_response_callbacks(None, True)
+    canonical = _cached_default_response_callbacks(None, True)
 
     copied = canonical.copy()
 
@@ -160,6 +159,33 @@ def test_copy_returns_caseinsensitivedict_and_is_independent():
     copied["EXTRA_ONLY_IN_COPY"] = lambda x: x
     assert "EXTRA_ONLY_IN_COPY" in copied
     assert "EXTRA_ONLY_IN_COPY" not in canonical
+    assert len(canonical) == canonical_len_before
+
+
+# Invariant 4b: the wrapper always hands out a fresh copy, never the canonical.
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("legacy_responses", _LEGACY_VARIANTS)
+@pytest.mark.parametrize("protocol", _PROTOCOL_VARIANTS)
+def test_default_response_callbacks_returns_fresh_copy(protocol, legacy_responses):
+    canonical = _cached_default_response_callbacks(protocol, legacy_responses)
+
+    first = default_response_callbacks(protocol, legacy_responses)
+    second = default_response_callbacks(protocol, legacy_responses)
+
+    assert type(first) is CaseInsensitiveDict
+    assert first == second == canonical
+    assert first is not second
+    assert first is not canonical
+    assert second is not canonical
+
+    # Mutating a returned table never reaches the canonical or other copies.
+    canonical_len_before = len(canonical)
+    first["WRAPPER_TEST_CMD"] = lambda x: x
+    del first["EXPIRE"]
+    assert "WRAPPER_TEST_CMD" not in canonical
+    assert "WRAPPER_TEST_CMD" not in second
+    assert "EXPIRE" in canonical
+    assert "EXPIRE" in second
     assert len(canonical) == canonical_len_before
 
 

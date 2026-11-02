@@ -164,25 +164,24 @@ class CaseInsensitiveDict(dict):
         super().update(data)
 
     def copy(self) -> "CaseInsensitiveDict":
-        # Keys are already upper-cased; bypass __init__/__setitem__ so we don't
-        # re-run ``str.upper`` on every entry when copying (see #3624).
+        # Keys are already upper-cased; bypass __init__/__setitem__ so the
+        # copy does not re-run ``str.upper`` on every entry.
         new = CaseInsensitiveDict.__new__(CaseInsensitiveDict)
         dict.update(new, self)
         return new
 
 
 @lru_cache(maxsize=None)
-def _get_default_response_callbacks(
-    user_protocol: Optional[Union[int, str]],
+def _cached_default_response_callbacks(
+    user_protocol: int | str | None,
     legacy_responses: bool,
 ) -> CaseInsensitiveDict:
     """Build the canonical response-callback table for a given
     ``(protocol, legacy_responses)`` combination exactly once.
 
-    The returned mapping is shared and MUST NOT be mutated; callers take a cheap
-    :meth:`CaseInsensitiveDict.copy` so each client owns an independent, mutable
-    mapping. This avoids rebuilding and re-upper-casing the ~165-entry callback
-    table on every client construction (see #3624).
+    The returned mapping is shared by every caller and MUST NOT be mutated or
+    handed to a client directly. Clients must use
+    :func:`default_response_callbacks`, which returns a per-client copy.
     """
     return CaseInsensitiveDict(
         get_response_callbacks(
@@ -190,6 +189,21 @@ def _get_default_response_callbacks(
             legacy_responses=legacy_responses,
         )
     )
+
+
+def default_response_callbacks(
+    user_protocol: int | str | None,
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Return the default response-callback table for a given
+    ``(protocol, legacy_responses)`` combination.
+
+    This is the helper clients should use. It returns an independent, mutable
+    per-client table copied from the cached canonical one, so the table is not
+    rebuilt and re-upper-cased on every client construction, and changes such
+    as :meth:`Redis.set_response_callback` stay local to the client.
+    """
+    return _cached_default_response_callbacks(user_protocol, legacy_responses).copy()
 
 
 class AbstractRedis:
@@ -603,10 +617,10 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             )
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = _get_default_response_callbacks(
+        self.response_callbacks = default_response_callbacks(
             connection_kwargs.get("protocol"),
             connection_kwargs.get("legacy_responses", True),
-        ).copy()
+        )
 
     def __repr__(self) -> str:
         return (

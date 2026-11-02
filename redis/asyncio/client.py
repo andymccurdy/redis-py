@@ -59,7 +59,7 @@ from redis.client import (
     EMPTY_RESPONSE,
     NEVER_DECODE,
     AbstractRedis,
-    _get_default_response_callbacks,
+    default_response_callbacks,
 )
 from redis.commands import (
     AsyncCoreCommands,
@@ -526,10 +526,10 @@ class Redis(
         self.connection: Optional[Connection] = None
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = _get_default_response_callbacks(
+        self.response_callbacks = default_response_callbacks(
             connection_kwargs.get("protocol"),
             connection_kwargs.get("legacy_responses", True),
-        ).copy()
+        )
 
         # If using a single connection client, we need to lock creation-of and use-of
         # the client in order to avoid race conditions such as using asyncio.gather

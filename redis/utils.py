@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import textwrap
+import threading
 import warnings
 import weakref
 from collections.abc import Callable, Iterable
@@ -55,6 +56,18 @@ SENTINEL = object()
 _SHARED_SSL_CONTEXTS: "weakref.WeakValueDictionary[Any, ssl.SSLContext]" = (
     weakref.WeakValueDictionary()
 )
+_SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+def _reset_shared_ssl_contexts_lock() -> None:
+    # A fork while another thread builds a context would leave the child with a lock
+    # that nothing can release.
+    global _SHARED_SSL_CONTEXTS_LOCK
+    _SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_shared_ssl_contexts_lock)
 
 
 def _file_signature(path: Any) -> tuple[int, int] | None:
@@ -81,19 +94,28 @@ def get_shared_ssl_context(
         files: The certificate files and directories the context is loaded from.
             They are identified by modification time and size, so that a rotated
             file is picked up by the next context built for it. The default CA
-            locations are always included.
+            locations are always included, as is SSLKEYLOGFILE, which
+            ssl.create_default_context() reads.
     """
     defaults = ssl.get_default_verify_paths()
     paths = (*files, defaults.cafile, defaults.capath)
-    key = (settings, tuple((path, _file_signature(path)) for path in paths if path))
+    key = (
+        settings,
+        os.environ.get("SSLKEYLOGFILE"),
+        tuple((path, _file_signature(path)) for path in paths if path),
+    )
     try:
-        context = _SHARED_SSL_CONTEXTS.get(key)
+        hash(key)
     except TypeError:
         # An unhashable setting, such as ssl_ca_data given as a bytearray
         return build()
-    if context is None:
-        context = build()
-        _SHARED_SSL_CONTEXTS[key] = context
+    # Held across the build: a socket keeps the context it was wrapped with, so a
+    # second build for the same key would stay in memory as long as that socket.
+    with _SHARED_SSL_CONTEXTS_LOCK:
+        context = _SHARED_SSL_CONTEXTS.get(key)
+        if context is None:
+            context = build()
+            _SHARED_SSL_CONTEXTS[key] = context
     return context
 
 

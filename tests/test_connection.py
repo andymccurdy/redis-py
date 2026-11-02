@@ -4741,6 +4741,72 @@ def test_ssl_context_is_rebuilt_after_ca_directory_change(tmp_path):
 
 
 @pytest.mark.fixed_client
+def test_ssl_context_follows_sslkeylogfile(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "first.log"))
+    context = _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none"))
+
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "second.log"))
+
+    assert _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none")) is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_built_once_by_concurrent_connections():
+    workers = 8
+    barrier = threading.Barrier(workers)
+    builds = []
+    contexts = []
+    create_default_context = ssl.create_default_context
+
+    def slow_create_default_context():
+        builds.append(1)
+        time.sleep(0.05)
+        return create_default_context()
+
+    def wrap_socket(context, sock, **kwargs):
+        contexts.append(context)
+        return MagicMock()
+
+    def connect(conn):
+        barrier.wait()
+        conn._wrap_socket_with_ssl(MagicMock())
+
+    connections = [
+        SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+        for _ in range(workers)
+    ]
+    with patch("ssl.create_default_context", slow_create_default_context):
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            threads = [
+                threading.Thread(target=connect, args=(conn,)) for conn in connections
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+    assert len(builds) == 1
+    assert len(contexts) == workers
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="Requires os.fork")
+def test_ssl_context_lock_is_usable_in_a_forked_child():
+    with redis.utils._SHARED_SSL_CONTEXTS_LOCK:
+        pid = os.fork()
+        if pid == 0:
+            usable = redis.utils._SHARED_SSL_CONTEXTS_LOCK.acquire(timeout=5)
+            os._exit(0 if usable else 1)
+
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
 def test_ssl_context_is_released_with_its_last_connection():
     context = _wrapped_ssl_context(
         SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+AESGCM")

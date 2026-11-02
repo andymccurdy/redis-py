@@ -5,8 +5,11 @@ import os
 import platform
 import socket
 import ssl
+import threading
+import time
 import types
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from errno import ECONNREFUSED, ETIMEDOUT
 from unittest.mock import patch
@@ -1796,6 +1799,48 @@ def test_ssl_context_is_rebuilt_after_ca_directory_change(tmp_path):
 
 
 @pytest.mark.fixed_client
+def test_ssl_context_follows_sslkeylogfile(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "first.log"))
+    context = SSLConnection(ssl_cert_reqs="none").ssl_context.get()
+
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "second.log"))
+
+    assert SSLConnection(ssl_cert_reqs="none").ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_built_once_by_concurrent_connections():
+    workers = 8
+    barrier = threading.Barrier(workers)
+    builds = []
+    create_default_context = ssl.create_default_context
+
+    def slow_create_default_context():
+        builds.append(1)
+        time.sleep(0.05)
+        return create_default_context()
+
+    def get_context(conn):
+        barrier.wait()
+        return conn.ssl_context.get()
+
+    connections = [
+        SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+        for _ in range(workers)
+    ]
+    with patch("ssl.create_default_context", slow_create_default_context):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            contexts = list(executor.map(get_context, connections))
+
+    assert len(builds) == 1
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
 def test_ssl_context_is_released_with_its_last_connection():
     conn = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+AESGCM")
     context_ref = weakref.ref(conn.ssl_context.get())

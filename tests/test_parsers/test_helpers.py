@@ -124,7 +124,7 @@ def test_parse_client_list_as_iter():
 @pytest.mark.fixed_client
 @pytest.mark.parametrize(
     "separator",
-    [chr(c) for c in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)],
+    [chr(c) for c in (0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)],
     ids=lambda c: f"U+{ord(c):04X}",
 )
 def test_parse_client_list_only_splits_records_on_newline(separator):

@@ -4404,15 +4404,15 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def set_retry(self, retry: Retry) -> None:
         self.connection_kwargs.update({"retry": retry})
-        for conn in self._available_connections:
+        for conn in self._get_free_connections():
             conn.retry = retry
-        for conn in self._in_use_connections:
+        for conn in self._get_in_use_connections():
             conn.retry = retry
 
     def re_auth_callback(self, token: TokenInterface):
         first_error = None
         with self._lock:
-            for conn in self._available_connections:
+            for conn in self._get_free_connections():
                 try:
                     conn.retry.call_with_retry(
                         lambda: conn.send_command(
@@ -4432,7 +4432,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 except Exception as e:
                     if first_error is None:
                         first_error = e
-            for conn in self._in_use_connections:
+            for conn in self._get_in_use_connections():
                 conn.set_re_auth_token(token)
         if first_error is not None:
             raise first_error

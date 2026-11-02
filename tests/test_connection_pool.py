@@ -327,6 +327,45 @@ class TestBlockingConnectionPool:
         c2 = pool.get_connection()
         assert c1 != c2
 
+    def _seed_pool_connections(self, pool, free, in_use):
+        # One connection sits in the queue (idle/free), the other is checked
+        # out (in use): tracked in ``_connections`` but absent from the queue.
+        while not pool.pool.empty():
+            pool.pool.get_nowait()
+        pool.pool.put_nowait(free)
+        pool.pool.put_nowait(None)
+        pool._connections = [free, in_use]
+
+    @pytest.mark.fixed_client
+    def test_re_auth_callback_reauthenticates_pooled_connections(self):
+        pool = self.get_pool()
+        free = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        in_use = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        self._seed_pool_connections(pool, free, in_use)
+        token = mock.Mock()
+        token.try_get.return_value = "oid"
+        token.get_value.return_value = "value"
+
+        pool.re_auth_callback(token)
+
+        free.send_command.assert_called_once_with("AUTH", "oid", "value")
+        free.read_response.assert_called_once()
+        in_use.set_re_auth_token.assert_called_once_with(token)
+
+    @pytest.mark.fixed_client
+    def test_set_retry_updates_pooled_connections(self):
+        pool = self.get_pool()
+        free = mock.Mock(spec=Connection)
+        in_use = mock.Mock(spec=Connection)
+        self._seed_pool_connections(pool, free, in_use)
+        retry = Retry(NoBackoff(), 5)
+
+        pool.set_retry(retry)
+
+        assert pool.connection_kwargs["retry"] is retry
+        assert free.retry is retry
+        assert in_use.retry is retry
+
     def test_capacity_survives_failed_connection_creation(self):
         pool = redis.BlockingConnectionPool(
             connection_class=failing_connection_class(2),

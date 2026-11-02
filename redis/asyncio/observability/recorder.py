@@ -605,6 +605,9 @@ async def record_streaming_lag_from_response(
                 effective_stream_name = (
                     None if hide_stream_names else str_if_bytes(stream_name)
                 )
+                # Unified responses omit the legacy RESP3 wrapper around entries.
+                if stream_messages and isinstance(stream_messages[0], tuple):
+                    stream_messages = [stream_messages]
                 for messages in stream_messages:
                     for message in messages:
                         message_id, _ = message

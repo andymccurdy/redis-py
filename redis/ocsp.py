@@ -1,7 +1,7 @@
 import base64
 import datetime
 import ssl
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urlparse
 
 import cryptography.hazmat.primitives.hashes
 import requests
@@ -109,6 +109,13 @@ def _check_certificate(issuer_cert, cert, ocsp_bytes, validate=True):
         ext = responder_cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
         if ext is None or x509.oid.ExtendedKeyUsageOID.OCSP_SIGNING not in ext.value:
             raise ConnectionError("delegate not authorized for ocsp signing")
+        # A delegate normally carries id-pkix-ocsp-nocheck, so it is never
+        # checked for revocation and its validity period is all that bounds
+        # how long its key is trusted.
+        if not (
+            responder_cert.not_valid_before <= now <= responder_cert.not_valid_after
+        ):
+            raise ConnectionError("delegate certificate is outside its validity period")
         cert_to_validate = responder_cert
 
     if validate:
@@ -285,7 +292,11 @@ class OCSPVerifier:
         path = base64.b64encode(
             request.public_bytes(hazmat.primitives.serialization.Encoding.DER)
         )
-        url = urljoin(server, path.decode("ascii"))
+        # RFC 6960 Appendix A.1: the base64 is url-encoded and appended to the
+        # responder url.
+        if not server.endswith("/"):
+            server += "/"
+        url = server + quote(path.decode("ascii"), safe="")
         return url
 
     def check_certificate(self, server, cert, issuer_url):
@@ -317,14 +328,10 @@ class OCSPVerifier:
         the validity of OCSP revocation status.
         """
 
-        # validate the certificate
-        try:
-            cert, issuer_url, ocsp_server = self.components_from_socket()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
-        except AuthorizationError:
-            cert, issuer_url, ocsp_server = self.components_from_direct_connection()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
+        # validate the certificate. An UNAUTHORIZED response fails closed:
+        # OCSP error statuses are unsigned, and asking again about the same
+        # certificate would send the responder the identical request.
+        cert, issuer_url, ocsp_server = self.components_from_socket()
+        if issuer_url is None:
+            raise ConnectionError("no issuers found in certificate chain")
+        return self.check_certificate(ocsp_server, cert, issuer_url)

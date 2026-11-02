@@ -822,6 +822,45 @@ class TestTokenManager:
         assert isinstance(errors[0], TokenRenewalErr)
         assert str(errors[0]) == "Some exception"
 
+    def test_renewal_continues_after_callback_error(self):
+        errors = []
+        renewed = threading.Event()
+
+        def generate_token(ttl):
+            now = datetime.now(timezone.utc).timestamp() * 1000
+            return SimpleToken("value", now + ttl, now, {"oid": "test"})
+
+        ttls = iter([100, 60000])
+        mock_provider = Mock(spec=IdentityProviderInterface)
+        mock_provider.request_token.side_effect = (
+            lambda *args, **kwargs: generate_token(next(ttls))
+        )
+
+        def on_next(token):
+            raise Exception("Some exception")
+
+        def on_error(error):
+            nonlocal errors
+            errors.append(error)
+            if len(errors) == 2:
+                renewed.set()
+
+        mock_listener = Mock(spec=CredentialsListener)
+        mock_listener.on_next = on_next
+        mock_listener.on_error = on_error
+
+        retry_policy = RetryPolicy(1, 10)
+        config = TokenManagerConfig(0.9, 0, 1000, retry_policy)
+        mgr = TokenManager(mock_provider, config)
+        mgr.start(mock_listener)
+        try:
+            assert renewed.wait(timeout=5)
+        finally:
+            mgr.stop()
+
+        assert mock_provider.request_token.call_count == 2
+        assert all(isinstance(error, TokenRenewalErr) for error in errors)
+
     @pytest.mark.asyncio
     async def test_async_failed_renewal_on_callback_error(self):
         errors = []
@@ -852,3 +891,91 @@ class TestTokenManager:
         assert len(errors) == 1
         assert isinstance(errors[0], TokenRenewalErr)
         assert str(errors[0]) == "Some exception"
+
+    @pytest.mark.asyncio
+    async def test_async_renewal_continues_after_callback_error(self):
+        errors = []
+        renewed = asyncio.Event()
+
+        def generate_token(ttl):
+            now = datetime.now(timezone.utc).timestamp() * 1000
+            return SimpleToken("value", now + ttl, now, {"oid": "test"})
+
+        ttls = iter([100, 60000])
+        mock_provider = Mock(spec=IdentityProviderInterface)
+        mock_provider.request_token.side_effect = (
+            lambda *args, **kwargs: generate_token(next(ttls))
+        )
+
+        async def on_next(token):
+            raise Exception("Some exception")
+
+        async def on_error(error):
+            nonlocal errors
+            errors.append(error)
+            if len(errors) == 2:
+                renewed.set()
+
+        mock_listener = Mock(spec=CredentialsListener)
+        mock_listener.on_next = on_next
+        mock_listener.on_error = on_error
+
+        retry_policy = RetryPolicy(1, 10)
+        config = TokenManagerConfig(0.9, 0, 1000, retry_policy)
+        mgr = TokenManager(mock_provider, config)
+        await mgr.start_async(mock_listener, block_for_initial=True)
+        await asyncio.wait_for(renewed.wait(), timeout=5)
+        mgr.stop()
+
+        assert mock_provider.request_token.call_count == 2
+        assert all(isinstance(error, TokenRenewalErr) for error in errors)
+
+    @pytest.mark.asyncio
+    async def test_async_stop_cancels_renewal_after_callback_error(self):
+        now = datetime.now(timezone.utc).timestamp() * 1000
+        mock_provider = Mock(spec=IdentityProviderInterface)
+        mock_provider.request_token.return_value = SimpleToken(
+            "value", now + 60000, now, {"oid": "test"}
+        )
+
+        async def on_next(token):
+            raise Exception("Some exception")
+
+        mock_listener = Mock(spec=CredentialsListener)
+        mock_listener.on_next = on_next
+        mock_listener.on_error = AsyncMock()
+
+        retry_policy = RetryPolicy(1, 10)
+        config = TokenManagerConfig(0.9, 0, 1000, retry_policy)
+        mgr = TokenManager(mock_provider, config)
+        await mgr.start_async(mock_listener, block_for_initial=True)
+        mgr.stop()
+
+        mock_listener.on_error.assert_awaited_once()
+        assert mgr._next_timer.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_async_renewal_is_scheduled_after_callback(self):
+        timers = []
+        now = datetime.now(timezone.utc).timestamp() * 1000
+        mock_provider = Mock(spec=IdentityProviderInterface)
+        mock_provider.request_token.return_value = SimpleToken(
+            "value", now + 60000, now, {"oid": "test"}
+        )
+
+        async def on_next(token):
+            timers.append(mgr._next_timer)
+            raise Exception("Some exception")
+
+        mock_listener = Mock(spec=CredentialsListener)
+        mock_listener.on_next = on_next
+        mock_listener.on_error = AsyncMock()
+
+        retry_policy = RetryPolicy(1, 10)
+        config = TokenManagerConfig(0.9, 0, 1000, retry_policy)
+        mgr = TokenManager(mock_provider, config)
+        await mgr.start_async(mock_listener, block_for_initial=True)
+        mgr.stop()
+
+        assert timers == [None]
+        assert mgr._next_timer is not None

@@ -1,3 +1,5 @@
+from redis.utils import str_if_bytes
+
 from ..helpers import nativestr
 from .utils import list_to_dict
 
@@ -78,10 +80,11 @@ class TSInfo:
         https://redis.io/docs/latest/develop/data-types/timeseries/configuration/#duplicate_policy
         """
         if isinstance(args, dict):
-            # RESP3 wire: response is a native map.
-            response = args
+            # RESP3 wire: response is a native map (bytes keys when not decoded).
+            response = {nativestr(k): v for k, v in args.items()}
             self.rules = response.get("rules") or {}
-            self.labels = response.get("labels") or {}
+            labels = response.get("labels") or {}
+            self.labels = {str_if_bytes(k): str_if_bytes(v) for k, v in labels.items()}
         else:
             # RESP2 wire: flat list of alternating key-value pairs.
             response = dict(zip(map(nativestr, args[::2]), args[1::2]))

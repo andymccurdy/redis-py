@@ -1,9 +1,9 @@
 ---
 x-client-libs-stack-image: &client-libs-stack-image
-  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_STACK_IMAGE_TAG:-8.6.1}"
+  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_STACK_IMAGE_TAG:-8.10.3}"
 
 x-client-libs-image: &client-libs-image
-  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_IMAGE_TAG:-8.6.1}"
+  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_IMAGE_TAG:-8.10.3}"
 
 networks:
   redis-net:
@@ -19,7 +19,7 @@ services:
       - REDIS_CLUSTER=no
       - PORT=6379
       - TLS_PORT=6666
-    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save ""}
+    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save "" --unixsocket /redis/work/redis.sock --unixsocketperm 777}
     ports:
       - 6379:6379
       - 6666:6666 # TLS port
@@ -69,6 +69,13 @@ services:
       - "27379-27384:27379-27384"
     volumes:
       - "./dockers/cluster:/redis/work"
+    # The cluster bus ports (data port + 21000, 37379-37384) fall inside the
+    # kernel's default ephemeral range, so an outgoing connection made while
+    # the nodes start (e.g. a readiness probe) can take one first and the
+    # node aborts with "Address already in use". Start the ephemeral range
+    # above every port the nodes listen on.
+    sysctls:
+      - net.ipv4.ip_local_port_range=40000 60999
     profiles:
       - cluster
       - all-stack
@@ -99,6 +106,10 @@ services:
       - "27385-27390:27385-27390"
     volumes:
       - "./dockers/cluster2:/redis/work"
+    # Keeps the bus ports (37385-37390) out of the ephemeral range, as for
+    # `cluster` above.
+    sysctls:
+      - net.ipv4.ip_local_port_range=40000 60999
     # Report healthy only once the cluster has actually formed
     # (cluster_state:ok), so `docker compose up --wait` blocks until the cluster
     # is usable rather than just until the container is running.

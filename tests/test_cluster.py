@@ -19,6 +19,7 @@ import redis
 from redis import Redis
 from redis._parsers import CommandsParser
 from redis.backoff import (
+    AbstractBackoff,
     ExponentialBackoff,
     ExponentialWithJitterBackoff,
     NoBackoff,
@@ -34,6 +35,7 @@ from redis.cluster import (
     LoadBalancingStrategy,
     NodesManager,
     RedisCluster,
+    _resolve_localhost,
     get_node_name,
     parse_cluster_shards,
     parse_cluster_shards_unified,
@@ -50,8 +52,14 @@ from redis.commands.metadata import (
     StaticMetadataResolver,
 )
 from redis.commands.policies import StaticPolicyResolver
-from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
+from redis.connection import (
+    BlockingConnectionPool,
+    Connection,
+    ConnectionPool,
+    SSLConnection,
+)
 from redis.crc import key_slot
+from redis.credentials import StreamingCredentialProvider
 from redis.event import (
     AfterSlotsCacheRefreshEvent,
     EventDispatcher,
@@ -64,12 +72,15 @@ from redis.exceptions import (
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
+    MaxClientsReachedError,
+    MaxConnectionsError,
     MovedError,
     NoPermissionError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
     ResponseError,
+    SlotNotCoveredError,
     TimeoutError,
 )
 from redis.himport import HIMPORT_SET
@@ -86,6 +97,7 @@ from .conftest import (
     assert_resp_response,
     expects_resp2_shape,
     expects_unified_shape,
+    patch_monotonic,
     skip_if_redis_enterprise,
     skip_if_server_version_lt,
     skip_unless_arch_bits,
@@ -540,6 +552,7 @@ class TestRedisClusterObj:
         # Third attempt must follow the MOVED redirect, not the stale ASK target.
         assert calls[2] == (moved_node.host, moved_node.port)
 
+    @pytest.mark.usefixtures("no_topology_refresh_interval", "no_cluster_retry_delay")
     def test_handling_cluster_failover_to_a_replica(self, r):
         # Set the key we'll test for
         key = "key"
@@ -805,6 +818,7 @@ class TestRedisClusterObj:
             assert replica.server_type == REPLICA
             assert replica in slot_nodes
 
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @skip_if_redis_enterprise()
     def test_not_require_full_coverage_cluster_down_error(self, r):
         """
@@ -943,6 +957,7 @@ class TestRedisClusterObj:
         assert "myself" not in nodes.get(curr_default_node.name).get("flags")
         assert r.get_default_node() != curr_default_node
 
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     def test_address_remap(self, request, master_host):
         """Test that we can create a rediscluster object with
         a host-port remapper and map connections through proxy objects
@@ -988,11 +1003,75 @@ class TestRedisClusterObj:
         n_used = sum((1 if p.n_connections else 0) for p in proxies)
         assert n_used > 1
 
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize(
+        "remap_host, offset",
+        # Not the ports of the other remap tests: their listeners may still be open
+        [("127.0.0.1", 2000), ("localhost", 2100)],
+    )
+    def test_address_remap_applies_to_redirects(
+        self, request, master_host, remap_host, offset
+    ):
+        """
+        A MOVED or ASK redirect names the address the node advertises, so the
+        retry must go through address_remap like the CLUSTER SLOTS addresses do.
+        A remap to localhost is cached under the resolved address, so the retry
+        must look the node up the same way.
+        """
+        n = 6
+        hostname, master_port = master_host
+        ports = [master_port + i for i in range(n)]
+
+        def address_remap(address):
+            host, port = address
+            if int(port) in ports:
+                host, port = remap_host, int(port) + offset
+            return host, port
+
+        proxies = [
+            NodeProxy(("127.0.0.1", port + offset), (hostname, port)) for port in ports
+        ]
+        for p in proxies:
+            p.start()
+        try:
+            r = _get_client(
+                RedisCluster, request, flushdb=False, address_remap=address_remap
+            )
+            try:
+                slot = r.keyslot("foo")
+                owner = r.nodes_manager.get_node_from_slot(slot)
+                other = next(p for p in r.get_primaries() if p.name != owner.name)
+                # The address the redirected-to node advertises, not its proxy
+                redirect_port = other.port - offset
+                for redirect_error in (AskError, MovedError):
+                    with patch.object(Redis, "parse_response") as parse_response:
+
+                        def redirect_effect(connection, *args, **options):
+                            def ok_response(connection, *args, **options):
+                                assert (connection.host, connection.port) == (
+                                    "127.0.0.1",
+                                    other.port,
+                                )
+                                return "MOCK_OK"
+
+                            parse_response.side_effect = ok_response
+                            raise redirect_error(f"{slot} {hostname}:{redirect_port}")
+
+                        parse_response.side_effect = redirect_effect
+
+                        assert r.execute_command("SET", "foo", "bar") == "MOCK_OK"
+            finally:
+                r.close()
+        finally:
+            for p in proxies:
+                p.close()
+
 
 @pytest.mark.fixed_client
 class TestRedisClusterObjMocked:
     """RedisCluster behaviour checked against mocked nodes; no server needed."""
 
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("error", RedisCluster.ERRORS_ALLOW_RETRY)
     def test_cluster_down_overreaches_retry_attempts(self, error):
         """
@@ -1028,6 +1107,39 @@ class TestRedisClusterObjMocked:
         assert str(ex.value).startswith(
             "RedisCluster requires at least one node to discover the cluster"
         ), str_if_bytes(ex.value)
+
+    def test_ssl_with_non_ssl_connection_class_raises(self):
+        with pytest.raises(RedisClusterException) as ex:
+            RedisCluster(
+                host=default_host,
+                port=default_port,
+                ssl=True,
+                connection_class=Connection,
+            )
+
+        assert "SSLConnection subclass" in str(ex.value)
+
+    def test_unix_socket_path_raises(self):
+        with pytest.raises(RedisClusterException) as ex:
+            RedisCluster(
+                host=default_host,
+                port=default_port,
+                unix_socket_path="/tmp/redis.sock",
+            )
+
+        assert "Unix Domain Socket" in str(ex.value)
+
+    def test_unix_socket_path_none_uses_tcp(self):
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            unix_socket_path=None,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            connection = node.redis_connection.connection_pool.make_connection()
+            assert isinstance(connection, Connection)
 
     def test_get_node_name(self):
         assert (
@@ -1475,6 +1587,13 @@ class TestClusterRedisCommands:
         assert isinstance(myshardid, str)
         assert len(myshardid) > 0
 
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    def test_cluster_myshardid_decoded(self, decoded_r):
+        myshardid = decoded_r.cluster_myshardid()
+        assert isinstance(myshardid, str)
+        assert len(myshardid) == 40
+
     @skip_if_redis_enterprise()
     def test_cluster_addslots(self, r):
         node = r.get_random_node()
@@ -1725,6 +1844,11 @@ class TestClusterRedisCommands:
         info = r.info(target_nodes=node)
         assert isinstance(info, dict)
         assert info["db0"]["keys"] == 3
+
+    def test_info_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response, **options: response)
+        info = decoded_r.info("server", target_nodes=decoded_r.get_random_node())
+        assert "redis_version" in info
 
     def _init_slowlog_test(self, r, node):
         slowlog_lim = r.config_get("slowlog-log-slower-than", target_nodes=node)
@@ -3646,6 +3770,976 @@ class TestSlotResolutionWithoutADefaultNode:
             rc.execute_command("GET", "foo")
 
 
+class RecordingBackoff(AbstractBackoff):
+    """A backoff that returns ``step * failures`` and records every call."""
+
+    def __init__(self, step: float = 0.5):
+        self.step = step
+        self.computed = []
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+
+    def compute(self, failures: int) -> float:
+        self.computed.append(failures)
+        return self.step * failures
+
+
+class TestTopologyRefreshPacing:
+    """
+    Error-triggered topology refreshes run at most once per
+    _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS, back off after failures as the retry
+    backoff says, and retries wait as long as the retry backoff says.
+    """
+
+    @staticmethod
+    def _nodes_manager():
+        slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        patcher, nm = TestNodesManager._refresh_with_cluster_slots([slots] * 10)
+        return patcher, nm
+
+    @pytest.mark.fixed_client
+    def test_refresh_is_due_after_the_interval(self):
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._last_refresh_at = 100.0
+            with patch_monotonic("redis.cluster", 100.9):
+                assert nm._refresh_due() is False
+            with patch_monotonic("redis.cluster", 101.0):
+                assert nm._refresh_due() is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_failed_refreshes_wait_as_long_as_the_retry_backoff_says(self):
+        patcher, nm = self._nodes_manager()
+        try:
+            backoff = RecordingBackoff(step=1.0)
+            retry = Retry(backoff, 3)
+            nm._last_refresh_at = 100.0
+            nm._failed_refreshes = 3
+            nm._refresh_due_at = None
+            with patch_monotonic("redis.cluster", 102.9):
+                assert nm._refresh_due(retry) is False
+            with patch_monotonic("redis.cluster", 103.0):
+                assert nm._refresh_due(retry) is True
+            # Computed once per refresh: a jittered backoff would otherwise
+            # give a new delay on every check
+            assert backoff.computed == [3]
+
+            # The minimum interval is the floor for a shorter backoff
+            short_retry = Retry(RecordingBackoff(step=0.1), 3)
+            nm._failed_refreshes = 1
+            nm._refresh_due_at = None
+            with patch_monotonic("redis.cluster", 100.9):
+                assert nm._refresh_due(short_retry) is False
+            with patch_monotonic("redis.cluster", 101.0):
+                assert nm._refresh_due(short_retry) is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_due_time_of_failed_refreshes_is_not_kept_after_a_success(self):
+        """
+        The due time computed after 3 failed refreshes must not hold back the
+        refresh after a successful one for the backoff instead of the minimum
+        interval.
+        """
+        patcher, nm = self._nodes_manager()
+        try:
+            retry = Retry(RecordingBackoff(step=10.0), 3)
+            nm._last_refresh_at = 100.0
+            nm._failed_refreshes = 3
+            nm._refresh_due_at = None
+            with patch_monotonic("redis.cluster", 101.0):
+                assert nm._refresh_due(retry) is False
+            assert nm._refresh_due_at == 130.0
+
+            with patch_monotonic("redis.cluster", 110.0):
+                nm.initialize()
+            assert nm._failed_refreshes == 0
+            with patch_monotonic("redis.cluster", 110.9):
+                assert nm._refresh_due(retry) is False
+            with patch_monotonic("redis.cluster", 111.0):
+                assert nm._refresh_due(retry) is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_retry_policy_without_a_backoff_gives_no_delay(self):
+        """
+        A duck-typed retry policy, such as an async-shaped one the async client
+        keeps as is, may have no backoff: retries are not delayed, and failed
+        refreshes wait only the minimum interval.
+        """
+
+        class DuckTypedRetry:
+            async def call_with_retry(self, do, fail):
+                return await do()
+
+            def get_retries(self):
+                return 3
+
+        retry = DuckTypedRetry()
+        assert RedisCluster._retry_backoff_delay(retry, 1) == 0
+        assert RedisCluster._retry_backoff_delay(retry, 2) == 0
+
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._last_refresh_at = 100.0
+            nm._failed_refreshes = 3
+            nm._refresh_due_at = None
+            with patch_monotonic("redis.cluster", 100.9):
+                assert nm._refresh_due(retry) is False
+            with patch_monotonic("redis.cluster", 101.0):
+                assert nm._refresh_due(retry) is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_outcome_is_recorded(self):
+        before = [[0, 16383, ["127.0.0.1", 7000]]]
+        patcher, nm = TestNodesManager._refresh_with_cluster_slots([before, before])
+        try:
+            assert nm._failed_refreshes == 0
+            with patch.object(
+                Redis, "execute_command", side_effect=ConnectionError("down")
+            ):
+                with pytest.raises(RedisClusterUnreachableError) as unreachable:
+                    nm.initialize()
+            assert nm._failed_refreshes == 1
+            # Only the message is kept, not the error and the frames it refers to
+            assert nm._last_refresh_unreachable_args == unreachable.value.args
+            failed_at = nm._last_refresh_at
+
+            nm.initialize()
+            assert nm._failed_refreshes == 0
+            assert nm._last_refresh_at >= failed_at
+            assert nm._last_refresh_unreachable_args is None
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_interrupted_refresh_is_not_counted_but_waits_the_interval(self):
+        """
+        A refresh interrupted before it ended (a BaseException, such as a gevent
+        timeout) is not a failed refresh, but the next one still waits the
+        interval, so callers that keep timing out do not refresh back to back.
+        Its outcome is unknown, so it leaves no record of a refresh that
+        reached no node either.
+        """
+
+        class Interrupted(BaseException):
+            pass
+
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._last_refresh_unreachable_args = ("down",)
+            with (
+                patch.object(Redis, "execute_command", side_effect=Interrupted()),
+                patch_monotonic("redis.cluster", 200.0),
+            ):
+                with pytest.raises(Interrupted):
+                    nm.initialize()
+            assert nm._failed_refreshes == 0
+            assert nm._last_refresh_at == 200.0
+            assert nm._last_refresh_unreachable_args is None
+            with patch_monotonic("redis.cluster", 200.9):
+                assert nm._refresh_due() is False
+            with patch_monotonic("redis.cluster", 201.0):
+                assert nm._refresh_due() is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_requested_refresh_is_kept_when_it_raises_another_error(self):
+        """
+        A requested refresh that raises an error other than a failed refresh
+        (for example a reply it cannot parse) raises it, and is still asked
+        for, still trying the failed node last.
+        """
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._request_refresh(last_failed_node_name="127.0.0.1:7000")
+            nm._last_refresh_at = nm._refresh_due_at = None
+            with patch.object(
+                NodesManager,
+                "initialize",
+                autospec=True,
+                side_effect=ValueError("bad reply"),
+            ):
+                with pytest.raises(ValueError):
+                    nm._run_requested_refresh()
+            assert nm._refresh_requested is True
+            assert nm._requested_last_failed_node_name == "127.0.0.1:7000"
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_registers_a_snapshot_of_the_published_nodes(self):
+        """
+        The refresh registers the nodes it published from a snapshot: another
+        thread that moves a failed node to the end of the published cache
+        meanwhile, which pops it and inserts it again, cannot break it.
+        """
+        patcher, nm = self._nodes_manager()
+        try:
+            dispatch = nm._dispatch_pools_instantiated
+            registered = []
+
+            def dispatch_while_a_node_moves(nodes):
+                for node in nodes:
+                    # As another thread halfway through moving the node
+                    moved = nm.nodes_cache.pop(node.name)
+                    registered.append(node.name)
+                    nm.nodes_cache[node.name] = moved
+                dispatch(nodes)
+
+            with patch.object(
+                nm,
+                "_dispatch_pools_instantiated",
+                side_effect=dispatch_while_a_node_moves,
+            ):
+                nm.initialize()
+            assert sorted(registered) == sorted(nm.nodes_cache)
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_does_not_release_a_node_another_thread_is_moving(self):
+        """
+        The nodes a refresh releases are the ones missing from the topology it
+        published, taken under the lock: a node of that topology that another
+        thread is halfway through moving to the end of the published cache
+        (popped, not inserted again yet) while the removed nodes are released
+        keeps its connections.
+        """
+        patcher, nm = self._nodes_manager()
+        try:
+            release = nm._release_removed_nodes
+            moved = []
+
+            def release_while_a_node_moves(old_nodes_cache, new_node_names):
+                # As another thread that popped a node of the new topology and
+                # has not inserted it again yet
+                name = next(iter(nm.nodes_cache))
+                node = nm.nodes_cache.pop(name)
+                moved.append(node)
+                try:
+                    release(old_nodes_cache, new_node_names)
+                finally:
+                    nm.nodes_cache[name] = node
+
+            with (
+                patch.object(
+                    nm,
+                    "_release_removed_nodes",
+                    side_effect=release_while_a_node_moves,
+                ),
+                patch.object(NodesManager, "_free_pool_connections") as free,
+            ):
+                nm.initialize()
+            freed = [c.args[0] for c in free.call_args_list]
+            (node,) = moved
+            assert node.redis_connection.connection_pool not in freed
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_moving_a_failed_node_to_the_end_takes_the_lock(self):
+        """
+        The error paths of many threads move a failed node to the end of the
+        caches at once; each move runs under the lock a refresh publishes the
+        caches under.
+        """
+
+        class RecordingLock:
+            def __init__(self):
+                self._lock = threading.RLock()
+                self.entered = 0
+
+            def __enter__(self):
+                self.entered += 1
+                return self._lock.__enter__()
+
+            def __exit__(self, *exc_info):
+                return self._lock.__exit__(*exc_info)
+
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._lock = RecordingLock()
+            nm.move_node_to_end_of_cached_nodes("127.0.0.1:7000")
+            assert nm._lock.entered == 1
+            assert list(nm.nodes_cache)[-1] == "127.0.0.1:7000"
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_requests_are_merged_and_run_once_when_due(self):
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._last_refresh_at = nm._refresh_due_at = None
+            nm._request_refresh(
+                additional_startup_nodes_info=[("127.0.0.1", 7001)],
+                last_failed_node_name="127.0.0.1:7000",
+            )
+            nm._request_refresh(
+                additional_startup_nodes_info=[("127.0.0.1", 7002)],
+                disconnect_startup_nodes_pools=False,
+            )
+            with patch.object(NodesManager, "initialize", autospec=True) as init:
+                nm._run_requested_refresh()
+                nm._run_requested_refresh()
+
+            init.assert_called_once_with(
+                nm,
+                additional_startup_nodes_info=[
+                    ("127.0.0.1", 7001),
+                    ("127.0.0.1", 7002),
+                ],
+                disconnect_startup_nodes_pools=False,
+                last_failed_node_name="127.0.0.1:7000",
+            )
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_request_waits_while_not_due_and_is_dropped_after_a_newer_refresh(self):
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._request_refresh()
+            with patch.object(NodesManager, "initialize", autospec=True) as init:
+                # The client was just created, so the interval has not passed
+                nm._run_requested_refresh()
+                init.assert_not_called()
+                assert nm._refresh_requested is True
+
+                # A refresh that completes after the request answers it
+                nm._epoch += 1
+                nm._last_refresh_at = nm._refresh_due_at = None
+                nm._run_requested_refresh()
+                init.assert_not_called()
+                assert nm._refresh_requested is False
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RedisClusterException("All slots are not covered"),
+            RedisClusterUnreachableError("down"),
+        ],
+    )
+    def test_requested_refresh_with_an_unusable_topology_keeps_the_current_one(
+        self, error
+    ):
+        """
+        A requested refresh that reaches no node, or whose nodes answer with a
+        topology that cannot replace the current one, does not fail the command
+        that runs it, and is asked for again with the same arguments.
+        """
+        patcher, nm = self._nodes_manager()
+        try:
+            nm._last_refresh_at = nm._refresh_due_at = None
+            nm._request_refresh(
+                additional_startup_nodes_info=[("127.0.0.1", 7001)],
+                last_failed_node_name="127.0.0.1:7000",
+                disconnect_startup_nodes_pools=False,
+            )
+            with patch.object(
+                NodesManager,
+                "initialize",
+                autospec=True,
+                side_effect=error,
+            ) as init:
+                nm._run_requested_refresh()
+
+            init.assert_called_once()
+            assert nm._refresh_requested is True
+            assert nm._requested_additional_startup_nodes == [("127.0.0.1", 7001)]
+            assert nm._requested_last_failed_node_name == "127.0.0.1:7000"
+            assert nm._requested_disconnect_startup_nodes_pools is False
+        finally:
+            patcher.stop()
+
+    @staticmethod
+    def _failing_then_ok(failures):
+        calls = []
+
+        def execute_command(target_node, *args, **kwargs):
+            calls.append(target_node.name)
+            if len(calls) <= failures:
+                raise ConnectionError("down")
+            return b"value"
+
+        return execute_command, calls
+
+    @staticmethod
+    def _checkout_failing_then_ok(failures):
+        """
+        Patch the connection checkout to fail ``failures`` times with a
+        connection error, then hand out a connection whose reply is b"value".
+        """
+        calls = []
+
+        def get_connection(redis_node):
+            calls.append(redis_node)
+            if len(calls) <= failures:
+                raise ConnectionError("down")
+            return Mock()
+
+        return (
+            patch("redis.cluster.get_connection", side_effect=get_connection),
+            patch.object(Redis, "parse_response", return_value=b"value"),
+            calls,
+        )
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_connection_error_refreshes_before_the_next_attempt_when_due(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        rc.nodes_manager._last_refresh_at = rc.nodes_manager._refresh_due_at = None
+        checkout, parse, calls = self._checkout_failing_then_ok(1)
+        with (
+            checkout,
+            parse,
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            assert rc.get("foo") == b"value"
+
+        assert len(calls) == 2
+        init.assert_called_once()
+        assert init.call_args.kwargs["last_failed_node_name"] is not None
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_refresh_not_due_runs_on_the_next_command_once_due(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        checkout, parse, calls = self._checkout_failing_then_ok(1)
+        with (
+            checkout,
+            parse,
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            # The client was just created: the retry goes out without a refresh
+            assert rc.get("foo") == b"value"
+            init.assert_not_called()
+            assert rc.nodes_manager._refresh_requested is True
+
+            # Once due, the next command runs the requested refresh first,
+            # even though it does not fail itself
+            rc.nodes_manager._last_refresh_at = rc.nodes_manager._refresh_due_at = None
+            assert rc.get("foo") == b"value"
+            init.assert_called_once()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
+    def test_cluster_down_refreshes_at_once_and_raises_a_failed_refresh(self, error):
+        """
+        A CLUSTERDOWN or an uncovered slot refreshes the topology at once, also
+        when an error-triggered refresh is not due yet, and the command raises
+        a refresh that fails.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        # The client was just created: an error-triggered refresh is not due
+        assert not nm._refresh_due(rc.retry)
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(Redis, "parse_response", side_effect=error),
+            patch.object(
+                NodesManager,
+                "initialize",
+                autospec=True,
+                side_effect=RedisClusterUnreachableError("down"),
+            ) as init,
+            patch("redis.cluster.time.sleep"),
+        ):
+            with pytest.raises(RedisClusterUnreachableError):
+                rc.get("foo")
+
+        init.assert_called_once()
+        assert nm._refresh_requested is False
+
+    @pytest.mark.fixed_client
+    def test_command_runs_on_the_current_topology_when_no_node_answers_a_refresh(
+        self,
+    ):
+        """
+        A due refresh that reaches no node (e.g. only seeds are queried, with
+        dynamic_startup_nodes=False) is logged and asked for again, and the
+        command that ran it still goes to its node of the current topology.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._request_refresh()
+        nm._last_refresh_at = nm._refresh_due_at = None
+        checkout, parse, calls = self._checkout_failing_then_ok(0)
+        with (
+            checkout,
+            parse,
+            patch.object(
+                NodesManager,
+                "initialize",
+                autospec=True,
+                side_effect=RedisClusterUnreachableError("down"),
+            ) as init,
+        ):
+            assert rc.get("foo") == b"value"
+
+        init.assert_called_once()
+        assert len(calls) == 1
+        assert nm._refresh_requested is True
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("unreachable", [True, False], ids=["unreachable", "up"])
+    @pytest.mark.parametrize("call", ["command", "pipeline", "transaction", "watch"])
+    def test_out_of_retries_raises_unreachable_error_while_no_node_answers(
+        self, call, unreachable
+    ):
+        """
+        A command, pipeline, transaction or WATCH that runs out of retries on
+        connection errors raises RedisClusterUnreachableError, with its own
+        error as the cause, while the last refresh reached no node; and its own
+        error otherwise.
+        """
+        # Transactions and WATCH retry with the backoff of their own copy of
+        # the retry
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 3)
+        )
+        if unreachable:
+            rc.nodes_manager._last_refresh_unreachable_args = (
+                "Redis Cluster cannot be connected",
+            )
+        checkout, parse, calls = self._checkout_failing_then_ok(100)
+        with (
+            checkout,
+            parse,
+            patch.object(NodesManager, "initialize", autospec=True),
+            # The slot of WATCH comes from COMMAND GETKEYS otherwise, which
+            # this client has no server for
+            patch.object(
+                ClusterPipeline, "determine_slot", return_value=rc.keyslot("foo")
+            ),
+        ):
+            with pytest.raises(
+                RedisClusterUnreachableError if unreachable else ConnectionError
+            ) as raised:
+                if call == "command":
+                    rc.get("foo")
+                elif call == "watch":
+                    with rc.pipeline(transaction=True) as pipe:
+                        pipe.watch("foo")
+                else:
+                    rc.pipeline(transaction=call == "transaction").get("foo").execute()
+
+        assert len(calls) > 1
+        if unreachable:
+            assert str(raised.value) == "Redis Cluster cannot be connected"
+            assert type(raised.value.__cause__) is ConnectionError
+        else:
+            assert type(raised.value) is ConnectionError
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay", "no_topology_refresh_interval")
+    @pytest.mark.parametrize("call", ["command", "pipeline", "transaction", "watch"])
+    def test_retry_gives_up_once_a_refresh_since_its_error_reached_no_node(self, call):
+        """
+        The refresh a connection error asks for runs on the next attempt and
+        reaches no node: the slot map that attempt would retry on is the one
+        the error came from, so the command, pipeline, transaction or WATCH
+        gives up at once with RedisClusterUnreachableError, with its own error
+        as the cause, instead of using up its retries.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(NoBackoff(), 3),
+            # A transaction asks for the refresh at this threshold
+            reinitialize_steps=1,
+        )
+        nm = rc.nodes_manager
+        checkout, parse, calls = self._checkout_failing_then_ok(100)
+        with (
+            checkout,
+            parse,
+            # Every node fails the CLUSTER SLOTS of the refresh too
+            patch.object(Redis, "execute_command", side_effect=ConnectionError("down")),
+            # The slot of WATCH comes from COMMAND GETKEYS otherwise, which
+            # this client has no server for
+            patch.object(
+                ClusterPipeline, "determine_slot", return_value=rc.keyslot("foo")
+            ),
+        ):
+            with pytest.raises(RedisClusterUnreachableError) as raised:
+                if call == "command":
+                    rc.get("foo")
+                elif call == "watch":
+                    with rc.pipeline(transaction=True) as pipe:
+                        pipe.watch("foo")
+                else:
+                    rc.pipeline(transaction=call == "transaction").get("foo").execute()
+
+        # One attempt failed, the refresh it asked for reached no node, and no
+        # further attempt was made
+        assert len(calls) == 1
+        assert nm._failed_refreshes == 1
+        assert "Redis Cluster cannot be connected" in str(raised.value)
+        assert type(raised.value.__cause__) is ConnectionError
+
+    @pytest.mark.fixed_client
+    def test_retries_wait_as_long_as_the_retry_backoff_says(self):
+        backoff = RecordingBackoff(step=0.001)
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(backoff, 3)
+        )
+        execute_command, calls = self._failing_then_ok(3)
+        with (
+            patch.object(RedisCluster, "_execute_command", side_effect=execute_command),
+            patch("redis.cluster.time.sleep") as sleep,
+        ):
+            assert rc.get("foo") == b"value"
+
+        assert len(calls) == 4
+        assert [c.args[0] for c in sleep.call_args_list] == [0.001, 0.002, 0.003]
+        # A new run of failures starts from a reset backoff
+        assert backoff.resets == 1
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("due", [True, False])
+    def test_moved_threshold_asks_for_refresh_run_once_due(self, due):
+        """
+        At the reinitialize_steps MOVED threshold the MOVED slot is patched and
+        the refresh is only asked for, also when one is due: the next command
+        runs it, once due.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, reinitialize_steps=1
+        )
+        if due:
+            rc.nodes_manager._last_refresh_at = rc.nodes_manager._refresh_due_at = None
+        slot = rc.keyslot("foo")
+        owner = rc.get_node_from_key("foo")
+        responses = [
+            MovedError(f"{slot} {owner.host}:{owner.port}"),
+            b"value",
+            b"value",
+        ]
+
+        def parse_response(connection, command, **kwargs):
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(Redis, "parse_response", side_effect=parse_response),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            patch.object(NodesManager, "move_slot", autospec=True) as move_slot,
+        ):
+            assert rc.get("foo") == b"value"
+
+            init.assert_not_called()
+            move_slot.assert_called_once()
+            assert rc.nodes_manager._refresh_requested
+            assert rc.nodes_manager._requested_additional_startup_nodes == [
+                (owner.host, owner.port)
+            ]
+
+            assert rc.get("foo") == b"value"
+
+        if due:
+            init.assert_called_once()
+            assert init.call_args.kwargs["additional_startup_nodes_info"] == [
+                (owner.host, owner.port)
+            ]
+            assert not rc.nodes_manager._refresh_requested
+        else:
+            init.assert_not_called()
+            # Still asked for, so a later command runs it once due
+            assert rc.nodes_manager._refresh_requested
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("due", [True, False])
+    @pytest.mark.parametrize("redirect", [True, False])
+    def test_transaction_threshold_asks_for_a_refresh(self, due, redirect):
+        """
+        At the reinitialize_steps threshold an error in a transaction only asks
+        for a refresh, also when one is due: the next attempt runs it through
+        _run_requested_refresh, which keeps the current topology if the refresh
+        fails. A MOVED patches the slot; a connection error asks for the failed
+        node to be tried last.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, reinitialize_steps=1
+        )
+        nm = rc.nodes_manager
+        if due:
+            nm._last_refresh_at = nm._refresh_due_at = None
+        strategy = rc.pipeline(transaction=True)._execution_strategy
+        owner = rc.get_node_from_key("foo")
+        error = (
+            MovedError(f"{rc.keyslot('foo')} {owner.host}:{owner.port}")
+            if redirect
+            else ConnectionError("down")
+        )
+        with (
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            patch.object(NodesManager, "move_slot", autospec=True) as move_slot,
+        ):
+            strategy._pipeline_slots.add(rc.keyslot("foo"))
+            strategy._reinitialize_on_error(error, 1)
+
+        assert move_slot.called is redirect
+        init.assert_not_called()
+        assert nm._refresh_requested is True
+        assert rc.reinitialize_counter == 0
+        assert nm._requested_last_failed_node_name == (None if redirect else owner.name)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("watch", [False, True])
+    def test_transaction_attempt_runs_a_requested_refresh(self, watch):
+        """
+        A refresh an earlier error asked for runs when a transaction attempt
+        starts, once due, so the retries do not keep hitting the stale owner.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._request_refresh()
+        nm._last_refresh_at = nm._refresh_due_at = None
+        strategy = rc.pipeline(transaction=True)._execution_strategy
+        with (
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            # Stop the attempt right after its refresh check
+            patch.object(
+                type(strategy),
+                "_get_client_and_connection_for_transaction",
+                side_effect=RuntimeError("stop"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="stop"):
+                if watch:
+                    strategy._get_connection_and_send_command("WATCH", "foo")
+                else:
+                    strategy._execute_transaction([], raise_on_error=True)
+
+        init.assert_called_once()
+        assert nm._refresh_requested is False
+
+    @pytest.mark.fixed_client
+    def test_pipeline_retries_wait_as_long_as_the_retry_backoff_says(self):
+        backoff = RecordingBackoff(step=0.001)
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(backoff, 2)
+        )
+        pipe = rc.pipeline()
+        strategy = pipe._execution_strategy
+        attempts = []
+
+        def send(stack, raise_on_error=True, allow_redirections=True):
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise ConnectionError("down")
+            return [b"value"]
+
+        with (
+            patch.object(strategy, "_send_cluster_commands", side_effect=send),
+            patch("redis.cluster.time.sleep") as sleep,
+        ):
+            assert pipe.get("foo").execute() == [b"value"]
+
+        assert len(attempts) == 3
+        assert [c.args[0] for c in sleep.call_args_list] == [0.001, 0.002]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
+    def test_pipeline_waits_for_the_cluster_before_retrying_a_cluster_down_error(
+        self, error
+    ):
+        """
+        A pipeline that failed with CLUSTERDOWN or an uncovered slot waits the
+        fixed 0.25 seconds a command does before its retry, and the backoff
+        delay after it.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(RecordingBackoff(step=0.001), 2),
+        )
+        pipe = rc.pipeline()
+        strategy = pipe._execution_strategy
+        attempts = []
+
+        def send(stack, raise_on_error=True, allow_redirections=True):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise error
+            return [b"value"]
+
+        with (
+            patch.object(strategy, "_send_cluster_commands", side_effect=send),
+            patch("redis.cluster.time.sleep") as sleep,
+        ):
+            assert pipe.get("foo").execute() == [b"value"]
+
+        assert len(attempts) == 2
+        assert [c.args[0] for c in sleep.call_args_list] == [0.25, 0.001]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
+    def test_pipeline_retry_asks_for_a_refresh_run_once_due(self, error):
+        """
+        A pipeline that failed with CLUSTERDOWN or an uncovered slot asks for a
+        topology refresh, which its next attempt runs once due, instead of
+        retrying on a slot map only another error could have replaced.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._last_refresh_at = nm._refresh_due_at = None
+        pipe = rc.pipeline()
+        strategy = pipe._execution_strategy
+        attempts = []
+
+        def send(stack, raise_on_error=True, allow_redirections=True):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise error
+            return [b"value"]
+
+        with (
+            patch.object(strategy, "_send_cluster_commands", side_effect=send),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            patch("redis.cluster.time.sleep"),
+        ):
+            assert pipe.get("foo").execute() == [b"value"]
+
+        assert len(attempts) == 2
+        init.assert_called_once()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("due", [True, False])
+    def test_pipeline_fallback_threshold_runs_or_asks_for_refresh(self, due):
+        """
+        At the reinitialize_steps threshold the pipeline asks for a refresh and
+        runs it before resending the failed commands, once due; when it is not
+        due it stays asked for instead of being dropped.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, reinitialize_steps=1
+        )
+        nm = rc.nodes_manager
+        if due:
+            nm._last_refresh_at = nm._refresh_due_at = None
+        owner = rc.get_node_from_key("foo")
+        moved = MovedError(f"{rc.keyslot('foo')} {owner.host}:{owner.port}")
+        pipe = rc.pipeline()
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(Redis, "parse_response", side_effect=moved),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            patch.object(
+                pipe, "parent_execute_command", return_value=b"value"
+            ) as resend,
+        ):
+            assert pipe.get("foo").execute() == [b"value"]
+
+        resend.assert_called_once()
+        if due:
+            init.assert_called_once()
+            assert nm._refresh_requested is False
+        else:
+            init.assert_not_called()
+            assert nm._refresh_requested is True
+
+    @pytest.mark.fixed_client
+    def test_pipeline_connection_error_tries_the_failed_node_last(self):
+        """
+        A node the pipeline cannot connect to moves to the end of the cached
+        nodes, and the refresh asked for tries it last.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 0)
+        )
+        nm = rc.nodes_manager
+        failed = rc.get_node_from_key("foo")
+        assert list(nm.nodes_cache)[-1] != failed.name
+        with (
+            patch("redis.cluster.get_connection", side_effect=ConnectionError("down")),
+            patch.object(NodesManager, "initialize", autospec=True),
+        ):
+            with pytest.raises(ConnectionError):
+                rc.pipeline().get("foo").execute()
+
+        assert list(nm.nodes_cache)[-1] == failed.name
+        assert nm._requested_last_failed_node_name == failed.name
+
+    @pytest.mark.fixed_client
+    def test_pubsub_topology_repair_is_a_paced_request(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        pubsub = rc.pubsub()
+        pubsub.shard_channels = {b"channel": None}
+        with patch.object(pubsub, "_submit_reconcile_work") as submit:
+            pubsub._schedule_topology_repair()
+
+        nm = rc.nodes_manager
+        assert nm._refresh_requested is True
+        assert nm._requested_disconnect_startup_nodes_pools is False
+        (work,), _ = submit.call_args
+        assert work.func == nm._run_requested_refresh
+        assert work.args == (rc.retry,)
+
+
+class TestPipelineNonNodeFailureErrors:
+    """
+    A full client pool, a server at its maxclients limit or rejected
+    credentials are not node failures: commands, pipelines and transactions
+    re-raise them without refreshing the topology and without a retry.
+    """
+
+    ERRORS = [
+        MaxConnectionsError("pool exhausted"),
+        MaxClientsReachedError("max number of clients reached"),
+        AuthenticationError("invalid password"),
+    ]
+    IDS = ["max_connections", "max_clients_reached", "authentication"]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("transaction", [False, True], ids=["pipeline", "tx"])
+    @pytest.mark.parametrize("error", ERRORS, ids=IDS)
+    def test_pipeline_does_not_refresh_or_retry(self, error, transaction):
+        r = get_mocked_redis_client(host=default_host, port=default_port)
+        with (
+            patch("redis.cluster.get_connection", side_effect=error) as checkout,
+            patch.object(NodesManager, "initialize", autospec=True) as initialize,
+        ):
+            with pytest.raises(type(error)):
+                r.pipeline(transaction=transaction).get("foo").execute()
+
+        assert checkout.call_count == 1
+        initialize.assert_not_called()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("error", ERRORS, ids=IDS)
+    def test_command_does_not_refresh_or_retry(self, error):
+        r = get_mocked_redis_client(host=default_host, port=default_port)
+        with (
+            patch("redis.cluster.get_connection", side_effect=error) as checkout,
+            patch.object(NodesManager, "initialize", autospec=True) as initialize,
+        ):
+            with pytest.raises(type(error)):
+                r.get("foo")
+
+        assert checkout.call_count == 1
+        initialize.assert_not_called()
+        assert r.nodes_manager._refresh_requested is False
+
+
 class TestNodesManager:
     """
     Tests for the NodesManager class
@@ -4028,6 +5122,551 @@ class TestNodesManager:
             assert nm.default_node.port == 7003
             assert nm.default_node.server_type == PRIMARY
 
+    @staticmethod
+    def _refresh_with_cluster_slots(cluster_slots_results, **nodes_manager_kwargs):
+        """
+        Patch CLUSTER SLOTS to return the given responses in order and build a
+        NodesManager from the first one. Returns (patcher, nodes_manager); the
+        caller stops the patcher.
+        """
+        patcher = patch.object(Redis, "execute_command", autospec=True)
+        execute_command_mock = patcher.start()
+
+        def execute_command(self, *args, **kwargs):
+            if args[0] == "CLUSTER SLOTS":
+                return cluster_slots_results.pop(0)
+            return None
+
+        execute_command_mock.side_effect = execute_command
+        nodes_manager_kwargs.setdefault(
+            "startup_nodes", [ClusterNode(host=default_host, port=default_port)]
+        )
+        nodes_manager_kwargs.setdefault("require_full_coverage", False)
+        nm = NodesManager(from_url=False, **nodes_manager_kwargs)
+        return patcher, nm
+
+    @staticmethod
+    def _freed_pools(update_mock, disconnect_mock):
+        """
+        The pools whose connections were released, asserting both halves of
+        the release ran on the same pools.
+        """
+        updated = {id(c.args[0]) for c in update_mock.call_args_list}
+        disconnected = {id(c.args[0]) for c in disconnect_mock.call_args_list}
+        assert updated == disconnected
+        return updated
+
+    @pytest.mark.fixed_client
+    def test_refresh_keeps_connections_of_nodes_that_switch_roles(self):
+        """
+        A primary/replica swap is not a reason to recycle connections: both
+        nodes keep their clients and pools, only their roles change.
+        """
+        before = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        after = [[0, 16383, ["127.0.0.1", 7003], ["127.0.0.1", 7000]]]
+        patcher, nm = self._refresh_with_cluster_slots([before, after])
+        try:
+            old_clients = {
+                name: node.redis_connection for name, node in nm.nodes_cache.items()
+            }
+            with (
+                patch.object(
+                    ConnectionPool,
+                    "update_active_connections_for_reconnect",
+                    autospec=True,
+                ) as update_mock,
+                patch.object(
+                    ConnectionPool, "disconnect_free_connections", autospec=True
+                ) as disconnect_mock,
+            ):
+                nm.initialize()
+
+            assert self._freed_pools(update_mock, disconnect_mock) == set()
+            for name, client in old_clients.items():
+                assert nm.nodes_cache[name].redis_connection is client
+            assert nm.nodes_cache["127.0.0.1:7003"].server_type == PRIMARY
+            assert nm.nodes_cache["127.0.0.1:7000"].server_type == REPLICA
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_releases_only_removed_nodes(self):
+        """
+        Only the node that left the topology has its connections released; the
+        node that stays and the node that joins are not touched.
+        """
+        before = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        after = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7004]]]
+        patcher, nm = self._refresh_with_cluster_slots([before, after])
+        try:
+            removed_pool = nm.nodes_cache[
+                "127.0.0.1:7003"
+            ].redis_connection.connection_pool
+            kept_client = nm.nodes_cache["127.0.0.1:7000"].redis_connection
+            with (
+                # Query the node that stays first, so CLUSTER SLOTS is answered
+                # by a node whose connections must be kept
+                patch("redis.cluster.random.shuffle"),
+                patch.object(
+                    ConnectionPool,
+                    "update_active_connections_for_reconnect",
+                    autospec=True,
+                ) as update_mock,
+                patch.object(
+                    ConnectionPool, "disconnect_free_connections", autospec=True
+                ) as disconnect_mock,
+            ):
+                nm.initialize()
+
+            assert self._freed_pools(update_mock, disconnect_mock) == {id(removed_pool)}
+            assert "127.0.0.1:7003" not in nm.nodes_cache
+            assert nm.nodes_cache["127.0.0.1:7000"].redis_connection is kept_client
+            assert nm.nodes_cache["127.0.0.1:7004"].redis_connection is not None
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("disconnect_startup_nodes_pools", [True, False])
+    def test_refresh_frees_startup_node_pool_outside_topology(
+        self, disconnect_startup_nodes_pools
+    ):
+        """
+        A startup node that is not part of the topology (e.g. a load balancer
+        address) has its pool freed after CLUSTER SLOTS unless the caller opts
+        out; the topology nodes are never freed by it.
+        """
+        slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        patcher, nm = self._refresh_with_cluster_slots(
+            [slots, slots], dynamic_startup_nodes=False
+        )
+        try:
+            seed_pool = nm.startup_nodes[
+                get_node_name(default_host, default_port)
+            ].redis_connection.connection_pool
+            with (
+                patch.object(
+                    ConnectionPool,
+                    "update_active_connections_for_reconnect",
+                    autospec=True,
+                ) as update_mock,
+                patch.object(
+                    ConnectionPool, "disconnect_free_connections", autospec=True
+                ) as disconnect_mock,
+            ):
+                nm.initialize(
+                    disconnect_startup_nodes_pools=disconnect_startup_nodes_pools
+                )
+
+            expected = {id(seed_pool)} if disconnect_startup_nodes_pools else set()
+            assert self._freed_pools(update_mock, disconnect_mock) == expected
+        finally:
+            patcher.stop()
+
+    @staticmethod
+    def _patch_pool_release():
+        """Patch both halves of a pool release, to see which pools were freed."""
+        return (
+            patch.object(
+                ConnectionPool, "update_active_connections_for_reconnect", autospec=True
+            ),
+            patch.object(ConnectionPool, "disconnect_free_connections", autospec=True),
+        )
+
+    @pytest.mark.fixed_client
+    def test_mixed_refresh_releases_only_the_removed_node(self):
+        """
+        In one refresh a shard swaps roles, a replica leaves, another joins and
+        a shard stays the same: only the node that left is released.
+        """
+        before = [
+            [0, 8191, ["127.0.0.1", 7000], ["127.0.0.1", 7003]],
+            [8192, 16383, ["127.0.0.1", 7001], ["127.0.0.1", 7004]],
+        ]
+        after = [
+            [0, 8191, ["127.0.0.1", 7003], ["127.0.0.1", 7000]],
+            [8192, 16383, ["127.0.0.1", 7001], ["127.0.0.1", 7005]],
+        ]
+        patcher, nm = self._refresh_with_cluster_slots([before, after])
+        try:
+            old_clients = {
+                name: node.redis_connection for name, node in nm.nodes_cache.items()
+            }
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with (
+                # Query a node that stays first, so CLUSTER SLOTS is answered by
+                # a node whose connections must be kept
+                patch("redis.cluster.random.shuffle"),
+                update_patch as update_mock,
+                disconnect_patch as disconnect_mock,
+            ):
+                nm.initialize()
+
+            assert self._freed_pools(update_mock, disconnect_mock) == {
+                id(old_clients["127.0.0.1:7004"].connection_pool)
+            }
+            for name in ("127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7003"):
+                assert nm.nodes_cache[name].redis_connection is old_clients[name]
+            assert nm.nodes_cache["127.0.0.1:7003"].server_type == PRIMARY
+            assert nm.nodes_cache["127.0.0.1:7000"].server_type == REPLICA
+            assert "127.0.0.1:7004" not in nm.nodes_cache
+            assert nm.nodes_cache["127.0.0.1:7005"].redis_connection is not None
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("disconnect_startup_nodes_pools", [True, False])
+    def test_refresh_keeps_pools_of_startup_nodes_in_the_topology(
+        self, disconnect_startup_nodes_pools
+    ):
+        """
+        With dynamic startup nodes the startup node that answers CLUSTER SLOTS
+        is a node of the topology, so its pool is kept whatever the flag says.
+        """
+        slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        patcher, nm = self._refresh_with_cluster_slots([slots, slots])
+        try:
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with update_patch as update_mock, disconnect_patch as disconnect_mock:
+                nm.initialize(
+                    disconnect_startup_nodes_pools=disconnect_startup_nodes_pools
+                )
+
+            assert self._freed_pools(update_mock, disconnect_mock) == set()
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("disconnect_startup_nodes_pools", [True, False])
+    def test_refresh_frees_clients_of_additional_startup_nodes(
+        self, disconnect_startup_nodes_pools
+    ):
+        """
+        An additional startup node gets a client only for this refresh, so its
+        pool is freed afterwards even when the startup node pools are kept.
+        """
+        full = [[0, 16383, ["127.0.0.1", 7000]]]
+        partial = [[0, 8191, ["127.0.0.1", 7000]]]
+        split = [
+            [0, 8191, ["127.0.0.1", 7000]],
+            [8192, 16383, ["127.0.0.1", 7001]],
+        ]
+        # The startup node covers only half of the slots, so the additional
+        # startup node is queried too
+        patcher, nm = self._refresh_with_cluster_slots([full, partial, split])
+        try:
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with update_patch as update_mock, disconnect_patch as disconnect_mock:
+                nm.initialize(
+                    additional_startup_nodes_info=[("127.0.0.1", 7009)],
+                    disconnect_startup_nodes_pools=disconnect_startup_nodes_pools,
+                )
+
+            freed = self._freed_pools(update_mock, disconnect_mock)
+            assert len(freed) == 1
+            assert not freed & self._current_pools(nm)
+            assert "127.0.0.1:7009" not in nm.nodes_cache
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("disconnect_startup_nodes_pools", [True, False])
+    def test_failed_refresh_frees_clients_of_additional_startup_nodes(
+        self, disconnect_startup_nodes_pools
+    ):
+        """
+        A refresh that fails after querying an additional startup node still
+        frees the pool of the client built for it, and keeps the topology.
+        """
+        full = [[0, 16383, ["127.0.0.1", 7000]]]
+        partial = [[0, 8191, ["127.0.0.1", 7000]]]
+        # Neither node covers every slot, so both are queried and the refresh
+        # fails on the coverage check
+        patcher, nm = self._refresh_with_cluster_slots(
+            [full, partial, partial], require_full_coverage=True
+        )
+        try:
+            current_pools = self._current_pools(nm)
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with update_patch as update_mock, disconnect_patch as disconnect_mock:
+                with pytest.raises(RedisClusterException):
+                    nm.initialize(
+                        additional_startup_nodes_info=[("127.0.0.1", 7009)],
+                        disconnect_startup_nodes_pools=disconnect_startup_nodes_pools,
+                    )
+
+            freed = self._freed_pools(update_mock, disconnect_mock)
+            assert len(freed) == 1
+            assert not freed & current_pools
+            assert self._current_pools(nm) == current_pools
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_frees_client_of_additional_node_whose_query_raised(self):
+        """
+        The client built for an additional startup node is freed also when its
+        CLUSTER SLOTS raises, not only when it answers.
+        """
+        partial = [[0, 8191, ["127.0.0.1", 7000]]]
+        patcher, nm = self._refresh_with_cluster_slots([partial])
+        try:
+            current_pools = self._current_pools(nm)
+
+            def execute_command(self, *args, **kwargs):
+                if self.connection_pool.connection_kwargs["port"] == 7009:
+                    raise ConnectionError("down")
+                return partial
+
+            # The patcher's mock of Redis.execute_command
+            Redis.execute_command.side_effect = execute_command
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with update_patch as update_mock, disconnect_patch as disconnect_mock:
+                nm.initialize(additional_startup_nodes_info=[("127.0.0.1", 7009)])
+
+            freed = self._freed_pools(update_mock, disconnect_mock)
+            assert len(freed) == 1
+            assert not freed & current_pools
+            assert self._current_pools(nm) == current_pools
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_additional_startup_node_that_is_a_startup_node_keeps_its_client(self):
+        """
+        An additional startup node that is already a startup node is queried
+        through that node's client, and not again through a new client that
+        would replace the live node's one.
+        """
+        partial = [[0, 8191, ["127.0.0.1", 7000]]]
+        patcher, nm = self._refresh_with_cluster_slots([partial, partial])
+        try:
+            old_client = nm.nodes_cache["127.0.0.1:7000"].redis_connection
+            update_patch, disconnect_patch = self._patch_pool_release()
+            with (
+                patch.object(
+                    nm, "create_redis_node", wraps=nm.create_redis_node
+                ) as create_mock,
+                update_patch as update_mock,
+                disconnect_patch as disconnect_mock,
+            ):
+                nm.initialize(additional_startup_nodes_info=[("127.0.0.1", 7000)])
+
+            create_mock.assert_not_called()
+            assert self._freed_pools(update_mock, disconnect_mock) == set()
+            assert nm.nodes_cache["127.0.0.1:7000"].redis_connection is old_client
+            assert nm.startup_nodes["127.0.0.1:7000"].redis_connection is old_client
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_localhost_remapped_startup_node_keeps_its_client(self):
+        """
+        With a remap to localhost, the refresh hint of a MOVED redirect is
+        localhost:port, while the startup node is named after the resolved
+        address. It is the same node, so it keeps its client.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return "localhost", port + 1000
+
+        partial = [[0, 8191, ["127.0.0.1", 7000]]]
+        patcher, nm = self._refresh_with_cluster_slots(
+            [partial, partial], address_remap=address_remap
+        )
+        try:
+            startup_node = nm.startup_nodes[get_node_name(_resolve_localhost(), 8000)]
+            old_client = startup_node.redis_connection
+            # The patcher's mock of Redis.execute_command
+            Redis.execute_command.reset_mock()
+            # The hint _execute_command passes on for a MOVED to 7000
+            nm.initialize(
+                additional_startup_nodes_info=[nm.remap_host_port("127.0.0.1", 7000)]
+            )
+
+            assert [c.args[0] for c in Redis.execute_command.call_args_list] == [
+                old_client
+            ]
+            assert startup_node.redis_connection is old_client
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_without_full_coverage_builds_no_node_clients(self):
+        """
+        A refresh that fails the full-coverage check raises before it builds
+        clients for the nodes it discovered.
+        """
+        full = [[0, 16383, ["127.0.0.1", 7000]]]
+        partial = [[0, 8191, ["127.0.0.1", 7001]]]
+        patcher, nm = self._refresh_with_cluster_slots(
+            [full, partial], require_full_coverage=True
+        )
+        try:
+            current_pools = self._current_pools(nm)
+            with patch.object(
+                nm, "create_redis_node", wraps=nm.create_redis_node
+            ) as create_mock:
+                with pytest.raises(RedisClusterException):
+                    nm.initialize()
+
+            create_mock.assert_not_called()
+            assert "127.0.0.1:7001" not in nm.nodes_cache
+            assert self._current_pools(nm) == current_pools
+        finally:
+            patcher.stop()
+
+    @staticmethod
+    def _streaming_credential_provider():
+        class FakeStreamingCredentialProvider(StreamingCredentialProvider):
+            def __init__(self):
+                self.on_next_callback = None
+
+            def get_credentials(self):
+                return "default", "token"
+
+            def on_next(self, callback):
+                self.on_next_callback = callback
+
+            def on_error(self, callback):
+                pass
+
+            def is_streaming(self) -> bool:
+                return False
+
+        return FakeStreamingCredentialProvider()
+
+    @staticmethod
+    def _re_authed_pools(credential_provider):
+        with patch.object(
+            ConnectionPool, "re_auth_callback", autospec=True
+        ) as re_auth_mock:
+            credential_provider.on_next_callback(Mock())
+        pools = [c.args[0] for c in re_auth_mock.call_args_list]
+        assert len(pools) == len({id(p) for p in pools})
+        return {id(p) for p in pools}
+
+    @staticmethod
+    def _current_pools(nm):
+        return {
+            id(node.redis_connection.connection_pool)
+            for node in nm.nodes_cache.values()
+        }
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "after",
+        [
+            # no topology change
+            [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]],
+            # a node joins
+            [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003], ["127.0.0.1", 7004]]],
+            # a node leaves
+            [[0, 16383, ["127.0.0.1", 7000]]],
+        ],
+        ids=["unchanged", "node_added", "node_removed"],
+    )
+    def test_refresh_keeps_re_auth_on_every_current_pool(self, after):
+        """
+        A streaming credential provider keeps only the last callback, so after
+        every refresh the callback must cover the pool of every current node -
+        not only the pools created by that refresh - and no removed one.
+        """
+        before = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        credential_provider = self._streaming_credential_provider()
+        patcher, nm = self._refresh_with_cluster_slots(
+            [before, after], credential_provider=credential_provider
+        )
+        try:
+            assert self._re_authed_pools(credential_provider) == self._current_pools(nm)
+
+            nm.initialize()
+
+            assert self._re_authed_pools(credential_provider) == self._current_pools(nm)
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_failed_refresh_keeps_re_auth_on_every_current_pool(self):
+        """
+        Every client a refresh builds - for an additional startup node or a new
+        node - registers its own pool with the credential provider. A refresh
+        that then fails must register the current pools again, or re-auth
+        would cover only those clients until the next successful refresh.
+        """
+        full = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        partial = [[0, 8000, ["127.0.0.1", 7005]]]
+        credential_provider = self._streaming_credential_provider()
+        patcher, nm = self._refresh_with_cluster_slots(
+            [full, partial, partial, partial],
+            credential_provider=credential_provider,
+            require_full_coverage=True,
+        )
+        try:
+            with pytest.raises(RedisClusterException, match="not covered"):
+                nm.initialize(additional_startup_nodes_info=[("127.0.0.1", 7009)])
+
+            assert set(nm.nodes_cache) == {"127.0.0.1:7000", "127.0.0.1:7003"}
+            assert self._re_authed_pools(credential_provider) == self._current_pools(nm)
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_failed_re_auth_does_not_stop_the_other_pools(self):
+        """
+        A pool whose re-authentication raises does not stop the remaining pools
+        from being re-authenticated. The first error is raised afterwards.
+        """
+        slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        credential_provider = self._streaming_credential_provider()
+        patcher, nm = self._refresh_with_cluster_slots(
+            [slots], credential_provider=credential_provider
+        )
+        re_authed = []
+
+        def re_auth_callback(pool, token):
+            re_authed.append(id(pool))
+            if len(re_authed) == 1:
+                raise AuthenticationError("first")
+            raise AuthenticationError("second")
+
+        try:
+            with patch.object(
+                ConnectionPool,
+                "re_auth_callback",
+                autospec=True,
+                side_effect=re_auth_callback,
+            ):
+                with pytest.raises(AuthenticationError, match="first"):
+                    credential_provider.on_next_callback(Mock())
+
+            assert set(re_authed) == self._current_pools(nm)
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_lazy_node_connection_keeps_re_auth_on_every_pool(self):
+        """
+        Creating the client of a node added by a MOVED redirect must not narrow
+        re-authentication down to that node.
+        """
+        slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
+        credential_provider = self._streaming_credential_provider()
+        patcher, nm = self._refresh_with_cluster_slots(
+            [slots], credential_provider=credential_provider
+        )
+        try:
+            nm.move_slot(MovedError("0 127.0.0.1:7005"))
+            new_node = nm.nodes_cache["127.0.0.1:7005"]
+            assert new_node.redis_connection is None
+
+            nm.create_redis_connections([new_node])
+
+            assert self._re_authed_pools(credential_provider) == self._current_pools(nm)
+            assert len(self._current_pools(nm)) == 3
+        finally:
+            patcher.stop()
+
     @pytest.mark.fixed_client
     def test_init_slots_cache_cluster_mode_disabled(self):
         """
@@ -4271,6 +5910,113 @@ class TestNodesManager:
             assert isinstance(
                 node.redis_connection.connection_pool, connection_pool_class
             )
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "connection_pool_class", [ConnectionPool, BlockingConnectionPool]
+    )
+    def test_connection_pool_class_with_host_and_port(self, connection_pool_class):
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            connection_pool_class=connection_pool_class,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            assert isinstance(
+                node.redis_connection.connection_pool, connection_pool_class
+            )
+
+    @pytest.mark.fixed_client
+    def test_connection_class_with_host_and_port(self):
+        class MyConnection(Connection):
+            pass
+
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            connection_class=MyConnection,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            pool = node.redis_connection.connection_pool
+            assert pool.connection_class is MyConnection
+            assert isinstance(pool.make_connection(), MyConnection)
+
+    @pytest.mark.fixed_client
+    def test_ssl_options_without_ssl_with_host_and_port(self):
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            ssl=False,
+            ssl_cert_reqs="none",
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            pool = node.redis_connection.connection_pool
+            assert pool.connection_class is Connection
+            assert isinstance(pool.make_connection(), Connection)
+
+    @pytest.mark.fixed_client
+    def test_ssl_connection_class_keeps_ssl_options_with_host_and_port(self):
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            connection_class=SSLConnection,
+            ssl_cert_reqs="none",
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            connection = node.redis_connection.connection_pool.make_connection()
+            assert isinstance(connection, SSLConnection)
+            assert connection.cert_reqs == ssl.CERT_NONE
+
+    @pytest.mark.fixed_client
+    def test_ssl_pool_default_keeps_ssl_options_with_host_and_port(self):
+        class SSLConnectionPool(ConnectionPool):
+            def __init__(self, connection_class=SSLConnection, **kwargs):
+                super().__init__(connection_class=connection_class, **kwargs)
+
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            connection_pool_class=SSLConnectionPool,
+            ssl_cert_reqs="none",
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            connection = node.redis_connection.connection_pool.make_connection()
+            assert isinstance(connection, SSLConnection)
+            assert connection.cert_reqs == ssl.CERT_NONE
+
+    @pytest.mark.fixed_client
+    def test_connection_pool_with_host_and_port(self):
+        pool = ConnectionPool(host=default_host, port=default_port)
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            cluster_slots=default_cluster_slots,
+            connection_pool=pool,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            assert node.redis_connection.connection_pool is pool
+            assert node.redis_connection.auto_close_connection_pool is False
+
+    @pytest.mark.fixed_client
+    def test_url_node_clients_close_their_pool(self):
+        rc = get_mocked_redis_client(
+            url="redis://my@DNS.com:7000",
+            cluster_slots=default_cluster_slots,
+        )
+
+        for node in rc.nodes_manager.nodes_cache.values():
+            assert node.redis_connection.auto_close_connection_pool is True
 
     @pytest.mark.fixed_client
     @pytest.mark.parametrize("queue_class", [Queue, LifoQueue])
@@ -4657,6 +6403,60 @@ class TestNodesManager:
         nm.move_slot(MovedError("0 127.0.0.1:7000"))
 
         listener.listen.assert_not_called()
+
+    @pytest.mark.fixed_client
+    def test_move_slot_remaps_redirect_address(self):
+        """
+        move_slot() must apply address_remap to the redirect address, which is
+        the one the node advertises, and never cache the unmapped address.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return host, port + 1000
+
+        r = get_mocked_redis_client(
+            host=default_host, port=default_port, address_remap=address_remap
+        )
+        nm = r.nodes_manager
+        # Default layout: slot 0 -> 127.0.0.1:7000, cached as 127.0.0.1:8000.
+        # Redirect to the primary of a different shard, by its advertised address.
+        nm.move_slot(MovedError("0 127.0.0.1:7001"))
+
+        assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8001"]
+        assert "127.0.0.1:7001" not in nm.nodes_cache
+
+        # A node not in the cache yet is added under its remapped address.
+        nm.move_slot(MovedError("0 127.0.0.1:7006"))
+
+        assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8006"]
+        assert "127.0.0.1:7006" not in nm.nodes_cache
+
+    @pytest.mark.fixed_client
+    def test_move_slot_resolves_localhost_once(self):
+        """
+        A remap to localhost must be resolved once and reused, not on every
+        node created or redirect looked up.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return "localhost", port + 1000
+
+        _resolve_localhost.cache_clear()
+        try:
+            with patch("socket.gethostbyname", return_value="127.0.0.1") as resolve:
+                r = get_mocked_redis_client(
+                    host=default_host, port=default_port, address_remap=address_remap
+                )
+                nm = r.nodes_manager
+                nm.move_slot(MovedError("0 127.0.0.1:7001"))
+                nm.move_slot(MovedError("0 127.0.0.1:7002"))
+
+            assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8002"]
+            resolve.assert_called_once_with("localhost")
+        finally:
+            _resolve_localhost.cache_clear()
 
     @pytest.mark.fixed_client
     def test_move_node_to_end_of_cached_nodes(self):
@@ -5426,6 +7226,7 @@ class TestClusterPipeline:
             assert node.redis_connection.connection.read_response.called
             assert isinstance(res[0], ConnectionError)
 
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     def test_connection_error_raised(self, r):
         """
         Test that the pipeline raises an error on connection error when

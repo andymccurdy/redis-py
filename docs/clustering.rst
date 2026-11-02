@@ -92,6 +92,77 @@ The ‘target_nodes’ parameter is explained in the following section,
    >>> # target-node: default-node
    >>> rc.ping()
 
+.. _cluster-retries-label:
+
+Retries and Topology Refresh
+----------------------------
+
+When a command fails with a connection error, a timeout, ``CLUSTERDOWN`` or a
+slot that is not covered, the cluster client retries it as many times as the
+``retry`` object allows, waiting before each attempt as long as its backoff
+says (``ExponentialWithJitterBackoff`` by default). Pipelines retry the same
+way. A command or a pipeline that failed with ``CLUSTERDOWN`` or a slot that
+is not covered first waits a fixed 0.25 seconds, to give the cluster time to
+recover, and then the backoff delay as well.
+
+Once a transaction's ``WATCH`` has been acknowledged, an error that would normally
+be retried raises ``WatchError`` instead of retrying without the watch. This
+includes redirects, connection errors and timeouts both before ``MULTI`` and
+during ``EXEC``. Retry the whole transaction, including ``WATCH`` and any reads,
+rather than just the failed command. Errors before the first ``WATCH`` reply can
+still be retried.
+This applies to both synchronous and asynchronous cluster transactions.
+
+A single command that failed with ``CLUSTERDOWN`` or a slot that is not covered
+also refreshes the cluster topology (``CLUSTER SLOTS``) at once, before the
+retry; if that refresh fails, the command raises the refresh error.
+
+A connection error or a timeout only asks for a refresh, which is run by the
+first command attempt that starts once it is due, whichever command that is.
+In a transaction (``MULTI``/``EXEC``, or ``WATCH``), a connection error asks
+for one every ``reinitialize_steps`` errors, as a ``MOVED`` error does.
+Refreshes asked for by errors, including the one every ``reinitialize_steps``
+MOVED errors, run at most once per second per client; requests in between are
+collapsed into one refresh, run by the next command once the second has passed.
+A refresh asked for this way that fails (no node reachable, or no usable
+topology) is logged and asked for again, and the command that ran it goes on
+with the slot map the client already has: the nodes it routes to may still
+answer, for example when ``dynamic_startup_nodes=False`` and only the startup
+nodes are unreachable. A command that failed with a connection error or a
+timeout gives up its retries as soon as a refresh that ended since reached no
+node, because the slot map it would retry on is the one it failed on, and
+raises ``RedisClusterUnreachableError`` with its own error as the cause; so
+does a command that runs out of retries while the last refresh reached no
+node. After refreshes that failed in a row, the next one waits as long as the
+``retry`` backoff gives for that many failures, but at least one second. A
+refresh that was interrupted, for example by a timeout around the command that
+ran it, is not counted as failed, but the next one still waits at least one
+second. Refreshes pushed by the server during maintenance (``SMIGRATED``) and
+the first connect are not limited.
+
+A refresh keeps the connections of every node that stays in the cluster,
+whatever its role; only the connections of nodes that left are closed.
+
+Some connection errors are not node failures, so they are raised at once,
+without a retry and without a refresh:
+
+- ``MaxConnectionsError``: the client's own pool for the node is full.
+- ``MaxClientsReachedError``: the server refused the connection because it
+  reached its ``maxclients`` limit.
+- ``AuthenticationError``: the credentials were rejected or have expired.
+
+.. code:: python
+
+   >>> from redis.backoff import ExponentialWithJitterBackoff
+   >>> from redis.cluster import RedisCluster
+   >>> from redis.retry import Retry
+   >>> # 3 retries, waiting a random 0-20 ms, 0-40 ms, 0-80 ms ... (at most 1 s)
+   >>> rc = RedisCluster(
+   ...     host="localhost",
+   ...     port=16379,
+   ...     retry=Retry(ExponentialWithJitterBackoff(base=0.01, cap=1), 3),
+   ... )
+
 Specifying Target Nodes
 -----------------------
 

@@ -29,9 +29,9 @@ env:
   COVERAGE_CORE: sysmon
   # patch releases get included in the base version image when they are published
   # for example after 8.2.1 is published, 8.2 image contains 8.2.1 content
-  CURRENT_REDIS_VERSION: '8.10.2'
+  CURRENT_REDIS_VERSION: '8.10.3'
   REDIS_VERSION_CUSTOM_MAP: >-
-    8.12.0:8.12-m02-int
+    8.12.0:custom-40894365660-debian
 
 jobs:
   dependency-audit:
@@ -47,28 +47,6 @@ jobs:
             CVE-2026-34073 # DNS name constraints were validated only against SANs, not against the peer name used in verification
                            # Update version when msal dependency in entraid is updated
             CVE-2026-4539  # pygments ReDoS in AdlLexer, local access only, no fix available yet
-            # PyJWT 2.13.0 issues, fixed in 2.14.0. PyJWT is pinned to ~=2.13.0 by redis-entraid 1.2.1 (latest),
-            # so no fixed version can be installed yet. redis-py only decodes claims with verify_signature=False
-            # and does not use JWKS, PyJWKClient or HMAC keys. Remove these when redis-entraid is updated.
-            CVE-2026-102265 # RecursionError from a deeply nested header escapes PyJWTError handling
-            CVE-2026-102266 # HS256 verification with an empty oct JWK
-            CVE-2026-102267 # PyJWKClient follows JWKS redirects without validating the destination
-            CVE-2026-102268 # algorithm confusion via PEM text not recognized by is_pem_format
-            CVE-2026-102269 # signature segments with non-Base64URL characters are accepted
-            CVE-2026-102271 # HMACAlgorithm.prepare_key asymmetric key check relies on text markers
-            CVE-2026-102272 # HMACAlgorithm.prepare_key JWK detection bypass (patch bypass of CVE-2026-48526)
-            CVE-2026-102273 # incomplete algorithm confusion defense when mixing symmetric and asymmetric algorithms
-            CVE-2026-102274 # a malformed RSA JWK aborts parsing of the whole JWK Set
-            CVE-2026-101917 # PyJWKClient unbounded JWKS requests via kid values (incomplete fix of CVE-2026-48524)
-            CVE-2026-102270 # ReDoS in is_pem_format with crafted PEM-like input
-            # Fixed in 2.15.0. This one does reach the verify_signature=False decode in JWToken, but the tokens
-            # come from the configured identity provider, and the impact is a RecursionError instead of DecodeError.
-            CVE-2026-101918 # RecursionError from a deeply nested payload escapes PyJWTError handling
-            # Fixed in 2.15.0. redis-py never imports JWKs (no PyJWK / from_jwk), so OKP key import is unreachable.
-            CVE-2026-102275 # OKP private JWK accepted when the declared x does not match the private key d
-            # No fix released yet. redis-py passes a fresh options dict on every decode call,
-            # so the in-place mutation is never reused for a verifying call.
-            CVE-2026-103001 # decode() mutates a caller-supplied options dict when verify_signature is falsy
 
   lint:
     name: Code linters
@@ -77,7 +55,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
           cache: 'pip'
       - name: run code linters
         run: |
@@ -106,9 +84,9 @@ jobs:
         # Pushes and the nightly build test every supported version.
         redis-version: >-
           ${{ fromJSON(github.event_name == 'pull_request'
-          && format('["8.12.0", "{0}", "8.8.3", "8.6.7", "7.2.14"]', needs.redis_version.outputs.CURRENT)
-          || format('["8.12.0", "{0}", "8.8.3", "8.6.7", "8.4.7", "8.2.10", "8.0.6", "7.4.9", "7.2.14"]', needs.redis_version.outputs.CURRENT)) }}
-        python-version: ['3.10', '3.14']
+          && format('["8.12.0", "{0}", "8.8.4", "8.6.8", "7.2.14"]', needs.redis_version.outputs.CURRENT)
+          || format('["8.12.0", "{0}", "8.8.4", "8.6.8", "8.4.8", "8.2.11", "8.0.6", "7.4.9", "7.2.14"]', needs.redis_version.outputs.CURRENT)) }}
+        python-version: ['3.11', '3.15']
         parser-backend: ['plain']
         event-loop: ['asyncio']
         # One job per protocol and response shape, running the standalone and
@@ -188,7 +166,7 @@ jobs:
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: ['pypy-3.10', 'pypy-3.11']
+        python-version: ['pypy-3.11']
         parser-backend: [ 'plain' ]
         event-loop: [ 'asyncio' ]
         # One job per protocol and response shape, running the standalone and
@@ -224,7 +202,7 @@ jobs:
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: [ '3.10', '3.14']
+        python-version: [ '3.11', '3.15']
         parser-backend: [ 'hiredis' ]
         hiredis-version: [ '>=3.2.0', '<3.0.0' ]
         event-loop: [ 'asyncio' ]
@@ -238,6 +216,11 @@ jobs:
           - 2-unified_responses
           - 3-legacy_responses
           - 3-unified_responses
+        # hiredis 2.x has no Python 3.15 wheel, and its setup.py does not
+        # build on Python 3.15.
+        exclude:
+          - python-version: '3.15'
+            hiredis-version: '<3.0.0'
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
     name: Redis ${{ matrix.redis-version }}; Python ${{ matrix.python-version }}; RESP Parser:${{matrix.parser-backend}} (${{ matrix.hiredis-version }}); EL:${{matrix.event-loop}}; Config:${{matrix.test-config}}${{ matrix.test-config == 'default-legacy_responses' && ' + fixed-clients' || '' }}
@@ -262,7 +245,7 @@ jobs:
       fail-fast: false
       matrix:
         redis-version: [ '${{ needs.redis_version.outputs.CURRENT }}' ]
-        python-version: [ '3.10', '3.14' ]
+        python-version: [ '3.11', '3.15' ]
         parser-backend: [ 'plain' ]
         event-loop: [ 'uvloop' ]
         # One job per protocol and response shape, running the standalone and
@@ -302,7 +285,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Run installed unit tests
         env:
           CLIENT_LIBS_TEST_IMAGE_TAG: ${{ env.CURRENT_REDIS_VERSION }}
@@ -316,7 +299,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', 'pypy-3.10', 'pypy-3.11']
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.15', 'pypy-3.11']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

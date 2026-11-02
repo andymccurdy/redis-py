@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from opentelemetry.metrics import Observation
 
+from redis._parsers.response_callbacks import get_response_callbacks
+
 from redis.observability import recorder
 from redis.observability.registry import (
     ObservablesRegistry,
@@ -736,6 +738,33 @@ class TestRecordStreamingLag:
         instruments.stream_lag.record.assert_called_once()
         attrs = instruments.stream_lag.record.call_args[1]["attributes"]
         assert attrs[REDIS_CLIENT_STREAM_NAME] == "events-stream"
+
+    @pytest.mark.parametrize("protocol", [None, 2, 3])
+    @pytest.mark.parametrize("legacy_responses", [False, True])
+    @pytest.mark.parametrize("command", ["XREAD", "XREADGROUP"])
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    def test_streaming_lag_response_modes(
+        self, setup_recorder, protocol, legacy_responses, command, decode_responses
+    ):
+        def encode(value):
+            return value if decode_responses else value.encode()
+
+        entries = [
+            [encode("1000-0"), [encode("field"), encode("first")]],
+            [encode("2000-0"), [encode("field"), encode("second")]],
+        ]
+        stream = encode("events")
+        raw = [[stream, entries]] if protocol == 2 else {stream: entries}
+        response = get_response_callbacks(protocol, legacy_responses)[command](raw)
+        group = "workers" if command == "XREADGROUP" else None
+        recorder.record_streaming_lag_from_response(response, consumer_group=group)
+        instrument = setup_recorder.stream_lag
+        assert instrument.record.call_count == 2
+        for call in instrument.record.call_args_list:
+            assert call.kwargs["attributes"][REDIS_CLIENT_STREAM_NAME] == "events"
+            assert call.args[0] >= 0
+            if group is not None:
+                assert call.kwargs["attributes"][REDIS_CLIENT_CONSUMER_GROUP] == group
 
 
 @pytest.mark.fixed_client

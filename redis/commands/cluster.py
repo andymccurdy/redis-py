@@ -469,6 +469,9 @@ class AsyncClusterMultiKeyCommands(ClusterMultiKeyCommands):
     async def _execute_pipeline_by_slot(
         self, command: str, slots_to_args: Mapping[int, Iterable[EncodableT]]
     ) -> List[Any]:
+        # Only _initialize and initialize() are asked of the host class (other
+        # clients may use this mixin), and initialize() returns at once while
+        # a requested refresh is not due
         if self._initialize:
             await self.initialize()
         replica_safe = (

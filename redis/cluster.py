@@ -11,7 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from copy import copy
 from enum import Enum
-from functools import partial
+from functools import cache, partial
 from itertools import chain
 from types import MethodType
 from typing import (
@@ -56,6 +56,7 @@ from redis.commands.policies import PolicyResolver, StaticPolicyResolver
 from redis.connection import (
     Connection,
     ConnectionPool,
+    SSLConnection,
     parse_url,
 )
 from redis.crc import REDIS_CLUSTER_HASH_SLOTS, key_slot
@@ -78,6 +79,7 @@ from redis.exceptions import (
     DataError,
     ExecAbortError,
     InvalidPipelineStack,
+    MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
     RedisClusterException,
@@ -99,7 +101,7 @@ from redis.observability.recorder import (
     record_error_count,
     record_operation_duration,
 )
-from redis.retry import Retry
+from redis.retry import AbstractRetry, Retry
 from redis.typing import (
     ChannelT,
     FieldT,
@@ -108,6 +110,7 @@ from redis.typing import (
 )
 from redis.utils import (
     check_protocol_version,
+    command_text,
     deprecated_args,
     deprecated_function,
     dict_merge,
@@ -128,6 +131,16 @@ def is_debug_log_enabled():
 
 def get_node_name(host: str, port: Union[str, int]) -> str:
     return f"{host}:{port}"
+
+
+@cache
+def _resolve_localhost() -> str:
+    """
+    The address a node given as ``localhost`` is cached under. Resolved once,
+    so lookups such as the one on every MOVED or ASK redirect don't each pay
+    for a resolver call.
+    """
+    return socket.gethostbyname("localhost")
 
 
 @deprecated_args(
@@ -288,7 +301,7 @@ def parse_cluster_myshardid(resp, **options):
     """
     Parse CLUSTER MYSHARDID response.
     """
-    return resp.decode("utf-8")
+    return str_if_bytes(resp)
 
 
 PRIMARY = "primary"
@@ -422,6 +435,66 @@ class MaintNotificationsAbstractRedisCluster:
         )
 
 
+# Topology refreshes triggered by errors (connection errors, the MOVED
+# threshold, pipeline failures, pubsub repair) run at most once per this many
+# seconds per client. Requests in between are collapsed into one refresh, run by
+# the next command once the interval has passed. After refreshes that failed in
+# a row, the next one waits as long as the client's retry backoff says for that
+# many failures, but never less than this. Server-pushed refreshes (SMIGRATED),
+# the first initialize and direct ``NodesManager.initialize()`` calls, such as
+# the one a CLUSTERDOWN or an uncovered slot runs, are not limited.
+_TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS = 1.0
+
+
+def _topology_refresh_delay(
+    retry: Optional[AbstractRetry], failed_refreshes: int
+) -> float:
+    """
+    How long an error-triggered topology refresh waits after the previous one:
+    the minimum interval, or what the retry backoff gives for that many failed
+    refreshes in a row, whichever is longer.
+    """
+    delay = _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS
+    # A duck-typed retry policy may have no backoff to compute a delay from
+    backoff = getattr(retry, "_backoff", None)
+    if failed_refreshes and backoff is not None:
+        delay = max(delay, backoff.compute(failed_refreshes))
+    return delay
+
+
+def _should_request_refresh(reinitialize_steps: int, reinitialize_counter: int) -> bool:
+    """
+    Whether the error just counted reached the ``reinitialize_steps`` threshold,
+    so a topology refresh should be asked for. With ``reinitialize_steps`` 1 a
+    refresh is asked for on every MOVED error, with 0 never on MOVED errors. A
+    negative value works like its absolute value.
+    """
+    return bool(reinitialize_steps) and reinitialize_counter % reinitialize_steps == 0
+
+
+def _error_to_raise(
+    last_refresh_unreachable_args: Optional[Tuple[Any, ...]],
+    error: Exception,
+) -> Exception:
+    """
+    The error a command, pipeline or transaction that gave up on :error:
+    raises. While the last topology refresh reached no node (it raised a
+    :class:`~.RedisClusterUnreachableError` with
+    :last_refresh_unreachable_args:), a connection or timeout error is raised
+    as a new :class:`~.RedisClusterUnreachableError` with those args and
+    :error: as its cause, so a cluster that cannot be reached fails as a
+    :class:`~.RedisClusterException`, whichever command ran the refresh.
+    """
+    if not isinstance(last_refresh_unreachable_args, tuple) or (
+        type(error) not in (ConnectionError, TimeoutError)
+    ):
+        return error
+    outage_error = RedisClusterUnreachableError(*last_refresh_unreachable_args)
+    outage_error.__cause__ = error
+    outage_error.__suppress_context__ = True
+    return outage_error
+
+
 class AbstractRedisCluster:
     RedisClusterRequestTTL = 16
 
@@ -504,6 +577,7 @@ class AbstractRedisCluster:
                 "COMMAND COUNT",
                 "COMMAND LIST",
                 "COMMAND GETKEYS",
+                "COMMAND GETKEYSANDFLAGS",
                 "CONFIG GET",
                 "DEBUG",
                 "RANDOMKEY",
@@ -645,6 +719,40 @@ class AbstractRedisCluster:
         ClusterDownError,
         SlotNotCoveredError,
     )
+
+    # Connection errors that do not mean the node failed: the client's own pool
+    # is exhausted, the server is at its maxclients limit, or the credentials
+    # were rejected. Recycling connections or refreshing the topology cannot
+    # repair them, so the cluster clients and their pipelines re-raise them
+    # without either, and without a retry.
+    NOT_NODE_FAILURE_ERRORS = (
+        AuthenticationError,
+        MaxConnectionsError,
+        MaxClientsReachedError,
+    )
+
+    @staticmethod
+    def _is_retryable_cluster_error(error: Exception) -> bool:
+        """
+        ``is_retryable`` for a cluster retry: never retry one of
+        ``NOT_NODE_FAILURE_ERRORS``.
+        """
+        return not isinstance(error, AbstractRedisCluster.NOT_NODE_FAILURE_ERRORS)
+
+    @staticmethod
+    def _retry_backoff_delay(retry: AbstractRetry, failures: int) -> float:
+        """
+        The delay before the next attempt of a cluster retry loop, after
+        ``failures`` failed attempts, as computed by the retry's backoff. A
+        duck-typed retry policy with no backoff gives no delay.
+        """
+        backoff = getattr(retry, "_backoff", None)
+        if backoff is None:
+            return 0
+        if failures == 1:
+            # A new run of failures starts, as in Retry.call_with_retry
+            backoff.reset()
+        return backoff.compute(failures)
 
     def replace_default_node(self, target_node: "ClusterNode" = None) -> None:
         """Replace the default cluster node.
@@ -802,11 +910,24 @@ class RedisCluster(
             :class:`~.ClusterDownError` are encountered
         :param retry:
             A retry object that defines the retry strategy and the number of
-            retries for the cluster client.
-            In current implementation for the cluster client (starting form redis-py version 6.0.0)
-            the retry object is not yet fully utilized, instead it is used just to determine
-            the number of retries for the cluster client.
-            In the future releases the retry object will be used to handle the cluster client retries!
+            retries for the cluster client. Its backoff sets the delay before
+            each retry of a command or a pipeline; one that failed with
+            :class:`~.ClusterDownError` or :class:`~.SlotNotCoveredError` also
+            waits a fixed 0.25 seconds before it. A topology refresh triggered
+            by an error (connection errors, the ``reinitialize_steps`` MOVED
+            threshold) is run by the first command attempt to start once it is
+            due, at most once per second; after refreshes that failed in a row,
+            the next one waits as long as the backoff gives for that many
+            failures, but at least one second. A command that failed with a
+            connection error or a timeout gives up with
+            :class:`~.RedisClusterUnreachableError` once a refresh that ended
+            since reached no node, or when it runs out of retries while the
+            last refresh did.
+            Backoffs that keep state between calls
+            (:class:`~.DecorrelatedJitterBackoff`) are not fully supported: the
+            retry object is shared by every command and pipeline of the client,
+            so concurrent retries reset and advance each other's backoff, and
+            the delays can come out shorter or longer than configured.
         :param reinitialize_steps:
             Specifies the number of MOVED errors that need to occur before
             reinitializing the whole cluster topology. If a MOVED error occurs
@@ -816,7 +937,12 @@ class RedisCluster(
             To reinitialize the cluster on every MOVED error, set
             reinitialize_steps to 1.
             To avoid reinitializing the cluster on moved errors, set
-            reinitialize_steps to 0.
+            reinitialize_steps to 0. A negative value is not the same as 0: it
+            works like its absolute value (-3 is the same as 3).
+            Every MOVED error patches its slot, so the redirect goes to the new
+            owner; the refresh is only asked for, and like every refresh
+            triggered by an error, it is run by the next command attempt once
+            due, at most once per second.
         :param address_remap:
             An optional callable which, when provided with an internal network
             address of a node, e.g. a `(host, port)` tuple, will return the address
@@ -895,6 +1021,19 @@ class RedisCluster(
             # The retries should be handled on cluster client level.
             raise RedisClusterException(
                 "The 'retry' argument cannot be used in kwargs when running in cluster mode."
+            )
+
+        if kwargs.get("ssl") and not issubclass(
+            kwargs.get("connection_class", SSLConnection), SSLConnection
+        ):
+            raise RedisClusterException(
+                "The 'ssl' argument requires 'connection_class' to be an "
+                "SSLConnection subclass"
+            )
+
+        if kwargs.pop("unix_socket_path", None) is not None:
+            raise RedisClusterException(
+                "RedisCluster does not currently support Unix Domain Socket connections"
             )
 
         # Get the startup node/s
@@ -1580,16 +1719,6 @@ class RedisCluster(
 
         return nodes
 
-    def _should_reinitialized(self):
-        # To reinitialize the cluster on every MOVED error,
-        # set reinitialize_steps to 1.
-        # To avoid reinitializing the cluster on moved errors, set
-        # reinitialize_steps to 0.
-        if self.reinitialize_steps == 0:
-            return False
-        else:
-            return self.reinitialize_counter % self.reinitialize_steps == 0
-
     def keyslot(self, key):
         """
         Calculate keyslot for a given key.
@@ -1806,8 +1935,9 @@ class RedisCluster(
             *args, target_nodes_specified=target_nodes_specified
         )
 
-        # If an error that allows retrying was thrown, the nodes and slots
-        # cache were reinitialized. We will retry executing the command with
+        # If an error that allows retrying was thrown, a refresh of the nodes
+        # and slots cache was requested; it is run by the next attempt, of any
+        # command, once due. We will retry executing the command with
         # the updated cluster setup only when the target nodes can be
         # determined again with the new cache tables. Therefore, when target
         # nodes were passed to this function, we cannot retry the command
@@ -1822,7 +1952,23 @@ class RedisCluster(
         # Start timing for observability
         start_time = time.monotonic()
 
+        # The error the previous attempt failed with, and when the last refresh
+        # had ended by then: a refresh since that reached no node ends the
+        # retries (see NodesManager._error_instead_of_retry)
+        last_error: Optional[Exception] = None
+        last_refresh_at: Optional[float] = None
+
         for _ in range(execute_attempts):
+            # Run a topology refresh an earlier error asked for, once due. The
+            # flag is read inline: this runs before every attempt.
+            if self.nodes_manager._refresh_requested:
+                self.nodes_manager._run_requested_refresh(self.retry)
+            if last_error is not None:
+                outage_error = self.nodes_manager._error_instead_of_retry(
+                    last_error, last_refresh_at
+                )
+                if outage_error is not None:
+                    raise outage_error
             try:
                 res = {}
                 if not target_nodes_specified:
@@ -1837,11 +1983,12 @@ class RedisCluster(
                         raise RedisClusterException(
                             f"No targets were found to execute {args} command on"
                         )
-                    if (
+                    # Per attempt: only an attempt that failed on the default
+                    # node replaces it
+                    is_default_node = (
                         len(target_nodes) == 1
                         and target_nodes[0] == self.get_default_node()
-                    ):
-                        is_default_node = True
+                    )
                 for node in target_nodes:
                     res[node.name] = self._execute_command(node, *args, **kwargs)
 
@@ -1869,6 +2016,8 @@ class RedisCluster(
                     # Try again with the new cluster setup.
                     retry_attempts -= 1
                     failure_count += 1
+                    last_error = e
+                    last_refresh_at = self.nodes_manager._last_refresh_at
 
                     if hasattr(e, "connection"):
                         # ``args[0]``, not the resolved ``command``: every other metric in
@@ -1888,6 +2037,11 @@ class RedisCluster(
                             connection=e.connection,
                             retry_attempts=failure_count,
                         )
+                    # Space the attempts out as the retry backoff says; the
+                    # refresh the error asked for runs after this delay
+                    delay = self._retry_backoff_delay(self.retry, failure_count)
+                    if delay > 0:
+                        time.sleep(delay)
                     continue
                 else:
                     # raise the exception
@@ -1898,7 +2052,9 @@ class RedisCluster(
                             retry_attempts=failure_count,
                             is_internal=False,
                         )
-                    raise e
+                    raise _error_to_raise(
+                        self.nodes_manager._last_refresh_unreachable_args, e
+                    )
 
     def _himport_reconcile_discards(self, redis_node, connection):
         """Delegate to the shared sync HIMPORT executor."""
@@ -1958,7 +2114,7 @@ class RedisCluster(
             ttl -= 1
             try:
                 if asking:
-                    target_node = self.get_node(node_name=redirect_addr)
+                    target_node = self.get_node(*redirect_addr)
                 elif moved:
                     # MOVED occurred and the slots cache was updated,
                     # refresh the target node
@@ -2057,6 +2213,22 @@ class RedisCluster(
                     error=e,
                 )
                 raise
+            except MaxClientsReachedError as e:
+                # The server refused a new connection because it is at its
+                # maxclients limit: server-side capacity, not a node failure.
+                # Recycling the node's working connections or refreshing the
+                # topology would only open more connections the server refuses,
+                # so re-raise without either. The connection that read the error
+                # has already disconnected itself: read_response drops the
+                # connection on any error it raises.
+                e.connection = connection if connection is not None else target_node
+                self._record_command_metric(
+                    command_name=command,
+                    duration_seconds=time.monotonic() - start_time,
+                    connection=e.connection,
+                    error=e,
+                )
+                raise
             except (ConnectionError, TimeoutError) as e:
                 if is_debug_log_enabled():
                     connection_details = (
@@ -2079,26 +2251,26 @@ class RedisCluster(
                 # this is an actual connection before attempting to disconnect.
                 if connection is not None:
                     connection.disconnect()
+                # The node's other connections are kept: a timeout or a dropped
+                # connection does not mean they are broken, and closing them all
+                # would reconnect every caller of a node that may be healthy.
+                # One the server closed is reconnected when it is checked out
+                # (ConnectionPool.ensure_connection).
 
-                # Instead of setting to None, properly handle the pool
-                # Get the pool safely - redis_connection could be set to None
-                # by another thread between the check and access
-                redis_conn = target_node.redis_connection
-                if redis_conn is not None:
-                    pool = redis_conn.connection_pool
-                    if pool is not None:
-                        with pool._lock:
-                            # take care for the active connections in the pool
-                            pool.update_active_connections_for_reconnect()
-                            # disconnect all free connections
-                            pool.disconnect_free_connections()
-
-                # Move the failed node to the end of the cached nodes list
+                # Move the failed node to the end of the cached nodes. This does
+                # not set the order the refresh queries nodes in (it shuffles the
+                # startup nodes and tries the failed one last through
+                # last_failed_node_name below), and the refresh replaces the
+                # nodes cache, so the new order only lasts until then.
                 self.nodes_manager.move_node_to_end_of_cached_nodes(target_node.name)
 
                 # DON'T set redis_connection = None - keep the pool for reuse
-                # provide the name of the failed node so we can try it last
-                self.nodes_manager.initialize(last_failed_node_name=target_node.name)
+                # Ask for a topology refresh, run by the next attempt, of any
+                # command, once due; provide the name of the failed node so we can
+                # try it last
+                self.nodes_manager._request_refresh(
+                    last_failed_node_name=target_node.name
+                )
                 self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -2120,25 +2292,28 @@ class RedisCluster(
                         f"MOVED error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
-                # First, we will try to patch the slots/nodes cache with the
-                # redirected node output and try again. If MovedError exceeds
-                # 'reinitialize_steps' number of times, we will force
-                # reinitializing the tables, and then try again.
+                # Patch the slots/nodes cache with the redirected node and try
+                # again. Every 'reinitialize_steps' MOVED errors, also ask for a
+                # refresh of the whole topology, run by the next attempt of any
+                # command once due: the redirect needs only this slot, which the
+                # patch already points to the node that owns it.
                 # 'reinitialize_steps' counter will increase faster when
                 # the same client object is shared between multiple threads. To
                 # reduce the frequency you can set this variable in the
                 # RedisCluster constructor.
                 self.reinitialize_counter += 1
-                if self._should_reinitialized():
-                    # during this call all connections are closed or marked for disconnect,
-                    # so we don't need to disconnect the changed node's connections
-                    self.nodes_manager.initialize(
-                        additional_startup_nodes_info=[(e.host, e.port)]
+                self.nodes_manager.move_slot(e)
+                if _should_request_refresh(
+                    self.reinitialize_steps, self.reinitialize_counter
+                ):
+                    # The refresh also queries the node the error pointed to
+                    self.nodes_manager._request_refresh(
+                        additional_startup_nodes_info=[
+                            self.nodes_manager.remap_host_port(e.host, e.port)
+                        ]
                     )
                     # Reset the counter
                     self.reinitialize_counter = 0
-                else:
-                    self.nodes_manager.move_slot(e)
                 moved = True
                 self._record_command_metric(
                     command_name=command,
@@ -2191,7 +2366,7 @@ class RedisCluster(
                         f"ASK error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
-                redirect_addr = get_node_name(host=e.host, port=e.port)
+                redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
 
                 self._record_command_metric(
@@ -2215,6 +2390,8 @@ class RedisCluster(
                 # and retry executing the command
 
                 time.sleep(0.25)
+                # Refreshed here, not paced or asked for: this command raises the
+                # refresh error if it fails
                 self.nodes_manager.initialize()
 
                 # if we have a connection, use it, otherwise use the target node
@@ -2381,7 +2558,7 @@ class RedisCluster(
 class ClusterNode:
     def __init__(self, host, port, server_type=None, redis_connection=None):
         if host == "localhost":
-            host = socket.gethostbyname(host)
+            host = _resolve_localhost()
 
         self.host = host
         self.port = port
@@ -2564,6 +2741,26 @@ class NodesManager:
         # Ident of the thread currently running initialize, or None. Written only
         # under _initialization_lock; see the re-entrancy guard in initialize.
         self._initializing_thread_id: Optional[int] = None
+        # When the last refresh ended, how many failed in a row, and when the
+        # next error-triggered refresh is due. Every refresh that ends clears
+        # the due time and the next check computes it, once, from the backoff
+        # of the caller's retry (a jittered backoff returns a new value on
+        # every call). See _refresh_due.
+        self._last_refresh_at: Optional[float] = None
+        self._failed_refreshes = 0
+        self._refresh_due_at: Optional[float] = None
+        # The message (args) of the error of the last refresh if it reached no
+        # node, cleared by a refresh that ends otherwise; only the message, so
+        # the error does not keep the frames of that refresh alive. See
+        # _error_to_raise.
+        self._last_refresh_unreachable_args: Optional[Tuple[Any, ...]] = None
+        # A refresh requested by an error path and not run yet; the next
+        # command runs it once it is due. All written under _lock.
+        self._refresh_requested = False
+        self._refresh_requested_at_epoch = 0
+        self._requested_additional_startup_nodes: List[Tuple[str, int]] = []
+        self._requested_last_failed_node_name: Optional[str] = None
+        self._requested_disconnect_startup_nodes_pools = True
 
         if event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -2590,7 +2787,7 @@ class NodesManager:
         if host and port:
             # the user passed host and port
             if host == "localhost":
-                host = socket.gethostbyname(host)
+                host = _resolve_localhost()
             with self._lock:
                 return self.nodes_cache.get(get_node_name(host=host, port=port))
         elif node_name:
@@ -2604,8 +2801,11 @@ class NodesManager:
         Update the slot's node with the redirected one
         """
         node_changed = False
+        # The redirect carries the address the node advertises, like
+        # CLUSTER SLOTS does, so it needs the same remapping to be reachable
+        host, port = self.remap_host_port(e.host, e.port)
         with self._lock:
-            redirected_node = self.get_node(host=e.host, port=e.port)
+            redirected_node = self.get_node(host=host, port=port)
             if redirected_node is not None:
                 # The node already exists
                 if redirected_node.server_type is not PRIMARY:
@@ -2613,7 +2813,7 @@ class NodesManager:
                     redirected_node.server_type = PRIMARY
             else:
                 # This is a new node, we will add it to the nodes cache
-                redirected_node = ClusterNode(e.host, e.port, PRIMARY)
+                redirected_node = ClusterNode(host, port, PRIMARY)
                 self.nodes_cache[redirected_node.name] = redirected_node
 
             slot_nodes = self.slots_cache[e.slot_id]
@@ -2739,17 +2939,23 @@ class NodesManager:
         Move a failing node to the end of startup_nodes and nodes_cache so it's
         tried last during reinitialization and when selecting the default node.
         If the node is not in the respective list, nothing is done.
-        """
-        # Move in startup_nodes
-        if node_name in self.startup_nodes and len(self.startup_nodes) > 1:
-            node = self.startup_nodes.pop(node_name)
-            self.startup_nodes[node_name] = node  # Re-insert at end
 
-        # Move in nodes_cache - this affects get_nodes_by_server_type ordering
-        # which is used to select the default_node during initialize()
-        if node_name in self.nodes_cache and len(self.nodes_cache) > 1:
-            node = self.nodes_cache.pop(node_name)
-            self.nodes_cache[node_name] = node  # Re-insert at end
+        Runs under the lock: the error paths of many threads call it at once
+        when a node fails, and with dynamic startup nodes both names point to
+        the same dict.
+        """
+        with self._lock:
+            # Move in startup_nodes
+            if node_name in self.startup_nodes and len(self.startup_nodes) > 1:
+                node = self.startup_nodes.pop(node_name)
+                self.startup_nodes[node_name] = node  # Re-insert at end
+
+            # Move in nodes_cache - this affects get_nodes_by_server_type
+            # ordering which is used to select the default_node during
+            # initialize()
+            if node_name in self.nodes_cache and len(self.nodes_cache) > 1:
+                node = self.nodes_cache.pop(node_name)
+                self.nodes_cache[node_name] = node  # Re-insert at end
 
     def check_slots_coverage(self, slots_cache):
         # Validate if all slots are covered or if we should try next
@@ -2763,7 +2969,17 @@ class NodesManager:
         """
         This function will create a redis connection to all nodes in :nodes:
         """
-        connection_pools = []
+        nodes = list(nodes)
+        self._create_redis_connections(nodes)
+        with self._lock:
+            current_nodes = list(self.nodes_cache.values())
+        self._dispatch_pools_instantiated(chain(current_nodes, nodes))
+
+    def _create_redis_connections(self, nodes) -> None:
+        """
+        Create a redis connection for every node in :nodes: that has none,
+        without registering them for re-authentication.
+        """
         for node in nodes:
             if node.redis_connection is None:
                 node.redis_connection = self.create_redis_node(
@@ -2772,13 +2988,62 @@ class NodesManager:
                     maint_notifications_config=self.maint_notifications_config,
                     **self.connection_kwargs,
                 )
-                connection_pools.append(node.redis_connection.connection_pool)
+
+    def _dispatch_pools_instantiated(self, nodes) -> None:
+        """
+        Register the connection pools of :nodes: for re-authentication.
+
+        A streaming credential provider keeps only the last callback registered,
+        so the event must list the pool of every node that is still serving the
+        cluster, not just the pools created last.
+        """
+        connection_pools = []
+        seen = set()
+        for node in nodes:
+            if node.redis_connection is None:
+                continue
+            pool = node.redis_connection.connection_pool
+            if id(pool) not in seen:
+                seen.add(id(pool))
+                connection_pools.append(pool)
 
         self._event_dispatcher.dispatch(
             AfterPooledConnectionsInstantiationEvent(
                 connection_pools, ClientType.SYNC, self._credential_provider
             )
         )
+
+    @staticmethod
+    def _free_pool_connections(pool) -> None:
+        """
+        Mark the in-use connections of :pool: for reconnect, so they are
+        closed once their current command completes, and disconnect its free
+        connections.
+        """
+        with pool._lock:
+            pool.update_active_connections_for_reconnect()
+            pool.disconnect_free_connections()
+
+    def _release_removed_nodes(self, old_nodes_cache, new_node_names) -> None:
+        """
+        Release the connections of the nodes that left the topology.
+
+        Nodes that stay keep their connections whatever their role: the server
+        keeps the session state of a connection across a role change, READONLY
+        is sent on every connection when reads from replicas are enabled, and a
+        command that reaches a node that no longer serves its slot gets MOVED.
+
+        :new_node_names: are the names of the new topology taken when it was
+        published, under the lock: the published cache itself can be halfway
+        through a move_node_to_end_of_cached_nodes on another thread.
+        """
+        for name, node in old_nodes_cache.items():
+            if name not in new_node_names and node.redis_connection is not None:
+                if is_debug_log_enabled():
+                    logger.debug(
+                        f"Topology refresh: releasing connections of removed node {name}"
+                    )
+                self._free_pool_connections(node.redis_connection.connection_pool)
 
     def create_redis_node(
         self,
@@ -2799,23 +3064,28 @@ class NodesManager:
             backoff=NoBackoff(), retries=0, supported_errors=(ConnectionError,)
         )
 
-        if self.from_url:
+        connection_pool = kwargs.pop("connection_pool", None)
+        if connection_pool is not None:
+            r = Redis(connection_pool=connection_pool)
+        else:
+            # parse_url already turns rediss:// into SSLConnection, do the same
+            # for ssl=True
+            if not self.from_url and kwargs.pop("ssl", False):
+                kwargs.setdefault("connection_class", SSLConnection)
             # Create a redis node with a custom connection pool
             kwargs.update({"host": host})
             kwargs.update({"port": port})
             kwargs.update({"cache": self._cache})
             kwargs.update({"metadata_resolver": self._metadata_resolver})
             kwargs.update({"retry": node_retry_config})
-            r = Redis(connection_pool=self.connection_pool_class(**kwargs))
-        else:
-            r = Redis(
-                host=host,
-                port=port,
-                cache=self._cache,
-                metadata_resolver=self._metadata_resolver,
-                retry=node_retry_config,
-                **kwargs,
-            )
+            pool = self.connection_pool_class(**kwargs)
+            if not self.from_url and not issubclass(
+                pool.connection_class, SSLConnection
+            ):
+                # a plain connection rejects the TLS options Redis() used to ignore
+                for key in [k for k in pool.connection_kwargs if k.startswith("ssl_")]:
+                    del pool.connection_kwargs[key]
+            r = Redis.from_pool(pool)
         # Share the one cluster-wide HIMPORT registry with this node's pool. Injected
         # here (rather than forwarded via connection_kwargs) so every node reuses the
         # same object; the node has no connections yet, so this is safe.
@@ -2869,6 +3139,202 @@ class NodesManager:
         finally:
             self._initializing_thread_id = None
 
+    @contextmanager
+    def _counting_failed_refresh(self):
+        """
+        Record a refresh that raised, so error-triggered refreshes back off,
+        and register the pools of the current nodes for re-authentication
+        again: every client built during the refresh registered its own pool
+        with the credential provider, which keeps only the last callback.
+
+        A refresh interrupted before it ended (``BaseException``, such as a
+        gevent timeout) is not counted as failed, but the next one still waits
+        the delay, so callers that keep timing out do not run one refresh
+        after another. Its outcome is unknown, so it clears the record of a
+        refresh that reached no node.
+        """
+        try:
+            yield
+        except BaseException as e:
+            with self._lock:
+                if isinstance(e, Exception):
+                    self._failed_refreshes += 1
+                self._last_refresh_unreachable_args = (
+                    e.args if isinstance(e, RedisClusterUnreachableError) else None
+                )
+                self._last_refresh_at = time.monotonic()
+                self._refresh_due_at = None
+                current_nodes = list(self.nodes_cache.values())
+            if current_nodes:
+                self._dispatch_pools_instantiated(current_nodes)
+            raise
+
+    @contextmanager
+    def _releasing_queried_clients(self, disconnect_startup_nodes_pools: bool):
+        """
+        Collect the clients queried for CLUSTER SLOTS during a refresh, whether
+        they answered or not, and release the ones that serve no node of the
+        topology once the refresh ends, whether it succeeded or raised.
+
+        Yields the two lists to fill: (node name, client) of the startup nodes,
+        and the clients built for the additional startup nodes, which exist
+        only for this refresh.
+        """
+        queried_startup_nodes: List[Tuple[str, Redis]] = []
+        queried_additional_clients: List[Redis] = []
+        try:
+            yield queried_startup_nodes, queried_additional_clients
+        finally:
+            if disconnect_startup_nodes_pools and queried_startup_nodes:
+                with self._lock:
+                    # A copy: another thread can be halfway through
+                    # move_node_to_end_of_cached_nodes on the published cache
+                    nodes_cache = dict(self.nodes_cache)
+                for name, r in queried_startup_nodes:
+                    node = nodes_cache.get(name)
+                    if node is None or node.redis_connection is not r:
+                        # This client serves no node of the topology (e.g. a
+                        # load balancer or DNS seed, or a startup node whose
+                        # node got its own client), so don't keep its
+                        # connections open
+                        self._free_pool_connections(r.connection_pool)
+            for r in queried_additional_clients:
+                # Never a client of the topology, whatever the flag says
+                self._free_pool_connections(r.connection_pool)
+
+    def _refresh_due(self, retry: Optional[AbstractRetry] = None) -> bool:
+        """
+        Whether a topology refresh triggered by an error may run now: not
+        before the delay of _topology_refresh_delay has passed since the
+        previous refresh ended. The due time is read without the lock; a stale
+        read only moves one refresh by a call. The first check after a refresh
+        ended computes it under the lock, so a due time computed for an older
+        refresh never replaces a newer one.
+        """
+        due_at = self._refresh_due_at
+        if due_at is None:
+            # The first check since a refresh ended
+            with self._lock:
+                due_at = self._refresh_due_at
+                if due_at is None:
+                    last_refresh_at = self._last_refresh_at
+                    if last_refresh_at is None:
+                        return True
+                    due_at = last_refresh_at + _topology_refresh_delay(
+                        retry, self._failed_refreshes
+                    )
+                    self._refresh_due_at = due_at
+        return time.monotonic() >= due_at
+
+    def _error_instead_of_retry(
+        self, error: Exception, last_refresh_at: Optional[float]
+    ) -> Optional[Exception]:
+        """
+        The error to raise instead of retrying :error:, the connection or
+        timeout error of the previous attempt, or None to retry. A refresh that
+        ended since that attempt failed (``_last_refresh_at`` moved from
+        :last_refresh_at:, read when the error was raised) and reached no node
+        leaves the retry the slot map that attempt failed on, so the caller
+        gives up now with the :class:`~.RedisClusterUnreachableError` that
+        _error_to_raise builds. The two values are read together under the
+        lock: a refresh ending between two reads could pair the outcome of one
+        refresh with the end time of the next.
+        """
+        with self._lock:
+            unreachable_args = self._last_refresh_unreachable_args
+            refresh_at = self._last_refresh_at
+        if unreachable_args is None or refresh_at == last_refresh_at:
+            return None
+        outage_error = _error_to_raise(unreachable_args, error)
+        return None if outage_error is error else outage_error
+
+    def _request_refresh(
+        self,
+        additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
+        last_failed_node_name: Optional[str] = None,
+        disconnect_startup_nodes_pools: bool = True,
+    ) -> None:
+        """
+        Ask for a topology refresh after an error. Requests are merged until
+        _run_requested_refresh runs them, once due.
+        """
+        with self._lock:
+            if not self._refresh_requested:
+                self._refresh_requested = True
+                self._requested_additional_startup_nodes = []
+                self._requested_last_failed_node_name = None
+                self._requested_disconnect_startup_nodes_pools = True
+            # The epoch of the newest request. A refresh that completes after
+            # it counts as answering every merged request, even one that
+            # started before the error and read a slot map from before it: an
+            # error that outlives it asks again
+            self._refresh_requested_at_epoch = self._epoch
+            for node_info in additional_startup_nodes_info or ():
+                if node_info not in self._requested_additional_startup_nodes:
+                    self._requested_additional_startup_nodes.append(node_info)
+            if last_failed_node_name is not None:
+                self._requested_last_failed_node_name = last_failed_node_name
+            if not disconnect_startup_nodes_pools:
+                self._requested_disconnect_startup_nodes_pools = False
+
+    def _run_requested_refresh(self, retry: Optional[AbstractRetry] = None) -> None:
+        """
+        Run the requested topology refresh, if there is one and it is due.
+        The command and pipeline loops check ``_refresh_requested`` themselves
+        before calling this, to keep the attempts that have nothing to run free
+        of a call.
+
+        A refresh that fails is logged and asked for again; the current
+        topology keeps serving. Any other error is raised, and the refresh is
+        still asked for again.
+        """
+        if not self._refresh_requested or not self._refresh_due(retry):
+            return
+        with self._lock:
+            if not self._refresh_requested:
+                # Another caller took it
+                return
+            self._refresh_requested = False
+            if self._refresh_requested_at_epoch != self._epoch:
+                # A refresh already completed after the last request
+                return
+            additional_startup_nodes_info = self._requested_additional_startup_nodes
+            last_failed_node_name = self._requested_last_failed_node_name
+            disconnect_startup_nodes_pools = (
+                self._requested_disconnect_startup_nodes_pools
+            )
+        try:
+            self.initialize(
+                additional_startup_nodes_info=additional_startup_nodes_info,
+                disconnect_startup_nodes_pools=disconnect_startup_nodes_pools,
+                last_failed_node_name=last_failed_node_name,
+            )
+        except RedisClusterException as e:
+            # The failure is counted, so the request made again here runs once
+            # the backoff allows, still trying the failed node last
+            self._request_refresh(
+                additional_startup_nodes_info=additional_startup_nodes_info,
+                last_failed_node_name=last_failed_node_name,
+                disconnect_startup_nodes_pools=disconnect_startup_nodes_pools,
+            )
+            # No node answered, or nodes answered with a topology that cannot
+            # replace the current one (slots not covered, or nodes that
+            # disagree on them). The current topology keeps serving until a
+            # refresh succeeds: this may be a command for a healthy shard, which
+            # must not fail for a refresh another error asked for, and the
+            # nodes queried may be only seeds (dynamic_startup_nodes=False)
+            # while the nodes of the current topology still answer.
+            logger.error(f"Topology refresh failed, keeping the current one: {e}")
+        except BaseException:
+            # Any other error is raised, but the request is kept: the flag was
+            # cleared above, and no later attempt would run it otherwise
+            self._request_refresh(
+                additional_startup_nodes_info=additional_startup_nodes_info,
+                last_failed_node_name=last_failed_node_name,
+                disconnect_startup_nodes_pools=disconnect_startup_nodes_pools,
+            )
+            raise
+
     def initialize(
         self,
         additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
@@ -2883,7 +3349,9 @@ class NodesManager:
             Whether to disconnect the connection pool of the startup nodes
             after the initialization is complete. This is useful when the
             startup nodes are not part of the cluster and we want to avoid
-            keeping the connection open.
+            keeping the connection open. Only the pools that serve no node
+            of the new topology are disconnected; the nodes of the topology
+            keep their connections.
         :additional_startup_nodes_info:
             Additional nodes to add temporarily to the startup nodes.
             The additional nodes will be used just in the process of extraction of the slots
@@ -2892,7 +3360,8 @@ class NodesManager:
             and initialize the client
             with them.
             The format of the list is a list of tuples, where each tuple contains
-            the host and port of the node.
+            the host and port of the node. The connections they open are
+            released once the refresh is done.
         :last_failed_node_name:
             Name of the node that just failed and should be tried only after
             other startup and additional startup nodes during this refresh.
@@ -2931,7 +3400,15 @@ class NodesManager:
         if additional_startup_nodes_info is None:
             additional_startup_nodes_info = []
 
-        with self._initialization_lock, self._initializing_on_this_thread():
+        with (
+            self._initialization_lock,
+            self._initializing_on_this_thread(),
+            self._counting_failed_refresh(),
+            self._releasing_queried_clients(disconnect_startup_nodes_pools) as (
+                queried_startup_nodes,
+                queried_additional_clients,
+            ),
+        ):
             with self._lock:
                 if epoch != self._epoch:
                     # another thread has already re-initialized the nodes; don't
@@ -2940,6 +3417,7 @@ class NodesManager:
 
             with self._lock:
                 startup_nodes = list(self.startup_nodes.values())
+            startup_node_names = {node.name for node in startup_nodes}
             deferred_failed_nodes = []
             if last_failed_node_name is not None:
                 for index, node in enumerate(startup_nodes):
@@ -2951,8 +3429,17 @@ class NodesManager:
                 # all reinitialize through the same node.
                 random.shuffle(startup_nodes)
 
+            # An address that is already a startup node is queried through that
+            # node's client, so a second client never replaces a live node's one.
+            # Startup nodes are named after the resolved localhost, like
+            # ClusterNode names them.
             additional_startup_nodes = [
-                ClusterNode(host, port) for host, port in additional_startup_nodes_info
+                ClusterNode(host, port)
+                for host, port in additional_startup_nodes_info
+                if get_node_name(
+                    _resolve_localhost() if host == "localhost" else host, port
+                )
+                not in startup_node_names
             ]
             if last_failed_node_name is not None:
                 for index, node in enumerate(additional_startup_nodes):
@@ -3002,10 +3489,16 @@ class NodesManager:
                             maint_notifications_config=self.maint_notifications_config,
                             **kwargs,
                         )
-                        if startup_node in self.startup_nodes.values():
+                        if startup_node.name in self.startup_nodes:
                             self.startup_nodes[startup_node.name].redis_connection = r
                         else:
                             startup_node.redis_connection = r
+                    # Collected before the query, so a client is released also
+                    # when its CLUSTER SLOTS raises
+                    if startup_node.name in self.startup_nodes:
+                        queried_startup_nodes.append((startup_node.name, r))
+                    else:
+                        queried_additional_clients.append(r)
                     try:
                         if is_debug_log_enabled():
                             logger.debug(
@@ -3014,14 +3507,6 @@ class NodesManager:
                             )
                         # Make sure cluster mode is enabled on this node
                         cluster_slots = str_if_bytes(r.execute_command("CLUSTER SLOTS"))
-                        if disconnect_startup_nodes_pools:
-                            with r.connection_pool._lock:
-                                # take care to clear connections before we move on
-                                # mark all active connections for reconnect - they will be
-                                # reconnected on next use, but will allow current in flight commands to complete first
-                                r.connection_pool.update_active_connections_for_reconnect()
-                                # Needed to clear READONLY state when it is no longer applicable
-                                r.connection_pool.disconnect_free_connections()
                     except ResponseError:
                         raise RedisClusterException(
                             "Cluster mode is not enabled on this node"
@@ -3142,9 +3627,6 @@ class NodesManager:
                     # Ensure we clear local references to caught exceptions
                     exception = None
 
-            # Create Redis connections to all nodes
-            self.create_redis_connections(list(tmp_nodes_cache.values()))
-
             # Check if the slots are not fully covered
             if not fully_covered and self._require_full_coverage:
                 # Despite the requirement that the slots be covered, there
@@ -3155,8 +3637,13 @@ class NodesManager:
                     f"covered..."
                 )
 
+            # Create Redis connections to all new nodes. They are registered for
+            # re-authentication once they replace the current nodes below.
+            self._create_redis_connections(tmp_nodes_cache.values())
+
             # Set the tmp variables to the real variables
             with self._lock:
+                old_nodes_cache = self.nodes_cache
                 self.nodes_cache = tmp_nodes_cache
                 self.slots_cache = tmp_slots
                 # Set the default node
@@ -3164,8 +3651,22 @@ class NodesManager:
                 if self._dynamic_startup_nodes:
                     # Populate the startup nodes with all discovered nodes
                     self.startup_nodes = tmp_nodes_cache
+                self._last_refresh_at = time.monotonic()
+                self._failed_refreshes = 0
+                self._refresh_due_at = None
+                self._last_refresh_unreachable_args = None
                 # Increment the epoch to signal that initialization has completed
                 self._epoch += 1
+                # The published cache can change under other threads from now
+                # on (move_slot, move_node_to_end_of_cached_nodes)
+                new_nodes = tuple(tmp_nodes_cache.values())
+                new_node_names = frozenset(tmp_nodes_cache)
+
+            # Register the new pools for re-authentication before releasing the
+            # removed ones, so a token refresh never targets a released pool.
+            # Connection pool locks are taken outside self._lock.
+            self._dispatch_pools_instantiated(new_nodes)
+            self._release_removed_nodes(old_nodes_cache, new_node_names)
             # Dispatch so listeners (e.g. ClusterPubSub) can reconcile per-node
             # state after slot ownership may have changed. A listener must not
             # break slots-cache refresh; log and continue so a single buggy
@@ -3896,23 +4397,20 @@ class ClusterPubSub(PubSub):
         read path itself has to ask, or the shard channels pinned to that node
         stay there for the lifetime of the pubsub.
 
-        ``NodesManager.initialize`` serializes concurrent callers, drops nodes
-        that have left the topology and dispatches
-        ``AfterSlotsCacheRefreshEvent``, which reaches ``on_slots_changed``; run
-        it on the reconciliation worker so a bounded poll does not pay for a
-        ``CLUSTER SLOTS`` round trip, and throttle it because a node that is
-        down fails every poll.
+        The repair asks the nodes manager for a refresh and runs it on the
+        reconciliation worker, once due, so a bounded poll does not pay for a
+        ``CLUSTER SLOTS`` round trip; it is throttled because a node that is
+        down fails every poll. The refresh drops nodes that have left the
+        topology and dispatches ``AfterSlotsCacheRefreshEvent``, which reaches
+        ``on_slots_changed``.
 
-        ``disconnect_startup_nodes_pools=False``, unlike every other caller: the
-        default marks the in-use connections of the startup node that answered
-        ``CLUSTER SLOTS`` for reconnect and drops its idle ones, to clear a
-        ``READONLY`` state that may no longer apply. A per-node pubsub draws its
-        connection from that very pool, so on the default one unreachable shard
-        would recycle command and pubsub connections on a *healthy* node once
-        per throttle window - forcing a resubscribe and dropping in-flight
-        messages on a node that never failed. A fresh slot map is all this
-        repair asks for. The async counterpart has no such parameter and never
-        recycles those pools, so this is also the shape parity asks for.
+        ``disconnect_startup_nodes_pools=False``, unlike every other caller: a
+        fresh slot map is all this repair asks for, so it also keeps the idle
+        connections of a startup node pool that serves no node of the topology.
+        Pools of the nodes that stay in the topology, which per-node pubsubs
+        draw their connections from, are not recycled by a refresh either way.
+        The async counterpart has no such parameter, so this is also the shape
+        parity asks for.
         """
         if not self.shard_channels:
             return
@@ -3923,16 +4421,18 @@ class ClusterPubSub(PubSub):
         # reconciliation pass doing per-channel network I/O, because the
         # cluster-wide delivery stall that would cause is the very thing this
         # repair exists to end. Two readers racing the throttle window can both
-        # submit; the single-worker executor runs them sequentially, so the
-        # loser costs one redundant CLUSTER SLOTS round trip at most (the epoch
-        # check in NodesManager.initialize dedups only overlapping refreshes,
-        # not queued ones), bounded by the throttle window.
+        # submit, but their requests merge into one: the single-worker executor
+        # runs them sequentially, the first run claims the request, and the
+        # second finds nothing left to run (or a refresh that already completed
+        # after its request) and returns without a CLUSTER SLOTS round trip.
         self._next_topology_repair = now + SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
+        # The refresh is subject to _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS like
+        # every other error-triggered one: if it is not due yet, the request
+        # stays and the next command, or the next repair, runs it.
+        nodes_manager = self.cluster.nodes_manager
+        nodes_manager._request_refresh(disconnect_startup_nodes_pools=False)
         self._submit_reconcile_work(
-            partial(
-                self.cluster.nodes_manager.initialize,
-                disconnect_startup_nodes_pools=False,
-            )
+            partial(nodes_manager._run_requested_refresh, self.cluster.retry)
         )
 
     def _handle_moved_on_read(self, pubsub, error: MovedError) -> None:
@@ -4066,7 +4566,10 @@ class ClusterPubSub(PubSub):
             # intentionally runs outside the lock so reconciliation is not
             # stalled by long polls.
             with self._shard_state_lock:
-                if message["channel"] in self.pending_unsubscribe_shard_channels:
+                if (
+                    message["channel"] in self.pending_unsubscribe_shard_channels
+                    and message["channel"] not in pubsub.shard_channels
+                ):
                     # User-initiated sunsubscribe: drop from cluster-level tracking.
                     self.pending_unsubscribe_shard_channels.remove(message["channel"])
                     self.shard_channels.pop(message["channel"], None)
@@ -4189,8 +4692,22 @@ class ClusterPubSub(PubSub):
         first_migrate_error: Optional[BaseException] = None
         with self._shard_state_lock:
             for channel, handler in list(self.shard_channels.items()):
+                old_name = self._shard_channel_to_node.get(channel)
                 if channel in self.pending_unsubscribe_shard_channels:
-                    continue
+                    # A reconnect clears the per-node pending set and replays
+                    # SSUBSCRIBE, so a channel the node still holds without a
+                    # pending unsubscribe is subscribed again, not leaving, and
+                    # its cluster-level entry is stale. Check the pending set
+                    # first: handle_message drops the channel before its
+                    # pending entry.
+                    old_pubsub = self.node_pubsub_mapping.get(old_name)
+                    if (
+                        old_pubsub is None
+                        or channel in old_pubsub.pending_unsubscribe_shard_channels
+                        or channel not in old_pubsub.shard_channels
+                    ):
+                        continue
+                    self.pending_unsubscribe_shard_channels.discard(channel)
                 try:
                     new_node = self.cluster.get_node_from_key(channel)
                 except SlotNotCoveredError:
@@ -4202,7 +4719,6 @@ class ClusterPubSub(PubSub):
                     # slots-cache change notification.
                     uncovered.append(channel)
                     continue
-                old_name = self._shard_channel_to_node.get(channel)
                 if old_name == new_node.name:
                     owner = self.node_pubsub_mapping.get(new_node.name)
                     if owner is not None and channel in owner.shard_channels:
@@ -4713,7 +5229,7 @@ class ClusterPipeline(RedisCluster):
         self._execution_strategy.load_scripts()
 
     def discard(self):
-        """ """
+        """Discards the transactional block."""
         self._execution_strategy.discard()
 
     def watch(self, *names):
@@ -4731,6 +5247,15 @@ class ClusterPipeline(RedisCluster):
         self._execution_strategy.delete(*names)
 
     def unlink(self, *names):
+        """
+        Stages an `UNLINK` for keys ``names``. Like `delete`, it returns ``None``
+        rather than the pipeline, so it does not chain.
+
+        Outside a transactional block only one key is accepted, as with `delete`; more
+        raises :class:`~.RedisClusterException`. Between :meth:`watch` and
+        :meth:`multi` it is not staged: it is sent at once, outside the eventual
+        transaction, and the response is discarded.
+        """
         self._execution_strategy.unlink(*names)
 
 
@@ -5127,7 +5652,7 @@ class AbstractStrategy(ExecutionStrategy):
         """
         Provides extra context to the exception prior to it being handled
         """
-        cmd = " ".join(map(safe_str, command))
+        cmd = command_text(command)
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) of pipeline "
             f"caused error: {exception.args[0]}"
@@ -5180,38 +5705,68 @@ class PipelineStrategy(AbstractStrategy):
         self, stack, raise_on_error=True, allow_redirections=True
     ):
         """
-        Wrapper for RedisCluster.ERRORS_ALLOW_RETRY errors handling.
-
-        If one of the retryable exceptions has been thrown we assume that:
-         - connection_pool was disconnected
-         - connection_pool was reset
-         - refresh_table_asap set to True
-
-        It will try the number of times specified by
-        the retries in config option "self.retry"
-        which defaults to 10 unless manually configured.
-
-        If it reaches the number of times, the command will
-        raises ClusterDownException.
+        Send the commands, retrying on RedisCluster.ERRORS_ALLOW_RETRY as many
+        times as ``retry`` allows, with the backoff delay before each attempt
+        and a fixed 0.25 seconds first after CLUSTERDOWN or an uncovered slot.
+        Every retried error asks for a topology refresh, which the next attempt
+        runs once due. NOT_NODE_FAILURE_ERRORS are raised at once. Out of
+        retries, the last error is raised, as RedisClusterUnreachableError when
+        the last refresh reached no node; a refresh that reached no node since
+        an attempt failed ends the retries the same way.
         """
         if not stack:
             return []
         retry_attempts = self._pipe.retry.get_retries()
+        failure_count = 0
+        # The error the previous attempt failed with, and when the last refresh
+        # had ended by then: a refresh since that reached no node ends the
+        # retries (see NodesManager._error_instead_of_retry)
+        last_error: Optional[Exception] = None
+        last_refresh_at: Optional[float] = None
         while True:
+            # Run a topology refresh an earlier error asked for, once due
+            if self._nodes_manager._refresh_requested:
+                self._nodes_manager._run_requested_refresh(self._pipe.retry)
+            if last_error is not None:
+                outage_error = self._nodes_manager._error_instead_of_retry(
+                    last_error, last_refresh_at
+                )
+                if outage_error is not None:
+                    raise outage_error
             try:
                 return self._send_cluster_commands(
                     stack,
                     raise_on_error=raise_on_error,
                     allow_redirections=allow_redirections,
                 )
+            except RedisCluster.NOT_NODE_FAILURE_ERRORS:
+                raise
             except RedisCluster.ERRORS_ALLOW_RETRY as e:
                 if retry_attempts > 0:
                     # Try again with the new cluster setup. All other errors
                     # should be raised.
                     retry_attempts -= 1
-                    pass
+                    failure_count += 1
+                    last_error = e
+                    last_refresh_at = self._nodes_manager._last_refresh_at
+                    # Ask for a refresh of the topology, run by the next attempt
+                    # once due; a request a connection error already made,
+                    # naming its node, is kept
+                    self._nodes_manager._request_refresh()
+                    if type(e) in (ClusterDownError, SlotNotCoveredError):
+                        # Give the cluster time to recover first, as a command
+                        # that failed so does
+                        time.sleep(0.25)
+                    # Space the attempts out as the retry backoff says
+                    delay = self._pipe._retry_backoff_delay(
+                        self._pipe.retry, failure_count
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
                 else:
-                    raise e
+                    raise _error_to_raise(
+                        self._nodes_manager._last_refresh_unreachable_args, e
+                    )
 
     def _send_cluster_commands(
         self, stack, raise_on_error=True, allow_redirections=True
@@ -5319,15 +5874,25 @@ class PipelineStrategy(AbstractStrategy):
                     redis_node = self._pipe.get_redis_connection(node)
                     try:
                         connection = get_connection(redis_node)
-                    except (ConnectionError, TimeoutError):
+                    except (ConnectionError, TimeoutError) as e:
                         # Release any connections we've already acquired before clearing nodes
                         for n in nodes.values():
                             n.connection_pool.release(n.connection)
-                        # Connection retries are being handled in the node's
-                        # Retry object. Reinitialize the node -> slot table.
-                        self._nodes_manager.initialize()
-                        if is_default_node:
-                            self._pipe.replace_default_node()
+                        if not isinstance(e, RedisCluster.NOT_NODE_FAILURE_ERRORS):
+                            # Connection retries are being handled in the node's
+                            # Retry object. Ask for a refresh of the node -> slot
+                            # table, run by the next attempt, of any command,
+                            # once due. The failed node moves to the end of the
+                            # cached nodes, so the refresh does not pick it as
+                            # the default node while it is still a primary.
+                            self._nodes_manager.move_node_to_end_of_cached_nodes(
+                                node.name
+                            )
+                            self._nodes_manager._request_refresh(
+                                last_failed_node_name=node.name
+                            )
+                            if is_default_node:
+                                self._pipe.replace_default_node()
                         nodes = {}
                         raise
                     nodes[node_name] = NodeCommands(
@@ -5413,6 +5978,7 @@ class PipelineStrategy(AbstractStrategy):
                 c
                 for c in attempt
                 if isinstance(c.result, ClusterPipeline.ERRORS_ALLOW_RETRY)
+                and not isinstance(c.result, ClusterPipeline.NOT_NODE_FAILURE_ERRORS)
             ),
             key=lambda x: x.position,
         )
@@ -5436,8 +6002,14 @@ class PipelineStrategy(AbstractStrategy):
             # flag to rebuild the slots table from scratch.
             # So MOVED errors should correct themselves fairly quickly.
             self._pipe.reinitialize_counter += 1
-            if self._pipe._should_reinitialized():
-                self._nodes_manager.initialize()
+            if _should_request_refresh(
+                self._pipe.reinitialize_steps, self._pipe.reinitialize_counter
+            ):
+                # Ask for a refresh of the topology and run it before the
+                # commands are sent again, once due. When it is not due it
+                # stays asked for, and a later command runs it.
+                self._nodes_manager._request_refresh()
+                self._nodes_manager._run_requested_refresh(self._pipe.retry)
                 if is_default_node:
                     self._pipe.replace_default_node()
             for c in attempt:
@@ -5578,6 +6150,7 @@ class TransactionStrategy(AbstractStrategy):
     SLOT_REDIRECT_ERRORS = (AskError, MovedError)
     CONNECTION_ERRORS = (
         ConnectionError,
+        TimeoutError,
         OSError,
         ClusterDownError,
         SlotNotCoveredError,
@@ -5587,11 +6160,17 @@ class TransactionStrategy(AbstractStrategy):
         super().__init__(pipe)
         self._explicit_transaction = False
         self._watching = False
+        self._watch_acknowledged = False
         self._pipeline_slots: Set[int] = set()
         # True once a keyed (non-slot-agnostic) command has fixed the slot
         self._transaction_has_keyed_slot = False
         self._transaction_connection: Optional[Connection] = None
+        self._transaction_node: Optional[ClusterNode] = None
         self._executing = False
+        # The error the running retry is retrying, and when the last refresh
+        # had ended by then: a refresh since that reached no node ends the
+        # retries (see NodesManager._error_instead_of_retry)
+        self._retrying: Optional[Tuple[Exception, Optional[float]]] = None
         self._retry = copy(self._pipe.retry)
         self._retry.update_supported_errors(
             RedisCluster.ERRORS_ALLOW_RETRY + self.SLOT_REDIRECT_ERRORS
@@ -5640,22 +6219,21 @@ class TransactionStrategy(AbstractStrategy):
                 "At least a command with a key is needed to identify a node"
             )
 
+        if self._transaction_connection:
+            # Keep the node the held connection belongs to, even if a refresh
+            # moved the slot: the server reports the move (MOVED), and the error
+            # path releases the connection to its own node before retargeting
+            return (
+                self._pipe.get_redis_connection(self._transaction_node),
+                self._transaction_connection,
+            )
+
         node: ClusterNode = self._nodes_manager.get_node_from_slot(
             list(self._pipeline_slots)[0], False
         )
         redis_node: Redis = self._pipe.get_redis_connection(node)
-        if self._transaction_connection:
-            if not redis_node.connection_pool.owns_connection(
-                self._transaction_connection
-            ):
-                previous_node = self._nodes_manager.find_connection_owner(
-                    self._transaction_connection
-                )
-                previous_node.connection_pool.release(self._transaction_connection)
-                self._transaction_connection = None
-
-        if not self._transaction_connection:
-            self._transaction_connection = get_connection(redis_node)
+        self._transaction_connection = get_connection(redis_node)
+        self._transaction_node = node
 
         return redis_node, self._transaction_connection
 
@@ -5697,13 +6275,35 @@ class TransactionStrategy(AbstractStrategy):
         self._watching = True
 
     def _immediate_execute_command(self, *args, **options):
-        return self._retry.call_with_retry(
-            lambda: self._get_connection_and_send_command(*args, **options),
-            self._reinitialize_on_error,
-            with_failure_count=True,
-        )
+        try:
+            return self._retry.call_with_retry(
+                lambda: self._get_connection_and_send_command(*args, **options),
+                self._reinitialize_on_error,
+                is_retryable=RedisCluster._is_retryable_cluster_error,
+                with_failure_count=True,
+            )
+        except (ConnectionError, TimeoutError) as e:
+            raise _error_to_raise(self._nodes_manager._last_refresh_unreachable_args, e)
+        finally:
+            # The error of a retried attempt serves the run's next attempt only
+            self._retrying = None
+
+    def _raise_instead_of_retry(self) -> None:
+        """
+        Give up the running retry when a refresh that ended since its error
+        reached no node (see NodesManager._error_instead_of_retry).
+        """
+        if self._retrying is not None:
+            outage_error = self._nodes_manager._error_instead_of_retry(*self._retrying)
+            if outage_error is not None:
+                raise outage_error
 
     def _get_connection_and_send_command(self, *args, **options):
+        # Run a topology refresh an earlier error asked for, once due. The flag
+        # is read inline: this runs before every attempt.
+        if self._nodes_manager._refresh_requested:
+            self._nodes_manager._run_requested_refresh(self._pipe.retry)
+        self._raise_instead_of_retry()
         redis_node, connection = self._get_client_and_connection_for_transaction()
 
         # Start timing for observability
@@ -5763,11 +6363,15 @@ class TransactionStrategy(AbstractStrategy):
             conn.send_command(*args)
             output = redis_node.parse_response(conn, command_name, **options)
 
-        if command_name in self.UNWATCH_COMMANDS:
+        if command_name == "WATCH":
+            self._watch_acknowledged = True
+        elif command_name in self.UNWATCH_COMMANDS:
             self._watching = False
+            self._watch_acknowledged = False
         return output
 
     def _reinitialize_on_error(self, error, failure_count):
+        self._retrying = (error, self._nodes_manager._last_refresh_at)
         if hasattr(error, "connection"):
             record_error_count(
                 server_address=error.connection.host,
@@ -5779,14 +6383,12 @@ class TransactionStrategy(AbstractStrategy):
                 is_internal=True,
             )
 
-        if self._watching:
-            if type(error) in self.SLOT_REDIRECT_ERRORS and self._executing:
-                raise WatchError("Slot rebalancing occurred while watching keys")
-
-        if (
-            type(error) in self.SLOT_REDIRECT_ERRORS
-            or type(error) in self.CONNECTION_ERRORS
+        # WATCH is requested before the first attempt, but only a reply
+        # establishes the protection that a retry must not silently discard.
+        if self._watch_acknowledged or isinstance(
+            error, self.SLOT_REDIRECT_ERRORS + self.CONNECTION_ERRORS
         ):
+            node = None
             if self._transaction_connection:
                 if is_debug_log_enabled():
                     logger.debug(
@@ -5796,24 +6398,52 @@ class TransactionStrategy(AbstractStrategy):
                     )
                 # Disconnect and release back to pool
                 self._transaction_connection.disconnect()
-                node = self._nodes_manager.find_connection_owner(
-                    self._transaction_connection
-                )
-                if node and node.redis_connection:
-                    node.redis_connection.connection_pool.release(
-                        self._transaction_connection
-                    )
-                self._transaction_connection = None
+                node = self._transaction_node
+                self._release_transaction_connection()
 
             self._pipe.reinitialize_counter += 1
-            if self._pipe._should_reinitialized():
-                self._nodes_manager.initialize()
-                self.reinitialize_counter = 0
-            else:
-                if isinstance(error, AskError):
-                    self._nodes_manager.move_slot(error)
+            should_request_refresh = _should_request_refresh(
+                self._pipe.reinitialize_steps, self._pipe.reinitialize_counter
+            )
+            if isinstance(error, AskError):
+                # MovedError is an AskError, so a MOVED slot is patched too, and
+                # the retry goes to the node that owns it now. The refresh is
+                # only asked for, run by the next command once due.
+                self._nodes_manager.move_slot(error)
+                if should_request_refresh:
+                    self._nodes_manager._request_refresh()
+                    self._pipe.reinitialize_counter = 0
+            elif should_request_refresh:
+                # A connection error: ask for a refresh that tries the failed
+                # node last. The next attempt runs it once due, through
+                # _run_requested_refresh, which keeps the current topology if
+                # the refresh fails.
+                if node is None and self._pipeline_slots:
+                    # Connecting failed, so no connection names the node: it is
+                    # the one that owns the slot the attempt targeted
+                    slot_nodes = self._nodes_manager.slots_cache.get(
+                        list(self._pipeline_slots)[0]
+                    )
+                    if slot_nodes:
+                        node = slot_nodes[0]
+                failed_node_name = node.name if node is not None else None
+                if failed_node_name is not None:
+                    self._nodes_manager.move_node_to_end_of_cached_nodes(
+                        failed_node_name
+                    )
+                self._nodes_manager._request_refresh(
+                    last_failed_node_name=failed_node_name
+                )
+                self._pipe.reinitialize_counter = 0
 
         self._executing = False
+        if self._watch_acknowledged:
+            self.reset()
+            if isinstance(error, self.SLOT_REDIRECT_ERRORS):
+                raise WatchError(
+                    "Slot rebalancing occurred while watching keys"
+                ) from error
+            raise WatchError("An error occurred while watching keys") from error
 
     def _raise_first_error(self, responses, stack, start_time):
         """
@@ -5843,13 +6473,20 @@ class TransactionStrategy(AbstractStrategy):
     def _execute_transaction_with_retries(
         self, stack: List["PipelineCommand"], raise_on_error: bool
     ):
-        return self._retry.call_with_retry(
-            lambda: self._execute_transaction(stack, raise_on_error),
-            lambda error, failure_count: self._reinitialize_on_error(
-                error, failure_count
-            ),
-            with_failure_count=True,
-        )
+        try:
+            return self._retry.call_with_retry(
+                lambda: self._execute_transaction(stack, raise_on_error),
+                lambda error, failure_count: self._reinitialize_on_error(
+                    error, failure_count
+                ),
+                is_retryable=RedisCluster._is_retryable_cluster_error,
+                with_failure_count=True,
+            )
+        except (ConnectionError, TimeoutError) as e:
+            raise _error_to_raise(self._nodes_manager._last_refresh_unreachable_args, e)
+        finally:
+            # The error of a retried attempt serves the run's next attempt only
+            self._retrying = None
 
     def _execute_transaction(
         self, stack: List["PipelineCommand"], raise_on_error: bool
@@ -5858,6 +6495,12 @@ class TransactionStrategy(AbstractStrategy):
             raise CrossSlotTransactionError(
                 "All keys involved in a cluster transaction must map to the same slot"
             )
+
+        # Run a topology refresh an earlier error asked for, once due. The flag
+        # is read inline: this runs before every attempt.
+        if self._nodes_manager._refresh_requested:
+            self._nodes_manager._run_requested_refresh(self._pipe.retry)
+        self._raise_instead_of_retry()
 
         self._executing = True
 
@@ -5935,6 +6578,7 @@ class TransactionStrategy(AbstractStrategy):
 
         # EXEC clears any watched keys
         self._watching = False
+        self._watch_acknowledged = False
 
         if response is None:
             raise WatchError("Watched variable changed.")
@@ -5971,6 +6615,19 @@ class TransactionStrategy(AbstractStrategy):
             data.append(r)
         return data
 
+    def _release_transaction_connection(self) -> None:
+        """
+        Return the held connection to the pool of the node it was taken from.
+
+        That node, not the one ``nodes_cache`` holds under its name now: a
+        refresh may have removed the node, or replaced it with a new instance,
+        and the connection belongs to the old node's pool either way.
+        """
+        connection, self._transaction_connection = self._transaction_connection, None
+        node = self._transaction_node
+        if connection and node and node.redis_connection:
+            node.redis_connection.connection_pool.release(connection)
+
     def reset(self):
         self._command_queue = []
 
@@ -5985,33 +6642,22 @@ class TransactionStrategy(AbstractStrategy):
                     self._transaction_connection.read_response()
                 # we can safely return the connection to the pool here since we're
                 # sure we're no longer WATCHing anything
-                node = self._nodes_manager.find_connection_owner(
-                    self._transaction_connection
-                )
-                if node and node.redis_connection:
-                    node.redis_connection.connection_pool.release(
-                        self._transaction_connection
-                    )
-                self._transaction_connection = None
+                self._release_transaction_connection()
             except self.CONNECTION_ERRORS:
                 # disconnect will also remove any previous WATCHes
                 if self._transaction_connection:
                     self._transaction_connection.disconnect()
-                    node = self._nodes_manager.find_connection_owner(
-                        self._transaction_connection
-                    )
-                    if node and node.redis_connection:
-                        node.redis_connection.connection_pool.release(
-                            self._transaction_connection
-                        )
-                    self._transaction_connection = None
+                    self._release_transaction_connection()
 
         # clean up the other instance attributes
+        self._transaction_node = None
         self._watching = False
+        self._watch_acknowledged = False
         self._explicit_transaction = False
         self._pipeline_slots = set()
         self._transaction_has_keyed_slot = False
         self._executing = False
+        self._retrying = None
 
     def send_cluster_commands(
         self, stack, raise_on_error=True, allow_redirections=True

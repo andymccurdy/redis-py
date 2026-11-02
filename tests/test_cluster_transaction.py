@@ -115,6 +115,147 @@ class TestClusterTransaction:
             assert pipe.execute() == [b"OK"]
 
     @pytest.mark.onlycluster
+    @pytest.mark.parametrize(
+        "error_type",
+        [
+            redis.exceptions.MovedError,
+            redis.exceptions.AskError,
+            redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError,
+            redis.exceptions.ClusterDownError,
+            redis.exceptions.SlotNotCoveredError,
+        ],
+    )
+    @pytest.mark.parametrize("command", ["GET", "WATCH", "EXEC"])
+    @pytest.mark.parametrize("failure_point", ["send", "read"])
+    def test_retry_after_acknowledged_watch_raises(
+        self, r, error_type, command, failure_point
+    ):
+        """A retried command must not silently abandon an acknowledged WATCH."""
+        key = "book"
+        slot = r.keyslot(key)
+        node = r.nodes_manager.get_node_from_slot(slot)
+        error = error_type(f"{slot} {node.name}")
+        r.set_retry(Retry(NoBackoff(), 1))
+        r.reinitialize_steps = 1
+
+        with r.pipeline(transaction=True) as pipe:
+            pipe.watch(key)
+            strategy = pipe._execution_strategy
+            connection = strategy._transaction_connection
+            # A concurrent write must not be overwritten by an unwatched retry.
+            r.set(key, 100)
+            if command == "EXEC":
+                pipe.multi()
+                pipe.set(key, 1)
+                send_method = "send_packed_command"
+            else:
+                send_method = "send_command"
+            original_send = getattr(connection, send_method)
+            attempts = []
+
+            def fail_once(*args, **kwargs):
+                attempts.append(args)
+                if len(attempts) == 1:
+                    raise error
+                return original_send(*args, **kwargs)
+
+            if failure_point == "send":
+                patcher = patch.object(connection, send_method, side_effect=fail_once)
+            else:
+                node_type = Redis
+                original_parse = node_type.parse_response
+
+                def fail_after_read(redis_node, conn, name, **options):
+                    result = original_parse(redis_node, conn, name, **options)
+                    if name == command:
+                        attempts.append(name)
+                        if len(attempts) == 1:
+                            raise error
+                    return result
+
+                patcher = patch.object(
+                    node_type,
+                    "parse_response",
+                    autospec=True,
+                    side_effect=fail_after_read,
+                )
+
+            with patcher:
+                with pytest.raises(redis.exceptions.WatchError) as exc_info:
+                    if command == "EXEC":
+                        pipe.execute()
+                    else:
+                        pipe.execute_command(command, key)
+
+            assert exc_info.value.__cause__ is error
+            assert len(attempts) == 1
+            assert strategy._transaction_connection is None
+            assert not connection.is_connected
+            assert r.get(key) == b"100"
+
+            # Reset and reuse must not retain acknowledged WATCH state.
+            pipe.reset()
+            assert not strategy._watch_acknowledged
+            pipe.watch(key)
+            assert strategy._watch_acknowledged
+            pipe.unwatch()
+            assert not strategy._watch_acknowledged
+            pipe.set(key, 2)
+            assert pipe.execute() == [b"OK"]
+            assert not strategy._watch_acknowledged
+
+    @pytest.mark.onlycluster
+    @pytest.mark.parametrize(
+        "error_type",
+        [
+            redis.exceptions.MovedError,
+            redis.exceptions.AskError,
+            redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError,
+            redis.exceptions.ClusterDownError,
+            redis.exceptions.SlotNotCoveredError,
+        ],
+    )
+    def test_error_before_watch_acknowledgement_is_retried(self, r, error_type):
+        key = "book"
+        slot = r.keyslot(key)
+        node = r.nodes_manager.get_node_from_slot(slot)
+        error = error_type(f"{slot} {node.name}")
+        r.set_retry(Retry(NoBackoff(), 1))
+        node_type = Redis
+        original_parse = node_type.parse_response
+        attempts = []
+
+        def fail_first_watch_reply(redis_node, connection, command, **options):
+            result = original_parse(redis_node, connection, command, **options)
+            if command == "WATCH":
+                attempts.append(connection)
+                if len(attempts) == 1:
+                    raise error
+            return result
+
+        with r.pipeline(transaction=True) as pipe:
+            with patch.object(
+                node_type,
+                "parse_response",
+                autospec=True,
+                side_effect=fail_first_watch_reply,
+            ):
+                pipe.watch(key)
+
+            assert len(attempts) == 2
+            assert pipe._execution_strategy._watch_acknowledged
+            # The successful retry must actually install a new WATCH.
+            r.set(key, 100)
+            pipe.multi()
+            pipe.set(key, 1)
+            with pytest.raises(redis.exceptions.WatchError, match="Watched variable"):
+                pipe.execute()
+            assert r.get(key) == b"100"
+            assert not pipe._execution_strategy._watch_acknowledged
+
+    @pytest.mark.onlycluster
     def test_retry_transaction_during_unfinished_slot_migration(self, r):
         """
         When a transaction is triggered during a migration, MovedError
@@ -270,6 +411,109 @@ class TestClusterTransaction:
                 )
 
     @pytest.mark.onlycluster
+    def test_watch_connection_stays_with_its_node_after_slot_move(self, r):
+        """
+        A requested refresh that moves the slot while keys are watched does not
+        pair the held connection with the new owner: commands keep using the
+        node the connection belongs to, and the connection goes back to that
+        node's pool.
+        """
+        key = "book"
+        slot = r.keyslot(key)
+        node_owning, node_other = _find_source_and_target_node_for_slot(r, slot)
+        original_slots_cache = r.nodes_manager.slots_cache[slot]
+
+        def move_slot(retry=None):
+            # As a refresh that moves the slot to another node would
+            r.nodes_manager._refresh_requested = False
+            r.nodes_manager.slots_cache[slot] = [node_other]
+
+        try:
+            with patch.object(
+                r.nodes_manager, "_run_requested_refresh", side_effect=move_slot
+            ):
+                with r.pipeline(transaction=True) as pipe:
+                    pipe.watch(key)
+                    strategy = pipe._execution_strategy
+                    connection = strategy._transaction_connection
+                    r.nodes_manager._refresh_requested = True
+                    pipe.get(key)
+                    assert strategy._get_client_and_connection_for_transaction() == (
+                        node_owning.redis_connection,
+                        connection,
+                    )
+
+                    pipe.multi()
+                    pipe.set(key, "val")
+                    assert len(pipe.execute()) == 1
+
+            owning_pool = node_owning.redis_connection.connection_pool
+            assert connection in owning_pool._available_connections
+            assert (
+                connection
+                not in node_other.redis_connection.connection_pool._available_connections
+            )
+        finally:
+            r.nodes_manager._refresh_requested = False
+            r.nodes_manager.slots_cache[slot] = original_slots_cache
+        assert r.get(key) == b"val"
+
+    @pytest.mark.onlycluster
+    @pytest.mark.parametrize("change", ["removed", "replaced"])
+    @pytest.mark.parametrize("release", ["reset", "error"])
+    def test_watch_connection_returns_to_its_node_after_node_left(
+        self, r, change, release
+    ):
+        """
+        A refresh that removes the node of the held WATCH connection, or
+        replaces it with a new instance under the same name, does not leak the
+        connection: it goes back to the pool of the node it was taken from,
+        both when the pipeline is reset and on the error path.
+        """
+        key = "book"
+        node_owning = r.nodes_manager.get_node_from_slot(r.keyslot(key))
+        owning_pool = node_owning.redis_connection.connection_pool
+        replacement = None
+        try:
+            with r.pipeline(transaction=True) as pipe:
+                pipe.watch(key)
+                strategy = pipe._execution_strategy
+                connection = strategy._transaction_connection
+                assert connection in owning_pool._in_use_connections
+
+                # As a refresh that drops the node, or rebuilds it, would
+                if change == "removed":
+                    del r.nodes_manager.nodes_cache[node_owning.name]
+                else:
+                    replacement = ClusterNode(
+                        node_owning.host,
+                        node_owning.port,
+                        PRIMARY,
+                        Redis(host=node_owning.host, port=node_owning.port),
+                    )
+                    r.nodes_manager.nodes_cache[node_owning.name] = replacement
+
+                if release == "error":
+                    with pytest.raises(redis.exceptions.WatchError):
+                        strategy._reinitialize_on_error(
+                            redis.exceptions.ConnectionError("Conn error"), 1
+                        )
+                    assert strategy._transaction_connection is None
+                    assert not connection.is_connected
+
+            assert connection not in owning_pool._in_use_connections
+            assert connection in owning_pool._available_connections
+            if replacement is not None:
+                replacement_pool = replacement.redis_connection.connection_pool
+                assert connection not in replacement_pool._available_connections
+        finally:
+            r.nodes_manager.nodes_cache[node_owning.name] = node_owning
+            r.nodes_manager._refresh_requested = False
+            if replacement is not None:
+                replacement.redis_connection.close()
+
+    @pytest.mark.usefixtures("no_topology_refresh_interval", "no_cluster_retry_delay")
+    @pytest.mark.onlycluster
     def test_retry_transaction_on_connection_error(self, r, mock_connection):
         key = "book"
         slot = r.keyslot(key)
@@ -304,6 +548,7 @@ class TestClusterTransaction:
             node_importing.redis_connection.connection_pool = original_pool
             r.nodes_manager.slots_cache[slot] = original_slots_cache
 
+    @pytest.mark.usefixtures("no_topology_refresh_interval", "no_cluster_retry_delay")
     @pytest.mark.onlycluster
     def test_retry_transaction_on_connection_error_with_watched_keys(
         self, r, mock_connection

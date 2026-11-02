@@ -66,6 +66,21 @@ class TestPipeline:
             assert await r.get("c") == b"c1"
 
     @pytest.mark.onlynoncluster
+    async def test_info_in_transaction(self, decoded_r):
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version" in info
+
+    @pytest.mark.onlynoncluster
+    async def test_info_in_transaction_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response, **options: response)
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version:" in info
+
+    @pytest.mark.onlynoncluster
     async def test_pipeline_no_transaction_watch(self, r):
         await r.set("a", 0)
 
@@ -214,6 +229,44 @@ class TestPipeline:
             # make sure the pipe was restored to a working state
             assert await pipe.set("z", "zzz").execute() == [True]
             assert await r.get("z") == b"zzz"
+
+    @pytest.mark.onlynoncluster
+    async def test_callback_error_does_not_leave_replies_on_connection(self, r):
+        # The score callback raises on the first reply, while the BLPOP reply is
+        # still in flight. The next command on the pooled connection must not
+        # read it.
+        await r.zadd("z", {"a": float("inf")})
+        await r.set("b", "b1")
+        async with r.pipeline(transaction=False) as pipe:
+            pipe.zrange("z", 0, -1, withscores=True, score_cast_func=int)
+            pipe.blpop("q", 0.5)
+            with pytest.raises(OverflowError):
+                await pipe.execute()
+
+        client = redis.asyncio.Redis(connection_pool=r.connection_pool)
+        assert await client.get("b") == b"b1"
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.0.0")
+    async def test_exec_error_in_pipeline_redacts_credentials(self, r):
+        try:
+            async with r.pipeline(transaction=False) as pipe:
+                pipe.acl_setuser(
+                    "redis-py-user",
+                    enabled=True,
+                    passwords=["+pipeline-secret"],
+                    commands=["+nosuchcommand"],
+                )
+
+                with pytest.raises(redis.ResponseError) as ex:
+                    await pipe.execute()
+        finally:
+            await r.acl_deluser("redis-py-user")
+
+        assert "pipeline-secret" not in str(ex.value)
+        assert str(ex.value).startswith(
+            "Command # 1 (ACL SETUSER <REDACTED>) of pipeline caused error: "
+        )
 
     @pytest.mark.onlynoncluster
     async def test_parse_error_raised_transaction(self, r):

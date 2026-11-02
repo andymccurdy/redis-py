@@ -33,7 +33,15 @@ def parse_debug_object(response):
     return response
 
 
-def parse_info(response):
+def decode_info(response, encoder):
+    """Decode a raw INFO reply, replacing any bytes the encoder can't decode"""
+    try:
+        return encoder.decode(response)
+    except UnicodeDecodeError:
+        return response.decode(encoder.encoding, errors="replace")
+
+
+def parse_info(response, **options):
     """Parse the result of Redis's INFO command into a Python dict"""
     info = {}
     response = str_if_bytes(response)
@@ -98,13 +106,21 @@ def parse_memory_stats(response, **kwargs):
 def parse_memory_stats_unified(response, **kwargs):
     """Parse MEMORY STATS for unified RESP2 output.
 
-    Unified responses decode structural keys while preserving string-like
-    values as delivered, matching the approved RESP2/RESP3 unification shape.
+    Unified responses decode structural keys and use native numeric values.
+    The RESP2 reply holds the ratios and percentages, such as
+    ``fragmentation``, as bulk strings, while RESP3 sends doubles. Convert
+    them to ``float`` so both wires give the same values; the integer
+    replies, and any string that isn't a number, are left as they are.
     """
     stats = pairs_to_dict(response, decode_keys=True)
     for key, value in stats.items():
         if key.startswith("db.") and isinstance(value, list):
             stats[key] = pairs_to_dict(value, decode_keys=True)
+        elif isinstance(value, (bytes, str)):
+            try:
+                stats[key] = float(value)
+            except ValueError:
+                pass
     return stats
 
 
@@ -1121,6 +1137,17 @@ def parse_zmscore(response, **options):
     return [float(score) if score is not None else None for score in response]
 
 
+def parse_increx_unified(response, **options):
+    """RESP2-wire INCREX -> unified ``[value, increment]``.
+
+    With ``BYFLOAT`` the RESP2 reply holds both numbers as bulk strings,
+    while RESP3 sends doubles. Convert the strings to ``float`` so both
+    wires give the same values; the integer replies of the default and
+    ``BYINT`` forms are left as they are.
+    """
+    return [float(x) if isinstance(x, (bytes, str)) else x for x in response]
+
+
 def parse_slowlog_get(response, **options):
     space = " " if options.get("decode_responses", False) else b" "
 
@@ -1663,6 +1690,63 @@ def parse_function_list_resp3_to_resp2_legacy(response, **options):
                 flat.append(value)
         result.append(flat)
     return result
+
+
+def parse_function_stats_unified(response, **options):
+    """FUNCTION STATS → unified nested ``dict`` with bytes keys.
+
+    Accepts either RESP2 wire (a flat ``[k, v, k, v, …]`` list whose
+    ``running_script`` value is a flat list or ``None`` and whose
+    ``engines`` value pairs each engine name with a flat list of its
+    stats) or RESP3 wire (nested maps). Both are normalised to nested
+    dicts.
+    """
+    if response is None or isinstance(response, dict):
+        return response
+    stats = {}
+    it = iter(response)
+    for key, value in zip(it, it):
+        if isinstance(value, list):
+            name = str_if_bytes(key)
+            if name == "running_script":
+                value = pairs_to_dict(value)
+            elif name == "engines":
+                engines = iter(value)
+                value = {
+                    engine: pairs_to_dict(engine_stats)
+                    for engine, engine_stats in zip(engines, engines)
+                }
+        stats[key] = value
+    return stats
+
+
+def parse_function_stats_resp3_to_resp2_legacy(response, **options):
+    """RESP3-wire FUNCTION STATS → today's RESP2 flat ``list`` shape.
+
+    The reply, the running script and the stats of each engine each arrive
+    as a ``dict``; flatten them back to interleaved ``[k, v, k, v, …]``
+    lists so the Python shape matches what RESP2 wire produces natively.
+    """
+    if not isinstance(response, dict):
+        return response
+    flat = []
+    for key, value in response.items():
+        if isinstance(value, dict):
+            if str_if_bytes(key) == "engines":
+                engines = []
+                for engine, engine_stats in value.items():
+                    if isinstance(engine_stats, dict):
+                        engine_stats = [
+                            item for kv in engine_stats.items() for item in kv
+                        ]
+                    engines.append(engine)
+                    engines.append(engine_stats)
+                value = engines
+            else:
+                value = [item for kv in value.items() for item in kv]
+        flat.append(key)
+        flat.append(value)
+    return flat
 
 
 def parse_cluster_links_unified(response, **options):

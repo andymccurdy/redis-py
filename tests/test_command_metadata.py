@@ -116,6 +116,8 @@ NEWLY_ELIGIBLE_VS_LEGACY_ALLOW_LIST = frozenset(
         "HPEXPIRETIME",
         "PEXPIRETIME",
         "SDIFFCARD",
+        "SEXPIRETIME",
+        "SPEXPIRETIME",
         "SUNIONCARD",
     }
 )
@@ -2148,10 +2150,10 @@ class TestStaticMetadataAgainstServer:
         }
         # And it is exactly this large, so a server or module version that starts reporting a
         # command as cacheable when it should not be surfaces here rather than silently
-        # broadening what an opt-in user caches. Measured against the pinned
-        # ``redislabs/client-libs-test`` stack image (Redis 8.9.241): 53 core reads, the
-        # probabilistic and t-digest read surfaces, and the vectorset reads.
-        assert len(eligible - allow_list) == 53
+        # broadening what an opt-in user caches. Measured against a Redis 8.11.240 stack
+        # build: 56 commands - core reads, the probabilistic, t-digest and timeseries read
+        # surfaces, and the vectorset reads.
+        assert len(eligible - allow_list) == 56
         # And the commands the specification names stay out, whichever layer answers.
         for name in (
             "keys",

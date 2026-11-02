@@ -11,7 +11,10 @@ from redis._parsers.helpers import (
     parse_client_info,
     parse_client_list,
     parse_command,
+    parse_function_stats_resp3_to_resp2_legacy,
+    parse_function_stats_unified,
     parse_info,
+    parse_memory_stats_unified,
     parse_sentinel_masters_resp3,
     zmpop_resp3_to_resp2_legacy,
     zpop_score_pairs,
@@ -263,6 +266,71 @@ def test_parse_acl_log_resp3_legacy_decodes_string_values():
         1700000000000,
     ]
     assert parse_acl_log([resp2_entry]) == [parsed]
+
+
+# FUNCTION STATS while a function runs. RESP2 sends the reply, the running
+# script and the stats of each engine as flat lists; RESP3 sends them as maps.
+_FUNCTION_STATS_RESP2 = [
+    b"running_script",
+    [b"name", b"busy", b"command", [b"FCALL", b"busy", b"0"], b"duration_ms", 500],
+    b"engines",
+    [b"LUA", [b"libraries_count", 1, b"functions_count", 1]],
+]
+_FUNCTION_STATS_RESP3 = {
+    b"running_script": {
+        b"name": b"busy",
+        b"command": [b"FCALL", b"busy", b"0"],
+        b"duration_ms": 500,
+    },
+    b"engines": {b"LUA": {b"libraries_count": 1, b"functions_count": 1}},
+}
+
+
+@pytest.mark.fixed_client
+def test_parse_function_stats_unified_gives_the_resp3_shape():
+    assert parse_function_stats_unified(_FUNCTION_STATS_RESP2) == _FUNCTION_STATS_RESP3
+    assert parse_function_stats_unified(_FUNCTION_STATS_RESP3) == _FUNCTION_STATS_RESP3
+
+
+@pytest.mark.fixed_client
+def test_parse_function_stats_resp3_to_resp2_legacy_gives_the_resp2_shape():
+    assert (
+        parse_function_stats_resp3_to_resp2_legacy(_FUNCTION_STATS_RESP3)
+        == _FUNCTION_STATS_RESP2
+    )
+
+
+@pytest.mark.fixed_client
+def test_parse_memory_stats_unified_converts_doubles_to_floats():
+    # RESP2 sends the doubles of MEMORY STATS as bulk strings.
+    stats = parse_memory_stats_unified(
+        [
+            b"peak.allocated",
+            1024,
+            b"db.0",
+            [b"overhead.hashtable.main", 72, b"overhead.hashtable.expires", 0],
+            b"dataset.percentage",
+            b"95.5",
+            b"fragmentation",
+            b"1",
+        ]
+    )
+    assert stats == {
+        "peak.allocated": 1024,
+        "db.0": {"overhead.hashtable.main": 72, "overhead.hashtable.expires": 0},
+        "dataset.percentage": 95.5,
+        "fragmentation": 1.0,
+    }
+    assert type(stats["fragmentation"]) is float
+    assert type(stats["peak.allocated"]) is int
+    # decode_responses=True gives str values
+    assert parse_memory_stats_unified(["fragmentation", "0.5"]) == {
+        "fragmentation": 0.5
+    }
+    # a value that isn't a number is left as it is
+    assert parse_memory_stats_unified([b"allocator", b"jemalloc"]) == {
+        "allocator": b"jemalloc"
+    }
 
 
 # pairs_to_dict / pairs_to_dict_typed turn a flat [k1, v1, k2, v2] reply into a

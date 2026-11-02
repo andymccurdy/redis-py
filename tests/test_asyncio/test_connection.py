@@ -1601,9 +1601,10 @@ class TestAsyncBlockingConnectionPoolMetricCount:
         assert used_net == 1
         await pool.release(conn2)
 
+    @patch("redis.observability.recorder.record_connection_count")
     @patch("redis.asyncio.connection.record_connection_count")
-    async def test_full_lifecycle_nets_to_zero(self, mock_rec):
-        """acquire -> release cycles must not drift the counter."""
+    async def test_full_lifecycle_nets_to_zero(self, mock_rec, mock_sync_rec):
+        """acquire -> release cycles -> destroy must not drift the counter."""
         pool = self._pool()
         pn = get_pool_name(pool)
         mock_rec.reset_mock()
@@ -1612,10 +1613,13 @@ class TestAsyncBlockingConnectionPoolMetricCount:
             conn = await pool.get_connection()
             await pool.release(conn)
 
-        idle_net, used_net = _async_net(_async_pool_metric_calls(mock_rec, pn))
-        # reset()/__del__ record IDLE -len(available) for the idle connections
-        # still pooled; account for that so the whole lifecycle nets to zero.
-        idle_net -= len(pool._available_connections)
+        # Destroy the pool's connections through the pool's own teardown path.
+        # reset() is not a coroutine, so it records through the sync recorder.
+        pool.reset()
+
+        calls = _async_pool_metric_calls(mock_rec, pn)
+        calls += _async_pool_metric_calls(mock_sync_rec, pn)
+        idle_net, used_net = _async_net(calls)
         assert idle_net == 0, f"Lifecycle IDLE should net 0, got {idle_net}"
         assert used_net == 0, f"Lifecycle USED should net 0, got {used_net}"
 

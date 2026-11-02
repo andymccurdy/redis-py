@@ -13,27 +13,24 @@ pytest-cov
 coverage<7.11.1
 pytest-cov==6.0.0 ; platform_python_implementation == "PyPy"
 coverage==7.6.12 ; platform_python_implementation == "PyPy"
-pytest-forked
 pytest-profiling==1.8.1
 pytest-timeout
 pytest-timeout==2.3.1 ; platform_python_implementation == "PyPy"
 
 ruff==0.9.6
 ujson>=4.2.0
-uvloop<=0.21.0; platform_python_implementation == "CPython" and python_version < "3.14"
-uvloop>=0.22; platform_python_implementation == "CPython" and python_version >= "3.14"
+uvloop<=0.21.0; platform_python_implementation == "CPython" and python_version < "3.14" and sys_platform != "win32"
+uvloop>=0.22; platform_python_implementation == "CPython" and python_version >= "3.14" and sys_platform != "win32"
 vulture>=2.3.0
 
 numpy>=1.24.0 ; platform_python_implementation == "CPython"
 numpy>=1.24.0,<2.0 ; platform_python_implementation == "PyPy"
 
-redis-entraid==1.2.1
+redis-entraid==1.2.2
 pybreaker>=1.4.0
 aiohttp>=3.9.0
 
 xxhash==3.6.0
-
-cryptography<46; platform_python_implementation == "PyPy" and python_version == "3.10"
 
 opentelemetry-api>=1.30.0
 opentelemetry-sdk>=1.30.0

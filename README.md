@@ -14,7 +14,8 @@ The Python interface to the Redis key-value store.
 ---------------------------------------------
 
 **Note:** redis-py 5.0 is the last version of redis-py that supports Python 3.7, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 5.1 supports Python 3.8+.<br>
-**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.
+**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.<br>
+**Note:** redis-py 8.1.0 is the last version of redis-py that supports Python 3.10, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 8.2.0 supports Python 3.11+.
 
 ---------------------------------------------
 

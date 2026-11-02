@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 from time import sleep
-from unittest.mock import MagicMock, patch, Mock
+from unittest.mock import MagicMock, patch, Mock, AsyncMock
 
 import pybreaker
 import pytest
@@ -79,6 +79,119 @@ class TestMultiDbClient:
                 assert RedisClusterException not in supported
             finally:
                 client.close()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_closes_every_database_client(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        A failover leaves the previous active database's client open so its
+        in-flight commands can complete, so close() must close every database
+        client, not only the active one.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.check_health.return_value = True
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            client.initialize()
+            client.set_active_database(mock_db2)
+            mock_db1.client.close.assert_not_called()
+
+            client.close()
+
+        for db in (mock_db, mock_db1, mock_db2):
+            db.client.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_closes_every_database_client_when_one_fails(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        A client that fails to close must not leave the later ones open, and
+        close() raises the first error once every client was closed.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.check_health.return_value = True
+        first_error = ConnectionError("first")
+        mock_db1.client.close.side_effect = first_error
+        mock_db2.client.close.side_effect = ConnectionError("second")
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            client.initialize()
+
+            with pytest.raises(ConnectionError) as exc_info:
+                client.close()
+
+        assert exc_info.value is first_error
+        for db in (mock_db, mock_db1, mock_db2):
+            db.client.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_closes_removed_active_database_client(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        Removing the active database leaves its client open for in-flight
+        commands, so close() must still close it although it is no longer in
+        the database list.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.check_health.return_value = True
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            client.initialize()
+            assert client.command_executor.active_database is mock_db1
+
+            client.remove_database(mock_db1)
+            assert client.command_executor.active_database is mock_db2
+            mock_db1.client.close.assert_not_called()
+
+            client.close()
+            # The removed database is dropped once closed
+            client.close()
+
+        mock_db1.client.close.assert_called_once_with()
+        for db in (mock_db, mock_db2):
+            assert db.client.close.call_count == 2
 
     @pytest.mark.parametrize(
         "mock_multi_db_config,mock_db, mock_db1, mock_db2",
@@ -215,6 +328,107 @@ class TestMultiDbClient:
                     )
             finally:
                 client.close()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_closes_health_checks(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        close() has to release the resources held by the health checks
+        themselves (e.g. the lag-aware check's HTTP thread pool), not only
+        the policy's connection pools, running them on the shared health
+        check event loop like the policy close does.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.close = AsyncMock()
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            client.close()
+
+        mock_hc.close.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_releases_health_checks_when_the_policy_close_fails(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        A policy close that raises must not skip the health checks: a policy
+        close is exactly the kind of call that can time out, and the health
+        checks hold resources of their own (the lag-aware check's HTTP thread
+        pool) that have to be released either way.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.close = AsyncMock()
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            with patch.object(
+                client._health_check_policy,
+                "close",
+                side_effect=RuntimeError("policy close timed out"),
+            ):
+                client.close()
+
+        mock_hc.close.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_close_keeps_closing_health_checks_after_one_fails(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        One health check failing to close must not strand the resources of the
+        others, which is what the async client gets from
+        gather(..., return_exceptions=True).
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        failing = MagicMock()
+        failing.close = AsyncMock(side_effect=RuntimeError("check close failed"))
+        surviving = MagicMock()
+        surviving.close = AsyncMock()
+        mock_multi_db_config.health_checks = [failing, surviving]
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            client = MultiDBClient(mock_multi_db_config)
+            client.close()
+
+        failing.close.assert_awaited_once()
+        surviving.close.assert_awaited_once()
 
     @pytest.mark.parametrize(
         "mock_multi_db_config,mock_db, mock_db1, mock_db2",

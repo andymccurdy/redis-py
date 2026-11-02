@@ -56,6 +56,7 @@ Before calling a claim confirmed, answer:
 - Does the regression test fail without the patch and pass with it?
 - Are stale build/`dist`, wrong virtualenv/imports, dependency drift (including hiredis presence/version), proxies, caches, runtime conditions, unavailable Docker/sandbox, authentication, quota, and Redis-server-version differences excluded?
 - Does an equivalent sync/async, RESP2/RESP3, `legacy_responses`, standalone/cluster/sentinel, or hiredis/pure-Python path differ?
+- When the patch changes a shared helper, does every caller's behavior change follow from the claimed fix, or only from where the change was placed?
 - Is behavior prohibited by a real contract (public API, documented Redis command semantics, error/exception type, wire protocol) or merely surprising?
 - For latency, timeout, buffering, backpressure, or cleanup, was observable time or state measured rather than inferred only from mocks?
 - For shared asynchronous state, do tests control completion order and prove that a stale failure or cleanup cannot affect the surviving operation?
@@ -123,7 +124,7 @@ Assess independently:
 
 1. **Need**: same-scope evidence demonstrates a concrete unmet user outcome or defect in supported behavior, and the closest supported capability cannot reasonably satisfy the scenario as-is. Do not inherit evidence from an adjacent variant (other stack, protocol, topology) or already-fixed scenario.
 2. **Correctness**: the fix covers the claim and meaningful boundaries, and preserves Redis command semantics and error/exception types.
-3. **Placement**: the invariant is enforced once at the owning layer (connection, pool, parser, callback, command mixin) instead of duplicating existing functionality, patching locally, or moving server- or application-owned policy into the client.
+3. **Placement**: the invariant is enforced once at the owning layer (connection, pool, parser, callback, command mixin) instead of duplicating existing functionality, patching locally, or moving server- or application-owned policy into the client. Behavior that only some callers need is attached to those callers, not pushed into a shared helper that other callers also go through; behavior that is correct for every caller stays at the owning helper, and the PR states and tests it for each affected caller.
 4. **Consistency**: equivalent sync/async, RESP2/RESP3, `legacy_responses`, standalone/cluster/sentinel, parser, and serialization paths stay aligned. Sync/async parity is a repository requirement, not optional polish.
 5. **Tests**: a regression test fails on base, passes on head, and asserts the non-happy-path value/state; protocol-sensitive changes run under both `--protocol 2` and `--protocol 3`. When shared state crosses an asynchronous boundary, tests control relevant completion orders and assert the surviving operation's behavior and final resource state.
 6. **Compatibility**: released public API (signatures, argument names, defaults, return types), error/exception types, wire-protocol handling, packaging extras, and connection/config behavior are preserved or intentionally migrated against the latest release.

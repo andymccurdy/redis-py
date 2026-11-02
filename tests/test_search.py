@@ -2416,6 +2416,35 @@ def collect_groups(client, res, alias, group_field="color"):
 
 
 class TestAggregations(SearchTestsBase):
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    def test_aggregation_zero_limit(self, client):
+        client.ft().create_index((TextField("title"),))
+        for i in range(3):
+            client.hset(f"doc:{i}", mapping={"title": "redis"})
+        self.waitForIndex(client, getattr(client.ft(), "index_name", "idx"))
+
+        res = client.ft().aggregate(aggregations.AggregateRequest("redis").limit(0, 0))
+
+        if expects_resp3_shape(client):
+            assert res["results"] == []
+            assert res["total_results"] == 3
+        else:
+            assert res.rows == []
+            expected_total = 3 if int(get_protocol_version(client)) == 3 else 0
+            assert res.total == expected_total
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.4")
+    def test_aggregation_invalid_zero_limit(self, client):
+        client.ft().create_index((TextField("title"),))
+        client.hset("doc:0", mapping={"title": "redis"})
+        self.waitForIndex(client, "idx")
+
+        with pytest.raises(ResponseError):
+            client.ft().aggregate(aggregations.AggregateRequest("redis").limit(5, 0))
+
     @pytest.fixture
     def collect_index(self, client):
         """Enable the preview feature and index the shared fruit documents.
@@ -3359,6 +3388,50 @@ class TestSearchWithJsonIndex(SearchTestsBase):
 class TestProfile(SearchTestsBase):
     @pytest.mark.redismod
     @pytest.mark.onlynoncluster
+    @pytest.mark.fixed_client
+    @skip_if_redis_enterprise()
+    @skip_if_server_version_lt("6.3.0")
+    @pytest.mark.parametrize(
+        "protocol,legacy_responses",
+        [(None, True), (None, False), (2, True), (2, False), (3, False)],
+    )
+    @pytest.mark.parametrize("limited", [False, True])
+    @pytest.mark.parametrize("with_scores", [False, True])
+    def test_profile_field_encodings(
+        self, request, stack_url, protocol, legacy_responses, limited, with_scores
+    ):
+        options = {"decode_responses": False, "legacy_responses": legacy_responses}
+        if protocol is not None:
+            options["protocol"] = protocol
+        client = _get_client(redis.Redis, request, from_url=stack_url, **options)
+        client.flushdb()
+        client.ft().create_index((TextField("title"),))
+        binary = b"\x00\x01\x82\xff"
+        client.hset(
+            "doc:1", mapping={"title": "hello", "vector": binary, "label": b"caf\xe9"}
+        )
+        self.waitForIndex(client, "idx")
+        query = (
+            Query("hello")
+            .return_field("vector", as_field="embedding", decode_field=False)
+            .return_field("label", encoding="latin-1")
+            .return_field("title")
+        )
+        if with_scores:
+            query.with_scores()
+
+        result, profile = client.ft().profile(query, limited=limited)
+
+        assert result.total == 1
+        assert result.docs[0].embedding == binary
+        assert result.docs[0].label == "café"
+        assert result.docs[0].title == "hello"
+        if with_scores:
+            assert isinstance(result.docs[0].score, float)
+        assert profile.info
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
     @skip_if_redis_enterprise()
     @skip_if_server_version_gte("7.9.0")
     @skip_if_server_version_lt("6.3.0")
@@ -3997,6 +4070,30 @@ class TestPipeline(SearchTestsBase):
                 == res[3]["results"][1]["extra_attributes"]
                 == {"txt": "foo bar"}
             )
+
+    @pytest.mark.redismod
+    def test_parsed_commands_return_the_pipeline(self, client):
+        p = client.ft().pipeline()
+        assert all(res is p for res in _queue_parsed_commands(p))
+        p = client.pipeline()
+        assert all(res is p for res in _queue_parsed_commands(p.ft()))
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_redis_enterprise()
+    def test_parsed_commands_execute_in_pipeline(self, client):
+        client.ft().create_index((TextField("txt"),))
+        client.hset("doc1", mapping={"txt": "foo bar"})
+        client.ft().synupdate("id1", False, "foo", "bar")
+        client.ft().sugadd("ac", Suggestion("hello"))
+        p = client.ft().pipeline()
+        p.info()
+        p.aggregate(aggregations.AggregateRequest("*"))
+        p.profile(Query("foo"))
+        p.spellcheck("fo")
+        p.syndump()
+        p.sugget("ac", "he")
+        assert len(p.execute()) == 6
 
     @pytest.mark.redismod
     @skip_if_redis_enterprise()
@@ -6091,36 +6188,79 @@ class TestHybridSearch(SearchTestsBase):
             timeout=10,
         )
 
-        expected_results = [
-            {
-                "description": b"red shoes",
-                "color": b"red",
-                "price": b"15",
-                "price_discount": b"13.5",
-            },
-            {
-                "description": b"red dress",
-                "color": b"red",
-                "price": b"17",
-                "price_discount": b"15.3",
-            },
-            {
-                "description": b"red shoes",
-                "color": b"red",
-                "price": b"16",
-                "price_discount": b"14.4",
-            },
-        ]
+        # The results fuse the tag match with a KNN ranking over random
+        # vectors, so their order is random; check each returned item instead.
+        expected_discounts = {
+            b"15": b"13.5",
+            b"16": b"14.4",
+            b"17": b"15.3",
+            b"18": b"16.2",
+        }
         if expects_resp2_shape(client) or expects_unified_shape(client):
             assert len(res.results) == 3
-            assert res.results == expected_results
             assert res.warnings == []
             assert res.execution_time > 0
+            assert any(item["color"] == b"red" for item in res.results)
+            for item in res.results:
+                assert item.keys() == {
+                    "description",
+                    "color",
+                    "price",
+                    "price_discount",
+                }
+                assert item["color"] == item["description"].split()[0]
+                assert item["price_discount"] == expected_discounts[item["price"]]
         elif expects_resp3_shape(client):
             assert len(res["results"]) == 3
-            assert res["results"] == expected_results
             assert res["warnings"] == []
             assert res["execution_time"] > 0
+            assert any(item["color"] == b"red" for item in res["results"])
+            for item in res["results"]:
+                assert item.keys() == {
+                    "description",
+                    "color",
+                    "price",
+                    "price_discount",
+                }
+                assert item["color"] == item["description"].split()[0]
+                assert item["price_discount"] == expected_discounts[item["price"]]
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.3.224")
+    def test_hybrid_search_query_with_zero_limit(self, client):
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client)
+
+        hybrid_query = HybridQuery(
+            HybridSearchQuery("@color:{red|green|orange|black}"),
+            HybridVsimQuery(
+                vector_field_name="@embedding",
+                vector_data="$vec",
+                vsim_search_method=VectorSearchMethods.KNN,
+                vsim_search_method_params={"K": 5},
+            ),
+        )
+        params = {"vec": np.array([1, 2, 7, 6], dtype=np.float32).tobytes()}
+
+        res = client.ft().hybrid_search(
+            query=hybrid_query,
+            post_processing=HybridPostProcessingConfig().limit(0, 0),
+            params_substitution=params,
+        )
+
+        if expects_resp3_shape(client):
+            assert res["results"] == []
+            assert res["total_results"] == 5
+        else:
+            assert res.results == []
+            assert res.total_results == 5
+
+        with pytest.raises(ResponseError):
+            client.ft().hybrid_search(
+                query=hybrid_query,
+                post_processing=HybridPostProcessingConfig().limit(5, 0),
+                params_substitution=params,
+            )
 
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")
@@ -6385,7 +6525,8 @@ class TestHybridSearch(SearchTestsBase):
             assert res["warnings"] == []
 
     @pytest.mark.redismod
-    @skip_if_server_version_lt("8.3.224")
+    @skip_if_server_version_lt("8.4")
+    @skip_if_server_version_gte("8.11")
     def test_hybrid_search_query_with_cursor(self, client):
         # Create index and add data
         self._create_hybrid_search_index(client)
@@ -6611,3 +6752,18 @@ class TestSearchResp3BytesKeys(SearchTestsBase):
         suggestions = res[b"impornant"]
         assert suggestions
         assert suggestions[0]["suggestion"] == b"important"
+
+
+def _queue_parsed_commands(ft):
+    """Queue the search commands whose replies are parsed by the client."""
+    return [
+        ft.info(),
+        ft.aggregate(aggregations.AggregateRequest("*")),
+        ft.profile(Query("foo")),
+        ft.spellcheck("foo"),
+        ft.config_get("TIMEOUT"),
+        ft.config_set("TIMEOUT", "100"),
+        ft.syndump(),
+        ft.sugget("ac", "he"),
+        ft.sugget("ac", "he", with_scores=True),
+    ]

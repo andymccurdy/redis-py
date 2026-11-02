@@ -1232,18 +1232,17 @@ class TestMaintNotificationsPoolHandler:
         )
 
         with (
-            patch("threading.Timer") as mock_timer,
+            patch.object(self.handler, "_schedule") as mock_schedule,
             patch("time.monotonic", return_value=1000),
         ):
             self.handler.handle_node_moving_notification(notification)
 
-            # Verify timer was started
-            mock_timer.assert_called_once_with(
+            # Verify the cleanup was scheduled
+            mock_schedule.assert_called_once_with(
                 notification.ttl,
                 self.handler.handle_node_moved_notification,
-                args=(notification,),
+                notification,
             )
-            mock_timer.return_value.start.assert_called_once()
 
             # Verify notification was added to processed set
             assert notification in self.handler._processed_notifications
@@ -1258,28 +1257,20 @@ class TestMaintNotificationsPoolHandler:
         )
 
         with (
-            patch("threading.Timer") as mock_timer,
+            patch.object(self.handler, "_schedule") as mock_schedule,
             patch("time.monotonic", return_value=1000),
         ):
             self.handler.handle_node_moving_notification(notification)
 
-            # Verify timer was started
-            mock_timer.assert_has_calls(
-                [
-                    call(
-                        notification.ttl / 2,
-                        self.handler.run_proactive_reconnect,
-                        args=(None,),
-                    ),
-                    call().start(),
-                    call(
-                        notification.ttl,
-                        self.handler.handle_node_moved_notification,
-                        args=(notification,),
-                    ),
-                    call().start(),
-                ]
-            )
+            # Verify the proactive reconnect and the cleanup were scheduled
+            assert mock_schedule.call_args_list == [
+                call(notification.ttl / 2, self.handler.run_proactive_reconnect, None),
+                call(
+                    notification.ttl,
+                    self.handler.handle_node_moved_notification,
+                    notification,
+                ),
+            ]
 
             # Verify notification was added to processed set
             assert notification in self.handler._processed_notifications

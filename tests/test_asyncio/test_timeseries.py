@@ -3,6 +3,7 @@ import time
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
+from redis.utils import SENTINEL
 from tests.conftest import (
     assert_resp_response,
     expected_response_shape,
@@ -83,6 +84,8 @@ async def test_alter(decoded_r: redis.Redis):
     assert_resp_response(
         decoded_r, 10, info.get("retention_msecs"), info.get("retentionTime")
     )
+    assert await decoded_r.ts().alter(KEY1, labels={})
+    assert {} == (await decoded_r.ts().info(KEY1))["labels"]
 
 
 @pytest.mark.redismod
@@ -1100,6 +1103,24 @@ async def test_info(decoded_r: redis.Redis):
 
 
 @pytest.mark.redismod
+@pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "protocol", [pytest.param(2, id="resp2"), pytest.param(SENTINEL, id="default")]
+)
+async def test_info_without_decode_responses(create_redis, stack_url, protocol):
+    kwargs = {"decode_responses": False, "url": stack_url}
+    if protocol is not SENTINEL:
+        kwargs["protocol"] = protocol
+    r = await create_redis(**kwargs)
+    await r.ts().create(KEY1, retention_msecs=5, labels={"currentLabel": "currentData"})
+    await r.ts().add(KEY1, 1, 1.5)
+    info = await r.ts().info(KEY1)
+    assert info.total_samples == 1
+    assert info.retention_msecs == 5
+    assert info.labels == {"currentLabel": "currentData"}
+
+
+@pytest.mark.redismod
 @skip_ifmodversion_lt("1.4.0", "timeseries")
 @skip_if_server_version_lt("7.9.0")
 async def test_info_duplicate_policy(decoded_r: redis.Redis):
@@ -1375,6 +1396,52 @@ async def test_decrby_with_insertion_filters(decoded_r: redis.Redis):
 
     data_points = await decoded_r.ts().range("time-series-1", "-", "+")
     assert_resp_response(decoded_r, data_points, [(1000, -11.1)], [[1000, -11.1]])
+
+
+@pytest.mark.redismod
+@skip_ifmodversion_lt("1.12.0", "timeseries")
+async def test_labels_with_insertion_filters_and_on_duplicate(decoded_r: redis.Redis):
+    ts = decoded_r.ts()
+    filters = {
+        "duplicate_policy": "last",
+        "ignore_max_time_diff": 5,
+        "ignore_max_val_diff": 10.0,
+    }
+    labels = {"sensor": "1"}
+
+    assert await ts.create("create", labels=labels, **filters)
+    assert labels == (await ts.info("create"))["labels"]
+    assert 1000 == await ts.add("create", 1000, 1.0)
+    assert 1000 == await ts.add("create", 1004, 3.0)
+
+    assert await ts.alter("create", labels={}, **filters)
+    assert {} == (await ts.info("create"))["labels"]
+    assert 1000 == await ts.add("create", 1003, 2.0)
+
+    assert 1000 == await ts.add("add", 1000, 1.0, labels=labels, **filters)
+    assert labels == (await ts.info("add"))["labels"]
+    assert 1000 == await ts.add("add", 1004, 3.0)
+
+    assert 1000 == await ts.add("add-dup", 1000, 1.0)
+    assert 1000 == await ts.add(
+        "add-dup", 1000, 2.0, labels=labels, on_duplicate="last"
+    )
+    assert {} == (await ts.info("add-dup"))["labels"]
+
+    assert 1000 == await ts.add(
+        "add-new", 1000, 1.0, labels=labels, on_duplicate="last"
+    )
+    assert labels == (await ts.info("add-new"))["labels"]
+
+    assert 1000 == await ts.incrby(
+        "incrby", 1.0, timestamp=1000, labels=labels, **filters
+    )
+    assert labels == (await ts.info("incrby"))["labels"]
+
+    assert 1000 == await ts.decrby(
+        "decrby", 1.0, timestamp=1000, labels=labels, **filters
+    )
+    assert labels == (await ts.info("decrby"))["labels"]
 
 
 @pytest.mark.redismod

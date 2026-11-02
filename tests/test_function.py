@@ -116,6 +116,21 @@ class TestFunction:
         resp3_res[node][0][b"library_code"] = code
         assert_resp_response(r, r.function_list(withcode=True), res, resp3_res)
 
+    @pytest.mark.onlynoncluster
+    def test_function_stats(self, r):
+        r.function_load(f"#!{engine} name={lib} \n {function}")
+        res = [
+            b"running_script",
+            None,
+            b"engines",
+            [b"LUA", [b"libraries_count", 1, b"functions_count", 1]],
+        ]
+        resp3_res = {
+            b"running_script": None,
+            b"engines": {b"LUA": {b"libraries_count": 1, b"functions_count": 1}},
+        }
+        assert_resp_response(r, r.function_stats(), res, resp3_res)
+
     def test_fcall(self, r):
         r.function_load(f"#!{engine} name={lib} \n {set_function}")
         r.function_load(f"#!{engine} name={lib2} \n {get_function}")

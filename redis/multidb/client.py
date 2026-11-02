@@ -54,6 +54,8 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
 
     def __init__(self, config: MultiDbConfig):
         self._databases = config.databases()
+        # Removed databases, kept so that close() still closes their clients
+        self._removed_databases: List[SyncDatabase] = []
         self._health_checks = (
             config.default_health_checks()
             if not config.health_checks
@@ -289,6 +291,9 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
         Removes a database from the database list.
         """
         weight = self._databases.remove(database)
+        # The client is left open for in-flight commands when the database
+        # was the active one, so it is closed with the others on close()
+        self._removed_databases.append(database)
         highest_weighted_db, highest_weight = self._databases.get_top_n(1)[0]
 
         if (
@@ -542,19 +547,51 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
         """
         Closes the client and all its resources.
         """
-        # Close health check policy BEFORE stopping the scheduler.
-        # The policy's connection pools were created on the shared health check
-        # event loop, so they must be disconnected on that same loop to avoid
-        # leaking sockets/file descriptors.
+        # Close health check policy and health checks BEFORE stopping the
+        # scheduler. The policy's connection pools were created on the shared
+        # health check event loop, so they must be disconnected on that same
+        # loop to avoid leaking sockets/file descriptors.
         if self._bg_scheduler:
+            # Each resource gets its own guard: a policy close that raises or
+            # times out must not skip the health checks, which hold resources of
+            # their own (the lag-aware check's HTTP thread pool).
             try:
                 self._bg_scheduler.run_coro_sync(self._health_check_policy.close)
             except Exception:
                 pass
+            try:
+                self._bg_scheduler.run_coro_sync(self._close_health_checks)
+            except Exception:
+                pass
             self._bg_scheduler.stop()
 
-        if self.command_executor.active_database:
-            self.command_executor.active_database.client.close()
+        # Close every database client: a failover leaves the previous active
+        # database's client open, so its in-flight commands can complete. A
+        # failing client must not leave the later ones open, so the first error
+        # is raised only after every client was closed.
+        error = None
+        databases = [database for database, _ in self._databases]
+        databases.extend(self._removed_databases)
+        # A removed database is only kept to be closed here
+        self._removed_databases.clear()
+        for database in databases:
+            try:
+                database.client.close()
+            except Exception as e:
+                if error is None:
+                    error = e
+        if error is not None:
+            raise error
+
+    async def _close_health_checks(self):
+        # Keep closing the remaining checks when one of them raises, the way the
+        # async client does with gather(..., return_exceptions=True): a single
+        # failing check must not strand the resources of the others.
+        for health_check in self._health_checks:
+            try:
+                await health_check.close()
+            except Exception:
+                pass
 
 
 def _half_open_circuit(circuit: CircuitBreaker):

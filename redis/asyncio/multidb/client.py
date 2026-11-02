@@ -42,6 +42,8 @@ class MultiDBClient(AsyncRedisModuleCommands, AsyncCoreCommands):
 
     def __init__(self, config: MultiDbConfig):
         self._databases = config.databases()
+        # Removed databases, kept so that close() still closes their clients
+        self._removed_databases: List[AsyncDatabase] = []
         self._health_checks = (
             config.default_health_checks()
             if not config.health_checks
@@ -101,12 +103,36 @@ class MultiDBClient(AsyncRedisModuleCommands, AsyncCoreCommands):
         for hc_task in self._hc_tasks:
             hc_task.cancel()
 
+        # Stop the scheduler: cancelling the tasks above does not stop the
+        # recurring timer, because run_recurring_async() returns right after
+        # scheduling. Without this, health checks keep being scheduled against
+        # the resources released below.
+        self._bg_scheduler.stop()
+
         # Close health check connection pools
         await self._health_check_policy.close()
 
-        # Close database client
-        if self.command_executor.active_database:
-            await self.command_executor.active_database.client.aclose()
+        # Release resources held by the health checks themselves
+        await asyncio.gather(
+            *(health_check.close() for health_check in self._health_checks),
+            return_exceptions=True,
+        )
+
+        # Close every database client: a failover leaves the previous active
+        # database's client open, so its in-flight commands can complete. A
+        # failing client must not leave the later ones open, so the first error
+        # is raised only after every client was closed.
+        databases = [database for database, _ in self._databases]
+        databases.extend(self._removed_databases)
+        # A removed database is only kept to be closed here
+        self._removed_databases.clear()
+        results = await asyncio.gather(
+            *(database.client.aclose() for database in databases),
+            return_exceptions=True,
+        )
+        error = next((r for r in results if isinstance(r, BaseException)), None)
+        if error is not None:
+            raise error
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         await self.aclose()
@@ -278,6 +304,9 @@ class MultiDBClient(AsyncRedisModuleCommands, AsyncCoreCommands):
         Removes a database from the database list.
         """
         weight = self._databases.remove(database)
+        # The client is left open for in-flight commands when the database
+        # was the active one, so it is closed with the others on close()
+        self._removed_databases.append(database)
         highest_weighted_db, highest_weight = self._databases.get_top_n(1)[0]
 
         if (

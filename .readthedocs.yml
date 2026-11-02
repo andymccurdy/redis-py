@@ -9,7 +9,7 @@ python:
 build:
   os: ubuntu-24.04
   tools:
-    python: "3.10"
+    python: "3.11"
 
 sphinx:
   configuration: docs/conf.py

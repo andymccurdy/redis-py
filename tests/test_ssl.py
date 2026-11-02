@@ -2,13 +2,14 @@ import datetime
 import os
 import socket
 import ssl
+import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 import redis
 from redis.backoff import NoBackoff
-from redis.exceptions import ConnectionError, RedisError
+from redis.exceptions import AuthorizationError, ConnectionError, RedisError
 from redis.retry import Retry
 
 from .conftest import (
@@ -225,21 +226,6 @@ class TestSSL:
                 with pytest.raises(ConnectionError) as e:
                     assert ocsp.is_valid()
                 assert "from the" in str(e.value)
-
-    @pytest.mark.fixed_client
-    @skip_if_nocryptography()
-    def test_unauthorized_then_direct(self):
-        from redis.ocsp import OCSPVerifier
-
-        # these certificates on the socket end return unauthorized
-        # then the second call succeeds
-        hostnames = ["wikipedia.org", "squarespace.com"]
-        for hostname in hostnames:
-            context = ssl.create_default_context()
-            with socket.create_connection((hostname, 443)) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as wrapped:
-                    ocsp = OCSPVerifier(wrapped, hostname, 443)
-                    assert ocsp.is_valid()
 
     @skip_if_nocryptography()
     def test_mock_ocsp_staple(self, request):
@@ -479,15 +465,27 @@ class TestOCSPCertificateBinding:
         ocsp_signing=False,
         rsa_key=False,
         rsa_padding=None,
+        expired=False,
+        aia=False,
     ):
         pytest.importorskip("cryptography")
 
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec, rsa
-        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+        from cryptography.x509.oid import (
+            AuthorityInformationAccessOID,
+            ExtendedKeyUsageOID,
+            NameOID,
+        )
 
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        if expired:
+            not_before = now - datetime.timedelta(days=400)
+            not_after = now - datetime.timedelta(days=30)
+        else:
+            not_before = now - datetime.timedelta(days=1)
+            not_after = now + datetime.timedelta(days=365)
         if rsa_key:
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         else:
@@ -502,8 +500,8 @@ class TestOCSPCertificateBinding:
             )
             .public_key(key.public_key())
             .serial_number(serial)
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=365))
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
         )
         if ca:
             builder = builder.add_extension(
@@ -512,6 +510,22 @@ class TestOCSPCertificateBinding:
         if ocsp_signing:
             builder = builder.add_extension(
                 x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]),
+                critical=False,
+            )
+        if aia:
+            builder = builder.add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            AuthorityInformationAccessOID.OCSP,
+                            x509.UniformResourceIdentifier("http://ocsp.test/"),
+                        ),
+                        x509.AccessDescription(
+                            AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier("http://ca.test/ca.der"),
+                        ),
+                    ]
+                ),
                 critical=False,
             )
         if rsa_padding is not None:
@@ -605,6 +619,30 @@ class TestOCSPCertificateBinding:
         )
 
         assert _check_certificate(ca, cert, response) is True
+
+    def test_check_certificate_rejects_expired_delegated_responder(self):
+        # A delegate is normally exempt from revocation checking, so once its
+        # certificate has expired its key must no longer be trusted.
+        from redis.ocsp import _check_certificate
+
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 111, signing_key=ca_key)
+        responder = self._make_certificate(
+            "Test OCSP", 5, signing_key=ca_key, ocsp_signing=True, expired=True
+        )
+        response = self._good_response(
+            ca,
+            ca_key,
+            cert,
+            now - datetime.timedelta(days=1),
+            now + datetime.timedelta(days=1),
+            responder=responder,
+        )
+
+        with pytest.raises(ConnectionError) as e:
+            _check_certificate(ca, cert, response)
+        assert "outside its validity period" in str(e.value)
 
     def test_check_certificate_accepts_rsa_pss_signed_certificate(self):
         # An RSA issuer may sign with RSASSA-PSS rather than PKCS1v15; the
@@ -715,3 +753,236 @@ class TestOCSPCertificateBinding:
             else:
                 os.environ["TZ"] = original_tz
             time.tzset()
+
+    @staticmethod
+    def _serve_tls(handshakes, sni=None):
+        """Accept one loopback TLS connection per (certificate, key, issuer,
+        staple) entry, in order, and return the listening port. A client that
+        sends a server name found in sni is given that entry instead."""
+        OpenSSL = pytest.importorskip("OpenSSL")
+
+        def context(cert, key, issuer, staple):
+            ctx = OpenSSL.SSL.Context(OpenSSL.SSL.TLS_SERVER_METHOD)
+            ctx.use_certificate(OpenSSL.crypto.X509.from_cryptography(cert))
+            ctx.use_privatekey(OpenSSL.crypto.PKey.from_cryptography_key(key))
+            ctx.add_extra_chain_cert(OpenSSL.crypto.X509.from_cryptography(issuer))
+            if staple is not None:
+                ctx.set_ocsp_server_callback(lambda *_, s=staple: s)
+            return ctx
+
+        sni_contexts = {name: context(*entry) for name, entry in (sni or {}).items()}
+
+        def select_context(con):
+            ctx = sni_contexts.get(con.get_servername())
+            if ctx is not None:
+                con.set_context(ctx)
+
+        listener = socket.create_server(("127.0.0.1", 0))
+
+        def serve():
+            accepted = []
+            with listener:
+                for entry in handshakes:
+                    raw, _ = listener.accept()
+                    accepted.append(raw)
+                    ctx = context(*entry)
+                    ctx.set_tlsext_servername_callback(select_context)
+                    con = OpenSSL.SSL.Connection(ctx, raw)
+                    con.set_accept_state()
+                    try:
+                        con.do_handshake()
+                    except OpenSSL.SSL.Error:
+                        pass
+            # Hold each socket until the client is done with it, so closing
+            # here does not race the probe's shutdown.
+            for raw in accepted:
+                raw.settimeout(5)
+                try:
+                    while raw.recv(4096):
+                        pass
+                except OSError:
+                    pass
+                raw.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return listener.getsockname()[1]
+
+    def _stapled_connection(self, port, ca, host="127.0.0.1"):
+        import OpenSSL
+        from cryptography.hazmat.primitives import serialization
+
+        return redis.SSLConnection(
+            host=host,
+            port=port,
+            ssl_ca_data=ca.public_bytes(serialization.Encoding.PEM).decode(),
+            ssl_check_hostname=False,
+            ssl_exclude_verify_flags=[ssl.VERIFY_X509_STRICT],
+            ssl_validate_ocsp_stapled=True,
+            ssl_ocsp_context=OpenSSL.SSL.Context(OpenSSL.SSL.TLS_CLIENT_METHOD),
+        )
+
+    def _stapled_handshake_material(self):
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, key = self._make_certificate("node", 111, signing_key=ca_key)
+        other, other_key = self._make_certificate("other", 999, signing_key=ca_key)
+        staples = {
+            serial: self._good_response(
+                ca,
+                ca_key,
+                target,
+                now - datetime.timedelta(days=1),
+                now + datetime.timedelta(days=1),
+            )
+            for serial, target in ((111, cert), (999, other))
+        }
+        return ca, (cert, key, staples[111]), (other, other_key, staples[999])
+
+    def test_stapled_ocsp_accepts_staple_for_connection_certificate(self):
+        pytest.importorskip("OpenSSL")
+        ca, (cert, key, staple), _ = self._stapled_handshake_material()
+        port = self._serve_tls([(cert, key, ca, None), (cert, key, ca, staple)])
+
+        sock = self._stapled_connection(port, ca)._connect()
+        sock.close()
+
+    def test_stapled_ocsp_rejects_staple_for_other_certificate(self):
+        # The staple is fetched over a second connection. A GOOD staple for
+        # whatever certificate that connection presents says nothing about the
+        # certificate on the socket being returned, which may be revoked.
+        pytest.importorskip("OpenSSL")
+        ca, (cert, key, _), (other, other_key, other_staple) = (
+            self._stapled_handshake_material()
+        )
+        port = self._serve_tls(
+            [(cert, key, ca, None), (other, other_key, ca, other_staple)]
+        )
+
+        with pytest.raises(ConnectionError) as e:
+            self._stapled_connection(port, ca)._connect()
+        assert "does not match" in str(e.value)
+
+    def test_stapled_ocsp_probe_sends_server_name(self):
+        # Behind SNI routing the default certificate differs from the one
+        # sslsock asked for by name; the probe must ask for the same one.
+        pytest.importorskip("OpenSSL")
+        ca, node, (other, other_key, other_staple) = self._stapled_handshake_material()
+        default = (other, other_key, ca, other_staple)
+        port = self._serve_tls(
+            [default, default], sni={b"localhost": (node[0], node[1], ca, node[2])}
+        )
+
+        sock = self._stapled_connection(port, ca, host="localhost")._connect()
+        sock.close()
+
+    def test_stapled_ocsp_rejects_forged_issuer_on_probe(self):
+        # The probe presents the right leaf, but with a self-made issuer that
+        # only copies the CA's name and signs a GOOD staple for it.
+        pytest.importorskip("OpenSSL")
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, (cert, key, _), _ = self._stapled_handshake_material()
+        fake_ca, fake_ca_key = self._make_certificate("Test CA", 1, ca=True)
+        forged_staple = self._good_response(
+            fake_ca,
+            fake_ca_key,
+            cert,
+            now - datetime.timedelta(days=1),
+            now + datetime.timedelta(days=1),
+        )
+        port = self._serve_tls(
+            [(cert, key, ca, None), (cert, key, fake_ca, forged_staple)]
+        )
+
+        with pytest.raises(ConnectionError) as e:
+            self._stapled_connection(port, ca)._connect()
+        assert "was not issued by" in str(e.value)
+
+    def test_unauthorized_ocsp_fails_closed(self, monkeypatch):
+        # An unsigned UNAUTHORIZED status must not let the check move on to a
+        # certificate fetched over a second handshake, GOOD as that one may be.
+        import base64
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.x509 import ocsp
+
+        import redis.ocsp
+
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 111, signing_key=ca_key, aia=True)
+        other, _ = self._make_certificate("other", 999, signing_key=ca_key, aia=True)
+        unauthorized = ocsp.OCSPResponseBuilder.build_unsuccessful(
+            ocsp.OCSPResponseStatus.UNAUTHORIZED
+        ).public_bytes(serialization.Encoding.DER)
+        queries = []
+
+        class Response:
+            ok = True
+
+            def __init__(self, content):
+                self.content = content
+
+        def get(url, headers=None):
+            if url == "http://ca.test/ca.der":
+                return Response(ca.public_bytes(serialization.Encoding.DER))
+            request = ocsp.load_der_ocsp_request(
+                base64.b64decode(unquote(urlparse(url).path.lstrip("/")))
+            )
+            queries.append(request.serial_number)
+            if len(queries) == 1:
+                return Response(unauthorized)
+            target = cert if request.serial_number == cert.serial_number else other
+            return Response(
+                self._good_response(
+                    ca,
+                    ca_key,
+                    target,
+                    now - datetime.timedelta(days=1),
+                    now + datetime.timedelta(days=1),
+                )
+            )
+
+        class Socket:
+            def getpeercert(self, binary_form=False):
+                return cert.public_bytes(serialization.Encoding.DER)
+
+        monkeypatch.setattr(redis.ocsp.requests, "get", get)
+        direct_fetches = []
+
+        def get_server_certificate(addr, ca_certs=None):
+            direct_fetches.append(addr)
+            return other.public_bytes(serialization.Encoding.PEM).decode()
+
+        monkeypatch.setattr(
+            redis.ocsp.ssl, "get_server_certificate", get_server_certificate
+        )
+        with pytest.raises(AuthorizationError):
+            redis.ocsp.OCSPVerifier(Socket(), "localhost", 6666).is_valid()
+        assert direct_fetches == []
+        assert queries == [cert.serial_number]
+
+    @pytest.mark.parametrize("server", ["http://ocsp.test", "http://ocsp.test/"])
+    def test_build_certificate_url_round_trips_request(self, server):
+        # The serial is the last field of the request, so whatever the keys,
+        # this one makes the base64 end in "Agh/////++++/w==", so it always
+        # contains "//" and "+".
+        import base64
+
+        from cryptography.x509 import ocsp
+
+        from redis.ocsp import OCSPVerifier
+
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 0x7FFFFFFFFBEFBEFF, signing_key=ca_key)
+
+        url = OCSPVerifier(None, "localhost", 6666).build_certificate_url(
+            server, cert, ca
+        )
+
+        assert url.startswith("http://ocsp.test/")
+        encoded = url.removeprefix("http://ocsp.test/")
+        assert "/" not in encoded and "+" not in encoded
+        request = unquote(encoded)
+        assert "//" in request and "+" in request
+        loaded = ocsp.load_der_ocsp_request(base64.b64decode(request))
+        assert loaded.serial_number == cert.serial_number

@@ -217,6 +217,14 @@ Core Commands
      - Flat function data becomes nested dictionaries.
      - ``[[b"library_name", b"lib", ...]]``
      - ``[{b"library_name": b"lib", b"functions": [...]}]``
+   * - ``FUNCTION STATS``
+     - Flat stats become nested dictionaries.
+     - ``[b"running_script", None, b"engines", [b"LUA", [...]]]``
+     - ``{b"running_script": None, b"engines": {b"LUA": {...}}}``
+   * - ``INCREX`` with ``BYFLOAT``
+     - The new value and the increment are floats.
+     - ``[b"1.75", b"0.25"]``
+     - ``[1.75, 0.25]``
    * - ``MEMORY STATS``
      - Structural keys are decoded and numeric values use native types.
      - ``{b"peak.allocated": b"1024"}``

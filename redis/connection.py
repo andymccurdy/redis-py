@@ -1,7 +1,9 @@
 import copy
 import functools
+import ipaddress
 import logging
 import os
+import secrets
 import socket
 import sys
 import threading
@@ -1333,8 +1335,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 # Use the passed function redis_connect_func
                 self.redis_connect_func(self)
-        except RedisError:
-            # clean up after any error in on_connect
+        except BaseException:
+            # clean up after any error in on_connect, which includes whatever a
+            # credential provider raises. A socket left in place reads as
+            # connected, so the next command would run without AUTH and SELECT.
             self.disconnect()
             raise
 
@@ -2067,7 +2071,8 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._conn = conn
         self.retry = self._conn.retry
         self.host = self._conn.host
-        self.port = self._conn.port
+        # A UnixDomainSocketConnection has no port
+        self.port = getattr(self._conn, "port", None)
         self.db = self._conn.db
         self._event_dispatcher = self._conn._event_dispatcher
         self.credential_provider = conn.credential_provider
@@ -2279,50 +2284,31 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                 self._conn.send_command(*args, **kwargs)
             return
 
-        # Creates cache key.
+        # Creates cache key. An invalidation names a key by the bytes it was sent as,
+        # which ``DefaultCache.delete_by_redis_keys`` matches to a ``str`` or ``bytes``
+        # key but never to a number, so a numeric key is indexed by its encoded form.
+        redis_keys = keys
+        for key in keys:
+            if isinstance(key, (int, float)):
+                encode = self._conn.encoder.encode
+                redis_keys = tuple(
+                    encode(k) if isinstance(k, (int, float)) else k for k in keys
+                )
+                break
         self._current_command_cache_key = CacheKey(
-            command=command, redis_keys=keys, redis_args=args
+            command=command, redis_keys=redis_keys, redis_args=args
         )
 
+        is_hit = False
         with self._cache_lock:
-            # We have to trigger invalidation processing in case if
-            # it was cached by another connection to avoid
-            # queueing invalidations in stale connections.
-            #
-            # Only an entry we might serve is drained. An IN_PROGRESS one is never served and
-            # is overwritten by our own placeholder below, so draining cannot change the
-            # result - while its ``connection_ref`` socket may hold the owner's reply pair,
-            # or another command's reply if the placeholder was stranded, and the drain
-            # (which returns non-push replies too) would consume either one.
-            entry = self._cache.get(self._current_command_cache_key)
-            if entry is not None and entry.status != CacheEntryStatus.IN_PROGRESS:
-                with self._pool_lock:
-                    self._drain_invalidations(entry.connection_ref)
-
-                # Re-check: the entry may have been invalidated during the drain, or filled
-                # in by the connection that was fetching it.
-                entry = self._cache.get(self._current_command_cache_key)
-
-            # Whether this read is served locally is decided here, once, and the value is
-            # carried to ``read_response`` - which must not re-derive it from cache state.
-            # Two things can happen to the entry between the two calls, and re-deriving
-            # desynchronises the connection under both:
-            #
-            # - another connection resolves this very entry object and flips it to VALID with
-            #   *its* reply, so a re-derived check would serve that value and never read the
-            #   reply we did send;
-            # - an invalidation removes it, so a re-derived check would find nothing and read
-            #   a reply for a command we never sent.
-            #
-            # An IN_PROGRESS entry is somebody else's fetch in flight and carries no value to
-            # serve, so it is not a hit: fall through and send. Returning without sending
-            # would leave ``read_response`` reading a reply that was never requested.
-            if entry is not None and entry.status != CacheEntryStatus.IN_PROGRESS:
-                cached_value = entry.cache_value
-                self._current_command_cache_key = None
-                is_hit = True
-            else:
-                is_hit = False
+            candidate = self._cache.get(self._current_command_cache_key)
+            if candidate is None or candidate.status == CacheEntryStatus.IN_PROGRESS:
+                # Commit to a miss even if another connection subsequently promotes
+                # the old placeholder, and never drain an IN_PROGRESS entry's owner:
+                # its socket may still hold the reply to its outstanding command, and
+                # the drain (which returns non-push replies too) would consume it.
+                # Setting the placeholder here keeps the miss on a single lock section.
+                candidate = None
                 # Set temporary entry value to prevent
                 # race condition from another connection.
                 self._cache.set(
@@ -2333,6 +2319,50 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                         connection_ref=self._conn,
                     )
                 )
+
+        if candidate is not None:
+            # Drain the connection that cached the entry so invalidations do not
+            # accumulate on idle connections. This must run outside our cache lock: the
+            # drain takes the pool lock, and invalidations call the owner's callback
+            # under its cache lock. Holding ours would order a cache lock before the
+            # pool lock and another after it, deadlocking connections draining each
+            # other or a pool.disconnect() holding the pool lock while waiting for ours.
+            with self._pool_lock:
+                self._drain_invalidations(candidate.connection_ref)
+
+            with self._cache_lock:
+                # Re-check: the drained entry may have been invalidated or replaced.
+                entry = self._cache.get(self._current_command_cache_key)
+
+                # A hit requires this very entry object to have been drained. A
+                # replacement filled during the drain may belong to another connection
+                # with pending invalidations and is not trusted, even if it is VALID by
+                # the time we check here.
+                #
+                # Whether this read is served locally is decided here, once, and the
+                # value is carried to ``read_response`` - which must not re-derive it
+                # from cache state. Two things can happen to the entry between the two
+                # calls, and re-deriving desynchronises the connection under both:
+                #
+                # - another connection resolves this very entry object and flips it to
+                #   VALID with *its* reply, so a re-derived check would serve that value
+                #   and never read the reply we did send;
+                # - an invalidation removes it, so a re-derived check would find nothing
+                #   and read a reply for a command we never sent.
+                if entry is candidate:
+                    cached_value = entry.cache_value
+                    self._current_command_cache_key = None
+                    is_hit = True
+                else:
+                    # Replace the lost candidate with our own placeholder.
+                    self._cache.set(
+                        CacheEntry(
+                            cache_key=self._current_command_cache_key,
+                            cache_value=self.DUMMY_CACHE_VALUE,
+                            status=CacheEntryStatus.IN_PROGRESS,
+                            connection_ref=self._conn,
+                        )
+                    )
 
         if is_hit:
             self._pending_cache_hit = _clone_cache_value(cached_value)
@@ -2975,7 +3005,9 @@ class SSLConnection(Connection):
                 "- not both."
             )
 
+        sock.settimeout(self.socket_connect_timeout)
         sslsock = context.wrap_socket(sock, server_hostname=self.host)
+        sslsock.settimeout(self.socket_timeout)
 
         # validation for the stapled case
         if self.ssl_validate_ocsp_stapled:
@@ -2997,10 +3029,27 @@ class SSLConnection(Connection):
 
             #  need another socket
             con = OpenSSL.SSL.Connection(staple_ctx, socket.socket())
+            # Send the same SNI as sslsock so the probe is given the same
+            # certificate. ssl sends none for an IP address, so neither do we.
+            try:
+                ipaddress.ip_address(self.host)
+            except ValueError:
+                con.set_tlsext_host_name(self.host.encode())
             con.request_ocsp()
             con.connect((self.host, self.port))
             con.do_handshake()
             con.shutdown()
+
+            # The staple was validated on a second connection, so it only
+            # vouches for sslsock if both presented the same certificate.
+            staple_cert = OpenSSL.crypto.dump_certificate(
+                OpenSSL.crypto.FILETYPE_ASN1, con.get_peer_certificate()
+            )
+            if staple_cert != sslsock.getpeercert(True):
+                sslsock.close()
+                raise ConnectionError(
+                    "ocsp stapled certificate does not match the connection certificate"
+                )
             return sslsock
 
         # pure ocsp validation
@@ -3101,6 +3150,8 @@ URL_QUERY_ARGUMENT_PARSERS = {
     "max_connections": int,
     "health_check_interval": int,
     "ssl_check_hostname": to_bool,
+    "ssl_validate_ocsp": to_bool,
+    "ssl_validate_ocsp_stapled": to_bool,
     "ssl_include_verify_flags": parse_ssl_verify_flags,
     "ssl_exclude_verify_flags": parse_ssl_verify_flags,
     "ssl_min_version": int,
@@ -3282,6 +3333,20 @@ class MaintNotificationsAbstractConnectionPool:
         else:
             self._maint_notifications_pool_handler = None
             self._oss_cluster_maint_notifications_handler = None
+
+    def _on_close(self) -> None:
+        """Hook invoked from the pool's ``close()`` before the pool is shut down."""
+        handler = getattr(self, "_maint_notifications_pool_handler", None)
+        if handler is not None:
+            handler.cancel_scheduled_tasks()
+
+    def _on_reset_after_fork(self) -> None:
+        """Hook invoked by ``reset()``; acts only in a forked child process."""
+        handler = getattr(self, "_maint_notifications_pool_handler", None)
+        # reset() also runs from __init__, where there is no pid yet
+        pid = getattr(self, "pid", None)
+        if handler is not None and pid is not None and pid != os.getpid():
+            handler.reset_after_fork()
 
     @property
     @abstractmethod
@@ -3943,8 +4008,6 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._lock = threading.RLock()
 
         # Generate unique pool ID for observability (matches go-redis behavior)
-        import secrets
-
         self._pool_id = secrets.token_hex(4)
 
         MaintNotificationsAbstractConnectionPool.__init__(
@@ -3999,10 +4062,20 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         return self.connection_kwargs.get("protocol", None)
 
     def reset(self) -> None:
+        is_fork = hasattr(self, "pid") and self.pid != os.getpid()
+        if is_fork:
+            # Inherited connections were counted by the parent, not this process.
+            self._pool_id = secrets.token_hex(4)
+            # A parent thread may have held the lock at fork time, and the
+            # handler reset below takes it to revert an active MOVING.
+            self._lock = threading.RLock()
+
         # Record metrics for connections being removed before clearing
         # (only if attributes exist - they won't during __init__)
-        if hasattr(self, "_available_connections") and hasattr(
-            self, "_in_use_connections"
+        if (
+            not is_fork
+            and hasattr(self, "_available_connections")
+            and hasattr(self, "_in_use_connections")
         ):
             with self._lock:
                 idle_count = len(self._available_connections)
@@ -4026,6 +4099,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._available_connections = []
         self._in_use_connections = set()
 
+        self._on_reset_after_fork()
+
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
         # can call _checkpid() which compares self.pid and os.getpid() without
@@ -4040,6 +4115,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def __del__(self) -> None:
         """Clean up connection pool and record metrics when garbage collected."""
         try:
+            if getattr(self, "pid", None) != os.getpid():
+                return
             if not hasattr(self, "_available_connections") or not hasattr(
                 self, "_in_use_connections"
             ):
@@ -4278,7 +4355,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                     # The connection was checked out by this process, so
                     # decrement USED, which was counted in get_connection().
                     # Connections inherited across a fork are skipped here,
-                    # their accounting is handled by reset()/__del__.
+                    # their accounting belongs to the parent process.
                     record_connection_count(
                         pool_name=get_pool_name(self),
                         connection_state=ConnectionState.USED,
@@ -4311,7 +4388,13 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
-        self.disconnect()
+        # A forked child must not touch the handler state inherited from the
+        # parent: reset it first (the lock may be held by a parent thread).
+        self._checkpid()
+        try:
+            self._on_close()
+        finally:
+            self.disconnect()
 
     def __enter__(self: _CP) -> _CP:
         return self
@@ -4327,19 +4410,32 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             conn.retry = retry
 
     def re_auth_callback(self, token: TokenInterface):
+        first_error = None
         with self._lock:
             for conn in self._available_connections:
-                conn.retry.call_with_retry(
-                    lambda: conn.send_command(
-                        "AUTH", token.try_get("oid"), token.get_value()
-                    ),
-                    lambda error: self._mock(error),
-                )
-                conn.retry.call_with_retry(
-                    lambda: conn.read_response(), lambda error: self._mock(error)
-                )
+                try:
+                    conn.retry.call_with_retry(
+                        lambda: conn.send_command(
+                            "AUTH", token.try_get("oid"), token.get_value()
+                        ),
+                        lambda error: self._mock(error),
+                    )
+                    conn.retry.call_with_retry(
+                        lambda: conn.read_response(),
+                        lambda error: self._mock(error),
+                        is_retryable=lambda error: not isinstance(
+                            error, AuthenticationError
+                        ),
+                    )
+                except AuthenticationError:
+                    raise
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
+        if first_error is not None:
+            raise first_error
 
     def _get_pool_lock(self):
         return self._lock
@@ -4385,18 +4481,18 @@ class BlockingConnectionPool(ConnectionPool):
     """
     Thread-safe blocking connection pool::
 
-        >>> from redis.client import Redis
+        >>> from redis import Redis, BlockingConnectionPool
         >>> client = Redis(connection_pool=BlockingConnectionPool())
 
     It performs the same function as the default
-    :py:class:`~redis.ConnectionPool` implementation, in that,
+    :py:class:`~redis.connection.ConnectionPool` implementation, in that,
     it maintains a pool of reusable connections that can be shared by
     multiple redis clients (safely across threads if required).
 
     The difference is that, in the event that a client tries to get a
     connection from the pool when all of connections are in use, rather than
-    raising a :py:class:`~redis.ConnectionError` (as the default
-    :py:class:`~redis.ConnectionPool` implementation does), it
+    raising a :py:class:`~redis.exceptions.MaxConnectionsError` (as the default
+    :py:class:`~redis.connection.ConnectionPool` implementation does), it
     makes the client wait ("blocks") for a specified number of seconds until
     a connection becomes available.
 
@@ -4434,6 +4530,19 @@ class BlockingConnectionPool(ConnectionPool):
         )
 
     def reset(self):
+        is_fork = hasattr(self, "pid") and self.pid != os.getpid()
+        if is_fork:
+            # Inherited connections were counted by the parent, not this process.
+            self._pool_id = secrets.token_hex(4)
+            # A parent thread may have held the lock at fork time, and the
+            # handler reset below takes it to revert an active MOVING.
+            self._lock = threading.RLock()
+            # The thread applying a MOVING in the parent does not exist here
+            # to clear these, and a stale flag makes a checkout nest on the
+            # lock and leak it.
+            self._in_maintenance = False
+            self._locked = False
+
         # Create and fill up a thread safe queue with ``None`` values.
         try:
             if self._in_maintenance:
@@ -4444,7 +4553,8 @@ class BlockingConnectionPool(ConnectionPool):
             # Note: Access pool.queue directly to avoid deadlock since we may
             # already hold self._lock (which is non-reentrant)
             if (
-                hasattr(self, "_connections")
+                not is_fork
+                and hasattr(self, "_connections")
                 and self._connections
                 and hasattr(self, "pool")
             ):
@@ -4485,6 +4595,8 @@ class BlockingConnectionPool(ConnectionPool):
                     pass
                 self._locked = False
 
+        self._on_reset_after_fork()
+
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
         # can call _checkpid() which compares self.pid and os.getpid() without
@@ -4499,6 +4611,8 @@ class BlockingConnectionPool(ConnectionPool):
     def __del__(self) -> None:
         """Clean up connection pool and record metrics when garbage collected."""
         try:
+            if getattr(self, "pid", None) != os.getpid():
+                return
             # Note: Access pool.queue directly to avoid potential deadlock
             # if GC runs while the lock is held by the same thread
             if (
@@ -4676,7 +4790,7 @@ class BlockingConnectionPool(ConnectionPool):
                 # rejects a connection checked out by this process, stop
                 # tracking it and decrement USED, which was counted in
                 # get_connection(). Connections inherited across a fork are
-                # skipped here, their accounting is handled by reset()/__del__.
+                # skipped here, their accounting belongs to the parent process.
                 if connection.pid == self.pid:
                     try:
                         self._connections.remove(connection)

@@ -6,6 +6,9 @@ import select
 import selectors
 import socket
 import ssl
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 import types
@@ -41,6 +44,7 @@ from redis.cache import (
 from redis.connection import (
     CacheProxyConnection,
     Connection,
+    ConnectionInterface,
     HiredisRespSerializer,
     SSLConnection,
     UnixDomainSocketConnection,
@@ -297,8 +301,33 @@ def test_hiredis_socket_can_read_handles_high_file_descriptor():
             os.close(high_read_fd)
 
 
+_FD_EXHAUSTION_SCRIPT = textwrap.dedent(
+    """
+    import os
+    import resource
+    import socket
+
+    from redis._parsers.hiredis import _socket_can_read
+
+    readable, writable = socket.socketpair()
+    empty_sock, peer = socket.socketpair()
+    writable.sendall(b"x")
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 256), hard))
+    try:
+        while True:
+            os.dup(0)
+    except OSError:
+        pass  # fd table is now full
+
+    assert _socket_can_read(readable, timeout=0) is True
+    assert _socket_can_read(empty_sock, timeout=0) is False
+    """
+)
+
+
 @pytest.mark.fixed_client
-@pytest.mark.forked
 @pytest.mark.skipif(
     not hasattr(select, "poll"), reason="select.poll not available on this platform"
 )
@@ -308,34 +337,27 @@ def test_hiredis_socket_can_read_under_fd_exhaustion():
     # allocate file descriptors themselves. A per-check epoll/kqueue selector
     # raises OSError (EMFILE) here; the poll() implementation passes.
     #
-    # RLIMIT_NOFILE is process-wide, so @pytest.mark.forked runs this in its own
-    # process to avoid starving other threads/tests of file descriptors.
-    resource = pytest.importorskip("resource")
+    # RLIMIT_NOFILE is process-wide, so the check runs in a child interpreter
+    # to avoid starving other threads/tests of file descriptors.
+    pytest.importorskip("resource")
 
-    readable, writable = socket.socketpair()
-    empty_sock, peer = socket.socketpair()
-    writable.sendall(b"x")
+    # Point the child at the redis package under test, not whatever else
+    # happens to be importable from its working directory.
+    env = dict(os.environ)
+    redis_root = os.path.dirname(os.path.dirname(redis.__file__))
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [redis_root, env.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _FD_EXHAUSTION_SCRIPT],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
 
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    held_fds = []
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 256), hard))
-        try:
-            while True:
-                held_fds.append(os.dup(0))
-        except OSError:
-            pass  # fd table is now full
-
-        assert _socket_can_read(readable, timeout=0) is True
-        assert _socket_can_read(empty_sock, timeout=0) is False
-    finally:
-        for fd in held_fds:
-            os.close(fd)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-        readable.close()
-        writable.close()
-        empty_sock.close()
-        peer.close()
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.fixed_client
@@ -1219,6 +1241,27 @@ def test_format_error_message(conn, error, expected_message):
 
 
 @pytest.mark.fixed_client
+def test_ssl_handshake_uses_socket_connect_timeout():
+    conn = SSLConnection(
+        socket_timeout=0.05, socket_connect_timeout=4, ssl_cert_reqs="none"
+    )
+    handshake_timeouts = []
+    ssl_sock = MagicMock()
+
+    def wrap_socket(context, sock, **kwargs):
+        handshake_timeouts.append(sock.gettimeout())
+        return ssl_sock
+
+    with socket.socket() as sock:
+        sock.settimeout(conn.socket_timeout)
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            assert conn._wrap_socket_with_ssl(sock) is ssl_sock
+
+    assert handshake_timeouts == [4]
+    ssl_sock.settimeout.assert_called_once_with(0.05)
+
+
+@pytest.mark.fixed_client
 def test_network_connection_failure():
     # Match only the stable part of the error message across OS
     exp_err = rf"Error {ECONNREFUSED} connecting to localhost:9999\."
@@ -1834,6 +1877,80 @@ class TestUnitCacheProxyConnection:
         another_conn.read_response.assert_called_once_with(
             push_request=True, timeout=0, disconnect_on_error=False
         )
+
+    @pytest.mark.skipif(
+        platform.python_implementation() == "PyPy",
+        reason="Pypy doesn't support side_effect",
+    )
+    def test_drain_of_another_connection_holds_no_cache_lock(
+        self, mock_cache, mock_connection
+    ):
+        """
+        The drain takes the pool lock, and an invalidation it reads runs the owner's
+        callback under the owner's cache lock. Holding this connection's cache lock across
+        it orders a cache lock before the pool lock, so two connections draining each other,
+        or a ``pool.disconnect()`` reaching this one, deadlock.
+        """
+        mock_connection.retry = "mock"
+        mock_connection.host = "mock"
+        mock_connection.port = "mock"
+        mock_connection.db = 0
+        mock_connection.credential_provider = UsernamePasswordCredentialProvider()
+        mock_connection._event_dispatcher = Mock(spec=EventDispatcher)
+
+        another_conn = copy.deepcopy(mock_connection)
+        another_conn.can_read.side_effect = [True, False]
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+        cache_entry = CacheEntry(
+            cache_key=cache_key,
+            cache_value=b"bar",
+            status=CacheEntryStatus.VALID,
+            connection_ref=another_conn,
+        )
+        mock_cache.is_cachable.return_value = True
+        mock_cache.get.return_value = cache_entry
+        mock_connection.can_read.return_value = False
+
+        pool_lock = threading.RLock()
+        proxy_connection = CacheProxyConnection(mock_connection, mock_cache, pool_lock)
+        acquired = []
+
+        def read_invalidation(**kwargs):
+            cache_lock_available = False
+            pool_lock_available = False
+
+            def probe_locks():
+                nonlocal cache_lock_available, pool_lock_available
+                # The sending thread must still hold the pool lock during this probe.
+                pool_lock_available = pool_lock.acquire(blocking=False)
+                if pool_lock_available:
+                    pool_lock.release()
+                cache_lock_available = proxy_connection._cache_lock.acquire(
+                    blocking=False
+                )
+                if cache_lock_available:
+                    proxy_connection._cache_lock.release()
+
+            other = threading.Thread(target=probe_locks)
+            other.start()
+            other.join(timeout=5)
+            assert not other.is_alive()
+            assert not pool_lock_available
+            acquired.append(cache_lock_available)
+            return None
+
+        another_conn.read_response.side_effect = read_invalidation
+
+        proxy_connection.send_command(*["GET", "foo"], **{"keys": ["foo"]})
+
+        another_conn.read_response.assert_called_once_with(
+            push_request=True, timeout=0, disconnect_on_error=False
+        )
+        assert acquired == [True]
+        mock_connection.send_command.assert_not_called()
+        assert proxy_connection.read_response() == b"bar"
 
     @pytest.mark.skipif(
         platform.python_implementation() == "PyPy",
@@ -2945,6 +3062,140 @@ class TestCacheEntryLifecycle:
     """
 
     # ---------------------------------------------------------------- the hit decision
+
+    @pytest.mark.parametrize("remove_entry", [False, True], ids=["queued", "removed"])
+    def test_an_entry_promoted_during_a_miss_is_not_a_hit(
+        self, proxy_factory, mock_connection, remove_entry
+    ):
+        """An initially IN_PROGRESS entry cannot become a hit without its own drain."""
+        proxy, cache = proxy_factory(TrackingMode.PLAIN)
+        owner_connection = Mock(
+            spec=ConnectionInterface,
+            retry="mock",
+            host="mock",
+            port=6379,
+            db=0,
+            credential_provider=UsernamePasswordCredentialProvider(),
+            _event_dispatcher=EventDispatcher(),
+        )
+        owner_connection.can_read.return_value = False
+        owner = CacheProxyConnection(owner_connection, cache, proxy._pool_lock)
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+
+        replies = iter([b"old", None])
+
+        def read_owner_reply(**kwargs):
+            reply = next(replies)
+            if reply is None:
+                owner._on_invalidation_callback(["invalidate", [b"foo"]])
+            return reply
+
+        owner_connection.read_response.side_effect = read_owner_reply
+        owner.send_command("GET", "foo", keys=["foo"])
+        candidate = cache.get(cache_key)
+        assert candidate.status is CacheEntryStatus.IN_PROGRESS
+        # The reply is followed by an invalidation queued on the owner's socket.
+        owner_connection.can_read.side_effect = [True, False]
+        mock_connection.read_response.return_value = b"new"
+
+        waiting = threading.Event()
+        resume = threading.Event()
+        errors = []
+        real_cache_set = cache.set
+
+        def send_command():
+            try:
+                proxy.send_command("GET", "foo", keys=["foo"])
+            except BaseException as error:
+                errors.append(error)
+
+        def set_cache_entry(entry):
+            # The miss path installs its placeholder right after classifying the
+            # entry as IN_PROGRESS. Stop between the two, while the original
+            # placeholder is still the one in the cache.
+            if (
+                entry.cache_key == cache_key
+                and entry.status is CacheEntryStatus.IN_PROGRESS
+                and entry.connection_ref is mock_connection
+            ):
+                waiting.set()
+                assert resume.wait(timeout=5)
+            return real_cache_set(entry)
+
+        with patch.object(cache, "set", side_effect=set_cache_entry):
+            sender = threading.Thread(target=send_command)
+            sender.start()
+            try:
+                assert waiting.wait(timeout=5)
+                # Promote the original entry before our miss replaces it.
+                assert owner.read_response() == b"old"
+                assert cache.get(cache_key) is candidate
+                assert candidate.status is CacheEntryStatus.VALID
+                if remove_entry:
+                    owner._process_pending_invalidations()
+                    assert cache.get(cache_key) is None
+            finally:
+                resume.set()
+                sender.join(timeout=5)
+
+            assert not sender.is_alive()
+            assert errors == []
+
+        # Promotion, with or without subsequent removal, cannot turn this
+        # already-decided miss into a hit.
+        assert proxy.read_response() == b"new"
+        mock_connection.send_command.assert_called_once_with("GET", "foo", keys=["foo"])
+        assert owner_connection.read_response.call_count == (2 if remove_entry else 1)
+
+    def test_an_entry_replaced_during_the_drain_is_not_a_hit(
+        self, proxy_factory, mock_connection
+    ):
+        """Draining one entry's owner does not make a replacement safe to serve."""
+        proxy, cache = proxy_factory(TrackingMode.PLAIN)
+        cache_key = CacheKey(
+            command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
+        )
+        owner = Mock()
+        owner.can_read.side_effect = [True, False]
+        candidate = CacheEntry(
+            cache_key=cache_key,
+            cache_value=b"old",
+            status=CacheEntryStatus.VALID,
+            connection_ref=owner,
+        )
+        replacement_owner = Mock()
+        replacement_owner.can_read.side_effect = [True, False]
+        replacement = CacheEntry(
+            cache_key=cache_key,
+            cache_value=b"replacement",
+            status=CacheEntryStatus.VALID,
+            connection_ref=replacement_owner,
+        )
+        cache.set(candidate)
+        mock_connection.read_response.return_value = b"new"
+
+        def replace_during_drain(**kwargs):
+            cache.delete_by_redis_keys([b"foo"])
+            cache.set(replacement)
+            return None
+
+        owner.read_response.side_effect = replace_during_drain
+
+        # A drained-only check would serve the replacement, although its owner's
+        # invalidations were never read. Equal hashes do not prove identity either.
+        with patch.object(CacheEntry, "__hash__", return_value=0):
+            assert candidate == replacement
+            assert candidate is not replacement
+            proxy.send_command("GET", "foo", keys=["foo"])
+
+        assert proxy.read_response() == b"new"
+        mock_connection.send_command.assert_called_once_with("GET", "foo", keys=["foo"])
+        owner.read_response.assert_called_once_with(
+            push_request=True, timeout=0, disconnect_on_error=False
+        )
+        replacement_owner.read_response.assert_not_called()
 
     def test_another_connection_filling_our_placeholder_does_not_skip_our_reply(
         self, proxy_factory, mock_connection
@@ -4194,6 +4445,32 @@ def _net(calls):
 
 
 @pytest.mark.fixed_client
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@patch("redis.connection.record_connection_count")
+def test_same_process_pool_reset_balances_connection_counts(mock_rec, pool_class):
+    pool = pool_class(connection_class=_DummyConnection, max_connections=2)
+    pool_name = get_pool_name(pool)
+    idle = pool.get_connection()
+    pool.get_connection()
+    pool.release(idle)
+    assert _net(_pool_metric_calls(mock_rec, pool_name)) == (1, 1)
+
+    pool.reset()
+    assert get_pool_name(pool) == pool_name
+    assert _net(_pool_metric_calls(mock_rec, pool_name)) == (0, 0)
+    pool.reset()
+    assert _net(_pool_metric_calls(mock_rec, pool_name)) == (0, 0)
+
+    connection = pool.get_connection()
+    pool.release(connection)
+    pool_ref = weakref.ref(pool)
+    del pool
+    gc.collect()
+    assert pool_ref() is None
+    assert _net(_pool_metric_calls(mock_rec, pool_name)) == (0, 0)
+
+
+@pytest.mark.fixed_client
 class TestConnectionPoolMetricCount:
     """Tests for db.client.connection.count UpDownCounter accuracy.
 
@@ -4246,14 +4523,8 @@ class TestConnectionPoolMetricCount:
         conn = pool.get_connection()
         pool.release(conn)
 
-        # Simulate destruction (what __del__ / reset does)
-        idle_count = len(pool._available_connections)
-        if idle_count:
-            mock_rec(
-                pool_name=pn,
-                connection_state=ConnectionState.IDLE,
-                counter=-idle_count,
-            )
+        # Destroy the pool's connections through the pool's own teardown path.
+        pool.reset()
 
         calls = _pool_metric_calls(mock_rec, pn)
         idle_net, used_net = _net(calls)
@@ -4263,8 +4534,8 @@ class TestConnectionPoolMetricCount:
     @patch("redis.connection.record_connection_count")
     def test_release_unowned_does_not_record(self, mock_rec):
         """release() of a connection the pool no longer owns (e.g. inherited by
-        a forked child) must not record connection.count. Fork-time accounting
-        is owned by reset()/__del__; recording here would double-count."""
+        a forked child) must not record connection.count. Accounting for inherited
+        connections belongs to the parent process."""
         pool = ConnectionPool(connection_class=_DummyConnection, max_connections=10)
 
         conn = pool.get_connection()
@@ -4322,8 +4593,8 @@ class TestBlockingConnectionPoolMetricCount:
 
     @patch("redis.connection.record_connection_count")
     def test_release_unowned_does_not_record(self, mock_rec):
-        """Unowned (inherited-across-fork) release must not record; fork-time
-        accounting is owned by reset()/__del__."""
+        """Unowned (inherited-across-fork) release must not record; accounting
+        for inherited connections belongs to the parent process."""
         pool = self._pool()
         mock_rec.reset_mock()
 

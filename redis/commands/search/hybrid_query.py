@@ -1,15 +1,9 @@
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
-
-from redis.utils import experimental
-
-try:
-    from typing import Self  # Py 3.11+
-except ImportError:
-    from typing_extensions import Self
+from typing import Any, Dict, List, Optional, Self, Union
 
 from redis.commands.search.aggregation import Limit, Reducer
 from redis.commands.search.query import Filter, SortbyField
+from redis.utils import experimental
 
 
 @experimental
@@ -357,6 +351,11 @@ class HybridPostProcessingConfig:
     def limit(self, offset: int, num: int) -> Self:
         """
         Add limit parameters to the query.
+
+        If `num` is 0, `offset` must also be 0; `LIMIT 0 0` omits result
+        rows. Do not use it as a counting API. To count search matches, use
+        `Query(...).paging(0, 0)` with `FT.SEARCH`. To count inside an
+        aggregation, use `group_by([], reducers.count())`.
         """
         self._limit = Limit(offset, num)
         return self
@@ -403,6 +402,9 @@ class HybridCursorQuery:
     def __init__(self, count: int = 0, max_idle: int = 0) -> None:
         """
         Create a new hybrid cursor query object.
+
+        ``WITHCURSOR`` for ``FT.HYBRID`` is exposed only by Redis versions
+        8.4 to 8.10. Newer servers reject it as an unknown argument.
 
         Args:
             count: Number of results to return per cursor iteration.

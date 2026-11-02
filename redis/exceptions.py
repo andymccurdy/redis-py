@@ -302,6 +302,16 @@ class MaxConnectionsError(ConnectionError):
     pass
 
 
+class MaxClientsReachedError(ConnectionError):
+    """
+    Raised when the server refuses a new connection because it has reached its
+    ``maxclients`` limit ("max number of clients reached").
+    This indicates server-side capacity exhaustion rather than a node failure.
+    """
+
+    pass
+
+
 class CrossSlotTransactionError(RedisClusterException):
     """
     Raised when a transaction or watch is triggered in a pipeline

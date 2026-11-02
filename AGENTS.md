@@ -102,9 +102,9 @@ RESP3 is now the default on the wire. Two knobs interact:
 
 ## Python and dependency notes
 
-- `requires-python = ">=3.10"`; `pyproject.toml` lists the supported versions.
+- `requires-python = ">=3.11"`; `pyproject.toml` lists the supported versions.
 - Optional extras: `hiredis`, `xxhash`, `ocsp`, `jwt`, `circuit_breaker`, `otel`.
-- Ruff is the only formatter/linter (`target-version = "py310"`, `line-length = 88`). `tests/*` has relaxed naming rules; module command packages (`bf`, `timeseries`, `json`, `search`) opt out of pep8 naming.
+- Ruff is the only formatter/linter (`target-version = "py311"`, `line-length = 88`). `tests/*` has relaxed naming rules; module command packages (`bf`, `timeseries`, `json`, `search`) opt out of pep8 naming.
 - `whitelist.py` is the vulture allowlist — extend it instead of silencing vulture inline.
 
 ---

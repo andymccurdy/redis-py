@@ -27,6 +27,7 @@ from ..exceptions import (
     ExternalAuthProviderError,
     InvalidResponse,
     MasterDownError,
+    MaxClientsReachedError,
     ModuleError,
     MovedError,
     NoPermissionError,
@@ -114,7 +115,7 @@ logger = logging.getLogger(__name__)
 class BaseParser(ABC):
     EXCEPTION_CLASSES = {
         "ERR": {
-            "max number of clients reached": ConnectionError,
+            "max number of clients reached": MaxClientsReachedError,
             "invalid password": AuthenticationError,
             # some Redis server versions report invalid command syntax
             # in lowercase

@@ -101,6 +101,11 @@ def parse_vsim_result(response, **options):
     withscores = bool(options.get(CallbacksOptions.WITHSCORES.value))
     withattribs = bool(options.get(CallbacksOptions.WITHATTRIBS.value))
 
+    # Redis replies to a missing key with an empty array, also with RESP3,
+    # where the elements with scores or attributes are otherwise in a map
+    if not response and (withscores or withattribs):
+        return {}
+
     # Exactly one of withscores or withattribs is True
     if (withscores and not withattribs) or (not withscores and withattribs):
         # Redis will return a list of list of pairs.

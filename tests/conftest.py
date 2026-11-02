@@ -510,6 +510,39 @@ def cluster_teardown(client, flushdb):
     client.disconnect_connection_pools()
 
 
+def patch_monotonic(module: str, value: float):
+    """
+    Freeze ``time.monotonic`` as :module: sees it, without patching the
+    ``time`` module that every other thread and library also uses.
+    """
+    frozen_time = Mock(wraps=time)
+    frozen_time.monotonic.return_value = value
+    return mock.patch(f"{module}.time", frozen_time)
+
+
+@pytest.fixture()
+def no_topology_refresh_interval():
+    """
+    Let every error-triggered cluster topology refresh run at once, for tests
+    of the refresh logic itself rather than of its minimum interval.
+    """
+    with mock.patch("redis.cluster._TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS", 0):
+        yield
+
+
+@pytest.fixture()
+def no_cluster_retry_delay():
+    """
+    Skip the backoff sleep between cluster retries, for tests that count
+    retries rather than time them.
+    """
+    # The async clients inherit it from the same class
+    with mock.patch.object(
+        redis.cluster.AbstractRedisCluster, "_retry_backoff_delay", return_value=0
+    ):
+        yield
+
+
 @pytest.fixture()
 def r(request):
     with _get_client(redis.Redis, request) as client:

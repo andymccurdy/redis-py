@@ -16,6 +16,8 @@ from redis.asyncio.connection import (
 )
 from unittest.mock import AsyncMock, MagicMock
 
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.observability.metrics import CloseReason
 from redis.auth.token import TokenInterface
 from tests.conftest import skip_if_redis_enterprise, skip_if_server_version_lt
@@ -198,6 +200,45 @@ class TestConnectionPool:
             await pool.get_connection()
             with pytest.raises(redis.ConnectionError):
                 await pool.get_connection()
+
+    @pytest.mark.fixed_client
+    async def test_failed_re_auth_does_not_stop_the_other_connections(self):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            failing.send_command.side_effect = redis.ConnectionError("broken")
+            other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            in_use = mock.Mock(spec=Connection)
+            pool._available_connections.extend([failing, other])
+            pool._in_use_connections.add(in_use)
+            token = mock.Mock()
+            token.try_get.return_value = "oid"
+            token.get_value.return_value = "value"
+
+            with pytest.raises(redis.ConnectionError, match="broken"):
+                await pool.re_auth_callback(token)
+
+            other.send_command.assert_awaited_once_with("AUTH", "oid", "value")
+            in_use.set_re_auth_token.assert_called_once_with(token)
+
+    @pytest.mark.fixed_client
+    async def test_re_auth_stops_at_authentication_error(self):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 3))
+            failing.read_response.side_effect = redis.AuthenticationError("expired")
+            other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            in_use = mock.Mock(spec=Connection)
+            pool._available_connections.extend([failing, other])
+            pool._in_use_connections.add(in_use)
+            token = mock.Mock()
+            token.try_get.return_value = "oid"
+            token.get_value.return_value = "value"
+
+            with pytest.raises(redis.AuthenticationError, match="expired"):
+                await pool.re_auth_callback(token)
+
+            failing.read_response.assert_awaited_once()
+            other.send_command.assert_not_awaited()
+            in_use.set_re_auth_token.assert_not_called()
 
     async def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0]}
@@ -521,6 +562,77 @@ class TestBlockingConnectionPool:
             await pool.release(c1)
             c2 = await pool.get_connection()
             assert c1 == c2
+
+    @pytest.mark.fixed_client
+    async def test_checkout_waits_for_idle_re_auth(self):
+        async with self.get_pool(max_connections=1) as pool:
+            connection = await pool.get_connection()
+            await pool.release(connection)
+            auth_started = asyncio.Event()
+            finish_auth = asyncio.Event()
+            checkout_started = asyncio.Event()
+
+            async def read_auth_response():
+                auth_started.set()
+                await finish_auth.wait()
+                return b"OK"
+
+            async def checkout():
+                checkout_started.set()
+                return await pool.get_connection()
+
+            connection.retry = Retry(NoBackoff(), 0)
+            connection.send_command = AsyncMock()
+            connection.read_response = AsyncMock(side_effect=read_auth_response)
+            token = mock.Mock()
+            token.try_get.return_value = "default"
+            token.get_value.return_value = "token"
+
+            refresh = asyncio.create_task(pool.re_auth_callback(token))
+            await auth_started.wait()
+            acquire = asyncio.create_task(checkout())
+            try:
+                await checkout_started.wait()
+                assert not acquire.done()
+                assert pool._available_connections == [connection]
+                assert not pool._in_use_connections
+            finally:
+                finish_auth.set()
+                await asyncio.gather(refresh, acquire)
+
+            assert acquire.result() is connection
+            connection.send_command.assert_awaited_once_with("AUTH", "default", "token")
+            await pool.release(connection)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_checkout_interrupted_while_pool_locked(self, cancel):
+        async with self.get_pool(max_connections=1, timeout=0.01) as pool:
+            connection = await pool.get_connection()
+            await pool.release(connection)
+            checkout_started = asyncio.Event()
+
+            async def checkout():
+                checkout_started.set()
+                return await pool.get_connection()
+
+            async with pool._lock:
+                acquire = asyncio.create_task(checkout())
+                await checkout_started.wait()
+                if cancel:
+                    acquire.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await acquire
+                else:
+                    with pytest.raises(
+                        redis.ConnectionError, match="No connection available"
+                    ):
+                        await acquire
+                assert pool._available_connections == [connection]
+                assert not pool._in_use_connections
+
+            assert await pool.get_connection() is connection
+            await pool.release(connection)
 
     @pytest.mark.fixed_client
     def test_repr_contains_db_info_tcp(self):

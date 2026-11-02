@@ -86,7 +86,7 @@ class AsyncMaintNotificationsPoolHandler:
         self.config = config
         self._processed_notifications: set[MaintenanceNotification] = set()
         self._scheduled_tasks: set[asyncio.Task[None]] = set()
-        # The handoffs whose relaxation the scheduled cleanup is still to end
+        # The handoffs whose scheduled cleanup has not finished yet
         self._pending_handoffs: set[NodeMovingNotification] = set()
         self._lock = asyncio.Lock()
         self.connection: Any | None = None
@@ -187,8 +187,7 @@ class AsyncMaintNotificationsPoolHandler:
                     self.handle_node_moved_notification,
                     notification,
                 )
-                if self.config.is_relaxed_timeouts_enabled():
-                    self._pending_handoffs.add(notification)
+                self._pending_handoffs.add(notification)
             except BaseException:
                 # The relaxation reported above was not applied, or has no
                 # cleanup to end it: close its pair
@@ -240,36 +239,48 @@ class AsyncMaintNotificationsPoolHandler:
 
     async def handle_node_moved_notification(
         self, notification: NodeMovingNotification
-    ) -> None:
+    ) -> bool:
         """
         Handle the cleanup after a node moving notification expires.
+
+        Returns whether the cleanup reverted the connection kwargs; it does not
+        when a newer MOVING notification has superseded this one.
         """
+        async with self._lock:
+            return await self._revert_node_moved_notification(notification)
+
+    async def _revert_node_moved_notification(
+        self, notification: NodeMovingNotification
+    ) -> bool:
+        # Runs under self._lock
         notification_hash = hash(notification)
 
-        async with self._lock:
-            self._pending_handoffs.discard(notification)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"Reverting temporary changes related to notification: {notification}, "
-                    f"with connection: {self.connection}, connected to ip "
-                    f"{self.connection.get_resolved_ip() if self.connection else None}"
-                )
-            reset_relaxed_timeout = self.config.is_relaxed_timeouts_enabled()
-            reset_host_address = self.config.proactive_reconnect
-
-            # Cleanup has to reset future connection kwargs and existing
-            # matching connections together under the pool lock. Splitting it
-            # lets an acquire/release interleave and leaves stale MOVING state.
-            reverted = await self.pool.cleanup_moving_notification(
-                notification_hash=notification_hash,
-                reset_relaxed_timeout=reset_relaxed_timeout,
-                reset_host_address=reset_host_address,
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Reverting temporary changes related to notification: {notification}, "
+                f"with connection: {self.connection}, connected to ip "
+                f"{self.connection.get_resolved_ip() if self.connection else None}"
             )
+        reset_relaxed_timeout = self.config.is_relaxed_timeouts_enabled()
+        reset_host_address = self.config.proactive_reconnect
 
-            # A newer MOVING notification has superseded this one when the
-            # kwargs were not reverted: the pool stays relaxed until it expires.
-            if reverted:
-                self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+        # Cleanup has to reset future connection kwargs and existing
+        # matching connections together under the pool lock. Splitting it
+        # lets an acquire/release interleave and leaves stale MOVING state.
+        reverted = await self.pool.cleanup_moving_notification(
+            notification_hash=notification_hash,
+            reset_relaxed_timeout=reset_relaxed_timeout,
+            reset_host_address=reset_host_address,
+        )
+
+        # Discarded once the cleanup is done, so one cancelled halfway is
+        # still run by cancel_scheduled_tasks(), and before the listeners run
+        self._pending_handoffs.discard(notification)
+        # A newer MOVING notification has superseded this one when the
+        # kwargs were not reverted: the pool stays relaxed until it expires.
+        if reverted:
+            self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+        return reverted
 
     def _schedule(
         self,
@@ -302,18 +313,33 @@ class AsyncMaintNotificationsPoolHandler:
         await callback(*args)
 
     async def cancel_scheduled_tasks(self) -> None:
-        if not self._scheduled_tasks:
-            return
-        # The pool is closing, which ends the relaxation the cancelled cleanups
-        # would have ended: report it so their start events are paired
-        pending_handoffs = tuple(self._pending_handoffs)
-        self._pending_handoffs.clear()
-        tasks = tuple(self._scheduled_tasks)
-        for task in tasks:
-            task.cancel()
+        # Taken under the lock so a MOVING still being handled finishes, and
+        # schedules its cleanup, before the snapshot. The cleanups take the
+        # lock themselves, so they are awaited after it is released.
+        async with self._lock:
+            # A cancelled aclose() can leave handoffs whose tasks are already
+            # gone: a retry still has to run their cleanups
+            if not self._scheduled_tasks and not self._pending_handoffs:
+                return
+            pending_handoffs = tuple(self._pending_handoffs)
+            tasks = tuple(self._scheduled_tasks)
+            for task in tasks:
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # The pool can be reused after aclose(): run the cancelled MOVING
+        # cleanups now so the temporary host and relaxed timeouts do not stay
+        # in its connection kwargs, and forget the handoffs so the server can
+        # redeliver a still-active MOVING to the reused pool.
         for notification in pending_handoffs:
-            self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+            async with self._lock:
+                # A concurrent aclose() may have run this cleanup already
+                if notification not in self._pending_handoffs:
+                    continue
+                reverted = await self._revert_node_moved_notification(notification)
+            if not reverted:
+                # Closing ends the relaxation of a superseded handoff too
+                self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+            self._processed_notifications.discard(notification)
 
 
 class AsyncMaintNotificationsConnectionHandler:

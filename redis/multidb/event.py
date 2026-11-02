@@ -61,19 +61,36 @@ class ResubscribeOnActiveDatabaseChanged(EventListenerInterface):
 
 class CloseConnectionOnActiveDatabaseChanged(EventListenerInterface):
     """
-    Close connection to the old active database.
+    Drop the free connections to the old active database and mark the in-use
+    ones for reconnect, so they are not torn down mid-command.
     """
 
     def listen(self, event: ActiveDatabaseChanged):
-        event.old_database.client.close()
+        client = event.old_database.client
 
-        if isinstance(event.old_database.client, Redis):
-            event.old_database.client.connection_pool.update_active_connections_for_reconnect()
-            event.old_database.client.connection_pool.disconnect()
+        if isinstance(client, Redis):
+            self._free_pool_connections(client.connection_pool)
         else:
-            for node in event.old_database.client.nodes_manager.nodes_cache.values():
-                node.redis_connection.connection_pool.update_active_connections_for_reconnect()
-                node.redis_connection.connection_pool.disconnect()
+            # Snapshot the nodes: a topology refresh on another thread can
+            # change the cache while this loop runs.
+            for node in list(client.nodes_manager.nodes_cache.values()):
+                self._free_pool_connections(node.redis_connection.connection_pool)
+
+    @staticmethod
+    def _free_pool_connections(pool) -> None:
+        # Mark and disconnect under one lock, so a connection acquired meanwhile
+        # is either marked for reconnect or disconnected while still free. The
+        # maintenance flag makes BlockingConnectionPool honour that lock too.
+        set_in_maintenance = getattr(pool, "set_in_maintenance", None)
+        with pool._get_pool_lock():
+            if set_in_maintenance is not None:
+                set_in_maintenance(True)
+            try:
+                pool.update_active_connections_for_reconnect()
+                pool.disconnect_free_connections()
+            finally:
+                if set_in_maintenance is not None:
+                    set_in_maintenance(False)
 
 
 class RegisterCommandFailure(EventListenerInterface):

@@ -261,21 +261,6 @@ class TestRedisClientRetry:
                 finally:
                     assert parse_response.call_count == retries + 1
 
-    @pytest.mark.onlycluster
-    def test_get_set_retry_object_for_cluster_client(self, request):
-        retry = Retry(NoBackoff(), 2)
-        r = _get_client(Redis, request, retry_on_timeout=True, retry=retry)
-        exist_conn = r.connection_pool.get_connection()
-        assert r.retry._retries == retry._retries
-        assert isinstance(r.retry._backoff, NoBackoff)
-        new_retry_policy = Retry(ExponentialBackoff(), 3)
-        r.set_retry(new_retry_policy)
-        assert r.retry._retries == new_retry_policy._retries
-        assert isinstance(r.retry._backoff, ExponentialBackoff)
-        assert exist_conn.retry._retries == new_retry_policy._retries
-        new_conn = r.connection_pool.get_connection()
-        assert new_conn.retry._retries == new_retry_policy._retries
-
     @pytest.mark.onlynoncluster
     def test_get_set_retry_object(self, request):
         retry = Retry(NoBackoff(), 2)

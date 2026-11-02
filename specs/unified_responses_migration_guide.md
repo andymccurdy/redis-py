@@ -87,6 +87,8 @@ the parser does not otherwise normalize structural keys or values.
 | Geo | `GEOPOS` | Coordinate tuples | Coordinate lists |
 | Geo | `GEOSEARCH`, `GEORADIUS`, `GEORADIUSBYMEMBER` with coordinates | Tuple coordinates | Tuple coordinates, matching the approved unified shape |
 | Functions | `FUNCTION LIST` | Flat sublists | Nested dictionaries |
+| Functions | `FUNCTION STATS` | Flat lists | Nested dictionaries |
+| Strings | `INCREX` with `BYFLOAT` | Value and increment as bytes | Value and increment as floats |
 | Memory | `MEMORY STATS` | Raw string-like values | Structural keys decoded; numeric values native |
 | JSON | `JSON.NUMINCRBY`, `JSON.NUMMULTBY` | Legacy scalar path | JSONPath-compatible array behavior |
 | JSON | `JSON.RESP` | Float values can be string leaves | Float leaves become Python floats |

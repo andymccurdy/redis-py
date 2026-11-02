@@ -13,6 +13,10 @@ from redis.exceptions import (
 )
 from redis.utils import SENTINEL
 
+DEMOTED_MASTER_UNBLOCKED_ERROR = (
+    "UNBLOCKED force unblock from blocking operation, instance state changed"
+)
+
 
 class MasterNotFoundError(ConnectionError):
     pass
@@ -87,6 +91,18 @@ class SentinelManagedConnection(Connection):
                 # to has been demoted to a slave and there's a new master.
                 # calling disconnect will force the connection to re-query
                 # sentinel during the next connect() attempt.
+                self.disconnect()
+                raise ConnectionError("The previous master is now a slave")
+            raise
+        except ResponseError as e:
+            if self.connection_pool.is_master and str(e).startswith(
+                DEMOTED_MASTER_UNBLOCKED_ERROR
+            ):
+                # A master that turns into a replica unblocks every client
+                # waiting on a blocking command (BLPOP, BRPOP, XREAD...) with
+                # this error and closes the connection, as when Sentinel runs
+                # a coordinated failover. Same meaning as the ReadOnlyError
+                # above: re-query Sentinel on the next connect() attempt.
                 self.disconnect()
                 raise ConnectionError("The previous master is now a slave")
             raise

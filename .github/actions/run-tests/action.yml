@@ -39,6 +39,15 @@ inputs:
       single matrix cell per combination instead of a job of their own.
     required: false
     default: 'false'
+  junit-suite-names:
+    description: |
+      When 'true', name the testsuite of each JUnit report after the suite that
+      produced it (fixed_client, standalone or cluster) instead of pytest's
+      default "pytest". Test metrics reporting uses the suite name to tell
+      apart tests that run in more than one suite, so this is meant for the
+      metrics job only.
+    required: false
+    default: 'false'
   run-multidb-integration:
     description: |
       When 'true', also run the MultiDBClient (active-active) integration tests
@@ -187,6 +196,18 @@ runs:
       run: |
         set -e
 
+        # Runs a suite's command, naming the testsuite of its JUnit report
+        # after the suite when junit-suite-names is enabled.
+        with_suite_name() {
+          local suite=$1
+          shift
+          if [ "${{inputs.junit-suite-names}}" == "true" ]; then
+            PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-o junit_suite_name=${suite}" "$@"
+          else
+            "$@"
+          fi
+        }
+
         run_tests() {
           local test_config=$1
           local eventloop=""
@@ -210,7 +231,7 @@ runs:
           if [ "$test_config" == "fixed-clients" ]; then
             echo "::group::Fixed client tests"
             echo "Running fixed client tests - in those tests client instance and configuration is fixed and not changed by pytest configuration"
-            invoke fixed-client-tests $eventloop || rc=1
+            with_suite_name fixed_client invoke fixed-client-tests $eventloop || rc=1
             echo "::endgroup::"
           else
             IFS='-' read -r protocol_label response_shape_label test_type extra <<< "$test_config"
@@ -254,11 +275,11 @@ runs:
             for test_type in $topologies; do
               if [ "$test_type" == "standalone" ]; then
                 echo "::group::${protocol_group} standalone tests (${response_group})"
-                invoke standalone-tests --redis-mod-url=${REDIS_MOD_URL} $eventloop ${protocol_arg} ${legacy_arg} || rc=1
+                with_suite_name standalone invoke standalone-tests --redis-mod-url=${REDIS_MOD_URL} $eventloop ${protocol_arg} ${legacy_arg} || rc=1
                 echo "::endgroup::"
               elif [ "$test_type" == "cluster" ]; then
                 echo "::group::${protocol_group} cluster tests (${response_group})"
-                invoke cluster-tests $eventloop ${protocol_arg} ${legacy_arg} || rc=1
+                with_suite_name cluster invoke cluster-tests $eventloop ${protocol_arg} ${legacy_arg} || rc=1
                 echo "::endgroup::"
               else
                 echo "Unknown test type: ${test_type}"
@@ -331,11 +352,32 @@ runs:
     - name: Debug
       if: failure()
       run: |
+        echo "::group::Docker containers"
+        docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+        echo "::endgroup::"
+
+        for container in $(docker ps -a --format '{{.Names}}'); do
+          echo "::group::Container ${container}"
+          docker inspect -f 'status={{.State.Status}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} finished_at={{.State.FinishedAt}}' "${container}"
+          docker logs --tail 200 "${container}" 2>&1
+          echo "::endgroup::"
+        done
+
+        # Each server logs to dockers/<service>/node-*/redis.log through the
+        # /redis/work bind mount; a crash report ("REDIS BUG REPORT") lands at the end.
+        for log in $(sudo find dockers -name redis.log | sort); do
+          echo "::group::${log}"
+          sudo tail -n 500 "${log}"
+          echo "::endgroup::"
+        done
+
+        echo "::group::Kernel OOM killer"
+        sudo dmesg | grep -iE 'out of memory|oom-kill|killed process' || echo "No OOM kills found"
+        echo "::endgroup::"
+
         sudo apt-get install -y redis-tools
-        echo "Docker Containers:"
-        docker ps
         echo "Cluster nodes:"
-        redis-cli -p 16379 CLUSTER NODES
+        redis-cli -p 16379 CLUSTER NODES || true
       shell: bash
 
     - name: Upload test results and profiling data

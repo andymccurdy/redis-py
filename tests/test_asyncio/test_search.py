@@ -2650,6 +2650,22 @@ class TestPipeline(AsyncSearchTestsBase):
 
     @pytest.mark.redismod
     @skip_if_redis_enterprise()
+    async def test_search_in_explicit_multi_matches_transaction(
+        self, decoded_r: redis.Redis
+    ):
+        await decoded_r.ft().create_index((TextField("txt"),))
+        await decoded_r.hset("doc1", mapping={"txt": "foo bar"})
+        p = await decoded_r.ft().pipeline()
+        await p.search(Query("foo bar"))
+        expected = await p.execute()
+        p = await decoded_r.ft().pipeline(transaction=False)
+        p.multi()
+        await p.search(Query("foo bar"))
+        res = await p.execute()
+        assert _search_docs(res[0]) == _search_docs(expected[0])
+
+    @pytest.mark.redismod
+    @skip_if_redis_enterprise()
     @skip_if_server_version_lt("8.9.0")
     async def test_aliaslist_in_pipeline(self, decoded_r: redis.Redis):
         index = decoded_r.ft("aliaslistpipeidx")
@@ -4397,6 +4413,15 @@ class TestHybridSearch(AsyncSearchTestsBase):
             assert len(vsim_res_from_cursor.rows) == 5
         elif expects_resp3_shape(decoded_r):
             assert len(vsim_res_from_cursor[0]["results"]) == 5
+
+
+def _search_docs(res):
+    """Search result documents, comparable across the response shapes."""
+    if isinstance(res, Result):
+        return [vars(doc) for doc in res.docs]
+    if isinstance(res, dict):
+        return res["results"]
+    return res
 
 
 def _contains_bytes(value):

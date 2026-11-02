@@ -4068,6 +4068,30 @@ class TestPipeline(SearchTestsBase):
 
     @pytest.mark.redismod
     @skip_if_redis_enterprise()
+    def test_search_in_explicit_multi_matches_transaction(self, client):
+        client.ft().create_index((TextField("txt"),))
+        client.hset("doc1", mapping={"txt": "foo bar"})
+        with client.ft().pipeline() as p:
+            p.search(Query("foo bar"))
+            expected = p.execute()
+        with client.ft().pipeline(transaction=False) as p:
+            p.multi()
+            p.search(Query("foo bar"))
+            res = p.execute()
+        assert _search_docs(res[0]) == _search_docs(expected[0])
+
+    @pytest.mark.redismod
+    @skip_if_redis_enterprise()
+    def test_search_through_pipeline_ft_is_decoded(self, client):
+        client.ft().create_index((TextField("txt"),))
+        client.hset("doc1", mapping={"txt": "foo bar"})
+        with client.pipeline() as p:
+            p.ft().search(Query("foo bar"))
+            res = p.execute()
+        assert not _contains_bytes(res[0])
+
+    @pytest.mark.redismod
+    @skip_if_redis_enterprise()
     @skip_if_server_version_lt("8.9.0")
     def test_aliaslist_in_pipeline(self, client):
         index = client.ft("aliaslistpipeidx")
@@ -6686,6 +6710,28 @@ class TestSearchResp3BytesKeys(SearchTestsBase):
         suggestions = res[b"impornant"]
         assert suggestions
         assert suggestions[0]["suggestion"] == b"important"
+
+
+def _search_docs(res):
+    """Search result documents, comparable across the response shapes."""
+    if isinstance(res, Result):
+        return [vars(doc) for doc in res.docs]
+    if isinstance(res, dict):
+        return res["results"]
+    return res
+
+
+def _contains_bytes(value):
+    """Whether a parsed reply still holds undecoded bytes anywhere."""
+    if isinstance(value, bytes):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_bytes(k) or _contains_bytes(v) for k, v in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_bytes(v) for v in value)
+    if hasattr(value, "__dict__"):
+        return _contains_bytes(vars(value))
+    return False
 
 
 def _queue_parsed_commands(ft):

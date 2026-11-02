@@ -66,7 +66,13 @@ from redis.asyncio.observability.recorder import (
 from redis.asyncio.retry import Retry, _to_async_retry
 from redis.auth.token import TokenInterface
 from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
-from redis.client import EMPTY_RESPONSE, NEVER_DECODE, AbstractRedis
+from redis.client import (
+    EMPTY_RESPONSE,
+    NEVER_DECODE,
+    AbstractRedis,
+    _decode_transaction_replies,
+    _transaction_never_decode,
+)
 from redis.cluster import (
     _REPLICAS_ONLY_STRATEGIES,
     PIPELINE_BLOCKED_COMMANDS,
@@ -4430,8 +4436,17 @@ class TransactionStrategy(AbstractStrategy):
 
         response = None
         # parse the EXEC.
+        never_decode = _transaction_never_decode(
+            redis_node.connection_kwargs,
+            ((c.args, c.kwargs) for c in self._command_queue),
+        )
         try:
-            response = await redis_node.parse_response(connection, "EXEC")
+            if never_decode:
+                response = await redis_node.parse_response(
+                    connection, "EXEC", **{NEVER_DECODE: []}
+                )
+            else:
+                response = await redis_node.parse_response(connection, "EXEC")
         except ExecAbortError:
             if errors:
                 raise errors[0]
@@ -4456,6 +4471,13 @@ class TransactionStrategy(AbstractStrategy):
                 " Command stack was {} but response had length {}".format(
                     [c.args[0] for c in self._command_queue], len(response)
                 )
+            )
+
+        if never_decode:
+            response = _decode_transaction_replies(
+                redis_node.get_encoder(),
+                response,
+                [(c.args, c.kwargs) for c in self._command_queue],
             )
 
         # find any errors in the response and raise if necessary

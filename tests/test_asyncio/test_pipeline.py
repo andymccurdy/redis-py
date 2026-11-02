@@ -497,6 +497,32 @@ class TestPipeline:
             assert pipe == pipe2
             assert response == [True, [0, 0, 15, 15, 14], b"1"]
 
+    @pytest.mark.parametrize("transaction", [True, False])
+    async def test_pipeline_never_decode_with_decode_responses(
+        self, decoded_r, transaction
+    ):
+        # https://github.com/redis/redis-py/issues/1884
+        await decoded_r.set("{k}str", "value")
+        await decoded_r.rpush("{k}list", "a", "b")
+        await decoded_r.hset("{k}hash", mapping={"f": "v"})
+        async with decoded_r.pipeline(transaction=transaction) as pipe:
+            pipe.dump("{k}str")
+            pipe.get("{k}str")
+            pipe.lrange("{k}list", 0, -1)
+            pipe.hmget("{k}hash", ["f", "missing"])
+            pipe.lpush("{k}str", "x")
+            dumped, value, items, fields, error = await pipe.execute(
+                raise_on_error=False
+            )
+
+        assert isinstance(dumped, bytes)
+        assert value == "value"
+        assert items == ["a", "b"]
+        assert fields == ["v", None]
+        assert isinstance(error, redis.ResponseError)
+        assert await decoded_r.restore("{k}copy", 0, dumped)
+        assert await decoded_r.get("{k}copy") == "value"
+
     async def test_pipeline_get(self, r):
         await r.set("a", "a1")
         async with r.pipeline() as pipe:

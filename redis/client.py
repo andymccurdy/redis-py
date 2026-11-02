@@ -111,6 +111,55 @@ EMPTY_RESPONSE = "EMPTY_RESPONSE"
 NEVER_DECODE = "NEVER_DECODE"
 
 
+def _decode_nested(encoder, value):
+    """Decode every bytes value in a parsed reply, as the parser would have."""
+    if isinstance(value, (bytes, memoryview)):
+        return encoder.decode(value)
+    if isinstance(value, list):
+        return [_decode_nested(encoder, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _decode_nested(encoder, k): _decode_nested(encoder, v)
+            for k, v in value.items()
+        }
+    return value
+
+
+# Transactional pipelines have always returned FT.SEARCH and FT.HYBRID replies
+# decoded, so their NEVER_DECODE option is not applied inside MULTI/EXEC.
+_TRANSACTION_DECODED_COMMANDS = frozenset(("FT.SEARCH", "FT.HYBRID"))
+
+
+def _keeps_raw_reply(args, options) -> bool:
+    return NEVER_DECODE in options and args[0] not in _TRANSACTION_DECODED_COMMANDS
+
+
+def _transaction_never_decode(connection_kwargs, commands) -> bool:
+    """
+    Whether the EXEC reply must be read without decoding.
+
+    EXEC returns the replies of all queued commands as one array, so the
+    per-command ``NEVER_DECODE`` option cannot be applied while parsing it.
+    When a queued command needs raw bytes, EXEC is read undecoded and the
+    other replies are decoded afterwards with ``_decode_transaction_replies``.
+    ``commands`` yields ``(args, options)`` pairs. They are only scanned when
+    the client decodes responses.
+    """
+    return bool(connection_kwargs.get("decode_responses", False)) and any(
+        _keeps_raw_reply(args, options) for args, options in commands
+    )
+
+
+def _decode_transaction_replies(encoder, response, commands):
+    """Decode the EXEC replies of the commands that do not keep raw replies."""
+    return [
+        r
+        if isinstance(r, Exception) or _keeps_raw_reply(args, options)
+        else _decode_nested(encoder, r)
+        for r, (args, options) in zip(response, commands)
+    ]
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -2117,8 +2166,12 @@ class Pipeline(Redis):
                     errors.append((i, e))
 
         # parse the EXEC.
+        never_decode = _transaction_never_decode(self.get_connection_kwargs(), commands)
         try:
-            response = self.parse_response(connection, "_")
+            if never_decode:
+                response = self.parse_response(connection, "_", **{NEVER_DECODE: []})
+            else:
+                response = self.parse_response(connection, "_")
         except ExecAbortError:
             if errors:
                 raise errors[0][1]
@@ -2138,6 +2191,11 @@ class Pipeline(Redis):
             self.connection.disconnect()
             raise ResponseError(
                 "Wrong number of response items from pipeline execution"
+            )
+
+        if never_decode:
+            response = _decode_transaction_replies(
+                self.get_encoder(), response, commands
             )
 
         # find any errors in the response and raise if necessary

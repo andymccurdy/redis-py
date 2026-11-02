@@ -82,6 +82,7 @@ from redis.exceptions import (
     ResponseError,
     SlotNotCoveredError,
     TimeoutError,
+    TryAgainError,
 )
 from redis.himport import HIMPORT_SET
 from redis.observability import recorder
@@ -1096,6 +1097,63 @@ class TestRedisClusterObjMocked:
                 rc.get("bar")
             # retry counts retries, so the first attempt is one more.
             assert execute_command.failed_calls == rc.retry.get_retries() + 1
+
+    @pytest.mark.parametrize(
+        "pool_kwargs",
+        [
+            {"connection_pool_class": ConnectionPool},
+            {"connection_pool_class": BlockingConnectionPool, "timeout": 0.01},
+        ],
+        ids=["ConnectionPool", "BlockingConnectionPool"],
+    )
+    def test_failed_retry_checkout_keeps_previous_connection_released(
+        self, pool_kwargs
+    ):
+        """
+        A retry whose connection checkout fails must not release the previous
+        attempt's connection again: that attempt already released it, and by
+        then another caller may have checked it out. A second release would
+        hand that caller's connection to the next one as well.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            max_connections=1,
+            retry=Retry(NoBackoff(), 0),
+            **pool_kwargs,
+        )
+        pool = rc.get_node_from_key("foo").redis_connection.connection_pool
+        checkout = pool.get_connection
+        checkouts = []
+        held_by_other_caller = []
+
+        def get_connection():
+            checkouts.append(None)
+            if len(checkouts) == 2:
+                # The retry: another caller gets the connection the first
+                # attempt released, which leaves the pool empty.
+                held_by_other_caller.append(checkout())
+            return checkout()
+
+        with (
+            patch.object(Connection, "connect"),
+            patch.object(Connection, "can_read", return_value=False),
+            patch.object(Connection, "send_command"),
+            patch.object(
+                Redis,
+                "parse_response",
+                side_effect=TryAgainError("Multiple keys request during rehashing"),
+            ),
+            patch.object(pool, "get_connection", side_effect=get_connection),
+        ):
+            with pytest.raises(ConnectionError):
+                rc.get("foo")
+            assert len(held_by_other_caller) == 1
+
+            # The other caller still holds the pool's only connection, so the
+            # next checkout must not get it too
+            with pytest.raises(ConnectionError):
+                checkout()
 
     def test_empty_startup_nodes(self):
         """

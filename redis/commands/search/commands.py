@@ -1501,6 +1501,30 @@ class SearchCommands:
 
         return AggregateResult(rows, cursor, schema)
 
+    def _mk_profile_args(
+        self,
+        query: Union[Query, AggregateRequest],
+        limited: bool = False,
+        query_params: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
+    ):
+        """Build the shared arguments for synchronous and asynchronous profiling."""
+        cmd = [PROFILE_CMD, self.index_name, ""]
+        if limited:
+            cmd.append("LIMITED")
+        cmd.append("QUERY")
+
+        if isinstance(query, AggregateRequest):
+            cmd[2] = "AGGREGATE"
+            cmd += query.build_args()
+        elif isinstance(query, Query):
+            cmd[2] = "SEARCH"
+            cmd += query.get_args()
+            cmd += self.get_params_args(query_params)
+        else:
+            raise ValueError("Must provide AggregateRequest object or Query object.")
+
+        return cmd
+
     def profile(
         self,
         query: Union[Query, AggregateRequest],
@@ -1525,20 +1549,7 @@ class SearchCommands:
 
         """
         st = time.monotonic()
-        cmd = [PROFILE_CMD, self.index_name, ""]
-        if limited:
-            cmd.append("LIMITED")
-        cmd.append("QUERY")
-
-        if isinstance(query, AggregateRequest):
-            cmd[2] = "AGGREGATE"
-            cmd += query.build_args()
-        elif isinstance(query, Query):
-            cmd[2] = "SEARCH"
-            cmd += query.get_args()
-            cmd += self.get_params_args(query_params)
-        else:
-            raise ValueError("Must provide AggregateRequest object or Query object.")
+        cmd = self._mk_profile_args(query, limited, query_params)
 
         options = {}
         if isinstance(self, Pipeline):
@@ -1868,7 +1879,16 @@ class SearchCommands:
 
 class AsyncSearchCommands(SearchCommands):
     def syndump(self):
-        """Dump synonym groups; await direct calls, queue pipeline calls immediately."""
+        """
+        Dumps the contents of a synonym group.
+
+        The command is used to dump the synonyms data structure.
+        Returns a list of synonym terms and their synonym group ids.
+
+        For more information see `FT.SYNDUMP <https://redis.io/commands/ft.syndump>`_.
+
+        Await direct calls; pipeline calls queue immediately.
+        """  # noqa
         if isinstance(self.client, _PIPELINE_TYPES):
             return super().syndump()
         return self._syndump()
@@ -1924,20 +1944,7 @@ class AsyncSearchCommands(SearchCommands):
     ]:
         """Execute and parse a direct asynchronous profile command."""
         st = time.monotonic()
-        cmd = [PROFILE_CMD, self.index_name, ""]
-        if limited:
-            cmd.append("LIMITED")
-        cmd.append("QUERY")
-
-        if isinstance(query, AggregateRequest):
-            cmd[2] = "AGGREGATE"
-            cmd += query.build_args()
-        elif isinstance(query, Query):
-            cmd[2] = "SEARCH"
-            cmd += query.get_args()
-            cmd += self.get_params_args(query_params)
-        else:
-            raise ValueError("Must provide AggregateRequest object or Query object.")
+        cmd = self._mk_profile_args(query, limited, query_params)
 
         res = await self.execute_command(*cmd)
 

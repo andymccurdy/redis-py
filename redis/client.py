@@ -166,7 +166,7 @@ class CaseInsensitiveDict(dict):
     def copy(self) -> "CaseInsensitiveDict":
         # Keys are already upper-cased; bypass __init__/__setitem__ so the
         # copy does not re-run ``str.upper`` on every entry.
-        new = CaseInsensitiveDict.__new__(CaseInsensitiveDict)
+        new = type(self).__new__(type(self))
         dict.update(new, self)
         return new
 

@@ -1,9 +1,10 @@
 """Tests for the cached default response-callback table.
 
-``Redis.__init__`` and ``redis.asyncio.Redis.__init__`` get their callback table
-from ``default_response_callbacks``, which copies a canonical
-``CaseInsensitiveDict`` memoized once per ``(protocol, legacy_responses)``
-combination by ``_cached_default_response_callbacks``.
+``Redis.__init__`` gets its callback table from ``default_response_callbacks``,
+which copies a canonical ``CaseInsensitiveDict`` memoized once per
+``(protocol, legacy_responses)`` combination by
+``_cached_default_response_callbacks``. The async client is covered in
+``tests/test_asyncio/test_response_callbacks_cache.py``.
 
 These tests are offline: clients are constructed with no Redis server
 (``single_connection_client`` is left at its default ``False`` so no connection
@@ -13,7 +14,6 @@ is opened) and are closed in ``finally``.
 import pytest
 
 import redis
-import redis.asyncio
 from redis._parsers.helpers import get_response_callbacks
 from redis.client import (
     CaseInsensitiveDict,
@@ -162,6 +162,20 @@ def test_copy_returns_caseinsensitivedict_and_is_independent():
     assert len(canonical) == canonical_len_before
 
 
+@pytest.mark.fixed_client
+def test_copy_preserves_subclass():
+    class _SubDict(CaseInsensitiveDict):
+        pass
+
+    source = _SubDict({"get": "callback"})
+
+    copied = source.copy()
+
+    assert type(copied) is _SubDict
+    assert copied == source
+    assert copied["get"] == "callback"
+
+
 # Invariant 4b: the wrapper always hands out a fresh copy, never the canonical.
 @pytest.mark.fixed_client
 @pytest.mark.parametrize("legacy_responses", _LEGACY_VARIANTS)
@@ -189,34 +203,8 @@ def test_default_response_callbacks_returns_fresh_copy(protocol, legacy_response
     assert len(canonical) == canonical_len_before
 
 
-# Invariant 5: sync vs async parity. Both client stacks produce equal contents
-# (value-by-identity) for the same combo, across the full matrix.
-@pytest.mark.fixed_client
-@pytest.mark.parametrize("legacy_responses", _LEGACY_VARIANTS)
-@pytest.mark.parametrize("protocol", _PROTOCOL_VARIANTS)
-async def test_sync_async_parity(protocol, legacy_responses):
-    sync_client = redis.Redis(**_make_client_kwargs(protocol, legacy_responses))
-    async_client = redis.asyncio.Redis(
-        **_make_client_kwargs(protocol, legacy_responses)
-    )
-    try:
-        sync_rc = sync_client.response_callbacks
-        async_rc = async_client.response_callbacks
-
-        assert isinstance(async_rc, CaseInsensitiveDict)
-        assert set(sync_rc.keys()) == set(async_rc.keys())
-        for command, callback in sync_rc.items():
-            assert async_rc[command] is callback, (
-                f"sync/async callback mismatch for {command!r} "
-                f"(protocol={protocol!r}, legacy_responses={legacy_responses!r})"
-            )
-    finally:
-        sync_client.close()
-        await async_client.aclose()
-
-
-# Invariant 6: two same-combo clients share equal-but-not-identical dicts (the
-# whole point of the per-instance ``copy()``), for both sync and async stacks.
+# Invariant 5: two same-combo clients share equal-but-not-identical dicts (the
+# whole point of the per-instance ``copy()``).
 @pytest.mark.fixed_client
 def test_same_combo_sync_clients_equal_not_identical():
     c1 = redis.Redis(protocol=3, legacy_responses=False)
@@ -227,15 +215,3 @@ def test_same_combo_sync_clients_equal_not_identical():
     finally:
         c1.close()
         c2.close()
-
-
-@pytest.mark.fixed_client
-async def test_same_combo_async_clients_equal_not_identical():
-    c1 = redis.asyncio.Redis(protocol=3, legacy_responses=False)
-    c2 = redis.asyncio.Redis(protocol=3, legacy_responses=False)
-    try:
-        assert c1.response_callbacks == c2.response_callbacks
-        assert c1.response_callbacks is not c2.response_callbacks
-    finally:
-        await c1.aclose()
-        await c2.aclose()

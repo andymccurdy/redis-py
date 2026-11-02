@@ -38,6 +38,31 @@ If no ``retry`` is provided, a default one is created with  :class:`~.Exponentia
 and 3 retries.
 
 
+Opt-in retryability checker
+***************************
+
+A :class:`~.Retry` object accepts an optional ``is_retryable`` callable. When it
+is set, an error is retried only if its type is one of the ``supported_errors``
+AND the callable returns ``True`` for it. The default (``None``) leaves the
+retry behavior unchanged.
+
+:func:`redis.retry.is_retryable_connect_error` is a ready-made checker that
+returns ``False`` for definitively unrecoverable connection errors - currently
+a missing Unix socket path (``ENOENT``) - while leaving transient errors such as
+``ECONNREFUSED`` retryable. Use it to fail fast instead of spending the whole
+backoff budget on a socket path that does not exist:
+
+>>> from redis import Redis
+>>> from redis.backoff import ExponentialBackoff
+>>> from redis.retry import Retry, is_retryable_connect_error
+>>> retry = Retry(
+...     ExponentialBackoff(), 3, is_retryable=is_retryable_connect_error
+... )
+>>> r = Redis(unix_socket_path="/tmp/does-not-exist.sock", retry=retry)
+
+The same checker works with ``redis.asyncio.retry.Retry``.
+
+
 Retry with asyncio
 ******************
 

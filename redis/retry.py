@@ -1,4 +1,5 @@
 import abc
+import errno
 import socket
 from time import sleep
 from typing import (
@@ -33,6 +34,7 @@ class AbstractRetry(Generic[E], abc.ABC):
         backoff: "AbstractBackoff",
         retries: int,
         supported_errors: Tuple[Type[E], ...],
+        is_retryable: Optional[Callable[[E], bool]] = None,
     ):
         """
         Initialize a `Retry` object with a `Backoff` object
@@ -40,17 +42,38 @@ class AbstractRetry(Generic[E], abc.ABC):
         `retries` can be negative to retry forever.
         You can specify the types of supported errors which trigger
         a retry with the `supported_errors` parameter.
+        You can pass an optional ``is_retryable`` checker to refine the
+        classification: an error is retried only if its type is one of the
+        ``supported_errors`` AND the checker returns ``True`` for it. When no
+        checker is set, the behavior is unchanged.
         """
         self._backoff = backoff
         self._retries = retries
         self._supported_errors = supported_errors
+        self._is_retryable = is_retryable
+
+    @property
+    def is_retryable(self) -> Optional[Callable[[E], bool]]:
+        """Optional checker applied in addition to ``supported_errors``."""
+        return self._is_retryable
+
+    @is_retryable.setter
+    def is_retryable(self, value: Optional[Callable[[E], bool]]) -> None:
+        self._is_retryable = value
 
     @abc.abstractmethod
     def __eq__(self, other: Any) -> bool:
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash((self._backoff, self._retries, frozenset(self._supported_errors)))
+        return hash(
+            (
+                self._backoff,
+                self._retries,
+                frozenset(self._supported_errors),
+                self._is_retryable,
+            )
+        )
 
     def update_supported_errors(self, specified_errors: Iterable[Type[E]]) -> None:
         """
@@ -85,8 +108,9 @@ class Retry(AbstractRetry[Exception]):
             TimeoutError,
             socket.timeout,
         ),
+        is_retryable: Optional[Callable[[Exception], bool]] = None,
     ):
-        super().__init__(backoff, retries, supported_errors)
+        super().__init__(backoff, retries, supported_errors, is_retryable)
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Retry):
@@ -96,6 +120,7 @@ class Retry(AbstractRetry[Exception]):
             self._backoff == other._backoff
             and self._retries == other._retries
             and set(self._supported_errors) == set(other._supported_errors)
+            and self._is_retryable == other._is_retryable
         )
 
     def call_with_retry(
@@ -110,7 +135,9 @@ class Retry(AbstractRetry[Exception]):
         raise the exception that was thrown depending on the `Backoff` object.
         `do`: the operation to call. Expects no argument.
         `fail`: the failure handler, expects the last error that was thrown
-        ``is_retryable``: optional function to determine if an error is retryable
+        ``is_retryable``: optional function to determine if an error is retryable.
+        It is composed with the checker set on this object (if any) using AND:
+        an error is retried only if both checkers return True.
         ``with_failure_count``: if True, the failure count is passed to the failure handler
         """
         self._backoff.reset()
@@ -119,7 +146,9 @@ class Retry(AbstractRetry[Exception]):
             try:
                 return do()
             except self._supported_errors as error:
-                if is_retryable and not is_retryable(error):
+                if self._is_retryable is not None and not self._is_retryable(error):
+                    raise
+                if is_retryable is not None and not is_retryable(error):
                     raise
                 failures += 1
 
@@ -133,3 +162,30 @@ class Retry(AbstractRetry[Exception]):
                 backoff = self._backoff.compute(failures)
                 if backoff > 0:
                     sleep(backoff)
+
+
+# OS-level errno values for which reconnecting can never succeed, so there is
+# no point in spending the retry/backoff budget on them.
+_UNRETRYABLE_CONNECT_ERRNOS = frozenset({errno.ENOENT})
+
+
+def is_retryable_connect_error(error: Exception) -> bool:
+    """``is_retryable`` checker that fails fast on unrecoverable connect errors.
+
+    Returns ``False`` only when ``error`` was raised from an ``OSError`` whose
+    ``errno`` is in a conservative set of definitively unrecoverable socket
+    errors (currently only ``ENOENT``: the socket path does not exist). Every
+    other error, including transient failures such as ``ECONNREFUSED`` while a
+    server is still starting, is left to the normal retry policy.
+
+    Use it as the optional checker on a :class:`Retry` object to stop a missing
+    Unix socket path from consuming the full backoff budget::
+
+        retry = Retry(
+            NoBackoff(), 3, is_retryable=is_retryable_connect_error
+        )
+    """
+    cause = error.__cause__
+    return not (
+        isinstance(cause, OSError) and cause.errno in _UNRETRYABLE_CONNECT_ERRNOS
+    )

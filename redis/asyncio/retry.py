@@ -33,8 +33,9 @@ class Retry(AbstractRetry[Exception]):
             ConnectionError,
             TimeoutError,
         ),
+        is_retryable: Optional[Callable[[Exception], bool]] = None,
     ):
-        super().__init__(backoff, retries, supported_errors)
+        super().__init__(backoff, retries, supported_errors, is_retryable)
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Retry):
@@ -44,6 +45,7 @@ class Retry(AbstractRetry[Exception]):
             self._backoff == other._backoff
             and self._retries == other._retries
             and set(self._supported_errors) == set(other._supported_errors)
+            and self._is_retryable == other._is_retryable
         )
 
     async def call_with_retry(
@@ -61,7 +63,9 @@ class Retry(AbstractRetry[Exception]):
         raise the exception that was thrown depending on the `Backoff` object.
         `do`: the operation to call. Expects no argument.
         `fail`: the failure handler, expects the last error that was thrown
-        ``is_retryable``: optional function to determine if an error is retryable
+        ``is_retryable``: optional function to determine if an error is retryable.
+        It is composed with the checker set on this object (if any) using AND:
+        an error is retried only if both checkers return True.
         ``with_failure_count``: if True, the failure count is passed to the failure handler
         """
         self._backoff.reset()
@@ -70,7 +74,9 @@ class Retry(AbstractRetry[Exception]):
             try:
                 return await do()
             except self._supported_errors as error:
-                if is_retryable and not is_retryable(error):
+                if self._is_retryable is not None and not self._is_retryable(error):
+                    raise
+                if is_retryable is not None and not is_retryable(error):
                     raise
                 failures += 1
 
@@ -105,4 +111,5 @@ def _to_async_retry(retry: Any) -> Any:
         backoff=retry._backoff,
         retries=retry._retries,
         supported_errors=retry._supported_errors,
+        is_retryable=getattr(retry, "_is_retryable", None),
     )

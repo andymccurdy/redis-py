@@ -1148,13 +1148,7 @@ class Monitor:
             return
         try:
             await connection.disconnect()
-        except BaseException:
-            try:
-                await asyncio.shield(self.connection_pool.release(connection))
-            except Exception:
-                pass
-            raise
-        else:
+        finally:
             await asyncio.shield(self.connection_pool.release(connection))
 
     async def next_command(self) -> MonitorCommandInfo:

@@ -1088,13 +1088,7 @@ class Monitor:
             return
         try:
             connection.disconnect()
-        except BaseException:
-            try:
-                self.connection_pool.release(connection)
-            except Exception:
-                pass
-            raise
-        else:
+        finally:
             self.connection_pool.release(connection)
 
     def next_command(self):

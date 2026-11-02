@@ -1,6 +1,7 @@
 import copy
 import logging
 import re
+import sys
 import threading
 import time
 from itertools import chain
@@ -1086,10 +1087,20 @@ class Monitor:
         connection, self.connection = self.connection, None
         if connection is None:
             return
+        disconnected = False
         try:
             connection.disconnect()
+            disconnected = True
         finally:
-            self.connection_pool.release(connection)
+            pending_error = None if disconnected else sys.exception()
+            try:
+                self.connection_pool.release(connection)
+            except Exception:
+                if pending_error is not None and not isinstance(
+                    pending_error, Exception
+                ):
+                    raise pending_error
+                raise
 
     def next_command(self):
         """Parse the response from a monitor command"""

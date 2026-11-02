@@ -1,5 +1,12 @@
+from unittest.mock import Mock
+
 import pytest
 import redis
+from redis.event import (
+    AfterConnectionReleasedEvent,
+    EventDispatcher,
+    EventListenerInterface,
+)
 from redis.exceptions import MaxConnectionsError, NoPermissionError
 
 from .conftest import (
@@ -14,25 +21,105 @@ from .conftest import (
 class TestMonitor:
     @skip_if_server_version_lt("6.0.0")
     @skip_if_redis_enterprise()
-    def test_failed_entry_releases_connection(self, r):
-        username = "monitor-no-permission"
+    @pytest.mark.parametrize("entry_failure", [False, True])
+    def test_release_error_does_not_restore_handled_interrupt(self, r, entry_failure):
+        username = "ambient-monitor"
         r.acl_setuser(
-            username, enabled=True, reset=True, nopass=True, commands=["+ping"]
+            username,
+            enabled=True,
+            reset=True,
+            nopass=True,
+            commands=["+ping"] if entry_failure else ["+ping", "+monitor"],
         )
+        dispatcher = EventDispatcher()
+        listener = Mock(spec=EventListenerInterface)
+        release_error = RuntimeError("release listener failed")
+        listener.listen.side_effect = release_error
         pool = redis.ConnectionPool(
             **{
                 **r.connection_pool.connection_kwargs,
                 "username": username,
                 "password": None,
+                "event_dispatcher": dispatcher,
             },
             max_connections=1,
         )
         client = redis.Redis(connection_pool=pool)
+        dispatcher.register_listeners({AfterConnectionReleasedEvent: [listener]})
+        observed = None
+        try:
+            try:
+                try:
+                    raise KeyboardInterrupt()
+                except KeyboardInterrupt:
+                    with client.monitor():
+                        pass
+            except BaseException as error:
+                observed = error
+            if entry_failure:
+                assert isinstance(observed, NoPermissionError)
+            else:
+                assert observed is release_error
+            listener.listen.assert_called_once()
+            dispatcher.unregister_listeners({AfterConnectionReleasedEvent: [listener]})
+            assert client.ping()
+        finally:
+            dispatcher.unregister_listeners({AfterConnectionReleasedEvent: [listener]})
+            client.close()
+            pool.disconnect()
+            r.acl_deluser(username)
+
+    @skip_if_server_version_lt("6.0.0")
+    @skip_if_redis_enterprise()
+    @pytest.mark.parametrize("interrupt_cleanup", [False, True])
+    def test_failed_entry_releases_connection(self, r, monkeypatch, interrupt_cleanup):
+        username = "monitor-no-permission"
+        r.acl_setuser(
+            username, enabled=True, reset=True, nopass=True, commands=["+ping"]
+        )
+        dispatcher = EventDispatcher()
+        pool = redis.ConnectionPool(
+            **{
+                **r.connection_pool.connection_kwargs,
+                "username": username,
+                "password": None,
+                "event_dispatcher": dispatcher,
+            },
+            max_connections=1,
+        )
+        client = redis.Redis(connection_pool=pool)
+        listener = Mock(spec=EventListenerInterface)
+        listener.listen.side_effect = RuntimeError("release listener failed")
+        connection = None
         try:
             monitor = client.monitor()
-            with pytest.raises(NoPermissionError):
+            connection = monitor.connection
+            disconnect = connection.disconnect
+            interrupt = KeyboardInterrupt()
+
+            def interrupted_disconnect(*args, **kwargs):
+                disconnect(*args, **kwargs)
+                raise interrupt
+
+            if interrupt_cleanup:
+                dispatcher.register_listeners(
+                    {AfterConnectionReleasedEvent: [listener]}
+                )
+                monkeypatch.setattr(
+                    monitor.connection, "disconnect", interrupted_disconnect
+                )
+            with pytest.raises(
+                KeyboardInterrupt if interrupt_cleanup else NoPermissionError
+            ) as raised:
                 with monitor:
                     pytest.fail("MONITOR must not enter without permission")
+            if interrupt_cleanup:
+                assert raised.value is interrupt
+                listener.listen.assert_called_once()
+                dispatcher.unregister_listeners(
+                    {AfterConnectionReleasedEvent: [listener]}
+                )
+                monkeypatch.setattr(connection, "disconnect", disconnect)
             assert client.ping()
 
             r.acl_setuser(username, enabled=True, commands=["+monitor"])
@@ -41,6 +128,9 @@ class TestMonitor:
                     client.ping()
             assert client.ping()
         finally:
+            dispatcher.unregister_listeners({AfterConnectionReleasedEvent: [listener]})
+            if connection is not None:
+                monkeypatch.setattr(connection, "disconnect", disconnect)
             client.close()
             pool.disconnect()
             r.acl_deluser(username)

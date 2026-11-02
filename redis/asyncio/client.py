@@ -4,6 +4,7 @@ import inspect
 import logging
 import math
 import re
+import sys
 import time
 import warnings
 from typing import (
@@ -1146,10 +1147,20 @@ class Monitor:
         connection, self.connection = self.connection, None
         if connection is None:
             return
+        disconnected = False
         try:
             await connection.disconnect()
+            disconnected = True
         finally:
-            await asyncio.shield(self.connection_pool.release(connection))
+            pending_error = None if disconnected else sys.exception()
+            try:
+                await asyncio.shield(self.connection_pool.release(connection))
+            except Exception:
+                if pending_error is not None and not isinstance(
+                    pending_error, Exception
+                ):
+                    raise pending_error
+                raise
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""

@@ -1251,6 +1251,14 @@ class PubSub:
         # immediately as there is nothing to clean-up.
         if not hasattr(self, "connection"):
             return
+        # Shield the teardown so that cancelling the caller (e.g. a cancelled
+        # task or anyio cancel scope exiting ``async with r.pubsub()``) cannot
+        # stop it while it waits for the lock, disconnects, or releases: the
+        # connection would otherwise never be returned to the pool. The caller
+        # still sees the CancelledError.
+        await asyncio.shield(self._aclose())
+
+    async def _aclose(self) -> None:
         async with self._lock:
             if self.connection:
                 # Use nowait=True to avoid awaiting StreamWriter.wait_closed(),
@@ -1259,8 +1267,10 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
-                await self.connection_pool.release(self.connection)
-                self.connection = None
+                # Detach before awaiting release, as Pipeline.reset() does, so
+                # the pubsub never holds a connection that is back in the pool.
+                connection, self.connection = self.connection, None
+                await self.connection_pool.release(connection)
             self.channels = {}
             self.pending_unsubscribe_channels = set()
             self.patterns = {}

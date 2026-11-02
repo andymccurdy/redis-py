@@ -2427,6 +2427,150 @@ class TestPubSubAcloseWithMocks:
         connection.disconnect.assert_awaited_once_with(nowait=True)
 
 
+@pytest.mark.onlynoncluster
+class TestPubSubAcloseCancellation:
+    """
+    Cancelling the task that runs PubSub.aclose() (e.g. a cancelled
+    anyio/Starlette scope tearing down an ``async with r.pubsub()``) must not
+    leak the pubsub connection: it still has to be disconnected and returned
+    to the pool.
+    """
+
+    @staticmethod
+    async def _cancel(task: asyncio.Task, started: asyncio.Event) -> None:
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @staticmethod
+    async def _wait_until_released(pool, connection) -> None:
+        async with async_timeout(2):
+            while connection in pool._in_use_connections:
+                await asyncio.sleep(0.01)
+
+    @staticmethod
+    def _blocking_disconnect(connection, started, resume):
+        disconnect = connection.disconnect
+
+        async def slow_disconnect(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            await disconnect(*args, **kwargs)
+
+        return mock.patch.object(connection, "disconnect", side_effect=slow_disconnect)
+
+    async def test_aclose_releases_connection_when_cancelled_in_disconnect(
+        self, r: redis.Redis
+    ):
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started)
+            resume.set()
+            await self._wait_until_released(pool, leased)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert leased in pool._available_connections
+        assert p.channels == {}
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_waiting_for_lock(
+        self, r: redis.Redis
+    ):
+        # PubSub._lock is also held by the streaming-credentials re-auth
+        # handler while it talks to the server, so aclose() can be cancelled
+        # while still waiting to acquire it.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await p._lock.acquire()
+        try:
+            task = asyncio.ensure_future(p.aclose())
+            asyncio.get_running_loop().call_soon(started.set)
+            await self._cancel(task, started)
+            assert leased in pool._in_use_connections
+        finally:
+            p._lock.release()
+        await self._wait_until_released(pool, leased)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_in_release(
+        self, r: redis.Redis
+    ):
+        # A cancel that lands while release() waits for the pool's lock must
+        # neither leave the pubsub holding the connection nor split the pool's
+        # in-use/available bookkeeping.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await pool._lock.acquire()
+        try:
+            task = asyncio.ensure_future(p.aclose())
+            asyncio.get_running_loop().call_soon(started.set)
+            await self._cancel(task, started)
+        finally:
+            pool._lock.release()
+        await self._wait_until_released(pool, leased)
+
+        assert p.connection is None
+        assert leased in pool._available_connections
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_cancelled_subscribe_then_cancelled_aclose_does_not_leak(
+        self, r: redis.Redis
+    ):
+        # Cancel subscribe() while it waits on the socket, then tear the
+        # pubsub down from a task that is itself being cancelled: the
+        # connection leased for subscribe() must still go back to the pool.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.connect()
+        leased = p.connection
+
+        started = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with mock.patch.object(leased, "send_command", side_effect=hang):
+            await self._cancel(asyncio.ensure_future(p.subscribe("foo")), started)
+        assert p.connection is leased
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started)
+            resume.set()
+            await self._wait_until_released(pool, leased)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+
 class TestClusterPubSubResubscribe:
     """
     Cluster-only tests verifying that sharded pubsub resubscription after a

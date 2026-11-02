@@ -8,7 +8,6 @@ from tests.conftest import (
     assert_resp_response,
     expected_response_shape,
     expects_resp2_shape,
-    expects_resp3_shape,
     is_resp2_connection,
     skip_if_server_version_gte,
     skip_if_server_version_lt,
@@ -246,10 +245,10 @@ async def test_create_and_delete_rule(decoded_r: redis.Redis):
     await decoded_r.ts().add(KEY1, time * 2, 1.5)
     assert round((await decoded_r.ts().get(KEY2))[1], 5) == 1.5
     info = await decoded_r.ts().info(KEY1)
-    if expects_resp3_shape(decoded_r):
-        assert info["rules"][KEY2][0] == 100
-    else:
+    if expects_resp2_shape(decoded_r):
         assert info.rules[0][:2] == [KEY2, 100]
+    else:
+        assert info["rules"][KEY2][0] == 100
 
     # test rule deletion
     await decoded_r.ts().deleterule(KEY1, KEY2)

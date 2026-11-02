@@ -71,13 +71,13 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_shared_ssl_contexts_lock)
 
 
-def _file_signature(path: Any) -> tuple[int, int] | None:
+def _file_signature(path: Any) -> tuple[int, int, int, int] | None:
     try:
         stat = os.stat(path)
     except (OSError, TypeError, ValueError):
         # Left for the context build to report, as it would without the cache
         return None
-    return stat.st_mtime_ns, stat.st_size
+    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
 
 
 def get_shared_ssl_context(
@@ -93,7 +93,7 @@ def get_shared_ssl_context(
         build: Builds the context when no live one matches.
         settings: Hashable values that determine the context.
         files: The certificate files and directories the context is loaded from.
-            They are identified by modification time and size, so that a rotated
+            They are identified by their timestamps, size and inode, so that a rotated
             file is picked up by the next context built for it. The default CA
             locations are always included, as is SSLKEYLOGFILE, which
             ssl.create_default_context() reads.

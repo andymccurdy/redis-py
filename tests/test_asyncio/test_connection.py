@@ -1786,6 +1786,24 @@ def test_ssl_context_is_rebuilt_after_certificate_rotation(tmp_path):
 
 
 @pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_replacement_with_same_size_and_mtime(tmp_path):
+    certfile = tmp_path / "client.crt"
+    certfile.write_text("old")
+    stat = certfile.stat()
+    settings = {"ssl_cert_reqs": "none", "ssl_certfile": str(certfile)}
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        context = SSLConnection(**settings).ssl_context.get()
+
+        replacement = tmp_path / "client.crt.new"
+        replacement.write_text("new")
+        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(replacement, certfile)
+
+        assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
 def test_ssl_context_is_rebuilt_after_ca_directory_change(tmp_path):
     settings = {"ssl_cert_reqs": "none", "ssl_ca_path": str(tmp_path)}
 

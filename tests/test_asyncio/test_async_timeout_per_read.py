@@ -15,6 +15,7 @@ from unittest import mock
 
 import pytest
 
+import redis._parsers.base as parser_base
 from redis._parsers.hiredis import _AsyncHiredisParser
 from redis._parsers.resp2 import _AsyncRESP2Parser
 from redis._parsers.resp3 import _AsyncRESP3Parser
@@ -281,3 +282,46 @@ async def test_read_exactly_keeps_pieces_when_eof_interrupts():
     await feeder
 
     assert parser._chunks == [b"a" * 1000, b"b" * 1000]
+
+
+async def test_read_exactly_constructs_one_timeout_for_multiple_waits(monkeypatch):
+    parser = _AsyncRESP2Parser(READ_SIZE)
+    reader = asyncio.StreamReader()
+    parser._stream = reader
+    parser._apply_read_timeout = True
+    parser._read_timeout = SOCKET_TIMEOUT
+    real_async_timeout = parser_base.async_timeout
+    timeout_count = 0
+
+    def counting_async_timeout(delay):
+        nonlocal timeout_count
+        timeout_count += 1
+        return real_async_timeout(delay)
+
+    monkeypatch.setattr(parser_base, "async_timeout", counting_async_timeout)
+
+    async def feed_pieces():
+        for piece in (b"ab", b"cd", b"ef"):
+            await asyncio.sleep(0.01)
+            reader.feed_data(piece)
+
+    feeder = asyncio.create_task(feed_pieces())
+    result = await parser._read_exactly(6)
+    await feeder
+
+    assert result == b"abcdef"
+    assert timeout_count == 1
+
+
+@requires_hiredis
+async def test_hiredis_read_from_socket_drains_buffered_data():
+    parser = _AsyncHiredisParser(8)
+    _, reader = make_connection(parser, 2)
+    payload = b"buffered response"
+    wire = b"$%d\r\n%s\r\n" % (len(payload), payload)
+    for start in range(0, len(wire), 7):
+        reader.feed_data(wire[start : start + 7])
+
+    await parser.read_from_socket()
+
+    assert parser._reader.gets() == payload

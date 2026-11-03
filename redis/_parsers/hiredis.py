@@ -393,6 +393,14 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         if not buffer or not isinstance(buffer, bytes):
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
         self._reader.feed(buffer)
+        bytes_read = len(buffer)
+        max_bytes = 8 * self._read_size
+        while bytes_read < max_bytes and self._stream._buffer:
+            buffer = await self._stream.read(
+                min(self._read_size, max_bytes - bytes_read)
+            )
+            self._reader.feed(buffer)
+            bytes_read += len(buffer)
         # data was read from the socket and added to the buffer.
         # return True to indicate that data was read.
         return True

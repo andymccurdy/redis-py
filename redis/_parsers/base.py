@@ -1,7 +1,7 @@
 import logging
 import sys
 from abc import ABC, abstractmethod
-from asyncio import IncompleteReadError, StreamReader
+from asyncio import IncompleteReadError, StreamReader, get_running_loop
 from typing import Awaitable, Callable, List, Optional, Protocol, Union
 
 # the functionality is available in 3.11.x but has a major issue before
@@ -687,37 +687,50 @@ class _AsyncRESPBase(AsyncBaseParser):
         the payload until the response is parsed; an interrupted read
         keeps its pieces, as they are the only copy of those bytes.
         """
-        chunks = []
         remaining = length
         # Index of this call's first piece in the resume state.
         chunks_start = len(self._chunks)
-        while remaining > 0:
-            # StreamReader.read returns as soon as any bytes are buffered.
-            # Check the flags first, avoiding private stream access unless
-            # per-read timeouts apply. StreamReader.read can only wait while
-            # its bytearray buffer is empty; only then arm the timeout.
-            if (
-                self._apply_read_timeout
-                and self._read_timeout is not None
-                and not self._stream._buffer
-            ):
-                async with async_timeout(self._read_timeout) as active_timeout:
-                    self._active_read_timeout = active_timeout
-                    try:
-                        chunk = await self._stream.read(remaining)
-                    finally:
-                        self._active_read_timeout = None
-            else:
+        active_timeout = None
+        try:
+            while remaining > 0:
+                # StreamReader.read returns as soon as any bytes are buffered.
+                # Check the flags first, avoiding private stream access unless
+                # per-read timeouts apply. StreamReader.read can only wait while
+                # its bytearray buffer is empty; only then arm the timeout.
+                if (
+                    self._apply_read_timeout
+                    and self._read_timeout is not None
+                    and not self._stream._buffer
+                ):
+                    if active_timeout is None:
+                        active_timeout = async_timeout(self._read_timeout)
+                        await active_timeout.__aenter__()
+                        self._active_read_timeout = active_timeout
+                    else:
+                        deadline = get_running_loop().time() + self._read_timeout
+                        if hasattr(active_timeout, "reschedule"):
+                            active_timeout.reschedule(deadline)
+                        elif hasattr(active_timeout, "update"):
+                            active_timeout.update(deadline)
                 chunk = await self._stream.read(remaining)
-            if not chunk:
-                # EOF before `length` bytes: report like readexactly did,
-                # so callers keep raising ConnectionError.
-                raise IncompleteReadError(b"".join(chunks), length)
-            chunks.append(chunk)
-            self._chunks.append(chunk)
-            remaining -= len(chunk)
-        joined = b"".join(chunks)
-        if len(chunks) > 1:
+                if not chunk:
+                    # EOF before `length` bytes: report like readexactly did,
+                    # so callers keep raising ConnectionError.
+                    partial = b"".join(self._chunks[chunks_start:])
+                    raise IncompleteReadError(partial, length)
+                self._chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            if active_timeout is not None:
+                try:
+                    await active_timeout.__aexit__(*sys.exc_info())
+                finally:
+                    self._active_read_timeout = None
+        pieces = self._chunks[chunks_start:]
+        if len(pieces) == 1:
+            return pieces[0]
+        joined = b"".join(pieces)
+        if len(pieces) > 1:
             self._chunks[chunks_start:] = [joined]
         return joined
 

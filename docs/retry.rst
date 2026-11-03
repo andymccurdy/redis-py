@@ -46,7 +46,7 @@ is set, an error is retried only if its type is one of the ``supported_errors``
 AND the callable returns ``True`` for it. The default (``None``) leaves the
 retry behavior unchanged.
 
-:func:`redis.retry.is_retryable_connect_error` is a ready-made checker that
+``redis.retry.is_retryable_connect_error`` is a ready-made checker that
 returns ``False`` for definitively unrecoverable connection errors - currently
 a missing Unix socket path (``ENOENT``) - while leaving transient errors such as
 ``ECONNREFUSED`` retryable. Use it to fail fast instead of spending the whole

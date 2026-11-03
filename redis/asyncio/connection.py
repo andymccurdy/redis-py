@@ -1098,8 +1098,13 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 is_internal=False,
             )
             # Preserve the original OSError (with its errno) as the cause so
-            # the retry policy can tell unrecoverable failures apart.
-            raise conn_error from e
+            # the retry policy can tell unrecoverable failures apart. Clear the
+            # local afterwards so its traceback does not form a reference cycle
+            # with this frame.
+            try:
+                raise conn_error from e
+            finally:
+                conn_error = None
         except Exception as exc:
             raise ConnectionError(exc) from exc
 

@@ -1032,6 +1032,47 @@ class TestConnection:
         self.clear(conn)
 
     @pytest.mark.skipif(
+        platform.python_implementation() == "PyPy",
+        reason="Immediate reclamation is a refcounting property",
+    )
+    def test_connect_check_health_clears_the_chained_exception_local(self):
+        """The connect handler must not leave the raised ConnectionError bound in
+        its frame. Its traceback points back at the frame, so the local would
+        form a cycle that only the collector can reclaim."""
+
+        class WeakReferenceableOSError(OSError):
+            """OSError itself cannot be weak-referenced."""
+
+        conn = Connection()
+        raised_ref = []
+
+        def fail_connect():
+            error = WeakReferenceableOSError("refused")
+            raised_ref.append(weakref.ref(error))
+            try:
+                raise error
+            finally:
+                # Clear this frame's local, or its traceback keeps the
+                # exception alive and the assertion measures the test.
+                error = None
+
+        conn._connect = fail_connect
+        gc.collect()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with pytest.raises(ConnectionError):
+                conn.connect_check_health(
+                    check_health=False, retry_socket_connect=False
+                )
+
+            (ref,) = raised_ref
+            assert ref() is None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    @pytest.mark.skipif(
         sys.platform == "win32",
         reason="Unix domain sockets are not available on Windows",
     )

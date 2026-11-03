@@ -1614,8 +1614,10 @@ class RedisCluster(
                     # Sent to every target, as the request policy asks, and answered
                     # with the first reply that is not an error: a SCRIPT KILL
                     # succeeds on the shard that runs the script, and the others
-                    # answer NOTBUSY. An error is raised only if every target replies
-                    # with one.
+                    # answer NOTBUSY. Once a target succeeds, the errors of the
+                    # others don't matter. If none does, an error that isn't a reply,
+                    # such as a ConnectionError, comes first: the script may run on
+                    # that node, and the retry handling applies to it.
                     replies = await asyncio.gather(
                         *(
                             asyncio.create_task(
@@ -1627,11 +1629,11 @@ class RedisCluster(
                     )
                     for reply in replies:
                         if isinstance(reply, BaseException) and not isinstance(
-                            reply, ResponseError
+                            reply, RedisError
                         ):
                             raise reply
                     for node, reply in zip(target_nodes, replies):
-                        if not isinstance(reply, ResponseError):
+                        if not isinstance(reply, RedisError):
                             if command in self.result_callbacks:
                                 reply = self.result_callbacks[command](
                                     command, {node.name: reply}, **kwargs
@@ -1639,7 +1641,14 @@ class RedisCluster(
                             return self._policies_callback_mapping[
                                 command_policies.response_policy
                             ](reply)
-                    raise replies[0]
+                    raise next(
+                        (
+                            reply
+                            for reply in replies
+                            if not isinstance(reply, ResponseError)
+                        ),
+                        replies[0],
+                    )
                 else:
                     keys = [node.name for node in target_nodes]
                     values = await asyncio.gather(

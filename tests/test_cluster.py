@@ -3367,6 +3367,73 @@ class TestStaticMetadataRouting:
         assert execute.call_count == len(rc.get_primaries())
 
     @pytest.mark.fixed_client
+    @pytest.mark.parametrize("unreachable_first", [True, False])
+    @pytest.mark.parametrize(
+        "method, success", [("script_kill", True), ("function_kill", b"OK")]
+    )
+    def test_kill_succeeds_when_another_primary_cannot_be_reached(
+        self, method, success, unreachable_first
+    ):
+        """
+        Once a primary stops the script or function, the errors of the others don't
+        matter: a retry would only get NOTBUSY, since the script is gone.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+        primaries = rc.get_primaries()
+        unreachable, busy = (
+            (primaries[0], primaries[-1])
+            if unreachable_first
+            else (primaries[-1], primaries[0])
+        )
+        called = []
+
+        def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is unreachable:
+                raise ConnectionError("down")
+            if node is busy and called.count(busy) == 1:
+                return success
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with patch.object(
+            RedisCluster, "_execute_command", side_effect=execute_command
+        ):
+            assert getattr(rc, method)() == success
+
+        assert called == primaries
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("unreachable_first", [True, False])
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    def test_kill_raises_the_error_of_an_unreachable_primary_first(
+        self, method, unreachable_first
+    ):
+        """
+        When no primary stops the script or function, a primary that can't be reached
+        is reported rather than the NOTBUSY of the others, as the script may run there.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 0)
+        )
+        primaries = rc.get_primaries()
+        unreachable = primaries[0] if unreachable_first else primaries[-1]
+        called = []
+
+        def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is unreachable:
+                raise ConnectionError("down")
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with patch.object(
+            RedisCluster, "_execute_command", side_effect=execute_command
+        ):
+            with pytest.raises(ConnectionError, match="down"):
+                getattr(rc, method)()
+
+        assert called == primaries
+
+    @pytest.mark.fixed_client
     def test_pipeline_function_kill_on_one_node_reaches_its_response_callback(self):
         """
         A cluster pipeline sends a command to a single node, so FUNCTION KILL needs a

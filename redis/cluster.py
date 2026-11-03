@@ -1994,9 +1994,12 @@ class RedisCluster(
                     # Sent to every target, as the request policy asks, and answered
                     # with the first reply that is not an error: a SCRIPT KILL
                     # succeeds on the shard that runs the script, and the others
-                    # answer NOTBUSY. An error is raised only if every target replies
-                    # with one.
+                    # answer NOTBUSY. Once a target succeeds, the errors of the
+                    # others don't matter. If none does, an error that isn't a reply,
+                    # such as a ConnectionError, comes first: the script may run on
+                    # that node, and the retry handling applies to it.
                     first_error = None
+                    first_failure = None
                     for node in target_nodes:
                         try:
                             reply = self._execute_command(node, *args, **kwargs)
@@ -2004,10 +2007,14 @@ class RedisCluster(
                             if first_error is None:
                                 first_error = e
                             continue
+                        except RedisError as e:
+                            if first_failure is None:
+                                first_failure = e
+                            continue
                         if not res:
                             res[node.name] = reply
                     if not res:
-                        raise first_error
+                        raise first_failure or first_error
                 else:
                     for node in target_nodes:
                         res[node.name] = self._execute_command(node, *args, **kwargs)

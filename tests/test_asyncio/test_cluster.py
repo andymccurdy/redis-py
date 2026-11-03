@@ -5188,6 +5188,79 @@ class TestStaticMetadataRouting:
         await rc.aclose()
 
     @pytest.mark.fixed_client
+    @pytest.mark.parametrize("unreachable_first", [True, False])
+    @pytest.mark.parametrize(
+        "method, success", [("script_kill", True), ("function_kill", b"OK")]
+    )
+    async def test_kill_succeeds_when_another_primary_cannot_be_reached(
+        self, method, success, unreachable_first
+    ) -> None:
+        """
+        Once a primary stops the script or function, the errors of the others don't
+        matter: a retry would only get NOTBUSY, since the script is gone.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        primaries = rc.get_primaries()
+        unreachable, busy = (
+            (primaries[0], primaries[-1])
+            if unreachable_first
+            else (primaries[-1], primaries[0])
+        )
+        called = []
+
+        async def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is unreachable:
+                raise ConnectionError("down")
+            if node is busy and called.count(busy) == 1:
+                return success
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=execute_command
+        ):
+            assert await getattr(rc, method)() == success
+
+        assert sorted(node.name for node in called) == sorted(
+            node.name for node in primaries
+        )
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("unreachable_first", [True, False])
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    async def test_kill_raises_the_error_of_an_unreachable_primary_first(
+        self, method, unreachable_first
+    ) -> None:
+        """
+        When no primary stops the script or function, a primary that can't be reached
+        is reported rather than the NOTBUSY of the others, as the script may run there.
+        """
+        rc = await get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 0)
+        )
+        primaries = rc.get_primaries()
+        unreachable = primaries[0] if unreachable_first else primaries[-1]
+        called = []
+
+        async def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is unreachable:
+                raise ConnectionError("down")
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=execute_command
+        ):
+            with pytest.raises(ConnectionError, match="down"):
+                await getattr(rc, method)()
+
+        assert sorted(node.name for node in called) == sorted(
+            node.name for node in primaries
+        )
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
     async def test_pipeline_function_kill_on_one_node_reaches_its_response_callback(
         self,
     ) -> None:

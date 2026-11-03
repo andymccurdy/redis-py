@@ -574,6 +574,18 @@ class TestExtractExpireFlags:
     def test_px_as_timedelta_uses_milliseconds(self):
         assert extract_expire_flags(px=timedelta(seconds=2)) == ["PX", 2000]
 
+    def test_px_as_timedelta_is_exact(self):
+        # 1.001 * 1000 is 1000.9999999999999 in floating point
+        assert extract_expire_flags(px=timedelta(milliseconds=1001)) == ["PX", 1001]
+
+    def test_px_as_negative_timedelta_truncates_toward_zero(self):
+        assert extract_expire_flags(px=timedelta(milliseconds=-1001)) == ["PX", -1001]
+        assert extract_expire_flags(px=timedelta(milliseconds=-1500.3)) == [
+            "PX",
+            -1500,
+        ]
+        assert extract_expire_flags(px=timedelta(microseconds=-500)) == ["PX", 0]
+
     def test_px_as_digit_string(self):
         assert extract_expire_flags(px="500") == ["PX", 500]
 

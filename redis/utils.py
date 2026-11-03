@@ -407,6 +407,15 @@ def ensure_string(key):
         raise TypeError("Key must be either a string or bytes")
 
 
+def _timedelta_to_ms(td: datetime.timedelta) -> int:
+    # Integer arithmetic: total_seconds() * 1000 goes through a float and can
+    # come out 1 ms low (1.001 * 1000 == 1000.9999999999999). Truncates toward
+    # zero, as int() did.
+    if td < datetime.timedelta(0):
+        return -(-td // datetime.timedelta(milliseconds=1))
+    return td // datetime.timedelta(milliseconds=1)
+
+
 def extract_expire_flags(
     ex: ExpiryT | str | None = None,
     px: ExpiryT | str | None = None,
@@ -427,7 +436,7 @@ def extract_expire_flags(
     elif px is not None:
         exp_options.append("PX")
         if isinstance(px, datetime.timedelta):
-            exp_options.append(int(px.total_seconds() * 1000))
+            exp_options.append(_timedelta_to_ms(px))
         elif isinstance(px, int):
             exp_options.append(px)
         elif isinstance(px, str) and px.isdecimal():

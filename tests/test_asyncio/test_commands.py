@@ -2304,6 +2304,15 @@ class TestRedisCommands:
         assert await r.pttl("a") == -1
 
     @skip_if_server_version_lt("2.6.0")
+    async def test_pexpire_timedelta_is_exact(self, r: redis.Redis):
+        await r.set("a", "foo")
+        with patch.object(r, "execute_command", AsyncMock(return_value=True)) as cmd:
+            await r.pexpire("a", datetime.timedelta(milliseconds=1001))
+        assert cmd.call_args.args == ("PEXPIRE", "a", 1001)
+        assert await r.pexpire("a", datetime.timedelta(milliseconds=1001))
+        assert 0 < await r.pttl("a") <= 1001
+
+    @skip_if_server_version_lt("2.6.0")
     async def test_pexpireat_datetime(self, r: redis.Redis):
         expire_at = await redis_server_time(r) + datetime.timedelta(minutes=1)
         await r.set("a", "foo")
@@ -2335,6 +2344,14 @@ class TestRedisCommands:
         assert await r.psetex("a", expire_at, "value")
         assert await r.get("a") == b"value"
         assert 0 < await r.pttl("a") <= 1000
+
+    @skip_if_server_version_lt("2.6.0")
+    async def test_psetex_timedelta_is_exact(self, r: redis.Redis):
+        with patch.object(r, "execute_command", AsyncMock(return_value=True)) as cmd:
+            await r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert cmd.call_args.args == ("PSETEX", "a", 1001, "value")
+        assert await r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert 0 < await r.pttl("a") <= 1001
 
     @skip_if_server_version_lt("2.6.0")
     async def test_pttl(self, r: redis.Redis):

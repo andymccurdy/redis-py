@@ -257,6 +257,8 @@ class PythonRespSerializer:
 
 
 class ConnectionInterface:
+    _resp2_fallback = False
+
     @abstractmethod
     def repr_pieces(self):
         pass

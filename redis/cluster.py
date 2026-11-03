@@ -5129,6 +5129,7 @@ class ClusterPipeline(RedisCluster):
             RequestPolicy.SPECIAL: self.get_special_nodes,
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
+            ResponsePolicy.ONE_SUCCEEDED: lambda res: res,
         }
 
         # ``RedisCluster.pipeline`` passes the client's own resolvers, so a pipeline routes by

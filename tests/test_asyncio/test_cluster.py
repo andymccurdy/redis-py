@@ -5188,6 +5188,26 @@ class TestStaticMetadataRouting:
         await rc.aclose()
 
     @pytest.mark.fixed_client
+    async def test_pipeline_function_kill_on_one_node_reaches_its_response_callback(
+        self,
+    ) -> None:
+        """
+        A cluster pipeline sends a command to a single node, so FUNCTION KILL needs a
+        target there, and the command keeps its ``ONE_SUCCEEDED`` response policy, which the
+        pipeline's response callback path must know.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        rc.set_response_callback(
+            "FUNCTION KILL", lambda response, **options: ("callback", response)
+        )
+        mock_all_nodes_resp(rc, b"OK")
+
+        async with rc.pipeline() as pipe:
+            pipe.execute_command("FUNCTION KILL", target_nodes=rc.get_primaries()[-1])
+            assert await pipe.execute() == [("callback", b"OK")]
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
     async def test_determine_nodes_raises_exception_when_no_policy_resolved(
         self,
     ) -> None:

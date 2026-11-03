@@ -192,6 +192,10 @@ class SentinelConnectionPool(ConnectionPool):
 
 
 class Sentinel(AsyncSentinelCommands):
+    # How many subsequent discovery calls keep a sentinel that just failed
+    # at the end of the try order before it gets another chance.
+    FAILED_SENTINEL_QUARANTINE = 8
+
     """
     Redis Sentinel cluster client
 
@@ -243,6 +247,55 @@ class Sentinel(AsyncSentinelCommands):
         self.min_other_sentinels = min_other_sentinels
         self.connection_kwargs = connection_kwargs
         self._force_master_ip = force_master_ip
+        # Sentinel clients that failed during a discovery call, mapped to the
+        # number of later discovery calls that keep trying them last. A dead
+        # sentinel therefore does not cost a connect timeout on every
+        # discovery call, but it is retried periodically and rejoins the
+        # rotation once it answers again.
+        self._failed_sentinels = {}
+
+    def _discovery_order(self):
+        # Iterate over a snapshot: a concurrent discovery call may rebind
+        # self.sentinels (see _promote_answering_sentinel) while this loop
+        # is still running, and iterating a list another call is mutating
+        # could skip or repeat a sentinel.
+        sentinels = list(self.sentinels)
+        if not self._failed_sentinels:
+            return sentinels
+        healthy = []
+        quarantined = []
+        for sentinel in sentinels:
+            remaining = self._failed_sentinels.get(sentinel)
+            if remaining is None:
+                healthy.append(sentinel)
+            elif remaining > 1:
+                self._failed_sentinels[sentinel] = remaining - 1
+                quarantined.append(sentinel)
+            else:
+                del self._failed_sentinels[sentinel]
+                healthy.append(sentinel)
+        return healthy + quarantined
+
+    def _promote_answering_sentinel(self, sentinel):
+        self._failed_sentinels.pop(sentinel, None)
+        # Build the next order as a new list and rebind self.sentinels in a
+        # single step: rebinding (instead of in-place pop/append/insert) is
+        # what keeps a concurrent discovery call - which iterates a snapshot
+        # of the old list - from seeing duplicates or losing a sentinel.
+        # - The head answered: rotate it to the end of the healthy subset, so
+        #   repeated discovery calls spread the load across the answering
+        #   nodes even while other sentinels sit in quarantine.
+        # - A non-head sentinel answered: promote it to the head, preserving
+        #   the pre-existing failover fast path of trying it first on the
+        #   next call.
+        next_order = [s for s in self.sentinels if s is not sentinel]
+        if sentinel is self.sentinels[0]:
+            healthy = [s for s in next_order if s not in self._failed_sentinels]
+            quarantined = [s for s in next_order if s in self._failed_sentinels]
+            next_order = healthy + [sentinel] + quarantined
+        else:
+            next_order.insert(0, sentinel)
+        self.sentinels = next_order
 
     async def execute_command(self, *args, **kwargs):
         """
@@ -330,19 +383,16 @@ class Sentinel(AsyncSentinelCommands):
         master is found.
         """
         collected_errors = list()
-        for sentinel_no, sentinel in enumerate(self.sentinels):
+        for sentinel in self._discovery_order():
             try:
                 masters = await sentinel.sentinel_masters()
             except (ConnectionError, TimeoutError) as e:
                 collected_errors.append(f"{sentinel} - {e!r}")
+                self._failed_sentinels[sentinel] = self.FAILED_SENTINEL_QUARANTINE
                 continue
             state = masters.get(service_name)
             if state and self.check_master_state(state, service_name):
-                # Put this sentinel at the top of the list
-                self.sentinels[0], self.sentinels[sentinel_no] = (
-                    sentinel,
-                    self.sentinels[0],
-                )
+                self._promote_answering_sentinel(sentinel)
 
                 ip = (
                     self._force_master_ip
@@ -381,13 +431,15 @@ class Sentinel(AsyncSentinelCommands):
         self, service_name: str
     ) -> Sequence[Tuple[EncodableT, EncodableT]]:
         """Returns a list of alive slaves for service ``service_name``"""
-        for sentinel in self.sentinels:
+        for sentinel in self._discovery_order():
             try:
                 slaves = await sentinel.sentinel_slaves(service_name)
             except (ConnectionError, ResponseError, TimeoutError):
+                self._failed_sentinels[sentinel] = self.FAILED_SENTINEL_QUARANTINE
                 continue
             slaves = self.filter_slaves(slaves)
             if slaves:
+                self._promote_answering_sentinel(sentinel)
                 return slaves
         return []
 

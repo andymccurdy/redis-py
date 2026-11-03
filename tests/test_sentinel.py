@@ -1,5 +1,7 @@
 import os
 import socket
+import sys
+import threading
 from unittest import mock
 
 import pytest
@@ -125,6 +127,101 @@ def deployed_sentinel(request):
 def test_discover_master(sentinel, master_ip):
     address = sentinel.discover_master("mymaster")
     assert address == (master_ip, 6379)
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_rotates_over_healthy_sentinels(cluster, sentinel, master_ip):
+    served = []
+    for _ in range(6):
+        assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+        # after each call the sentinel that just answered is at the head
+        served.append(sentinel.sentinels[0].id)
+    assert set(served) == {("foo", 26379), ("bar", 26379)}
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_keeps_failed_sentinel_last(cluster, sentinel, master_ip):
+    sentinel.discover_master("mymaster")
+    cluster.nodes_down.add(("bar", 26379))
+    for _ in range(3):
+        assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+        # 'foo' answers every call: the failed sentinel is not retried at
+        # the head of the list
+        assert sentinel.sentinels[0].id == ("foo", 26379)
+    cluster.nodes_down.clear()
+    # the failed sentinel is retried after a bounded number of calls and
+    # rejoins the rotation once it answers again
+    served = set()
+    for _ in range(sentinel.FAILED_SENTINEL_QUARANTINE + 2):
+        assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+        served.add(sentinel.sentinels[0].id)
+    assert served == {("foo", 26379), ("bar", 26379)}
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_rotates_over_healthy_sentinels_during_partial_outage(
+    cluster, master_ip
+):
+    # With one sentinel down and two healthy, discovery traffic must keep
+    # alternating between the two healthy nodes instead of pinning to
+    # whichever of them answered first.
+    cluster.nodes_down.add(("foo", 26379))
+    sentinel = Sentinel([("foo", 26379), ("first", 26379), ("second", 26379)])
+    served = []
+    for _ in range(8):
+        assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+        served.append(sentinel.sentinels[0].id)
+    # quarantine expires every FAILED_SENTINEL_QUARANTINE calls, so 'foo'
+    # is retried at most once inside this loop and cannot stay at the head
+    assert served.count(("first", 26379)) >= 3
+    assert served.count(("second", 26379)) >= 3
+    assert served.count(("foo", 26379)) <= 1
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_order_permutes_never_dups(cluster, sentinel, master_ip):
+    orders = set()
+    for _ in range(10):
+        assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+        ids = tuple(s.id for s in sentinel.sentinels)
+        # every order is a permutation of the configured sentinels: no
+        # duplicates, nothing lost
+        assert sorted(ids) == [("bar", 26379), ("foo", 26379)]
+        orders.add(ids)
+    # both orders are actually exercised
+    assert len(orders) == 2
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_rotates_concurrently(cluster, sentinel, master_ip):
+    # Concurrent discovery calls must not duplicate or drop sentinels.
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(20):
+                assert sentinel.discover_master("mymaster") == (master_ip, 6379)
+                ids = [s.id for s in sentinel.sentinels]
+                assert len(ids) == len(set(ids)), f"duplicate sentinels: {ids}"
+                assert set(ids) == {("foo", 26379), ("bar", 26379)}
+                barrier.wait(timeout=5)
+        except Exception as e:  # pragma: no cover - failure reporting
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    # force frequent thread switches so the interleaving is exercised
+    switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        sys.setswitchinterval(switch_interval)
+    assert not any(t.is_alive() for t in threads), "workers did not finish"
+    assert not errors
 
 
 @pytest.mark.onlynoncluster

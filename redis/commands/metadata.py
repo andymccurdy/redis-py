@@ -1279,6 +1279,15 @@ _DONT_CACHE_READONLY_KEYLESS = replace(_READONLY_KEYLESS, is_dont_cache=True)
 _DONT_CACHE_WRITE_KEYLESS = replace(_WRITE_KEYLESS, is_dont_cache=True)
 _DONT_CACHE_WRITE_KEYED = replace(_WRITE_KEYED, is_dont_cache=True)
 
+# SCRIPT KILL and FUNCTION KILL, which the server tips request_policy:all_shards and
+# response_policy:one_succeeded: sent to every primary, they succeed on the shard that runs
+# the script or function, while the others answer NOTBUSY.
+_WRITE_KEYLESS_ALL_SHARDS_ONE_SUCCEEDED = replace(
+    _WRITE_KEYLESS,
+    request_policy=RequestPolicy.ALL_SHARDS,
+    response_policy=ResponsePolicy.ONE_SUCCEEDED,
+)
+
 
 # =============================================================================
 # Static command metadata table
@@ -1381,6 +1390,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "exists": _CACHEABLE_KEYED,
                 "expiretime": _CACHEABLE_KEYED,
                 "fcall_ro": _SCRIPT_RUNNER_MOVABLE_KEYS,
+                "function kill": _WRITE_KEYLESS_ALL_SHARDS_ONE_SUCCEEDED,
                 "geodist": _CACHEABLE_KEYED,
                 "geohash": _CACHEABLE_KEYED,
                 "geopos": _CACHEABLE_KEYED,
@@ -1425,6 +1435,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 # routing SCAN to all primary nodes (PRIMARIES) rather than a single random node.
                 "scan": _NONDETERMINISTIC_KEYLESS_WITHHELD_ROUTING,
                 "scard": _CACHEABLE_KEYED,
+                "script kill": _WRITE_KEYLESS_ALL_SHARDS_ONE_SUCCEEDED,
                 "sdiff": _CACHEABLE_KEYED,
                 "sdiffcard": _CACHEABLE_MOVABLE_KEYS,
                 "sexpiretime": _CACHEABLE_KEYED,

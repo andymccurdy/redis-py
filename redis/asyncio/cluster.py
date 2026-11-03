@@ -739,6 +739,7 @@ class RedisCluster(
             RequestPolicy.SPECIAL: self.get_special_nodes,
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
+            ResponsePolicy.ONE_SUCCEEDED: lambda res: res,
         }
 
         # Built here rather than defaulted in the signature, so that each client owns its
@@ -1609,6 +1610,36 @@ class RedisCluster(
                     return self._policies_callback_mapping[
                         command_policies.response_policy
                     ](ret)
+                elif command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED:
+                    # Sent to every target, as the request policy asks, and answered
+                    # with the first reply that is not an error: a SCRIPT KILL
+                    # succeeds on the shard that runs the script, and the others
+                    # answer NOTBUSY. An error is raised only if every target replies
+                    # with one.
+                    replies = await asyncio.gather(
+                        *(
+                            asyncio.create_task(
+                                self._execute_command(node, *args, **kwargs)
+                            )
+                            for node in target_nodes
+                        ),
+                        return_exceptions=True,
+                    )
+                    for reply in replies:
+                        if isinstance(reply, BaseException) and not isinstance(
+                            reply, ResponseError
+                        ):
+                            raise reply
+                    for node, reply in zip(target_nodes, replies):
+                        if not isinstance(reply, ResponseError):
+                            if command in self.result_callbacks:
+                                reply = self.result_callbacks[command](
+                                    command, {node.name: reply}, **kwargs
+                                )
+                            return self._policies_callback_mapping[
+                                command_policies.response_policy
+                            ](reply)
+                    raise replies[0]
                 else:
                     keys = [node.name for node in target_nodes]
                     values = await asyncio.gather(

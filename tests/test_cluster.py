@@ -3295,7 +3295,7 @@ class TestStaticMetadataRouting:
     def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(self):
         """
         A response policy resolved for the whole cluster must not apply when the caller
-        named its targets: ``ONE_SUCCEEDED`` would stop the loop after the first node the
+        named its targets: ``ONE_SUCCEEDED`` would answer with the reply of a single node the
         caller picked, and an ``AGG_*`` would fold the replies of the rest into it.
         """
         resolver = DynamicMetadataResolver(
@@ -3319,6 +3319,52 @@ class TestStaticMetadataRouting:
 
         assert execute.call_count == len(nodes)
         assert result == 7 * len(nodes)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "method, success", [("script_kill", True), ("function_kill", b"OK")]
+    )
+    def test_kill_reaches_every_primary_and_returns_the_first_success(
+        self, method, success
+    ):
+        """
+        SCRIPT KILL and FUNCTION KILL are tipped ``request_policy:all_shards`` and
+        ``response_policy:one_succeeded``: only the shard that runs the script or function
+        can stop it, and the others answer NOTBUSY.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+        primaries = rc.get_primaries()
+        assert len(primaries) > 1
+        busy = primaries[-1]
+        called = []
+
+        def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is busy:
+                return success
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with patch.object(
+            RedisCluster, "_execute_command", side_effect=execute_command
+        ):
+            assert getattr(rc, method)() == success
+
+        assert called == primaries
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    def test_kill_raises_when_every_primary_replies_with_an_error(self, method):
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+
+        with patch.object(
+            RedisCluster,
+            "_execute_command",
+            side_effect=ResponseError("NOTBUSY No scripts in execution right now."),
+        ) as execute:
+            with pytest.raises(ResponseError, match="NOTBUSY"):
+                getattr(rc, method)()
+
+        assert execute.call_count == len(rc.get_primaries())
 
     @pytest.mark.fixed_client
     def test_determine_nodes_raises_exception_when_no_policy_resolved(self):

@@ -5104,8 +5104,9 @@ class TestStaticMetadataRouting:
     ) -> None:
         """
         A response policy resolved for the whole cluster must not apply when the caller
-        named its targets. RANDOMKEY has no result callback, so the reply is handed to the
-        response-policy callback - which knows only the two defaults.
+        named its targets. RANDOMKEY has no result callback, so the replies are handed to the
+        response-policy callback as they are, where ``ONE_SUCCEEDED`` would answer with the
+        reply of a single node.
         """
         resolver = AsyncDynamicMetadataResolver(
             {
@@ -5130,6 +5131,60 @@ class TestStaticMetadataRouting:
 
         assert execute.call_count == len(nodes)
         assert result == {node.name: "k" for node in nodes}
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "method, success", [("script_kill", True), ("function_kill", b"OK")]
+    )
+    async def test_kill_reaches_every_primary_and_returns_the_first_success(
+        self, method, success
+    ) -> None:
+        """
+        SCRIPT KILL and FUNCTION KILL are tipped ``request_policy:all_shards`` and
+        ``response_policy:one_succeeded``: only the shard that runs the script or function
+        can stop it, and the others answer NOTBUSY.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        primaries = rc.get_primaries()
+        assert len(primaries) > 1
+        busy = primaries[-1]
+        called = []
+
+        async def execute_command(node, *args, **kwargs):
+            called.append(node)
+            if node is busy:
+                return success
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=execute_command
+        ):
+            assert await getattr(rc, method)() == success
+
+        assert sorted(node.name for node in called) == sorted(
+            node.name for node in primaries
+        )
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    async def test_kill_raises_when_every_primary_replies_with_an_error(
+        self, method
+    ) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+
+        with mock.patch.object(
+            ClusterNode,
+            "execute_command",
+            new=mock.AsyncMock(
+                side_effect=ResponseError("NOTBUSY No scripts in execution right now.")
+            ),
+        ) as execute:
+            with pytest.raises(ResponseError, match="NOTBUSY"):
+                await getattr(rc, method)()
+
+        assert execute.call_count == len(rc.get_primaries())
         await rc.aclose()
 
     @pytest.mark.fixed_client

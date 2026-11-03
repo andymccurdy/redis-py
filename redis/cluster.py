@@ -1193,6 +1193,7 @@ class RedisCluster(
             RequestPolicy.SPECIAL: self.get_special_nodes,
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
+            ResponsePolicy.ONE_SUCCEEDED: lambda res: res,
         }
 
         # ``policy_resolver`` is the routing view of a metadata resolver, so the two
@@ -1989,11 +1990,27 @@ class RedisCluster(
                         len(target_nodes) == 1
                         and target_nodes[0] == self.get_default_node()
                     )
-                for node in target_nodes:
-                    res[node.name] = self._execute_command(node, *args, **kwargs)
-
-                    if command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED:
-                        break
+                if command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED:
+                    # Sent to every target, as the request policy asks, and answered
+                    # with the first reply that is not an error: a SCRIPT KILL
+                    # succeeds on the shard that runs the script, and the others
+                    # answer NOTBUSY. An error is raised only if every target replies
+                    # with one.
+                    first_error = None
+                    for node in target_nodes:
+                        try:
+                            reply = self._execute_command(node, *args, **kwargs)
+                        except ResponseError as e:
+                            if first_error is None:
+                                first_error = e
+                            continue
+                        if not res:
+                            res[node.name] = reply
+                    if not res:
+                        raise first_error
+                else:
+                    for node in target_nodes:
+                        res[node.name] = self._execute_command(node, *args, **kwargs)
 
                 # Return the processed result
                 # ``command``, not ``args[0]``: the result callbacks are keyed by the name

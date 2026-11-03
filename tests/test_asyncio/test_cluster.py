@@ -279,6 +279,7 @@ async def get_mocked_redis_client(
 
 def mock_node_resp(node: ClusterNode, response: Any) -> ClusterNode:
     connection = mock.AsyncMock(spec=Connection)
+    connection._resp2_fallback = False
     connection.is_connected = True
     connection.should_reconnect.return_value = False
     connection.read_response.return_value = response
@@ -290,6 +291,7 @@ def mock_node_resp(node: ClusterNode, response: Any) -> ClusterNode:
 
 def mock_node_resp_exc(node: ClusterNode, exc: Exception) -> ClusterNode:
     connection = mock.AsyncMock(spec=Connection)
+    connection._resp2_fallback = False
     connection.is_connected = True
     connection.should_reconnect.return_value = False
     connection.read_response.side_effect = exc
@@ -1913,6 +1915,7 @@ class TestTopologyRefreshKeepsConnections:
 
         # No socket to leak: keeps ClusterNode.__del__ quiet
         is_connected = False
+        _resp2_fallback = False
 
         def __init__(self) -> None:
             self.closed_by_server = True
@@ -7086,6 +7089,7 @@ class TestNodesManager:
                 self.reconnect = False
                 self.response_ready = asyncio.Event()
                 self.send_called = asyncio.Event()
+                self._resp2_fallback = False
 
             def pack_command(self, *args):
                 return b"packed"
@@ -7976,6 +7980,7 @@ class TestClusterNodeConnectionHandling:
                 self.disconnect_started = asyncio.Event()
                 self.allow_disconnect = asyncio.Event()
                 self.disconnect_calls = 0
+                self._resp2_fallback = False
 
             def pack_command(self, *args: Any) -> bytes:
                 return b"packed-command"
@@ -8856,6 +8861,7 @@ class TestClusterPipelineMocked:
             connection.is_connected = caller_connected
             connection.should_reconnect.return_value = False
             connection.pack_command.return_value = [b"COMMAND GETKEYS"]
+            connection._resp2_fallback = False
             connection.read_response.return_value = ["{tag}a", "{tag}b"]
 
             async def disconnect_caller(connection=connection):
@@ -8871,6 +8877,7 @@ class TestClusterPipelineMocked:
 
         def make_private_connection(**kwargs):
             connection = mock.AsyncMock(spec=Connection)
+            connection._resp2_fallback = False
             connection.is_connected = False
             connection.should_reconnect.return_value = False
 

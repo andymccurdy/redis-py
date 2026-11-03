@@ -2599,7 +2599,12 @@ class ClusterNode:
         kwargs.pop("keys", None)
 
         # Return response
-        callback = _get_response_callback(self.response_callbacks, command, connection)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command)
         if callback is not None:
             return callback(response, **kwargs)
 
@@ -4964,11 +4969,16 @@ class TransactionStrategy(AbstractStrategy):
         for r, cmd in zip(response, self._command_queue):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
-                callback = _get_response_callback(
-                    self._pipe.cluster_client.response_callbacks,
-                    command_name,
-                    connection,
-                )
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self._pipe.cluster_client.response_callbacks,
+                        command_name,
+                        connection,
+                    )
+                else:
+                    callback = self._pipe.cluster_client.response_callbacks.get(
+                        command_name
+                    )
                 if callback is not None:
                     # The keys option is only for the client cache and is
                     # not an option of the callbacks

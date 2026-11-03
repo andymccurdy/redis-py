@@ -503,6 +503,8 @@ class MaintNotificationsAbstractConnection:
         way, as is a drain that does not complete within
         ``PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT``.
         """
+        if self._resp2_fallback:
+            raise ConnectionError("Connection has data")
         parser = self._get_push_notifications_parser()
         deferred: list = []
 
@@ -765,6 +767,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_cluster_handler_for_connection(
         self, oss_cluster_maint_notifications_handler: OSSMaintNotificationsHandler
     ):
+        if self._resp2_fallback:
+            return
         parser = self._get_push_notifications_parser()
         parser.set_oss_cluster_maint_push_handler(
             oss_cluster_maint_notifications_handler.handle_notification
@@ -1451,6 +1455,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.protocol = 2
         self._resp2_fallback = True
         self.handshake_metadata = {}
+        self._oss_cluster_maint_notifications_handler = None
+        self._maint_notifications_pool_handler = None
+        self._maint_notifications_connection_handler = None
         if auth_args:
             self._do_resp2_auth(auth_args)
 

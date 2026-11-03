@@ -19,7 +19,7 @@ from redis.client import CaseInsensitiveDict
 from redis.cluster import PipelineCommand, TransactionStrategy
 from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.credentials import CredentialProvider
-from redis.exceptions import AuthenticationError, ResponseError
+from redis.exceptions import AuthenticationError, ConnectionError, ResponseError
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.utils import HIREDIS_AVAILABLE
 
@@ -289,6 +289,10 @@ class TestHelloFallback:
         assert conn._parser.EXCEPTION_CLASSES is exceptions
         assert conn.get_protocol() == 2
         assert conn._resp2_fallback is True
+        conn.set_maint_notifications_cluster_handler_for_connection(mock.Mock())
+        assert conn._oss_cluster_maint_notifications_handler is None
+        with pytest.raises(ConnectionError, match="Connection has data"):
+            conn.handle_pending_push_notifications()
         assert not any(
             c.args[:2] == ("CLIENT", "MAINT_NOTIFICATIONS")
             for c in conn.send_command.call_args_list
@@ -393,20 +397,23 @@ def test_bytes_commands_without_fallback_keep_raw_replies(protocol, legacy_respo
     custom.assert_called_once_with(wire)
 
 
-def test_normal_callback_path_only_checks_fallback_flag():
-    conn = Connection()
+@pytest.mark.parametrize("protocol", [None, 2, 3])
+def test_normal_callback_path_skips_fallback_helper(protocol):
+    conn = Connection(protocol=protocol)
     conn.get_protocol = mock.Mock(
         side_effect=AssertionError("unexpected protocol lookup")
     )
-    callback = mock.Mock()
-    callbacks = {"hgetall": callback}
+    conn.read_response = mock.Mock(return_value=b"value")
+    callback = mock.Mock(return_value="custom")
+    client = redis.Redis(protocol=protocol)
+    client.response_callbacks = {"hgetall": callback}
     with mock.patch(
-        "redis._parsers.response_callbacks.str_if_bytes",
-        side_effect=AssertionError("unexpected normalization"),
+        "redis.client._get_response_callback",
+        side_effect=AssertionError("unexpected fallback helper call"),
     ):
-        assert _get_response_callback(callbacks, "hgetall", conn) is callback
-        assert _get_response_callback(callbacks, "HGETALL", conn) is None
-        assert _get_response_callback(callbacks, b"hgetall", conn) is None
+        assert client.parse_response(conn, "hgetall") == "custom"
+        assert client.parse_response(conn, "HGETALL") == b"value"
+        assert client.parse_response(conn, b"hgetall") == b"value"
 
 
 @pytest.mark.parametrize("legacy_responses", [True, False])
@@ -484,10 +491,11 @@ def test_original_callback_keys_are_preserved(mapping_type):
 
 
 @pytest.mark.parametrize("legacy_responses", [True, False])
-def test_cluster_transaction_uses_negotiated_callbacks(legacy_responses):
+@pytest.mark.parametrize("fallback", [False, True])
+def test_cluster_transaction_preserves_raw_replies(legacy_responses, fallback):
     conn = Connection(legacy_responses=legacy_responses)
     conn.protocol = 2
-    conn._resp2_fallback = True
+    conn._resp2_fallback = fallback
     conn.send_packed_command = mock.Mock()
     conn.read_response = mock.Mock(
         side_effect=[b"OK", b"QUEUED", [[b"field", b"value"]]]
@@ -495,6 +503,8 @@ def test_cluster_transaction_uses_negotiated_callbacks(legacy_responses):
     node = redis.Redis(legacy_responses=legacy_responses)
     strategy = object.__new__(TransactionStrategy)
     strategy._pipeline_slots = {0}
+    strategy._retrying = None
+    strategy._nodes_manager = mock.Mock(_refresh_requested=False)
     strategy._pipe = mock.Mock(cluster_response_callbacks={})
     strategy._command_queue = [PipelineCommand(("HGETALL", "key"), {"keys": ["key"]})]
     strategy._get_client_and_connection_for_transaction = mock.Mock(
@@ -503,8 +513,60 @@ def test_cluster_transaction_uses_negotiated_callbacks(legacy_responses):
     strategy._himport_prepare_pipeline = mock.Mock()
     strategy._raise_first_error = mock.Mock()
     assert strategy._execute_transaction(strategy._command_queue, True) == [
-        {b"field": b"value"}
+        [b"field", b"value"]
     ]
+
+
+@pytest.mark.onlycluster
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("legacy_responses", [True, False])
+def test_fallback_cluster_initialization_and_transaction(
+    request, parser_class, legacy_responses
+):
+    url = request.config.getoption("--redis-url")
+    client = redis.RedisCluster.from_url(
+        url,
+        connection_class=HelloRejectingConnection,
+        parser_class=parser_class,
+        legacy_responses=legacy_responses,
+        driver_info=None,
+    )
+    control = redis.RedisCluster.from_url(
+        url, protocol=2, legacy_responses=legacy_responses
+    )
+    key = "{hello-fallback}:hash"
+    value_key = "{hello-fallback}:value"
+    number_key = "{hello-fallback}:number"
+    try:
+        control.hset(key, mapping={"field": "value"})
+        results = []
+        for cluster in (control, client):
+            cluster.set(number_key, "1.5")
+            with cluster.pipeline(transaction=True) as pipe:
+                results.append(
+                    pipe.set(value_key, "value")
+                    .hgetall(key)
+                    .incrbyfloat(number_key, 1.5)
+                    .execute()
+                )
+        assert results == [[b"OK", [b"field", b"value"], b"3"]] * 2
+        assert client.hgetall(key) == {b"field": b"value"}
+        for node in client.get_nodes():
+            pool = node.redis_connection.connection_pool
+            connection = pool.get_connection()
+            try:
+                assert connection._resp2_fallback is True
+                assert connection.get_protocol() == 2
+                assert connection._oss_cluster_maint_notifications_handler is None
+            finally:
+                pool.release(connection)
+        client.disconnect_connection_pools()
+        assert client.hgetall(key) == {b"field": b"value"}
+    finally:
+        control.delete(key, value_key, number_key)
+        control.close()
+        client.close()
 
 
 @pytest.mark.onlynoncluster

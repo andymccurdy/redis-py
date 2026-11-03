@@ -15,6 +15,7 @@ from redis.credentials import CredentialProvider
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
+    ConnectionError,
     ResponseError,
 )
 from redis.maint_notifications import MaintNotificationsConfig
@@ -78,6 +79,10 @@ class TestHelloFallback:
         assert conn.get_protocol() == 2
         assert conn._resp2_fallback is True
         assert conn.handshake_metadata == {}
+        conn.set_maint_notifications_cluster_handler_for_connection(mock.Mock())
+        assert conn._oss_cluster_maint_notifications_handler is None
+        with pytest.raises(ConnectionError, match="Connection has data"):
+            await conn.handle_pending_push_notifications()
         assert not any(
             c.args[:2] == ("CLIENT", "MAINT_NOTIFICATIONS")
             for c in conn.send_command.call_args_list
@@ -208,6 +213,26 @@ class TestHelloFallback:
         assert await client.parse_response(conn, b"HGETALL") == "custom"
         custom.assert_awaited_once_with(wire)
 
+    @pytest.mark.parametrize("protocol", [None, 2, 3])
+    async def test_normal_callback_path_skips_fallback_helper(self, protocol):
+        conn = self._make_connection(protocol=protocol)
+        conn.read_response = mock.AsyncMock(return_value=b"value")
+        callback = mock.Mock(return_value="custom")
+        callbacks = {"GET": callback}
+        client = redis.Redis(protocol=protocol)
+        client.response_callbacks = callbacks
+        node = ClusterNode("127.0.0.1", 6379, response_callbacks=callbacks)
+        for target, module in (
+            (client, "redis.asyncio.client"),
+            (node, "redis.asyncio.cluster"),
+        ):
+            with mock.patch(
+                f"{module}._get_response_callback",
+                side_effect=AssertionError("unexpected fallback helper call"),
+            ):
+                assert await target.parse_response(conn, "GET") == "custom"
+                assert await target.parse_response(conn, b"GET") == b"value"
+
     @pytest.mark.parametrize("legacy_responses", [True, False])
     async def test_cluster_node_uses_negotiated_callbacks(self, legacy_responses):
         conn = self._make_connection(legacy_responses=legacy_responses)
@@ -252,12 +277,15 @@ class TestHelloFallback:
         custom.assert_awaited_once_with(wire)
 
     @pytest.mark.parametrize("legacy_responses", [True, False])
+    @pytest.mark.parametrize("protocol", [None, 2])
     async def test_cluster_transaction_uses_negotiated_callbacks(
-        self, legacy_responses
+        self, legacy_responses, protocol
     ):
-        conn = self._make_connection(legacy_responses=legacy_responses)
+        conn = self._make_connection(
+            protocol=protocol, legacy_responses=legacy_responses
+        )
         conn.protocol = 2
-        conn._resp2_fallback = True
+        conn._resp2_fallback = protocol is None
         conn.send_packed_command = mock.AsyncMock()
         node = mock.Mock(spec=ClusterNode)
         node.parse_response = mock.AsyncMock(
@@ -267,10 +295,13 @@ class TestHelloFallback:
         node._himport_prepare_pipeline = mock.AsyncMock()
         strategy = object.__new__(TransactionStrategy)
         strategy._pipeline_slots = {0}
+        strategy._retrying = None
+        strategy._transaction_connection = None
         strategy._watching = False
         strategy._pipe = mock.Mock()
+        strategy._pipe.cluster_client._initialize_due.return_value = False
         strategy._pipe.cluster_client.response_callbacks = get_response_callbacks(
-            None, legacy_responses
+            protocol, legacy_responses
         )
         strategy._command_queue = [PipelineCommand(0, "HGETALL", "key", keys=["key"])]
         strategy._get_client_and_connection_for_transaction = mock.Mock(
@@ -280,6 +311,50 @@ class TestHelloFallback:
         assert await strategy._execute_transaction(strategy._command_queue, True) == [
             {b"field": b"value"}
         ]
+
+
+@pytest.mark.onlycluster
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("legacy_responses", [True, False])
+@pytest.mark.parametrize("protocol", [None, 2])
+async def test_cluster_transaction_strips_keys_option(
+    request, monkeypatch, parser_class, legacy_responses, protocol
+):
+    class ParserConnection(HelloRejectingConnection):
+        def __init__(self, **kwargs):
+            super().__init__(parser_class=parser_class, **kwargs)
+
+    monkeypatch.setattr("redis.asyncio.cluster.Connection", ParserConnection)
+    client = redis.RedisCluster.from_url(
+        request.config.getoption("--redis-url"),
+        protocol=protocol,
+        legacy_responses=legacy_responses,
+        driver_info=None,
+    )
+    key = "{async-hello-fallback}:hash"
+    value_key = "{async-hello-fallback}:value"
+    number_key = "{async-hello-fallback}:number"
+    try:
+        await client.initialize()
+        await client.hset(key, mapping={"field": "value"})
+        await client.set(number_key, "1.5")
+        async with client.pipeline(transaction=True) as pipe:
+            assert await pipe.set(value_key, "value").hgetall(key).incrbyfloat(
+                number_key, 1.5
+            ).execute() == [True, {b"field": b"value"}, 3.0]
+        node = client.get_default_node()
+        connection = node.acquire_connection()
+        try:
+            await connection.connect()
+            assert connection.get_protocol() == 2
+            assert connection._resp2_fallback is (protocol is None)
+            assert connection._oss_cluster_maint_notifications_handler is None
+        finally:
+            node.release(connection)
+    finally:
+        await client.delete(key, value_key, number_key)
+        await client.aclose()
 
 
 @pytest.mark.onlynoncluster

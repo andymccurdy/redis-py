@@ -1034,9 +1034,12 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        callback = _get_response_callback(
-            self.response_callbacks, command_name, connection
-        )
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
         if callback is not None:
             return callback(response, **options)
         return response
@@ -2220,9 +2223,12 @@ class Pipeline(Redis):
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
                 command_name = args[0]
-                callback = _get_response_callback(
-                    self.response_callbacks, command_name, connection
-                )
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
                 if callback is not None:
                     r = callback(r, **options)
             data.append(r)

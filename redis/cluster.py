@@ -143,13 +143,18 @@ def _resolve_localhost() -> str:
     return socket.gethostbyname("localhost")
 
 
-def _reuse_origin_host(error: AskError, origin_host: str) -> None:
+def _fill_missing_redirect_host(error: AskError, origin_host: str) -> None:
     """
     Give a MOVED or ASK redirect that came without a host the host of the node
     that sent it. A node whose endpoint is unknown
     (``cluster-preferred-endpoint-type unknown-endpoint``) redirects with only a
     port, as in ``MOVED 3999 :6381``, and expects the client to reach out on
     the endpoint it sent the command to.
+
+    ``origin_host`` is the host the client connected to, which has already been
+    through ``address_remap``, so the redirect is remapped a second time when it
+    is followed. That is harmless for a remap that only picks the port, as for a
+    proxy, but not for one that changes the host.
     """
     if not error.host:
         error.host = origin_host
@@ -2305,7 +2310,7 @@ class RedisCluster(
                         f"MOVED error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
-                _reuse_origin_host(e, target_node.host)
+                _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
                 # refresh of the whole topology, run by the next attempt of any
@@ -2380,7 +2385,7 @@ class RedisCluster(
                         f"ASK error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
-                _reuse_origin_host(e, target_node.host)
+                _fill_missing_redirect_host(e, target_node.host)
                 redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
 
@@ -4499,6 +4504,10 @@ class ClusterPubSub(PubSub):
         # move_slot indexes slots_cache by the redirected slot, so an
         # as-yet-uncovered slot raises: log and still reconcile rather than let
         # a repair attempt break a pubsub read.
+        if node_name is not None:
+            # A redirect without a host is relative to the node that sent it,
+            # and a node's name is its host and port
+            _fill_missing_redirect_host(error, node_name.rsplit(":", 1)[0])
         try:
             self.cluster.nodes_manager.move_slot(error)
         except Exception as exc:
@@ -6431,7 +6440,7 @@ class TransactionStrategy(AbstractStrategy):
                 # the retry goes to the node that owns it now. The refresh is
                 # only asked for, run by the next command once due.
                 if self._transaction_node is not None:
-                    _reuse_origin_host(error, self._transaction_node.host)
+                    _fill_missing_redirect_host(error, self._transaction_node.host)
                 self._nodes_manager.move_slot(error)
                 if should_request_refresh:
                     self._nodes_manager._request_refresh()

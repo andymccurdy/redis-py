@@ -1353,6 +1353,48 @@ class TestRedisClusterObjMocked:
         ]
 
     @pytest.mark.parametrize("error", [AskError, MovedError])
+    def test_redirect_without_host_with_address_remap(self, error):
+        """
+        The host filled in for a redirect without one has already been through
+        address_remap, and following the redirect remaps it again. With a remap
+        that only picks the port, as for a proxy, the command still reaches the
+        remapped address of the node the redirect names.
+        """
+        offset = 1000
+
+        def address_remap(address):
+            host, port = address
+            return host, port + offset
+
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, address_remap=address_remap
+        )
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+
+        def parse_response(redis_node, connection, command, **kwargs):
+            calls.append((redis_node, command))
+            if redis_node is origin.redis_connection:
+                # A node redirects to the port it advertises, not the remapped one
+                raise error(f"{slot} :{target.port - offset}")
+            return b"value"
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+        ):
+            assert rc.get("foo") == b"value"
+
+        expected = [(origin.redis_connection, "GET"), (target.redis_connection, "GET")]
+        if error is AskError:
+            expected.insert(1, (target.redis_connection, "ASKING"))
+        assert calls == expected
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
     def test_transaction_redirect_without_host(self, error):
         """
         A transaction redirected with only a port is retried on that port of the

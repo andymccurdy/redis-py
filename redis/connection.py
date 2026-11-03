@@ -2155,6 +2155,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     ):
         self.pid = os.getpid()
         self._conn = conn
+        self._resp2_fallback = False
         if isinstance(conn, AbstractConnection):
             conn._client_side_caching = True
         self.retry = self._conn.retry

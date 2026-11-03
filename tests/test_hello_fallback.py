@@ -416,6 +416,23 @@ def test_normal_callback_path_skips_fallback_helper(protocol):
         assert client.parse_response(conn, b"hgetall") == b"value"
 
 
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize("parser_class", PARSERS)
+def test_caching_normal_response_skips_fallback_helper(pool_class, parser_class):
+    pool = pool_class(cache_config=CacheConfig(), parser_class=parser_class)
+    client = redis.Redis(connection_pool=pool)
+    connection = pool.make_connection()
+    connection.read_response = mock.Mock(return_value=b"value")
+    try:
+        with mock.patch(
+            "redis.client._get_response_callback",
+            side_effect=AssertionError("unexpected fallback helper call"),
+        ):
+            assert client.parse_response(connection, "GET") == b"value"
+    finally:
+        pool.disconnect()
+
+
 @pytest.mark.parametrize("legacy_responses", [True, False])
 def test_callbacks_are_selected_per_connection(legacy_responses):
     client = redis.Redis(legacy_responses=legacy_responses)

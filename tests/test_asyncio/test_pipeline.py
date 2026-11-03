@@ -55,11 +55,14 @@ class TestPipeline:
                 await asyncio.sleep(0)
                 if packing_started.is_set() and not packing_finished.is_set():
                     event_loop_ticks_during_packing += 1
+                    # Release only after observing a loop tick while the worker
+                    # is inside pack_commands. A fixed delay races with slow
+                    # thread dispatch on loaded CI runners and can set the
+                    # event before the worker starts.
+                    release_packing.set()
 
         observer = asyncio.create_task(observe_event_loop())
         await asyncio.sleep(0)
-        timer = threading.Timer(0.05, release_packing.set)
-        timer.start()
 
         try:
             if transaction:
@@ -76,7 +79,6 @@ class TestPipeline:
             release_packing.set()
             observer.cancel()
             await asyncio.gather(observer, return_exceptions=True)
-            timer.cancel()
 
         assert packing_started.is_set()
         assert result == command_responses

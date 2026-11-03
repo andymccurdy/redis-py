@@ -518,7 +518,6 @@ def test_cluster_transaction_preserves_raw_replies(legacy_responses, fallback):
 
 
 @pytest.mark.onlycluster
-@pytest.mark.fixed_client
 @pytest.mark.parametrize("parser_class", PARSERS)
 @pytest.mark.parametrize("legacy_responses", [True, False])
 def test_fallback_cluster_initialization_and_transaction(

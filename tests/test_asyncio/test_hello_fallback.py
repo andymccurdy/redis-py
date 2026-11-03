@@ -314,7 +314,6 @@ class TestHelloFallback:
 
 
 @pytest.mark.onlycluster
-@pytest.mark.fixed_client
 @pytest.mark.parametrize("parser_class", PARSERS)
 @pytest.mark.parametrize("legacy_responses", [True, False])
 @pytest.mark.parametrize("protocol", [None, 2])

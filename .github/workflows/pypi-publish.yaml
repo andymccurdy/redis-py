@@ -12,6 +12,12 @@ jobs:
 
   build_and_package:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mandatory for OIDC trusted publishing
+      contents: read    # needed because this job runs actions/checkout
+    environment:
+      name: pypi
+      url: https://pypi.org/project/redis/
     steps:
       - uses: actions/checkout@v7
       - name: install python
@@ -28,7 +34,4 @@ jobs:
           twine check dist/*
 
       - name: Publish to Pypi
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0

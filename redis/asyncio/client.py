@@ -1191,6 +1191,13 @@ class Monitor:
             yield await self.next_command()
 
 
+class _UncancellableFuture(asyncio.Future):
+    """A future that ignores cancel(): awaiting it is not woken by Task.cancel()."""
+
+    def cancel(self, msg: Any = None) -> bool:
+        return False
+
+
 class PubSub:
     """
     PubSub provides publish, subscribe and listen support to Redis channels.
@@ -1263,6 +1270,32 @@ class PubSub:
         # immediately as there is nothing to clean-up.
         if not hasattr(self, "connection"):
             return
+        # Shield the teardown so that cancelling the caller (e.g. a cancelled
+        # task or anyio cancel scope exiting ``async with r.pubsub()``) cannot
+        # stop it while it waits for the lock, disconnects, or releases: the
+        # connection would otherwise never be returned to the pool. The caller
+        # still sees the CancelledError.
+        teardown = asyncio.ensure_future(self._aclose())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
+            # Repeated cancels (anyio re-cancels on every loop turn) only mark
+            # this task while it waits here, so it wakes once, when done.
+            waiter = _UncancellableFuture(loop=asyncio.get_running_loop())
+            teardown.add_done_callback(lambda _: waiter.set_result(None))
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass  # the cancels marked while waiting
+            if not teardown.cancelled() and teardown.exception() is not None:
+                logger.warning(
+                    "PubSub teardown failed after a cancellation",
+                    exc_info=teardown.exception(),
+                )
+            raise
+
+    async def _aclose(self) -> None:
         async with self._lock:
             if self.connection:
                 # Use nowait=True to avoid awaiting StreamWriter.wait_closed(),
@@ -1271,8 +1304,10 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
-                await self.connection_pool.release(self.connection)
-                self.connection = None
+                # Detach before awaiting release, as Pipeline.reset() does, so
+                # the pubsub never holds a connection that is back in the pool.
+                connection, self.connection = self.connection, None
+                await self.connection_pool.release(connection)
             self.channels = {}
             self.pending_unsubscribe_channels = set()
             self.patterns = {}

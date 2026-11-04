@@ -1116,6 +1116,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             # clean up after any error in on_connect
             await self.disconnect()
             raise
+        except BaseException:
+            # Likewise for whatever a credential provider raises and for a
+            # cancelled task. A socket left in place reads as connected, so the
+            # next command would run without AUTH and SELECT.
+            await self.disconnect(nowait=True)
+            raise
 
         # run any user callbacks. right now the only internal callback
         # is for pubsub channel/pattern resubscription

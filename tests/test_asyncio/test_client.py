@@ -101,12 +101,7 @@ class TestAsyncRedisClientOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             # Mock _send_command_parse_response to return a successful response
@@ -150,12 +145,7 @@ class TestAsyncRedisClientOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             async def mock_send(*args, **kwargs):
@@ -185,12 +175,7 @@ class TestAsyncRedisClientOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             async def mock_send(*args, **kwargs):
@@ -291,12 +276,7 @@ class TestAsyncRedisClientErrorMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_error_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             # Make command raise an exception
@@ -334,12 +314,7 @@ class TestAsyncRedisClientErrorMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_error_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             # Make command raise a ConnectionError
@@ -374,12 +349,7 @@ class TestAsyncRedisClientErrorMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_error_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             # Make command raise a TimeoutError
@@ -414,12 +384,7 @@ class TestAsyncRedisClientErrorMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_error_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             client = redis.Redis(connection_pool=mock_async_connection_pool)
 
             async def raise_error(*args, **kwargs):

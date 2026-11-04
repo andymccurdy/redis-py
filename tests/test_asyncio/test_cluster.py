@@ -8,7 +8,7 @@ import platform
 import ssl
 import warnings
 import weakref
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Type, Union
 from unittest import mock
 from urllib.parse import urlparse
 
@@ -5892,6 +5892,28 @@ class TestMultiShardRequests:
 
         assert sorted(args[1] for _, args, _ in sent) == sorted([*keys, keys[-1]])
         assert await r.exists(*keys) == 0
+
+    async def test_a_split_command_holds_one_connection_per_node(
+        self, r: RedisCluster, monkeypatch
+    ) -> None:
+        """
+        Each node is sent its slots one at a time, so keys over more slots than a node has
+        connections do not exhaust its pool with ``MaxConnectionsError``.
+        """
+        keys = [f"{{conn{index}}}key" for index in range(60)]
+        await r.mset_nonatomic({key: 1 for key in keys})
+        slots_per_node: Dict[str, Set[int]] = {}
+        for key in keys:
+            node = r.get_node_from_key(key).name
+            slots_per_node.setdefault(node, set()).add(r.keyslot(key))
+        assert min(len(slots) for slots in slots_per_node.values()) > 1
+        for node in r.get_primaries():
+            monkeypatch.setattr(node, "max_connections", 1)
+
+        with _sent_commands() as sent:
+            assert await r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert len(sent) == len({r.keyslot(key) for key in keys})
 
     async def test_a_pipeline_merges_a_split_command_per_slot(
         self, r: RedisCluster, monkeypatch

@@ -1316,27 +1316,51 @@ class RedisCluster(
         resending one that succeeded would run a write twice and change what a summed reply
         counts. A slot is fixed by its keys, so it names the same command on every attempt,
         while its node is looked up again in case the topology changed.
+
+        The commands for different nodes run in parallel, but the commands for one node
+        run one at a time. The command therefore uses at most one connection per node.
+        Running one task per slot would open one connection per slot instead, and raise
+        ``MaxConnectionsError`` once a node holds more of the keys' slots than its
+        ``max_connections``.
         """
-        pending = [split for split in splits if split[0] not in slot_replies]
-        nodes = [await self._get_node_from_slot(command, slot) for slot, *_ in pending]
-        # Every slot runs to completion, so the ones that succeed are kept even when
-        # another fails.
+        by_node: Dict[str, Tuple["ClusterNode", List[MultiShardSplit]]] = {}
+        for split in splits:
+            if split[0] not in slot_replies:
+                node = await self._get_node_from_slot(command, split[0])
+                by_node.setdefault(node.name, (node, []))[1].append(split)
+        # Every node runs to completion, so the slots that succeed are kept even when
+        # another node fails.
         values = await asyncio.gather(
             *(
                 asyncio.create_task(
-                    self._execute_command(node, *slot_args, **_with_keys(kwargs, keys))
+                    self._send_slots_to_node(node, node_splits, slot_replies, kwargs)
                 )
-                for node, (_, slot_args, _, keys) in zip(nodes, pending)
+                for node, node_splits in by_node.values()
             ),
             return_exceptions=True,
         )
-        error = _record_slot_replies(
-            slot_replies, zip((slot for slot, *_ in pending), values)
-        )
-        if error is not None:
-            raise error
+        for error in values:
+            if error is not None:
+                raise error
 
         return _merge_multi_shard_replies(slot_replies, splits, response_policy)
+
+    async def _send_slots_to_node(
+        self,
+        node: "ClusterNode",
+        node_splits: List[MultiShardSplit],
+        slot_replies: Dict[int, Any],
+        kwargs: Dict[str, Any],
+    ) -> None:
+        """
+        Sends the commands of the slots of a split MULTI_SHARD command that ``node`` holds,
+        one at a time, recording each reply in ``slot_replies`` as it arrives. The first
+        error stops the node's remaining slots, which are left for the retry.
+        """
+        for slot, slot_args, _, keys in node_splits:
+            slot_replies[slot] = await self._execute_command(
+                node, *slot_args, **_with_keys(kwargs, keys)
+            )
 
     def get_special_nodes(self) -> Optional[list["ClusterNode"]]:
         """

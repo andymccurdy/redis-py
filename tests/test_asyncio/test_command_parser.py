@@ -47,21 +47,37 @@ class TestAsyncCommandParser:
                 ]
 
     @skip_if_server_version_lt("8.5.240")
+    @skip_if_server_version_gte("8.10.0")
+    @pytest.mark.asyncio
+    async def test_get_command_policies_json_debug_without_its_key_stays_keyless(
+        self, r
+    ):
+        """
+        From 8.5.240, JSON.DEBUG reports ``first_key_pos`` 0. Before 8.10 the server does
+        not report its key in the key specs either, so the keyless default is derived.
+        """
+        await self._assert_json_debug_policies(
+            r, RequestPolicy.DEFAULT_KEYLESS, ResponsePolicy.DEFAULT_KEYLESS
+        )
+
+    @skip_if_server_version_lt("8.10.0")
     @pytest.mark.asyncio
     async def test_get_command_policies_json_debug_movablekeys_stays_keyed(self, r):
         """
-        JSON.DEBUG is ``movablekeys`` from 8.5.240 on, so its key is only in the key specs
-        and ``first_key_pos`` is 0. The keyed default is derived from those specs instead.
+        From 8.10, JSON.DEBUG is ``movablekeys`` and its key is only in the key specs, as
+        ``first_key_pos`` is 0. The keyed default is derived from those specs instead.
         """
+        await self._assert_json_debug_policies(
+            r, RequestPolicy.DEFAULT_KEYED, ResponsePolicy.DEFAULT_KEYED
+        )
+
+    @staticmethod
+    async def _assert_json_debug_policies(r, request_policy, response_policy):
         commands_parser = AsyncCommandsParser()
         await commands_parser.initialize(node=r.get_default_node())
         changes_in_defaults = {
             "json": {
-                "debug": [
-                    "debug",
-                    RequestPolicy.DEFAULT_KEYED,
-                    ResponsePolicy.DEFAULT_KEYED,
-                ],
+                "debug": ["debug", request_policy, response_policy],
             },
         }
         expected_command_policies = get_expected_command_policies(changes_in_defaults)

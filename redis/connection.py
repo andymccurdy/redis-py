@@ -82,6 +82,7 @@ from .maint_notifications import (
     MaintNotificationsConnectionHandler,
     MaintNotificationsPoolHandler,
     OSSMaintNotificationsHandler,
+    _defer_maintenance_events,
     _dispatch_maintenance_event,
 )
 from .observability.attributes import (
@@ -2339,7 +2340,10 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # A cache shared across pools can retain owners from before a fork.
             # Their locks may have been held by threads that do not exist here.
             elif isinstance(owner, CacheProxyConnection) and owner.pid == self.pid:
-                with owner._in_use_lock:
+                # A push listener may close the pool and need this lock again.
+                # Apply notifications while owning the socket, then dispatch
+                # application events after releasing it, even on a read error.
+                with _defer_maintenance_events(), owner._in_use_lock:
                     if not owner._conn.is_connected:
                         # Pool disconnect may have closed this owner while we
                         # waited. can_read() would reconnect its raw connection.

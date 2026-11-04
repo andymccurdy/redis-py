@@ -1,5 +1,6 @@
 import multiprocessing
 import signal
+import socket
 import threading
 import time
 import uuid
@@ -15,10 +16,12 @@ from redis.event import (
     EventDispatcher,
     EventListenerInterface,
     MaintenanceCompletedEvent,
+    MaintenanceStartedEvent,
 )
-from redis.exceptions import AuthenticationError
+from redis.exceptions import AuthenticationError, InvalidResponse
 from redis.maint_notifications import (
     MaintNotificationsConfig,
+    MaintNotificationsConnectionHandler,
     MaintNotificationsPoolHandler,
     MaintenanceState,
     NodeMovingNotification,
@@ -248,6 +251,91 @@ class TestCachePoolOwnership:
         assert len(events) == 2
         assert {event.connection for event in events} == set(owners)
         assert all(not owner.is_connected for owner in owners)
+
+    @pytest.mark.parametrize("outcome", ["close", "listener_error", "parse_error"])
+    def test_idle_owner_push_listeners_run_after_drain(self, pool, r2, outcome):
+        pool.update_maint_notifications_config(MaintNotificationsConfig(enabled="auto"))
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        events, errors = [], []
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    # Fail deterministically on the old code without leaving
+                    # a blocked thread behind when close reacquires this lock.
+                    acquired = owner._in_use_lock.acquire(blocking=False)
+                    assert acquired, "push listener holds the idle owner's lock"
+                    owner._in_use_lock.release()
+                    assert not owner._idle_maintenance
+                    events.append(event)
+                    if isinstance(event, MaintenanceCompletedEvent):
+                        assert owner.maintenance_state == MaintenanceState.NONE
+                        pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                if outcome == "listener_error":
+                    raise RuntimeError("application listener failed")
+
+        config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher(
+                {
+                    MaintenanceStartedEvent: [Listener()],
+                    MaintenanceCompletedEvent: [Listener()],
+                }
+            ),
+        )
+        # A socket pair delivers real RESP3 frames to both parser implementations
+        # without requiring an Enterprise server to emit maintenance pushes.
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        handler = MaintNotificationsConnectionHandler(owner, config)
+        owner._conn._parser.set_maintenance_push_handler(handler.handle_notification)
+        owner.maint_notifications_config = config
+        payload = b">3\r\n+MIGRATING\r\n:1\r\n:10\r\n>2\r\n+MIGRATED\r\n:1\r\n"
+        if outcome == "parse_error":
+            payload += b"?invalid\r\n"
+        server.sendall(payload)
+
+        try:
+            if outcome == "parse_error":
+                with pytest.raises(InvalidResponse):
+                    borrower.send_command("GET", key, keys=[key])
+            else:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            assert not errors
+            assert [type(event) for event in events] == [
+                MaintenanceStartedEvent,
+                MaintenanceCompletedEvent,
+            ]
+            assert all(event.connection is owner for event in events)
+            assert not owner.is_connected
+            # A callback close invalidates the candidate; subsequent replies
+            # still come from the correct socket, including after a parse error.
+            r2.set(key, "new")
+            if outcome != "parse_error":
+                # SET's reply on the writer does not guarantee delivery of the
+                # invalidation on the borrower's independent connection yet.
+                assert borrower.can_read(timeout=1)
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"new"
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            server.close()
+            client.close()
+            peers.release(borrower)
+            peers.disconnect()
 
     def test_own_cache_hit_drains_once_and_observes_invalidations(self, pool, r2):
         key = str(uuid.uuid4())

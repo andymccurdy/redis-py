@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -794,6 +795,27 @@ def _should_skip_connection_timeout_update(
 # timeout - or, with a blocking socket, indefinitely.
 PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT = 1.0
 
+_maintenance_event_state = threading.local()
+
+
+@contextmanager
+def _defer_maintenance_events():
+    """Keep listener callbacks outside a synchronous socket ownership scope."""
+    previous = getattr(_maintenance_event_state, "pending", None)
+    if previous is not None:
+        yield
+        return
+    pending = []
+    _maintenance_event_state.pending = pending
+    try:
+        yield
+    finally:
+        # A listener may reenter the pool. Restore immediate dispatch before
+        # calling it, including when the drain failed or was interrupted.
+        _maintenance_event_state.pending = previous
+        for config, event in pending:
+            _dispatch_maintenance_event(config, event)
+
 
 def _dispatch_maintenance_event(
     config: MaintNotificationsConfig,
@@ -807,6 +829,10 @@ def _dispatch_maintenance_event(
     """
     dispatcher = config.event_dispatcher
     if dispatcher is None:
+        return
+    pending = getattr(_maintenance_event_state, "pending", None)
+    if pending is not None:
+        pending.append((config, event))
         return
     try:
         dispatcher.dispatch(event)

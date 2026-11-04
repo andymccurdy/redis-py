@@ -9,6 +9,39 @@ import pytest
 
 from redis.commands.search import reducers
 from redis.commands.search.aggregation import FIELDNAME, AggregateRequest
+from redis.commands.search.hybrid_query import HybridPostProcessingConfig
+
+
+@pytest.mark.fixed_client
+class TestRequestLimit:
+    @pytest.mark.parametrize(
+        "request_type", [AggregateRequest, HybridPostProcessingConfig]
+    )
+    @pytest.mark.parametrize("offset, count", [(0, 0), (0, 1), (0, 10), (3, 10)])
+    def test_explicit_limit(self, request_type, offset, count):
+        request = request_type().limit(offset, count)
+
+        assert request.build_args()[-3:] == ["LIMIT", str(offset), str(count)]
+
+    @pytest.mark.parametrize(
+        "request_type", [AggregateRequest, HybridPostProcessingConfig]
+    )
+    def test_no_limit(self, request_type):
+        assert "LIMIT" not in request_type().build_args()
+
+    @pytest.mark.parametrize("limit_first", [False, True])
+    def test_zero_limit_preserves_aggregation_stage_order(self, limit_first):
+        request = AggregateRequest("*")
+        if limit_first:
+            request.limit(0, 0)
+        request.group_by("@id", reducers.count())
+        if not limit_first:
+            request.limit(0, 0)
+
+        group_args = ["GROUPBY", "1", "@id", "REDUCE", "COUNT", "0"]
+        limit_args = ["LIMIT", "0", "0"]
+        expected = limit_args + group_args if limit_first else group_args + limit_args
+        assert request.build_args()[-len(expected) :] == expected
 
 
 @pytest.mark.fixed_client

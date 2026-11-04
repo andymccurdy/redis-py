@@ -43,14 +43,15 @@ class TSInfo:
     chunk_size = None
     duplicate_policy = None
 
-    def __init__(self, args):
+    def __init__(self, args, unified=False):
         """
         Hold information and statistics on the time-series.
 
         The supported params that can be passed as args:
 
         rules:
-            A list of compaction rules of the time series.
+            A list of compaction rules of the time series, or a dict keyed
+            by destination key when ``unified`` is set.
         sourceKey:
             Key name for source time series in case the current series
             is a target of a rule.
@@ -82,13 +83,23 @@ class TSInfo:
         if isinstance(args, dict):
             # RESP3 wire: response is a native map (bytes keys when not decoded).
             response = {nativestr(k): v for k, v in args.items()}
-            self.rules = response.get("rules") or {}
+            rules = response.get("rules") or {}
+            if unified:
+                self.rules = rules
+            else:
+                # Match the RESP2 list of [dest_key, bucket, aggregator, alignment].
+                self.rules = [[key, *rule] for key, rule in rules.items()]
             labels = response.get("labels") or {}
             self.labels = {str_if_bytes(k): str_if_bytes(v) for k, v in labels.items()}
         else:
             # RESP2 wire: flat list of alternating key-value pairs.
             response = dict(zip(map(nativestr, args[::2]), args[1::2]))
-            self.rules = response.get("rules")
+            rules = response.get("rules")
+            if unified:
+                # Key the rules by destination key, like the RESP3 map.
+                self.rules = {rule[0]: rule[1:] for rule in rules or []}
+            else:
+                self.rules = rules
             self.labels = list_to_dict(response.get("labels"))
         self.source_key = response.get("sourceKey")
         self.chunk_count = response.get("chunkCount")
@@ -117,3 +128,12 @@ class TSInfo:
 
     def __getitem__(self, item):
         return getattr(self, _FIELD_ALIASES.get(item, item))
+
+
+def parse_info_unified(response, **kwargs):
+    """Unified parser for TS.INFO.
+
+    Emits a :class:`TSInfo` whose ``rules`` are ``{dest_key: [bucket,
+    aggregator, alignment]}`` on both wire formats, the shape of the RESP3 map.
+    """
+    return TSInfo(response, unified=True)

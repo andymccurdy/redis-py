@@ -77,6 +77,7 @@ from redis.cluster import (
     LoadBalancer,
     LoadBalancingStrategy,
     _error_to_raise,
+    _one_succeeded_error,
     _resolve_localhost,
     _should_request_refresh,
     _topology_refresh_delay,
@@ -1615,9 +1616,7 @@ class RedisCluster(
                     # with the first reply that is not an error: a SCRIPT KILL
                     # succeeds on the shard that runs the script, and the others
                     # answer NOTBUSY. Once a target succeeds, the errors of the
-                    # others don't matter. If none does, an error that isn't a reply,
-                    # such as a ConnectionError, comes first: the script may run on
-                    # that node, and the retry handling applies to it.
+                    # others don't matter.
                     replies = await asyncio.gather(
                         *(
                             asyncio.create_task(
@@ -1641,13 +1640,8 @@ class RedisCluster(
                             return self._policies_callback_mapping[
                                 command_policies.response_policy
                             ](reply)
-                    raise next(
-                        (
-                            reply
-                            for reply in replies
-                            if not isinstance(reply, ResponseError)
-                        ),
-                        replies[0],
+                    raise _one_succeeded_error(
+                        list(replies), self.__class__.ERRORS_ALLOW_RETRY
                     )
                 else:
                     keys = [node.name for node in target_nodes]

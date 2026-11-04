@@ -495,6 +495,26 @@ def _error_to_raise(
     return outage_error
 
 
+def _one_succeeded_error(
+    errors: List[Exception], retryable: Tuple[Type[Exception], ...]
+) -> Exception:
+    """
+    The error to raise for a ``ONE_SUCCEEDED`` command that no target answered
+    without one, the first in target order of its kind: an error that isn't a
+    reply or that :retryable: has, such as a ``ConnectionError`` or
+    ``CLUSTERDOWN``, as the script may run on that node; then an error reply such
+    as ``UNKILLABLE``, from a node whose script can't be stopped; and ``NOTBUSY``
+    last, which only says that a node runs none.
+    """
+
+    def kind(error: Exception) -> int:
+        if not isinstance(error, ResponseError) or isinstance(error, retryable):
+            return 0
+        return 2 if str(error).startswith("NOTBUSY") else 1
+
+    return min(errors, key=kind)
+
+
 class AbstractRedisCluster:
     RedisClusterRequestTTL = 16
 
@@ -1995,26 +2015,20 @@ class RedisCluster(
                     # with the first reply that is not an error: a SCRIPT KILL
                     # succeeds on the shard that runs the script, and the others
                     # answer NOTBUSY. Once a target succeeds, the errors of the
-                    # others don't matter. If none does, an error that isn't a reply,
-                    # such as a ConnectionError, comes first: the script may run on
-                    # that node, and the retry handling applies to it.
-                    first_error = None
-                    first_failure = None
+                    # others don't matter.
+                    errors = []
                     for node in target_nodes:
                         try:
                             reply = self._execute_command(node, *args, **kwargs)
-                        except ResponseError as e:
-                            if first_error is None:
-                                first_error = e
-                            continue
                         except RedisError as e:
-                            if first_failure is None:
-                                first_failure = e
+                            errors.append(e)
                             continue
                         if not res:
                             res[node.name] = reply
                     if not res:
-                        raise first_failure or first_error
+                        raise _one_succeeded_error(
+                            errors, self.__class__.ERRORS_ALLOW_RETRY
+                        )
                 else:
                     for node in target_nodes:
                         res[node.name] = self._execute_command(node, *args, **kwargs)

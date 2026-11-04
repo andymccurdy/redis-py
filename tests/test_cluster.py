@@ -3434,6 +3434,39 @@ class TestStaticMetadataRouting:
         assert called == primaries
 
     @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ResponseError(
+                "UNKILLABLE Sorry the script already executed write commands"
+            ),
+            ClusterDownError("CLUSTERDOWN The cluster is down"),
+        ],
+        ids=["unkillable", "clusterdown"],
+    )
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    def test_kill_raises_another_error_rather_than_notbusy(self, method, error):
+        """
+        When no primary stops the script or function, NOTBUSY only says that a
+        primary runs none, so the error of another primary is raised instead.
+        """
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 0)
+        )
+        primaries = rc.get_primaries()
+
+        def execute_command(node, *args, **kwargs):
+            if node is primaries[-1]:
+                raise error
+            raise ResponseError("NOTBUSY No scripts in execution right now.")
+
+        with patch.object(
+            RedisCluster, "_execute_command", side_effect=execute_command
+        ):
+            with pytest.raises(type(error), match=str(error).split()[0]):
+                getattr(rc, method)()
+
+    @pytest.mark.fixed_client
     def test_pipeline_function_kill_on_one_node_reaches_its_response_callback(self):
         """
         A cluster pipeline sends a command to a single node, so FUNCTION KILL needs a

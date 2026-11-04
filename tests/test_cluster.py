@@ -4350,6 +4350,20 @@ class TestMultiShardRequests:
 
         assert [args for _, args, _ in sent] == [("EXISTS", *keys)]
 
+    def test_keys_that_share_a_slot_are_hashed_once(self, r):
+        """The split routes the command by the slot it computed, not by its keys again."""
+        keys = ["{same}1", "{same}2", "{same}3"]
+
+        with patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert r.execute_command("EXISTS", *keys) == 0
+        assert keyslot.call_count == len(keys)
+
+        with r.pipeline() as pipe:
+            with patch.object(pipe, "keyslot", wraps=pipe.keyslot) as keyslot:
+                pipe.execute_command("EXISTS", *keys)
+                assert pipe.execute() == [0]
+        assert keyslot.call_count == len(keys)
+
     def test_a_single_key_is_not_split(self, r):
         """It has nothing to split, so its slot is left to the keyed routing to compute."""
         with patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
@@ -4382,7 +4396,12 @@ class TestMultiShardRequests:
         assert not sent
 
     @pytest.mark.parametrize(
-        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+        "error",
+        [
+            ConnectionError("lost"),
+            TryAgainError("TRYAGAIN"),
+            ClusterDownError("CLUSTERDOWN The cluster is down"),
+        ],
     )
     def test_a_retry_resends_only_the_slots_that_failed(self, r, monkeypatch, error):
         """
@@ -4412,6 +4431,83 @@ class TestMultiShardRequests:
             ]
         ) == sorted(("DEL", key) for key in keys)
         assert r.exists(*keys) == 0
+
+    def test_a_slot_without_a_known_node_is_retried(self, r, monkeypatch):
+        """
+        A slot the client knows no node for is resent on its own, with the retries a
+        command sent on its own gets, while the other slots are sent once.
+        """
+        keys = _keys_on_every_shard(r, "uncovered")
+        r.mset_nonatomic({key: 1 for key in keys})
+        get_node_from_slot = r.nodes_manager.get_node_from_slot
+        uncovered = r.keyslot(keys[-1])
+        failed = []
+
+        def lose_the_slot_once(slot, *args, **kwargs):
+            if slot == uncovered and not failed:
+                failed.append(slot)
+                raise SlotNotCoveredError(f"Slot {slot} is not covered")
+            return get_node_from_slot(slot, *args, **kwargs)
+
+        monkeypatch.setattr(r.nodes_manager, "get_node_from_slot", lose_the_slot_once)
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert failed
+        assert sorted(args for batch in batches for args, _ in batch) == sorted(
+            ("EXISTS", key) for key in keys[:-1]
+        )
+        assert [args for _, args, _ in sent] == [("EXISTS", keys[-1])]
+
+    def test_an_error_read_from_the_pipeline_is_counted(self, r):
+        """
+        The pipeline counts no command's error, so the split counts the one it raises,
+        on the node its slot was sent to, as a command sent on its own would.
+        """
+        keys = _keys_on_every_shard(r, "counted")
+        error = ResponseError("OOM command not allowed")
+
+        def fail(args):
+            return error if args == ("EXISTS", keys[-1]) else None
+
+        with _pipelined_commands(fail):
+            with patch.object(r, "_record_error_metric") as record:
+                with pytest.raises(ResponseError, match="OOM"):
+                    r.execute_command("EXISTS", *keys)
+
+        record.assert_called_once_with(
+            error=error,
+            connection=r.get_node_from_key(keys[-1]),
+            is_internal=False,
+        )
+
+    def test_a_requested_refresh_runs_before_the_slots_are_routed(self, r):
+        """As a command sent on its own: the slots are routed by the refreshed topology."""
+        keys = _keys_on_every_shard(r, "refresh")
+        events = []
+        run = r.nodes_manager._run_requested_refresh
+        get_node_from_slot = r.nodes_manager.get_node_from_slot
+
+        def run_requested_refresh(*args, **kwargs):
+            events.append("refresh")
+            return run(*args, **kwargs)
+
+        def route(*args, **kwargs):
+            events.append("route")
+            return get_node_from_slot(*args, **kwargs)
+
+        r.nodes_manager._request_refresh()
+        with (
+            patch.object(
+                r.nodes_manager, "_run_requested_refresh", run_requested_refresh
+            ),
+            patch.object(r.nodes_manager, "get_node_from_slot", route),
+        ):
+            assert r.execute_command("EXISTS", *keys) == 0
+
+        assert events[0] == "refresh"
+        assert "route" in events
 
     def test_a_pipeline_merges_a_split_command_per_slot(self, r, monkeypatch):
         _route_by_live_tips(r, monkeypatch)

@@ -1272,6 +1272,21 @@ class RedisCluster(
             )
         ]
 
+    async def _get_node_from_slot(self, command: str, slot: int) -> "ClusterNode":
+        """
+        Returns the node a command for the given slot is sent to, a replica when the
+        command is replica safe and the client reads from replicas - for a command whose
+        slot is already known, so its keys are not hashed again.
+        """
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and await self._is_replica_safe(command)
+        return self.nodes_manager.get_node_from_slot(
+            slot,
+            replica_safe,
+            self.load_balancing_strategy if replica_safe else None,
+        )
+
     def _split_multi_shard_command(self, *args: Any) -> Optional[List[MultiShardSplit]]:
         """
         Splits a command with the MULTI_SHARD request policy into one command per hash
@@ -1298,32 +1313,42 @@ class RedisCluster(
         per node rather than one per slot, and holds one connection per node. Each command
         names the node holding its slot, so the pipeline does not split it again, and a
         command that fails is retried on its own, routed by its keys: the pipeline retries
-        a redirection, and a connection error is resent here, as the sync pipeline does.
-        A slot that succeeded is therefore not sent again, which would run a write twice
-        and change what a summed reply counts. The failed slots are resent one at a time,
-        so they do not take one connection each.
+        a redirection, and the errors the client retries - a connection error, CLUSTERDOWN,
+        or a slot the client knows no node for - are resent here, with the retries of a
+        command sent on its own, as the sync client does. A slot that succeeded is
+        therefore not sent again, which would run a write twice and change what a summed
+        reply counts. The failed slots are resent one at a time, so they do not take one
+        connection each.
         """
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and await self._is_replica_safe(command)
         load_balancing_strategy = self.load_balancing_strategy if replica_safe else None
         pipe = self.pipeline()
-        for slot, slot_args, _, keys in splits:
+        replies: List[Any] = [None] * len(splits)
+        # The node each slot's command is queued for. None for a slot that is not queued
+        # or is resent: its error is recorded by the command that raised it.
+        nodes: List[Optional[ClusterNode]] = [None] * len(splits)
+        for index, (slot, slot_args, _, keys) in enumerate(splits):
+            try:
+                nodes[index] = self.nodes_manager.get_node_from_slot(
+                    slot, replica_safe, load_balancing_strategy
+                )
+            except SlotNotCoveredError as e:
+                replies[index] = e
+                continue
             pipe.execute_command(
-                *slot_args,
-                target_nodes=[
-                    self.nodes_manager.get_node_from_slot(
-                        slot, replica_safe, load_balancing_strategy
-                    )
-                ],
-                **_with_keys(kwargs, keys),
+                *slot_args, target_nodes=[nodes[index]], **_with_keys(kwargs, keys)
             )
 
-        replies = await pipe.execute(raise_on_error=False)
+        queued = [index for index, node in enumerate(nodes) if node is not None]
+        for index, reply in zip(queued, await pipe.execute(raise_on_error=False)):
+            replies[index] = reply
         for index, ((_, slot_args, _, keys), reply) in enumerate(zip(splits, replies)):
-            if isinstance(reply, (ConnectionError, TimeoutError)) and not isinstance(
-                reply, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            if isinstance(reply, self.ERRORS_ALLOW_RETRY) and not isinstance(
+                reply, self.NOT_NODE_FAILURE_ERRORS
             ):
+                nodes[index] = None
                 try:
                     replies[index] = await self.execute_command(
                         *slot_args, **_with_keys(kwargs, keys)
@@ -1332,11 +1357,18 @@ class RedisCluster(
                     replies[index] = e
 
         slot_replies: Dict[int, Any] = {}
-        error = _record_slot_replies(
-            slot_replies, zip((split[0] for split in splits), replies)
-        )
-        if error is not None:
-            raise error
+        for index, ((slot, _, _, _), reply) in enumerate(zip(splits, replies)):
+            if isinstance(reply, BaseException):
+                # A command sent on its own counts the error it fails with. The pipeline
+                # counts none, so an error read from it is counted here; one a retry
+                # raised carries the connection its command already counted it on.
+                node = nodes[index]
+                if node is not None and not hasattr(reply, "connection"):
+                    await self._record_error_metric(
+                        error=reply, connection=node, is_internal=False
+                    )
+                raise reply
+            slot_replies[slot] = reply
         return _merge_multi_shard_replies(slot_replies, splits, response_policy)
 
     def get_special_nodes(self) -> Optional[list["ClusterNode"]]:
@@ -1679,6 +1711,7 @@ class RedisCluster(
 
         # A MULTI_SHARD command whose keys span several slots is sent in one pipeline,
         # which retries the failed slots itself, so it is not retried here as well.
+        splits = None
         if (
             not target_nodes_specified
             and command_policies.request_policy == RequestPolicy.MULTI_SHARD
@@ -1706,12 +1739,19 @@ class RedisCluster(
                     raise outage_error
             try:
                 if not target_nodes_specified:
-                    # Determine the nodes to execute the command on
-                    target_nodes = await self._determine_nodes(
-                        *args,
-                        request_policy=command_policies.request_policy,
-                        node_flag=passed_targets,
-                    )
+                    if splits is None:
+                        # Determine the nodes to execute the command on
+                        target_nodes = await self._determine_nodes(
+                            *args,
+                            request_policy=command_policies.request_policy,
+                            node_flag=passed_targets,
+                        )
+                    else:
+                        # One slot: sent as it is, to the node of the slot the split
+                        # already computed
+                        target_nodes = [
+                            await self._get_node_from_slot(command, splits[0][0])
+                        ]
                     if not target_nodes:
                         raise RedisClusterException(
                             f"No targets were found to execute {args} command on"
@@ -3638,12 +3678,17 @@ for command in PIPELINE_BLOCKED_COMMANDS:
 setattr(ClusterPipeline, "client_list_iter", block_pipeline_command("client_list_iter"))
 
 
+# The result of a pipeline command no node has answered yet. A reply can be None, so None
+# cannot tell an unanswered command from one a node answered.
+_UNANSWERED = object()
+
+
 class PipelineCommand:
     def __init__(self, position: int, *args: Any, **kwargs: Any) -> None:
         self.args = args
         self.kwargs = kwargs
         self.position = position
-        self.result: Union[Any, Exception] = None
+        self.result: Union[Any, Exception] = _UNANSWERED
         # Either record type: a policy resolver serves ``CommandPolicies``, while the
         # fallbacks below reuse the shared ``CommandMetadata`` defaults. Only the two routing
         # policies, which both carry, are ever read.
@@ -3928,8 +3973,12 @@ class PipelineStrategy(AbstractStrategy):
         raise_on_error: bool = True,
         allow_redirections: bool = True,
     ) -> List[Any]:
+        # A retry resends only the commands no node answered and the ones that failed:
+        # resending one that succeeded would run a write twice.
         todo = [
-            cmd for cmd in stack if not cmd.result or isinstance(cmd.result, Exception)
+            cmd
+            for cmd in stack
+            if cmd.result is _UNANSWERED or isinstance(cmd.result, Exception)
         ]
 
         nodes = {}
@@ -3963,11 +4012,15 @@ class PipelineStrategy(AbstractStrategy):
                     and not client._is_node_flag(passed_targets)
                 ):
                     splits = client._split_multi_shard_command(*cmd.args)
-                    if splits is not None and len(splits) < 2:
-                        # One slot: routed by its keys as a whole, as it is sent.
-                        splits = None
 
-                if splits is None:
+                if splits is not None and len(splits) < 2:
+                    # One slot: sent as it is, to the node of the slot the split
+                    # already computed
+                    target_nodes = [
+                        await client._get_node_from_slot(command, splits[0][0])
+                    ]
+                    splits = None
+                elif splits is None:
                     target_nodes = await client._determine_nodes(
                         *cmd.args,
                         request_policy=request_policy,

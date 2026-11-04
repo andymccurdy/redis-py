@@ -5963,6 +5963,21 @@ class TestMultiShardRequests:
 
         assert [args for _, args, _ in sent] == [("EXISTS", *keys)]
 
+    async def test_keys_that_share_a_slot_are_hashed_once(
+        self, r: RedisCluster
+    ) -> None:
+        keys = ["{same}1", "{same}2", "{same}3"]
+
+        with mock.patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert await r.execute_command("EXISTS", *keys) == 0
+        assert keyslot.call_count == len(keys)
+
+        with mock.patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            async with r.pipeline() as pipe:
+                pipe.execute_command("EXISTS", *keys)
+                assert await pipe.execute() == [0]
+        assert keyslot.call_count == len(keys)
+
     async def test_keys_that_cannot_be_located_are_not_split(
         self, r: RedisCluster, monkeypatch
     ) -> None:
@@ -5973,7 +5988,12 @@ class TestMultiShardRequests:
             await r.execute_command("MSETEX", 2, first, "a", second, "b")
 
     @pytest.mark.parametrize(
-        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+        "error",
+        [
+            ConnectionError("lost"),
+            TryAgainError("TRYAGAIN"),
+            ClusterDownError("CLUSTERDOWN The cluster is down"),
+        ],
     )
     async def test_a_retry_resends_only_the_slots_that_failed(
         self, r: RedisCluster, monkeypatch, error: Exception
@@ -6001,6 +6021,84 @@ class TestMultiShardRequests:
             ]
         ) == sorted(("DEL", key) for key in keys)
         assert await r.exists(*keys) == 0
+
+    async def test_a_slot_without_a_known_node_is_retried(
+        self, r: RedisCluster, monkeypatch
+    ) -> None:
+        keys = _keys_on_every_shard(r, "uncovered")
+        await r.mset_nonatomic({key: 1 for key in keys})
+        get_node_from_slot = NodesManager.get_node_from_slot
+        uncovered = r.keyslot(keys[-1])
+        failed: List[int] = []
+
+        def lose_the_slot_once(
+            self: NodesManager, slot: int, *args: Any, **kwargs: Any
+        ) -> ClusterNode:
+            if slot == uncovered and not failed:
+                failed.append(slot)
+                raise SlotNotCoveredError(f"Slot {slot} is not covered")
+            return get_node_from_slot(self, slot, *args, **kwargs)
+
+        # NodesManager has __slots__, so the method is patched on the class
+        monkeypatch.setattr(NodesManager, "get_node_from_slot", lose_the_slot_once)
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert await r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert failed
+        assert sorted(args for batch in batches for args, _ in batch) == sorted(
+            ("EXISTS", key) for key in keys[:-1]
+        )
+        assert [args for _, args, _ in sent] == [("EXISTS", keys[-1])]
+
+    async def test_an_error_read_from_the_pipeline_is_counted(
+        self, r: RedisCluster
+    ) -> None:
+        keys = _keys_on_every_shard(r, "counted")
+        error = ResponseError("OOM command not allowed")
+
+        def fail(args: tuple) -> Optional[Exception]:
+            return error if args == ("EXISTS", keys[-1]) else None
+
+        with _pipelined_commands(fail):
+            with mock.patch.object(r, "_record_error_metric") as record:
+                with pytest.raises(ResponseError, match="OOM"):
+                    await r.execute_command("EXISTS", *keys)
+
+        record.assert_called_once_with(
+            error=error,
+            connection=r.get_node_from_key(keys[-1]),
+            is_internal=False,
+        )
+
+    async def test_a_retry_does_not_resend_a_slot_that_answered(
+        self, r: RedisCluster, monkeypatch
+    ) -> None:
+        """
+        A write lost on one node retries the pipeline, which resends only the commands
+        no node answered: the DEL of a missing key answered 0, which is not resent.
+        """
+        await _route_by_live_tips(r, monkeypatch)
+        keys = _keys_on_every_shard(r, "answered")
+        await r.mset_nonatomic({key: 1 for key in keys[1:]})
+        lost = r.get_node_from_key(keys[-1]).name
+        assert r.get_node_from_key(keys[0]).name != lost
+        execute_pipeline = ClusterNode.execute_pipeline
+        written: List[tuple] = []
+        failed: List[str] = []
+
+        async def lose_a_write_once(self: ClusterNode, commands: List[Any]) -> bool:
+            if self.name == lost and not failed:
+                failed.append(self.name)
+                raise ConnectionError("lost")
+            written.extend(c.args for c in commands)
+            return await execute_pipeline(self, commands)
+
+        with mock.patch.object(ClusterNode, "execute_pipeline", lose_a_write_once):
+            assert await r.execute_command("DEL", *keys) == len(keys) - 1
+
+        assert failed
+        assert sorted(written) == sorted(("DEL", key) for key in keys)
 
     async def test_a_split_command_costs_one_round_trip_per_node(
         self, r: RedisCluster, monkeypatch

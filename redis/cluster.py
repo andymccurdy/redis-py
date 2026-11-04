@@ -370,6 +370,9 @@ def _split_by_slot(
     the last are repeated in every command. Each command keeps its keys in the order the
     caller gave them, and the commands are ordered by the slot's first key.
 
+    When every key maps to one slot, the one command returned is the command as the caller
+    sent it, and the caller routes it by that slot, so its keys are not hashed again.
+
     Returns None when the keys cannot be located that way - a ``movablekeys`` command, whose
     ``first_key_pos`` is 0, or a command the parser does not know - which leaves the command
     to be routed by its keys as a whole. Returns None for a single key too, which has nothing
@@ -389,12 +392,23 @@ def _split_by_slot(
     if len(positions) < 2 or positions[-1] + step > len(args):
         return None
 
+    slots = [keyslot(args[position]) for position in positions]
+    if slots.count(slots[0]) == len(slots):
+        return [
+            (
+                slots[0],
+                args,
+                list(range(len(positions))),
+                [args[position] for position in positions],
+            )
+        ]
+
     prefix = args[:first]
     suffix = args[positions[-1] + step :]
     by_slot: Dict[int, Tuple[List[Any], List[int], List[Any]]] = {}
-    for ordinal, position in enumerate(positions):
+    for ordinal, (position, slot) in enumerate(zip(positions, slots)):
         key = args[position]
-        slot_args, ordinals, keys = by_slot.setdefault(keyslot(key), ([], [], []))
+        slot_args, ordinals, keys = by_slot.setdefault(slot, ([], [], []))
         slot_args.extend(args[position : position + step])
         ordinals.append(ordinal)
         keys.append(key)
@@ -1647,6 +1661,21 @@ class RedisCluster(
             )
         ]
 
+    def _get_node_from_slot(self, command: str, slot: int) -> "ClusterNode":
+        """
+        Returns the node a command for the given slot is sent to, a replica when the
+        command is replica safe and the client reads from replicas - for a command whose
+        slot is already known, so its keys are not hashed again.
+        """
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and self._is_replica_safe(command)
+        return self.nodes_manager.get_node_from_slot(
+            slot,
+            replica_safe,
+            self.load_balancing_strategy if replica_safe else None,
+        )
+
     def _split_multi_shard_command(self, *args) -> Optional[List[MultiShardSplit]]:
         """
         Splits a command with the MULTI_SHARD request policy into one command per hash
@@ -1669,33 +1698,66 @@ class RedisCluster(
 
         The pipeline batches the commands per node, so the command costs one round trip
         per node rather than one per slot. Each command names the node holding its slot,
-        so the pipeline does not split it again, and the pipeline retries a command that
-        fails on its own, routed by its keys. A slot that succeeded is therefore not sent
-        again, which would run a write twice and change what a summed reply counts.
+        so the pipeline does not split it again, and a command that fails is retried on its
+        own, routed by its keys: the pipeline retries a connection error or a redirection,
+        and the errors only the client retries - CLUSTERDOWN, or a slot the client knows
+        no node for - are resent here, with the retries of a command sent on its own. A
+        slot that succeeded is therefore not sent again, which would run a write twice
+        and change what a summed reply counts. The failed slots are resent one at a time.
         """
+        # Run a topology refresh an earlier error asked for first, as the retry loop of a
+        # command sent on its own does, so the slots are routed by the refreshed topology
+        if self.nodes_manager._refresh_requested:
+            self.nodes_manager._run_requested_refresh(self.retry)
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and self._is_replica_safe(command)
         load_balancing_strategy = self.load_balancing_strategy if replica_safe else None
         pipe = self.pipeline()
-        for slot, slot_args, _, keys in splits:
+        replies: List[Any] = [None] * len(splits)
+        # The node each slot's command is queued for. None for a slot that is not queued
+        # or is resent: its error is recorded by the command that raised it.
+        nodes: List[Optional[ClusterNode]] = [None] * len(splits)
+        for index, (slot, slot_args, _, keys) in enumerate(splits):
+            try:
+                nodes[index] = self.nodes_manager.get_node_from_slot(
+                    slot, replica_safe, load_balancing_strategy
+                )
+            except SlotNotCoveredError as e:
+                replies[index] = e
+                continue
             pipe.execute_command(
-                *slot_args,
-                target_nodes=[
-                    self.nodes_manager.get_node_from_slot(
-                        slot, replica_safe, load_balancing_strategy
-                    )
-                ],
-                **_with_keys(kwargs, keys),
+                *slot_args, target_nodes=[nodes[index]], **_with_keys(kwargs, keys)
             )
 
+        queued = [index for index, node in enumerate(nodes) if node is not None]
+        for index, reply in zip(queued, pipe.execute(raise_on_error=False)):
+            replies[index] = reply
+        for index, ((_, slot_args, _, keys), reply) in enumerate(zip(splits, replies)):
+            if isinstance(reply, self.ERRORS_ALLOW_RETRY) and not isinstance(
+                reply, ClusterPipeline.ERRORS_ALLOW_RETRY
+            ):
+                nodes[index] = None
+                try:
+                    replies[index] = self.execute_command(
+                        *slot_args, **_with_keys(kwargs, keys)
+                    )
+                except RedisError as e:
+                    replies[index] = e
+
         slot_replies: Dict[int, Any] = {}
-        error = _record_slot_replies(
-            slot_replies,
-            zip((split[0] for split in splits), pipe.execute(raise_on_error=False)),
-        )
-        if error is not None:
-            raise error
+        for index, ((slot, _, _, _), reply) in enumerate(zip(splits, replies)):
+            if isinstance(reply, BaseException):
+                # A command sent on its own counts the error it fails with. The pipeline
+                # counts none, so an error read from it is counted here; one a retry
+                # raised carries the connection its command already counted it on.
+                node = nodes[index]
+                if node is not None and not hasattr(reply, "connection"):
+                    self._record_error_metric(
+                        error=reply, connection=node, is_internal=False
+                    )
+                raise reply
+            slot_replies[slot] = reply
         return _merge_multi_shard_replies(slot_replies, splits, response_policy)
 
     def _execute_multi_shard_command_per_slot(
@@ -2271,10 +2333,11 @@ class RedisCluster(
             and not self._is_nodes_flag(passed_targets)
         ):
             splits = self._split_multi_shard_command(*args)
-            if splits is not None and len(splits) < 2:
-                # One slot: routed by its keys as a whole, as it is sent.
-                splits = None
-            elif splits is not None and self.nodes_manager._cache is None:
+            if (
+                splits is not None
+                and len(splits) > 1
+                and self.nodes_manager._cache is None
+            ):
                 return self._execute_multi_shard_command(
                     command, splits, command_policies.response_policy, **kwargs
                 )
@@ -2297,7 +2360,14 @@ class RedisCluster(
             try:
                 res = {}
                 if not target_nodes_specified:
-                    if splits is not None:
+                    if splits is None:
+                        # Determine the nodes to execute the command on
+                        target_nodes = self._determine_nodes(
+                            *args,
+                            request_policy=command_policies.request_policy,
+                            nodes_flag=passed_targets,
+                        )
+                    elif len(splits) > 1:
                         return self._execute_multi_shard_command_per_slot(
                             command,
                             splits,
@@ -2305,13 +2375,10 @@ class RedisCluster(
                             slot_replies,
                             **kwargs,
                         )
-
-                    # Determine the nodes to execute the command on
-                    target_nodes = self._determine_nodes(
-                        *args,
-                        request_policy=command_policies.request_policy,
-                        nodes_flag=passed_targets,
-                    )
+                    else:
+                        # One slot: sent as it is, to the node of the slot the split
+                        # already computed
+                        target_nodes = [self._get_node_from_slot(command, splits[0][0])]
 
                     if not target_nodes:
                         raise RedisClusterException(
@@ -2830,12 +2897,13 @@ class RedisCluster(
     def _record_error_metric(
         self,
         error: Exception,
-        connection: Connection,
+        connection: Union[Connection, "ClusterNode"],
         is_internal: bool = True,
         retry_attempts: Optional[int] = None,
     ):
         """
         Records error count metric directly.
+        Accepts either a Connection or ClusterNode object.
         """
         record_error_count(
             server_address=connection.host,
@@ -6230,11 +6298,15 @@ class PipelineStrategy(AbstractStrategy):
                         and not self._is_nodes_flag(passed_targets)
                     ):
                         splits = self._pipe._split_multi_shard_command(*c.args)
-                        if splits is not None and len(splits) < 2:
-                            # One slot: routed by its keys as a whole, as it is sent.
-                            splits = None
 
-                    if splits is None:
+                    if splits is not None and len(splits) < 2:
+                        # One slot: sent as it is, to the node of the slot the split
+                        # already computed
+                        target_nodes = [
+                            self._pipe._get_node_from_slot(c.args[0], splits[0][0])
+                        ]
+                        splits = None
+                    elif splits is None:
                         target_nodes = self._determine_nodes(
                             *c.args,
                             request_policy=request_policy,

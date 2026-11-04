@@ -3476,6 +3476,14 @@ class TestClusterRedisCommands:
         myshardid = await r.cluster_myshardid(node)
         assert len(myshardid) == 40
 
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    async def test_cluster_myshardid_decoded(self, decoded_r: RedisCluster) -> None:
+        node = decoded_r.get_random_node()
+        myshardid = await decoded_r.cluster_myshardid(node)
+        assert isinstance(myshardid, str)
+        assert len(myshardid) == 40
+
     @skip_if_redis_enterprise()
     async def test_cluster_slots(self, r: RedisCluster) -> None:
         mock_all_nodes_resp(r, default_cluster_slots)
@@ -8659,15 +8667,7 @@ class TestAsyncClusterMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
-            # Also set the collector directly to ensure it's used
-            async_recorder._async_metrics_collector = collector
-
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher
@@ -8859,15 +8859,7 @@ class TestAsyncClusterPipelineMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
-            # Also set the collector directly to ensure it's used
-            async_recorder._async_metrics_collector = collector
-
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher

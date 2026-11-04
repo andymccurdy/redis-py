@@ -234,6 +234,75 @@ class TestCache:
                 "cache": DefaultCache(CacheConfig(max_size=5)),
                 "single_connection_client": False,
             },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+                "decode_responses": True,
+            },
+        ],
+        ids=["single", "pool", "decoded"],
+        indirect=True,
+    )
+    @pytest.mark.onlynoncluster
+    def test_numeric_key_is_invalidated(self, r, r2):
+        # The invalidation for a key passed as an int or float names it by its
+        # encoded bytes, and must still evict the entry cached for it.
+        cache = r.get_cache()
+        for key in (1234, 12.5):
+            r.set(key, "bar")
+            size = cache.size
+            assert r.get(key) in [b"bar", "bar"]
+            assert cache.size == size + 1
+            # change key in redis (cause invalidation)
+            r2.set(key, "barbar")
+            assert wait_for_invalidated_value(r, key, [b"barbar", "barbar"]) in [
+                b"barbar",
+                "barbar",
+            ]
+
+    @pytest.mark.parametrize(
+        "r",
+        [
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": True,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+                "decode_responses": True,
+            },
+        ],
+        ids=["single", "pool", "decoded"],
+        indirect=True,
+    )
+    @pytest.mark.onlynoncluster
+    def test_equal_int_and_float_keys_do_not_share_an_entry(self, r):
+        # 42 == 42.0, but they are sent as the different Redis keys "42" and
+        # "42.0", so a read of one must not be served the entry of the other.
+        cache = r.get_cache()
+        r.set(42, "int")
+        r.set(42.0, "float")
+        size = cache.size
+        assert r.get(42) in [b"int", "int"]
+        assert r.get(42.0) in [b"float", "float"]
+        assert cache.size == size + 2
+
+    @pytest.mark.parametrize(
+        "r",
+        [
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": True,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+            },
         ],
         ids=["single", "pool"],
         indirect=True,

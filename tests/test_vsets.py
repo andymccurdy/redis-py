@@ -48,10 +48,16 @@ def test_add_elem_with_values(d_client):
 
 
 @skip_if_server_version_lt("7.9.0")
-def test_add_elem_with_empty_name(d_client):
-    assert d_client.vset().vadd("myset", [1.0, 0.0], "") == 1
+@pytest.mark.parametrize("element", ["", b""])
+def test_add_elem_with_empty_name(d_client, r, element):
+    assert d_client.vset().vadd("myset", [1.0, 0.0], element) == 1
     assert d_client.vset().vcard("myset") == 1
-    assert d_client.vset().vemb("myset", "") == [1.0, 0.0]
+    assert d_client.vset().vemb("myset", element) == [1.0, 0.0]
+
+    name = r.vset().vrandmember("myset")
+    assert name == b""
+    assert r.vset().vadd("myset_copy", [1.0, 0.0], name) == 1
+    assert r.vset().vemb("myset_copy", name) == [1.0, 0.0]
 
 
 @skip_if_server_version_lt("7.9.0")

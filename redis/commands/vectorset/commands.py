@@ -113,7 +113,7 @@ class VectorSetCommands(CommandsProtocol):
         """
         Add vector ``vector`` for element ``element`` to a vector set ``key``.
 
-        ``element`` may be an empty string.
+        ``element`` may be an empty string or bytestring.
 
         ``reduce_dim`` sets the dimensions to reduce the vector to.
                 If not provided, the vector is not reduced.
@@ -141,7 +141,7 @@ class VectorSetCommands(CommandsProtocol):
 
         For more information, see https://redis.io/commands/vadd.
         """
-        if not vector or (not element and not isinstance(element, str)):
+        if not vector or element is None:
             raise DataError("Both vector and element must be provided")
 
         pieces = []

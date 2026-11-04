@@ -1,6 +1,8 @@
 import select
 import selectors
 import socket
+import sys
+from asyncio import get_running_loop
 from logging import getLogger
 from typing import Callable, List, Optional, TypedDict, Union
 
@@ -301,13 +303,17 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
 class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
     """Async implementation of parser class for connections using Hiredis"""
 
-    __slots__ = ("_reader",)
+    __slots__ = ("_reader", "_response_read_timeout")
 
     def __init__(self, socket_read_size: int):
         if not HIREDIS_AVAILABLE:
             raise RedisError("Hiredis is not available.")
         super().__init__(socket_read_size=socket_read_size)
         self._reader = None
+        # Timeout context shared by all socket reads of one response,
+        # created lazily by the first read that can wait and closed when
+        # read_response() returns; see read_from_socket().
+        self._response_read_timeout = None
         self.pubsub_push_handler_func = self.handle_pubsub_push_response
         self.invalidation_push_handler_func = None
         self._hiredis_PushNotificationType = None
@@ -374,33 +380,35 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
     async def read_from_socket(self):
         # Each socket read is bounded by its own socket_timeout window,
         # matching the sync parser, where the OS timeout applies to every
-        # recv(). Check the flags first to avoid private stream access when
-        # per-read timeouts do not apply. StreamReader.read can only wait
-        # while its bytearray buffer is empty; only then arm the timeout.
+        # recv(). One timeout context is shared across all socket reads
+        # of a single response and rescheduled before each read that can
+        # wait, mirroring _read_exactly: entering a fresh context per
+        # read costs a new asyncio.Timeout per socket read. Check the
+        # flags first to avoid private stream access when per-read
+        # timeouts do not apply. StreamReader.read can only wait while
+        # its bytearray buffer is empty; only then arm (or reschedule)
+        # the timeout. The context is closed by read_response().
         if (
             self._apply_read_timeout
             and self._read_timeout is not None
             and not self._stream._buffer
         ):
-            async with async_timeout(self._read_timeout) as active_timeout:
-                self._active_read_timeout = active_timeout
-                try:
-                    buffer = await self._stream.read(self._read_size)
-                finally:
-                    self._active_read_timeout = None
+            if self._response_read_timeout is None:
+                self._response_read_timeout = async_timeout(self._read_timeout)
+                await self._response_read_timeout.__aenter__()
+                self._active_read_timeout = self._response_read_timeout
+            else:
+                deadline = get_running_loop().time() + self._read_timeout
+                if hasattr(self._response_read_timeout, "reschedule"):
+                    self._response_read_timeout.reschedule(deadline)
+                elif hasattr(self._response_read_timeout, "update"):
+                    self._response_read_timeout.update(deadline)
+            buffer = await self._stream.read(self._read_size)
         else:
             buffer = await self._stream.read(self._read_size)
         if not buffer or not isinstance(buffer, bytes):
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
         self._reader.feed(buffer)
-        bytes_read = len(buffer)
-        max_bytes = 8 * self._read_size
-        while bytes_read < max_bytes and self._stream._buffer:
-            buffer = await self._stream.read(
-                min(self._read_size, max_bytes - bytes_read)
-            )
-            self._reader.feed(buffer)
-            bytes_read += len(buffer)
         # data was read from the socket and added to the buffer.
         # return True to indicate that data was read.
         return True
@@ -414,37 +422,47 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         if not self._connected:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
 
-        if disable_decoding:
-            response = self._reader.gets(False)
-        else:
-            response = self._reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            await self.read_from_socket()
+        try:
             if disable_decoding:
                 response = self._reader.gets(False)
             else:
                 response = self._reader.gets()
 
-        # if the response is a ConnectionError or the response is a list and
-        # the first item is a ConnectionError, raise it as something bad
-        # happened
-        if isinstance(response, ConnectionError):
-            raise response
-        elif self._hiredis_PushNotificationType is not None and isinstance(
-            response, self._hiredis_PushNotificationType
-        ):
-            response = await self.handle_push_response(response)
-            if not push_request:
-                return await self.read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
-                )
-            else:
-                return response
-        elif (
-            isinstance(response, list)
-            and response
-            and isinstance(response[0], ConnectionError)
-        ):
-            raise response[0]
-        return response
+            while response is NOT_ENOUGH_DATA:
+                await self.read_from_socket()
+                if disable_decoding:
+                    response = self._reader.gets(False)
+                else:
+                    response = self._reader.gets()
+
+            # if the response is a ConnectionError or the response is a list and
+            # the first item is a ConnectionError, raise it as something bad
+            # happened
+            if isinstance(response, ConnectionError):
+                raise response
+            elif self._hiredis_PushNotificationType is not None and isinstance(
+                response, self._hiredis_PushNotificationType
+            ):
+                response = await self.handle_push_response(response)
+                if not push_request:
+                    return await self.read_response(
+                        disable_decoding=disable_decoding, push_request=push_request
+                    )
+                else:
+                    return response
+            elif (
+                isinstance(response, list)
+                and response
+                and isinstance(response[0], ConnectionError)
+            ):
+                raise response[0]
+            return response
+        finally:
+            # Close the timeout context shared by this response's socket
+            # reads, if one was armed; a later response arms a fresh one.
+            if self._response_read_timeout is not None:
+                try:
+                    await self._response_read_timeout.__aexit__(*sys.exc_info())
+                finally:
+                    self._response_read_timeout = None
+                    self._active_read_timeout = None

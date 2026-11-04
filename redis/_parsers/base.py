@@ -650,7 +650,15 @@ class _AsyncRESPBase(AsyncBaseParser):
             tail = self._buffer[self._pos :]
             try:
                 remaining = want - len(tail)
-                if len(self._stream._buffer) >= remaining:
+                if not self._apply_read_timeout:
+                    # No per-read deadline applies here (explicit caller
+                    # timeout or blocking read): a cancelled readexactly
+                    # leaves its bytes on the stream, so the next poll
+                    # resumes from the stream instead of re-joining and
+                    # re-parsing saved pieces on every poll.
+                    data = await self._stream.readexactly(remaining)
+                    self._chunks.append(data)
+                elif len(self._stream._buffer) >= remaining:
                     data = await self._stream.readexactly(remaining)
                     self._chunks.append(data)
                 else:
@@ -753,7 +761,8 @@ class _AsyncRESPBase(AsyncBaseParser):
             if (
                 self._apply_read_timeout
                 and self._read_timeout is not None
-                and b"\n" not in self._stream._buffer
+                # int needle: ~8ns vs ~80ns for a bytes needle on a bytearray
+                and 10 not in self._stream._buffer
             ):
                 async with async_timeout(self._read_timeout) as active_timeout:
                     self._active_read_timeout = active_timeout

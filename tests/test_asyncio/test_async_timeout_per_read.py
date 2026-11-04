@@ -314,14 +314,29 @@ async def test_read_exactly_constructs_one_timeout_for_multiple_waits(monkeypatc
 
 
 @requires_hiredis
-async def test_hiredis_read_from_socket_drains_buffered_data():
-    parser = _AsyncHiredisParser(8)
-    _, reader = make_connection(parser, 2)
-    payload = b"buffered response"
-    wire = b"$%d\r\n%s\r\n" % (len(payload), payload)
-    for start in range(0, len(wire), 7):
-        reader.feed_data(wire[start : start + 7])
+async def test_hiredis_read_from_socket_shares_one_timeout_per_response(monkeypatch):
+    # One response's socket reads share a single timeout context,
+    # rescheduled before each read that waits, instead of entering a
+    # fresh context per socket read.
+    import redis._parsers.hiredis as hiredis_parser
 
-    await parser.read_from_socket()
+    real_async_timeout = hiredis_parser.async_timeout
+    timeout_count = 0
 
-    assert parser._reader.gets() == payload
+    def counting_async_timeout(delay):
+        nonlocal timeout_count
+        timeout_count += 1
+        return real_async_timeout(delay)
+
+    monkeypatch.setattr(hiredis_parser, "async_timeout", counting_async_timeout)
+    conn, reader = make_hiredis_connection()
+    parser = conn._parser
+    feeder = asyncio.create_task(feed_in_pieces(reader, BULK_WIRE))
+
+    response = await conn.read_response()
+    await feeder
+
+    assert response == PAYLOAD
+    assert timeout_count == 1
+    assert parser._response_read_timeout is None
+    assert parser._active_read_timeout is None

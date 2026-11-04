@@ -1,4 +1,5 @@
 import multiprocessing
+import signal
 import threading
 import time
 import uuid
@@ -10,10 +11,16 @@ from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
 from redis.connection import BlockingConnectionPool, ConnectionPool
+from redis.event import (
+    EventDispatcher,
+    EventListenerInterface,
+    MaintenanceCompletedEvent,
+)
 from redis.exceptions import AuthenticationError
 from redis.maint_notifications import (
     MaintNotificationsConfig,
     MaintNotificationsPoolHandler,
+    MaintenanceState,
     NodeMovingNotification,
 )
 from redis.utils import HIREDIS_AVAILABLE
@@ -37,6 +44,219 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    def test_maintenance_config_disconnect_joins_owner_drain(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        draining, finish, attempted = (threading.Event() for _ in range(3))
+        errors = []
+        real_can_read, real_disconnect = owner._conn.can_read, owner.disconnect
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                draining.set()
+                assert finish.wait(5)
+                with pool._lock:
+                    pass
+            return real_can_read(*args, **kwargs)
+
+        def disconnect(*args, **kwargs):
+            assert finish.is_set(), "configuration disconnected a draining owner"
+            return real_disconnect(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        def configure():
+            attempted.set()
+            try:
+                pool.update_maint_notifications_config(
+                    MaintNotificationsConfig(enabled=True)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        updater = threading.Thread(target=configure, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                updater.start()
+                assert attempted.wait(3)
+                updater.join(0.1)
+                finish.set()
+                reader.join(3)
+                updater.join(3)
+                assert not reader.is_alive() and not updater.is_alive()
+                assert not errors
+                assert not owner.is_connected
+        finally:
+            finish.set()
+            for thread in [reader, updater]:
+                if thread.ident is not None:
+                    thread.join(5)
+            peers.release(borrower)
+            peers.disconnect()
+
+    def test_maintenance_config_defers_disconnect_after_checkout(self, pool):
+        owner = pool.get_connection()
+        pool.release(owner)
+        configured, finish = threading.Event(), threading.Event()
+        errors = []
+        real_disconnect = owner._disconnect_from_pool
+
+        def disconnect(*args, **kwargs):
+            configured.set()
+            assert finish.wait(5)
+            return real_disconnect(*args, **kwargs)
+
+        def configure():
+            try:
+                pool.update_maint_notifications_config(
+                    MaintNotificationsConfig(enabled=True)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        updater = threading.Thread(target=configure, daemon=True)
+        acquired = None
+        try:
+            with patch.object(owner, "_disconnect_from_pool", side_effect=disconnect):
+                updater.start()
+                assert configured.wait(3)
+                acquired = pool.get_connection()
+                assert acquired is owner
+                assert owner.should_reconnect()
+                owner.send_command("PING")
+                finish.set()
+                updater.join(3)
+                assert not updater.is_alive() and not errors
+                assert owner._in_use and owner.is_connected
+                assert owner.read_response() == b"PONG"
+        finally:
+            finish.set()
+            if updater.ident is not None:
+                updater.join(5)
+            if acquired is not None:
+                pool.release(acquired)
+        assert not owner.is_connected
+
+    def test_completion_listener_can_close_cached_pool(self, pool):
+        events, errors = [], []
+
+        class ClosingListener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    # Detect the deadlock without leaving a blocked thread in
+                    # the failing test's cleanup. The nested close takes this
+                    # lock again in _disconnect_from_pool.
+                    acquired = event.connection._in_use_lock.acquire(blocking=False)
+                    assert acquired, "completion listener holds the owner lock"
+                    event.connection._in_use_lock.release()
+                    events.append(event)
+                    pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        # Initialize maintenance state even when the test server does not
+        # support the optional notification handshake.
+        config = MaintNotificationsConfig(
+            enabled="auto",
+            event_dispatcher=EventDispatcher(
+                {MaintenanceCompletedEvent: [ClosingListener()]}
+            ),
+        )
+        pool.update_maint_notifications_config(config)
+        owners = [pool.get_connection() for _ in range(2)]
+        for owner in owners:
+            pool.release(owner)
+            owner.maintenance_state = MaintenanceState.MAINTENANCE
+
+        pool.close()
+
+        assert not errors
+        assert len(events) == 2
+        assert {event.connection for event in events} == set(owners)
+        assert all(not owner.is_connected for owner in owners)
+
+    @pytest.mark.skipif(
+        not hasattr(signal, "setitimer"), reason="requires interval-timer signals"
+    )
+    @pytest.mark.parametrize("maintenance", [False, True])
+    def test_interrupted_ownership_wait_returns_pool_slot(self, pool, maintenance):
+        owner = pool.get_connection()
+        pool.release(owner)
+        free_before = set(pool._get_free_connections())
+        held, finish = threading.Event(), threading.Event()
+        errors = []
+
+        class Cancelled(BaseException):
+            pass
+
+        def interrupt(signum, frame):
+            raise Cancelled()
+
+        def hold():
+            try:
+                if maintenance:
+                    assert owner._try_acquire_idle()
+                    try:
+                        held.set()
+                        assert finish.wait(5)
+                    finally:
+                        owner._release_idle()
+                else:
+                    with owner._in_use_lock:
+                        held.set()
+                        assert finish.wait(5)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=hold, daemon=True)
+        previous_handler = signal.signal(signal.SIGALRM, interrupt)
+        previous_timer = None
+        try:
+            worker.start()
+            assert held.wait(3)
+            previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.05)
+            with pytest.raises(Cancelled):
+                pool.get_connection()
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            assert set(pool._get_free_connections()) == free_before
+            if maintenance:
+                assert owner._in_use and owner._idle_maintenance
+            else:
+                assert not owner._in_use
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer is not None:
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+            finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+        assert not worker.is_alive() and not errors
+        acquired = pool.get_connection()
+        try:
+            assert acquired is owner
+            acquired.send_command("PING")
+            assert acquired.read_response() == b"PONG"
+        finally:
+            pool.release(acquired)
+
     def test_concurrent_owner_invalidations_remove_shared_entries(self, pool, r2):
         key = str(uuid.uuid4())
         r2.set(key, "old")

@@ -450,11 +450,15 @@ class MaintNotificationsAbstractConnection:
         return parser
 
     def _complete_maintenance_on_disconnect(self) -> None:
+        event = self._reset_maintenance_on_disconnect()
+        if event is not None:
+            _dispatch_maintenance_event(event.config, event)
+
+    def _reset_maintenance_on_disconnect(self) -> MaintenanceCompletedEvent | None:
         """
-        Restore the settings a maintenance relaxed on this connection when it is
-        closed, and report the relaxation as completed - the same way the
-        completion notification would have been reported. The MOVING state is
-        left alone: it is owned by the pool-level TTL cleanup.
+        Restore the settings a maintenance relaxed on this connection and
+        return its completion event for dispatch. The MOVING state is left
+        alone: it is owned by the pool-level TTL cleanup.
         """
         if self.maintenance_state != MaintenanceState.MAINTENANCE:
             return
@@ -465,17 +469,14 @@ class MaintNotificationsAbstractConnection:
         self.reset_received_notifications()
         if self.maint_notifications_config is not None:
             pool_handler = self._maint_notifications_pool_handler
-            _dispatch_maintenance_event(
-                self.maint_notifications_config,
-                MaintenanceCompletedEvent(
-                    connection_pool=(
-                        pool_handler.pool if pool_handler is not None else None
-                    ),
-                    connection=self,
-                    state=MaintenanceState.MAINTENANCE,
-                    notification=None,
-                    config=self.maint_notifications_config,
+            return MaintenanceCompletedEvent(
+                connection_pool=(
+                    pool_handler.pool if pool_handler is not None else None
                 ),
+                connection=self,
+                state=MaintenanceState.MAINTENANCE,
+                notification=None,
+                config=self.maint_notifications_config,
             )
 
     def handle_pending_push_notifications(self) -> None:
@@ -2708,11 +2709,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def _disconnect_from_pool(self, inuse_connections):
         # Called outside the pool lock: a drain can dispatch MOVING and need it.
-        with self._in_use_lock:
-            while self._idle_maintenance:
-                self._idle_maintenance_done.wait()
-            if inuse_connections or not self._in_use:
-                self.disconnect()
+        event = None
+        try:
+            with self._in_use_lock:
+                while self._idle_maintenance:
+                    self._idle_maintenance_done.wait()
+                if inuse_connections or not self._in_use:
+                    event = self._reset_maintenance_on_disconnect()
+                    self.disconnect()
+        finally:
+            # A completion listener may close the pool again. Dispatch only
+            # after releasing the connection lock and closing its socket.
+            if event is not None:
+                _dispatch_maintenance_event(event.config, event)
 
     def re_auth(self):
         self._conn.re_auth()
@@ -3569,6 +3578,7 @@ class MaintNotificationsAbstractConnectionPool:
         ] = None,
     ):
         """Update the maintenance notifications config for all connections in the pool."""
+        cached_connections = []
         with self._get_pool_lock():
             for conn in self._get_free_connections():
                 if oss_cluster_maint_notifications_handler:
@@ -3590,7 +3600,13 @@ class MaintNotificationsAbstractConnectionPool:
                     raise ValueError(
                         "Either maint_notifications_pool_handler or oss_cluster_maint_notifications_handler must be set"
                     )
-                conn.disconnect()
+                if isinstance(conn, CacheProxyConnection):
+                    # Checkout may take this connection before the drain ends.
+                    # In that case defer reconnect as for an active connection.
+                    conn.mark_for_reconnect()
+                    cached_connections.append(conn)
+                else:
+                    conn.disconnect()
             for conn in self._get_in_use_connections():
                 if oss_cluster_maint_notifications_handler:
                     # Use set_maint_notifications_cluster_handler_for_connection
@@ -3623,6 +3639,9 @@ class MaintNotificationsAbstractConnectionPool:
                         f"config update: {conn}, {conn.extract_connection_details()}"
                     )
                 conn.mark_for_reconnect()
+
+        for conn in cached_connections:
+            conn._disconnect_from_pool(inuse_connections=False)
 
     def _should_update_connection(
         self,
@@ -4275,7 +4294,15 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
         if isinstance(connection, CacheProxyConnection):
             # Wait only for this connection's drain, without holding the pool lock.
-            connection._acquire()
+            try:
+                connection._acquire()
+            except BaseException:
+                # No ownership or metrics transition occurred. Return the slot
+                # without release events or socket I/O on the existing owner.
+                with self._lock:
+                    self._in_use_connections.remove(connection)
+                    self._available_connections.append(connection)
+                raise
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4799,7 +4826,16 @@ class BlockingConnectionPool(ConnectionPool):
 
         if isinstance(connection, CacheProxyConnection):
             # Join this connection's drain before connect/can_read uses the socket.
-            connection._acquire()
+            try:
+                connection._acquire()
+            except BaseException:
+                # Maintenance may still own it; release() would clear that state
+                # and could disconnect its socket. Only return the reserved slot.
+                try:
+                    self.pool.put_nowait(connection)
+                except Full:
+                    pass
+                raise
 
         # Record state transition for observability
         pool_name = get_pool_name(self)

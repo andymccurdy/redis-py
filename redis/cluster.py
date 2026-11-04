@@ -2130,6 +2130,10 @@ class RedisCluster(
 
         while ttl > 0:
             ttl -= 1
+            # The previous attempt's connection was released by its finally and
+            # may already belong to another caller. Forget it, so a failed
+            # checkout below does not disconnect or release it a second time.
+            connection = None
             try:
                 if asking:
                     target_node = self.get_node(*redirect_addr)

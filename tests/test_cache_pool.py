@@ -44,7 +44,10 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
-    @pytest.mark.parametrize("shutdown", ["close", "disconnect", "disconnect_idle"])
+    @pytest.mark.parametrize(
+        "shutdown",
+        ["close", "disconnect", "disconnect_idle", "disconnect_free_connections"],
+    )
     def test_custom_connection_without_maintenance_can_close(
         self, pool, pool_class, r2, shutdown
     ):
@@ -82,7 +85,7 @@ class TestCachePoolOwnership:
 
             assert not idle.is_connected
             assert custom_pool.cache.size == 0
-            if shutdown == "disconnect_idle":
+            if shutdown in ["disconnect_idle", "disconnect_free_connections"]:
                 assert active.is_connected
                 assert active.read_response() == b"PONG"
             else:
@@ -203,7 +206,8 @@ class TestCachePoolOwnership:
                 pool.release(acquired)
         assert not owner.is_connected
 
-    def test_completion_listener_can_close_cached_pool(self, pool):
+    @pytest.mark.parametrize("shutdown", ["close", "disconnect_free_connections"])
+    def test_completion_listener_can_close_cached_pool(self, pool, shutdown):
         events, errors = [], []
 
         class ClosingListener(EventListenerInterface):
@@ -215,6 +219,10 @@ class TestCachePoolOwnership:
                     acquired = event.connection._in_use_lock.acquire(blocking=False)
                     assert acquired, "completion listener holds the owner lock"
                     event.connection._in_use_lock.release()
+                    assert not event.connection._idle_maintenance, (
+                        "completion listener holds idle ownership"
+                    )
+                    assert not event.connection.is_connected
                     events.append(event)
                     pool.close()
                 except BaseException as exc:
@@ -234,12 +242,41 @@ class TestCachePoolOwnership:
             pool.release(owner)
             owner.maintenance_state = MaintenanceState.MAINTENANCE
 
-        pool.close()
+        getattr(pool, shutdown)()
 
         assert not errors
         assert len(events) == 2
         assert {event.connection for event in events} == set(owners)
         assert all(not owner.is_connected for owner in owners)
+
+    def test_own_cache_hit_drains_once_and_observes_invalidations(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner = pool.get_connection()
+        try:
+            owner.send_command("GET", key, keys=[key])
+            assert owner.read_response() == b"old"
+            with (
+                patch.object(
+                    owner._conn, "can_read", wraps=owner._conn.can_read
+                ) as can_read,
+                patch.object(
+                    owner._conn, "send_command", wraps=owner._conn.send_command
+                ) as send,
+            ):
+                owner.send_command("GET", key, keys=[key])
+                assert owner.read_response() == b"old"
+                assert can_read.call_count == 1
+                send.assert_not_called()
+
+            r2.set(key, "new")
+            assert owner._conn.can_read(timeout=1)
+            owner.send_command("GET", key, keys=[key])
+            assert owner.read_response() == b"new"
+            owner.send_command("PING")
+            assert owner.read_response() == b"PONG"
+        finally:
+            pool.release(owner)
 
     @pytest.mark.skipif(
         not hasattr(signal, "setitimer"), reason="requires interval-timer signals"

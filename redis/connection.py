@@ -2332,15 +2332,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # two connections draining each other.
             owner = candidate.connection_ref
             can_serve = False
+            if owner is self:
+                # This checked-out connection was drained at the start of
+                # send_command; peers cannot use its socket while we own it.
+                can_serve = True
             # A cache shared across pools can retain owners from before a fork.
             # Their locks may have been held by threads that do not exist here.
-            if isinstance(owner, CacheProxyConnection) and owner.pid == self.pid:
+            elif isinstance(owner, CacheProxyConnection) and owner.pid == self.pid:
                 with owner._in_use_lock:
                     if not owner._conn.is_connected:
                         # Pool disconnect may have closed this owner while we
                         # waited. can_read() would reconnect its raw connection.
                         pass
-                    elif owner is self or not owner._in_use:
+                    elif not owner._in_use:
                         self._drain_invalidations(owner._conn)
                         can_serve = True
                     elif time.monotonic() < owner._busy_cache_deadline:
@@ -3852,25 +3856,38 @@ class MaintNotificationsAbstractConnectionPool:
         :param moving_address_src: The address of the node that is being moved.
         """
         debug = logger.isEnabledFor(logging.DEBUG)
-        with self._get_pool_lock():
-            for conn in self._get_free_connections():
-                if self._should_update_connection(
-                    conn, "connected_address", moving_address_src
-                ):
-                    if debug:
-                        logger.debug(
-                            f"Disconnecting free connection: {conn}, "
-                            f"{conn.extract_connection_details()}"
-                        )
-                    cached = isinstance(conn, CacheProxyConnection)
-                    if cached and not conn._try_acquire_idle():
-                        conn.mark_for_reconnect()
-                        continue
-                    try:
-                        conn.disconnect()
-                    finally:
-                        if cached:
-                            conn._release_idle()
+        events = []
+        try:
+            with self._get_pool_lock():
+                for conn in self._get_free_connections():
+                    if self._should_update_connection(
+                        conn, "connected_address", moving_address_src
+                    ):
+                        if debug:
+                            logger.debug(
+                                f"Disconnecting free connection: {conn}, "
+                                f"{conn.extract_connection_details()}"
+                            )
+                        cached = isinstance(conn, CacheProxyConnection)
+                        if cached and not conn._try_acquire_idle():
+                            conn.mark_for_reconnect()
+                            continue
+                        try:
+                            if cached and isinstance(
+                                conn._conn, MaintNotificationsAbstractConnection
+                            ):
+                                event = conn._reset_maintenance_on_disconnect()
+                                if event is not None:
+                                    events.append(event)
+                            conn.disconnect()
+                        finally:
+                            if cached:
+                                conn._release_idle()
+        finally:
+            # A completion listener may close the pool. Release both idle
+            # ownership and the pool lock before invoking application code.
+            for event in events:
+                _dispatch_maintenance_event(event.config, event)
 
 
 class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInterface):

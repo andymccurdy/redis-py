@@ -547,13 +547,20 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
         """
         Closes the client and all its resources.
         """
-        # Close health check policy BEFORE stopping the scheduler.
-        # The policy's connection pools were created on the shared health check
-        # event loop, so they must be disconnected on that same loop to avoid
-        # leaking sockets/file descriptors.
+        # Close health check policy and health checks BEFORE stopping the
+        # scheduler. The policy's connection pools were created on the shared
+        # health check event loop, so they must be disconnected on that same
+        # loop to avoid leaking sockets/file descriptors.
         if self._bg_scheduler:
+            # Each resource gets its own guard: a policy close that raises or
+            # times out must not skip the health checks, which hold resources of
+            # their own (the lag-aware check's HTTP thread pool).
             try:
                 self._bg_scheduler.run_coro_sync(self._health_check_policy.close)
+            except Exception:
+                pass
+            try:
+                self._bg_scheduler.run_coro_sync(self._close_health_checks)
             except Exception:
                 pass
             self._bg_scheduler.stop()
@@ -575,6 +582,16 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
                     error = e
         if error is not None:
             raise error
+
+    async def _close_health_checks(self):
+        # Keep closing the remaining checks when one of them raises, the way the
+        # async client does with gather(..., return_exceptions=True): a single
+        # failing check must not strand the resources of the others.
+        for health_check in self._health_checks:
+            try:
+                await health_check.close()
+            except Exception:
+                pass
 
 
 def _half_open_circuit(circuit: CircuitBreaker):

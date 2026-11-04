@@ -278,14 +278,17 @@ class KeyNotification:
 
     # Regex patterns for parsing keyspace/keyevent channels
     # Pattern: __keyspace@<db>__:<key> or __keyevent@<db>__:<event>
+    # A key may contain any byte, newlines included, so the patterns that capture
+    # one need re.DOTALL: without it "." stops at a newline and "$" matches before
+    # a trailing one, dropping or truncating the key.
     _KEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__keyspace@(\d+|\*)__:(.+)$"
+        r"^__keyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _KEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__keyevent@(\d+|\*)__:(.+)$"
     )
     _SUBKEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__subkeyspace@(\d+|\*)__:(.+)$"
+        r"^__subkeyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _SUBKEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__subkeyevent@(\d+|\*)__:(.+)$"
@@ -294,7 +297,7 @@ class KeyNotification:
         r"^__subkeyspaceitem@(\d+|\*)__:(.+)$", re.DOTALL
     )
     _SUBKEYSPACEEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__subkeyspaceevent@(\d+|\*)__:(.+)$"
+        r"^__subkeyspaceevent@(\d+|\*)__:(.+)$", re.DOTALL
     )
 
     key: str

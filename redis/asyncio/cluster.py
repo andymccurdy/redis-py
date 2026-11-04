@@ -2,7 +2,6 @@ import asyncio
 import collections
 import logging
 import random
-import socket
 import threading
 import time
 import warnings
@@ -48,7 +47,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers import AsyncCommandsParser, Encoder
-from redis._parsers.helpers import get_response_callbacks
+from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import PubSub, ResponseCallbackT
 from redis.asyncio.connection import (
@@ -78,6 +77,7 @@ from redis.cluster import (
     LoadBalancer,
     LoadBalancingStrategy,
     _error_to_raise,
+    _resolve_localhost,
     _should_request_refresh,
     _topology_refresh_delay,
     block_pipeline_command,
@@ -1688,7 +1688,7 @@ class RedisCluster(
             ask_himport = False
             try:
                 if asking:
-                    target_node = self.get_node(node_name=redirect_addr)
+                    target_node = self.get_node(*redirect_addr)
                     if parse_himport_set_args(args) is not None:
                         # ASKING must sit on the same connection as the SET,
                         # immediately before it. HIMPORT SET's own executor folds
@@ -1849,7 +1849,9 @@ class RedisCluster(
                 ):
                     # The refresh also queries the node the error pointed to
                     self._request_refresh(
-                        additional_startup_nodes_info=[(e.host, e.port)]
+                        additional_startup_nodes_info=[
+                            self.nodes_manager.remap_host_port(e.host, e.port)
+                        ]
                     )
                     # Reset the counter
                     self.reinitialize_counter = 0
@@ -1865,7 +1867,7 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
-                redirect_addr = get_node_name(host=e.host, port=e.port)
+                redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
                 await self._record_command_metric(
                     command_name=command,
@@ -2127,7 +2129,7 @@ class ClusterNode:
         **connection_kwargs: Any,
     ) -> None:
         if host == "localhost":
-            host = socket.gethostbyname(host)
+            host = _resolve_localhost()
 
         connection_kwargs["host"] = host
         connection_kwargs["port"] = port
@@ -2351,6 +2353,8 @@ class ClusterNode:
             if NEVER_DECODE in kwargs:
                 response = await connection.read_response(disable_decoding=True)
                 kwargs.pop(NEVER_DECODE)
+                if command == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = await connection.read_response()
         except ResponseError:
@@ -2632,7 +2636,7 @@ class NodesManager:
         if host and port:
             # the user passed host and port
             if host == "localhost":
-                host = socket.gethostbyname(host)
+                host = _resolve_localhost()
             return self.nodes_cache.get(get_node_name(host=host, port=port))
         elif node_name:
             return self.nodes_cache.get(node_name)
@@ -2699,7 +2703,10 @@ class NodesManager:
 
     async def move_slot(self, e: AskError | MovedError):
         node_changed = False
-        redirected_node = self.get_node(host=e.host, port=e.port)
+        # The redirect carries the address the node advertises, like
+        # CLUSTER SLOTS does, so it needs the same remapping to be reachable
+        host, port = self.remap_host_port(e.host, e.port)
+        redirected_node = self.get_node(host=host, port=port)
         if redirected_node:
             # The node already exists
             if redirected_node.server_type != PRIMARY:
@@ -2707,9 +2714,7 @@ class NodesManager:
                 redirected_node.server_type = PRIMARY
         else:
             # This is a new node, we will add it to the nodes cache
-            redirected_node = ClusterNode(
-                e.host, e.port, PRIMARY, **self.connection_kwargs
-            )
+            redirected_node = ClusterNode(host, port, PRIMARY, **self.connection_kwargs)
             self.set_nodes(self.nodes_cache, {redirected_node.name: redirected_node})
         slot_nodes = self.slots_cache[e.slot_id]
         if redirected_node not in slot_nodes:
@@ -2937,11 +2942,15 @@ class NodesManager:
                 # all reinitialize through the same node.
                 random.shuffle(startup_nodes)
             # An address that is already a startup node is queried through that
-            # node, so no temporary node is built for it
+            # node, so no temporary node is built for it. Startup nodes are
+            # named after the resolved localhost, like ClusterNode names them.
             additional_startup_nodes = [
                 ClusterNode(host, port, **self.connection_kwargs)
                 for host, port in additional_startup_nodes_info
-                if get_node_name(host, port) not in self.startup_nodes
+                if get_node_name(
+                    _resolve_localhost() if host == "localhost" else host, port
+                )
+                not in self.startup_nodes
             ]
             temporary_nodes.extend(additional_startup_nodes)
             if last_failed_node_name is not None:
@@ -4029,15 +4038,53 @@ class TransactionStrategy(AbstractStrategy):
         # on the caller's loop: running it here would do I/O on connections
         # bound to that loop. Only a client that never initialized has no
         # topology to queue against.
-        if (
+        initialize_here = (
             cluster_client._initialize
             and cluster_client.nodes_manager.default_node is None
-        ):
-            await cluster_client.initialize()
-
+        )
+        startup_nodes = (
+            tuple(cluster_client.nodes_manager.startup_nodes.values())
+            if initialize_here
+            else ()
+        )
+        parser_node = (
+            None
+            if initialize_here or args[0] in self.NO_SLOTS_COMMANDS
+            else cluster_client.commands_parser.node
+        )
+        if parser_node is not None:
+            # Parser I/O during slot resolution belongs to this private loop,
+            # not to the caller's node or its connection pool.
+            cluster_client.commands_parser.node = ClusterNode(
+                parser_node.host,
+                parser_node.port,
+                **cluster_client.nodes_manager.connection_kwargs,
+            )
         slot_number: Optional[int] = None
-        if args[0] not in self.NO_SLOTS_COMMANDS:
-            slot_number = await self._resolve_transaction_slot(*args)
+        try:
+            if initialize_here:
+                await cluster_client.initialize()
+            if args[0] not in self.NO_SLOTS_COMMANDS:
+                slot_number = await self._resolve_transaction_slot(*args)
+        finally:
+            if initialize_here:
+                # Keep the discovered topology and metadata, but not sockets bound
+                # to the private loop that closes when this command is queued.
+                # Same-address nodes can have distinct pools; deduplicate by identity.
+                nodes = {
+                    id(node): node
+                    for node in chain(startup_nodes, cluster_client.get_nodes())
+                }
+                await asyncio.gather(
+                    *(node.disconnect() for node in nodes.values()),
+                    return_exceptions=True,
+                )
+            elif parser_node is not None:
+                temporary_node = cluster_client.commands_parser.node
+                cluster_client.commands_parser.node = parser_node
+                await asyncio.gather(
+                    temporary_node.disconnect(), return_exceptions=True
+                )
 
         if (
             self._watching or args[0] in self.IMMEDIATE_EXECUTE_COMMANDS
@@ -4425,6 +4472,9 @@ class TransactionStrategy(AbstractStrategy):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
                 if command_name in self._pipe.cluster_client.response_callbacks:
+                    # The keys option is only for the client cache and is
+                    # not an option of the callbacks
+                    cmd.kwargs.pop("keys", None)
                     r = self._pipe.cluster_client.response_callbacks[command_name](
                         r, **cmd.kwargs
                     )

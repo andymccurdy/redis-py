@@ -45,6 +45,15 @@ class TestClusterTransaction:
             assert pipe
 
     @pytest.mark.onlycluster
+    async def test_transaction_applies_response_callbacks(self, r) -> None:
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.hset("{foo}hash", mapping={"a": "1", "b": "2"})
+            pipe.hgetall("{foo}hash")
+            result = await pipe.execute()
+
+        assert result == [2, {b"a": b"1", b"b": b"2"}]
+
+    @pytest.mark.onlycluster
     async def test_pipeline_empty_transaction(self, r):
         await r.set("a", 0)
 

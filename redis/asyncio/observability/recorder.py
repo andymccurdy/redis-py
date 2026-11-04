@@ -29,7 +29,10 @@ from redis.observability.attributes import (
     PubSubDirection,
 )
 from redis.observability.metrics import CloseReason, RedisMetricsCollector
-from redis.observability.providers import get_observability_instance
+from redis.observability.providers import (
+    _register_reset_hook,
+    get_observability_instance,
+)
 from redis.observability.registry import get_observables_registry_instance
 from redis.utils import deprecated_function, str_if_bytes
 
@@ -40,6 +43,18 @@ if TYPE_CHECKING:
 
 # Global metrics collector instance (lazy-initialized)
 _async_metrics_collector: Optional[RedisMetricsCollector] = None
+# Whether the collector above has been looked up already. A *miss* is cached
+# too: resolving it walks the observability singleton, and while observability
+# is disabled each recording call would run that lookup again.
+# ObservabilityInstance.init() clears both this flag and the collector, so
+# enabling observability after a recording call still starts collecting.
+_async_collector_resolved = False
+# Bumped by reset_collector() every time the caches below are dropped. A
+# resolution that spans a reset can see the fields it owns cleared underneath
+# it, so it records the generation it started from and hands the cache back
+# rather than publishing an answer that belongs to the configuration the
+# reset replaced.
+_async_collector_generation = 0
 
 CONNECTION_COUNT_REGISTRY_KEY = "connection_count"
 
@@ -51,10 +66,17 @@ def _get_or_create_collector() -> Optional[RedisMetricsCollector]:
     Returns:
         RedisMetricsCollector instance if observability is enabled, None otherwise
     """
-    global _async_metrics_collector
+    global _async_metrics_collector, _async_collector_resolved
+    global _async_collector_generation
 
     if _async_metrics_collector is not None:
         return _async_metrics_collector
+    if _async_collector_resolved:
+        # A previous lookup found observability disabled; keep the miss cached
+        return None
+
+    generation = _async_collector_generation
+    _async_collector_resolved = True
 
     try:
         manager = get_observability_instance().get_provider_manager()
@@ -67,6 +89,12 @@ def _get_or_create_collector() -> Optional[RedisMetricsCollector]:
         )
 
         _async_metrics_collector = RedisMetricsCollector(meter, manager.config)
+        if _async_collector_generation != generation:
+            # A reset landed while this resolution was in flight: the value
+            # above describes the configuration that was just replaced, so
+            # hand the cache back instead of publishing it.
+            _async_metrics_collector = None
+            _async_collector_resolved = False
         return _async_metrics_collector
 
     except ImportError:
@@ -124,9 +152,13 @@ async def record_operation_duration(
         >>> # ... execute command ...
         >>> await record_operation_duration('SET', time.monotonic() - start, 'localhost', 6379, '0')
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_operation_duration(
@@ -156,9 +188,13 @@ async def record_connection_create_time(
         connection_pool: Connection pool implementation
         duration_seconds: Time taken to create connection in seconds
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_create_time(
@@ -182,9 +218,13 @@ async def record_connection_count(
         connection_state: State to update (IDLE or USED)
         counter: Number to add (positive) or subtract (negative)
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_count(
@@ -205,9 +245,13 @@ async def init_connection_count() -> None:
     """
     Initialize observable gauge for connection count metric.
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     def observable_callback(__):
         observables_registry = get_observables_registry_instance()
@@ -238,9 +282,13 @@ async def register_pools_connection_count(
     """
     Add connection pools to connection count observable registry.
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         # Lazy import
@@ -270,9 +318,13 @@ async def record_connection_timeout(
     Args:
         pool_name: Connection pool identifier
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_timeout(
@@ -293,9 +345,13 @@ async def record_connection_wait_time(
         pool_name: Connection pool identifier
         duration_seconds: Wait time in seconds
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_wait_time(
@@ -317,9 +373,13 @@ async def record_connection_closed(
         close_reason: Reason for closing (e.g. 'error', 'application_close')
         error_type: Error type if closed due to error
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_closed(
@@ -343,9 +403,13 @@ async def record_connection_relaxed_timeout(
         maint_notification: Maintenance notification type
         relaxed: True to count up (relaxed), False to count down (unrelaxed)
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_relaxed_timeout(
@@ -366,9 +430,13 @@ async def record_connection_handoff(
     Args:
         pool_name: Connection pool identifier
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_connection_handoff(
@@ -399,9 +467,13 @@ async def record_error_count(
         retry_attempts: Retry attempts
         is_internal: Whether the error is internal (e.g., timeout, network error)
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_error_count(
@@ -430,9 +502,13 @@ async def record_pubsub_message(
         channel: Pub/Sub channel name
         sharded: True if sharded Pub/Sub channel
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     # Check if channel names should be hidden
     effective_channel = channel
@@ -467,9 +543,13 @@ async def record_streaming_lag(
         stream_name: Stream name
         consumer_group: Consumer group name
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     # Check if stream names should be hidden
     effective_stream_name = stream_name
@@ -501,9 +581,13 @@ async def record_streaming_lag_from_response(
         response: Response from XREAD/XREADGROUP command
         consumer_group: Consumer group name (for XREADGROUP)
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     if not response:
         return
@@ -576,9 +660,13 @@ async def record_maint_notification_count(
         network_peer_port: Network peer port
         maint_notification: Maintenance notification type (e.g., 'MOVING', 'MIGRATING')
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_maint_notification_count(
@@ -605,9 +693,13 @@ async def record_geo_failover(
         fail_to: Database failed to
         reason: Reason for the failover
     """
-    collector = _get_or_create_collector()
+    collector = _async_metrics_collector
     if collector is None:
-        return
+        if _async_collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         collector.record_geo_failover(
@@ -623,8 +715,12 @@ def reset_collector() -> None:
     """
     Reset the global async collector (used for testing or re-initialization).
     """
-    global _async_metrics_collector
+    global _async_metrics_collector, _async_collector_resolved
+    global _async_collector_generation
+
     _async_metrics_collector = None
+    _async_collector_resolved = False
+    _async_collector_generation += 1
 
 
 async def is_enabled() -> bool:
@@ -636,3 +732,8 @@ async def is_enabled() -> bool:
     """
     collector = _get_or_create_collector()
     return collector is not None
+
+
+# Register this module's cache invalidation with the observability singleton, so
+# ObservabilityInstance.init() drops the cached collector (see providers.py).
+_register_reset_hook(reset_collector)

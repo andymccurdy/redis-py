@@ -1,9 +1,11 @@
 import json
 import random
+from unittest.mock import patch
 import numpy as np
 import pytest
 import pytest_asyncio
 import redis
+import redis.asyncio as async_redis
 from redis.commands.vectorset.commands import QuantizationOptions
 
 from tests.conftest import (
@@ -603,6 +605,29 @@ async def test_vrem(d_client):
 
     resp = await d_client.vset().vrem("myset_unexisting", "elem1")
     assert resp == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("client_factory", ["direct", "from_url", "pool"])
+async def test_vemb_raw_default_decode_responses(client_factory):
+    if client_factory == "direct":
+        r = async_redis.Redis()
+    elif client_factory == "from_url":
+        r = async_redis.Redis.from_url("redis://localhost:6379")
+    else:
+        r = async_redis.Redis(connection_pool=async_redis.ConnectionPool())
+
+    response = [b"embedding"]
+    try:
+        with patch.object(
+            r, "execute_command", return_value=response
+        ) as execute_command:
+            assert await r.vset().vemb("vectors", "item", raw=True) is response
+        execute_command.assert_awaited_once_with(
+            "VEMB", "vectors", "item", "RAW", RESP3=True, NEVER_DECODE=True, RAW=True
+        )
+    finally:
+        await r.aclose()
 
 
 @skip_if_server_version_lt("7.9.0")

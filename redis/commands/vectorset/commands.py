@@ -391,10 +391,14 @@ class VectorSetCommands(CommandsProtocol):
             options[NEVER_DECODE] = True
             if (
                 hasattr(self.client, "connection_pool")
-                and self.client.connection_pool.connection_kwargs["decode_responses"]
+                and self.client.connection_pool.connection_kwargs.get(
+                    "decode_responses", False
+                )
             ) or (
                 hasattr(self.client, "nodes_manager")
-                and self.client.nodes_manager.connection_kwargs["decode_responses"]
+                and self.client.nodes_manager.connection_kwargs.get(
+                    "decode_responses", False
+                )
             ):
                 # allow decoding in the postprocessing callback
                 # if the user set decode_responses=True

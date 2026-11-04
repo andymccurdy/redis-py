@@ -66,6 +66,21 @@ class TestPipeline:
             assert await r.get("c") == b"c1"
 
     @pytest.mark.onlynoncluster
+    async def test_info_in_transaction(self, decoded_r):
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version" in info
+
+    @pytest.mark.onlynoncluster
+    async def test_info_in_transaction_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response, **options: response)
+        async with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = await pipe.execute()
+            assert "redis_version:" in info
+
+    @pytest.mark.onlynoncluster
     async def test_pipeline_no_transaction_watch(self, r):
         await r.set("a", 0)
 
@@ -646,12 +661,7 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create pipeline with mocked connection pool
             pipeline = Pipeline(
                 connection_pool=mock_async_connection_pool,
@@ -718,12 +728,7 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create pipeline with transaction=False
             pipeline = Pipeline(
                 connection_pool=mock_async_connection_pool,
@@ -778,12 +783,7 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # First pipeline execution
             pipeline1 = Pipeline(
                 connection_pool=mock_async_connection_pool,
@@ -826,12 +826,7 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
         with patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             pipeline = Pipeline(
                 connection_pool=mock_async_connection_pool,
                 response_callbacks={},

@@ -4,12 +4,12 @@ import socket
 import ssl
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pytest
 import redis
 from redis.backoff import NoBackoff
-from redis.exceptions import ConnectionError, RedisError
+from redis.exceptions import AuthorizationError, ConnectionError, RedisError
 from redis.retry import Retry
 
 from .conftest import (
@@ -226,21 +226,6 @@ class TestSSL:
                 with pytest.raises(ConnectionError) as e:
                     assert ocsp.is_valid()
                 assert "from the" in str(e.value)
-
-    @pytest.mark.fixed_client
-    @skip_if_nocryptography()
-    def test_unauthorized_then_direct(self):
-        from redis.ocsp import OCSPVerifier
-
-        # these certificates on the socket end return unauthorized
-        # then the second call succeeds
-        hostnames = ["wikipedia.org", "squarespace.com"]
-        for hostname in hostnames:
-            context = ssl.create_default_context()
-            with socket.create_connection((hostname, 443)) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as wrapped:
-                    ocsp = OCSPVerifier(wrapped, hostname, 443)
-                    assert ocsp.is_valid()
 
     @skip_if_nocryptography()
     def test_mock_ocsp_staple(self, request):
@@ -481,13 +466,18 @@ class TestOCSPCertificateBinding:
         rsa_key=False,
         rsa_padding=None,
         expired=False,
+        aia=False,
     ):
         pytest.importorskip("cryptography")
 
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec, rsa
-        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+        from cryptography.x509.oid import (
+            AuthorityInformationAccessOID,
+            ExtendedKeyUsageOID,
+            NameOID,
+        )
 
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         if expired:
@@ -520,6 +510,22 @@ class TestOCSPCertificateBinding:
         if ocsp_signing:
             builder = builder.add_extension(
                 x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]),
+                critical=False,
+            )
+        if aia:
+            builder = builder.add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            AuthorityInformationAccessOID.OCSP,
+                            x509.UniformResourceIdentifier("http://ocsp.test/"),
+                        ),
+                        x509.AccessDescription(
+                            AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier("http://ca.test/ca.der"),
+                        ),
+                    ]
+                ),
                 critical=False,
             )
         if rsa_padding is not None:
@@ -890,3 +896,93 @@ class TestOCSPCertificateBinding:
         with pytest.raises(ConnectionError) as e:
             self._stapled_connection(port, ca)._connect()
         assert "was not issued by" in str(e.value)
+
+    def test_unauthorized_ocsp_fails_closed(self, monkeypatch):
+        # An unsigned UNAUTHORIZED status must not let the check move on to a
+        # certificate fetched over a second handshake, GOOD as that one may be.
+        import base64
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.x509 import ocsp
+
+        import redis.ocsp
+
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 111, signing_key=ca_key, aia=True)
+        other, _ = self._make_certificate("other", 999, signing_key=ca_key, aia=True)
+        unauthorized = ocsp.OCSPResponseBuilder.build_unsuccessful(
+            ocsp.OCSPResponseStatus.UNAUTHORIZED
+        ).public_bytes(serialization.Encoding.DER)
+        queries = []
+
+        class Response:
+            ok = True
+
+            def __init__(self, content):
+                self.content = content
+
+        def get(url, headers=None):
+            if url == "http://ca.test/ca.der":
+                return Response(ca.public_bytes(serialization.Encoding.DER))
+            request = ocsp.load_der_ocsp_request(
+                base64.b64decode(unquote(urlparse(url).path.lstrip("/")))
+            )
+            queries.append(request.serial_number)
+            if len(queries) == 1:
+                return Response(unauthorized)
+            target = cert if request.serial_number == cert.serial_number else other
+            return Response(
+                self._good_response(
+                    ca,
+                    ca_key,
+                    target,
+                    now - datetime.timedelta(days=1),
+                    now + datetime.timedelta(days=1),
+                )
+            )
+
+        class Socket:
+            def getpeercert(self, binary_form=False):
+                return cert.public_bytes(serialization.Encoding.DER)
+
+        monkeypatch.setattr(redis.ocsp.requests, "get", get)
+        direct_fetches = []
+
+        def get_server_certificate(addr, ca_certs=None):
+            direct_fetches.append(addr)
+            return other.public_bytes(serialization.Encoding.PEM).decode()
+
+        monkeypatch.setattr(
+            redis.ocsp.ssl, "get_server_certificate", get_server_certificate
+        )
+        with pytest.raises(AuthorizationError):
+            redis.ocsp.OCSPVerifier(Socket(), "localhost", 6666).is_valid()
+        assert direct_fetches == []
+        assert queries == [cert.serial_number]
+
+    @pytest.mark.parametrize("server", ["http://ocsp.test", "http://ocsp.test/"])
+    def test_build_certificate_url_round_trips_request(self, server):
+        # The serial is the last field of the request, so whatever the keys,
+        # this one makes the base64 end in "Agh/////++++/w==", so it always
+        # contains "//" and "+".
+        import base64
+
+        from cryptography.x509 import ocsp
+
+        from redis.ocsp import OCSPVerifier
+
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 0x7FFFFFFFFBEFBEFF, signing_key=ca_key)
+
+        url = OCSPVerifier(None, "localhost", 6666).build_certificate_url(
+            server, cert, ca
+        )
+
+        assert url.startswith("http://ocsp.test/")
+        encoded = url.removeprefix("http://ocsp.test/")
+        assert "/" not in encoded and "+" not in encoded
+        request = unquote(encoded)
+        assert "//" in request and "+" in request
+        loaded = ocsp.load_der_ocsp_request(base64.b64decode(request))
+        assert loaded.serial_number == cert.serial_number

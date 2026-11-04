@@ -351,6 +351,11 @@ class HybridPostProcessingConfig:
     def limit(self, offset: int, num: int) -> Self:
         """
         Add limit parameters to the query.
+
+        If `num` is 0, `offset` must also be 0; `LIMIT 0 0` omits result
+        rows. Do not use it as a counting API. To count search matches, use
+        `Query(...).paging(0, 0)` with `FT.SEARCH`. To count inside an
+        aggregation, use `group_by([], reducers.count())`.
         """
         self._limit = Limit(offset, num)
         return self

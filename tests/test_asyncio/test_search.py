@@ -1390,6 +1390,27 @@ class TestBaseSearchFunctionality(AsyncSearchTestsBase):
             "The text field is not decoded correctly"
         )
 
+    @pytest.mark.redismod
+    async def test_syndump(self, decoded_r):
+        client = decoded_r
+        definition = IndexDefinition(index_type=IndexType.HASH)
+        await client.ft().create_index(
+            (TextField("title"), TextField("body")), definition=definition
+        )
+
+        await client.ft().synupdate("id1", False, "boy", "child", "offspring")
+        await client.ft().synupdate("id2", False, "baby", "child")
+        await client.ft().synupdate("id3", False, "tree", "wood")
+        res = await client.ft().syndump()
+        assert res == {
+            "boy": ["id1"],
+            "tree": ["id3"],
+            "wood": ["id3"],
+            "child": ["id1", "id2"],
+            "baby": ["id2"],
+            "offspring": ["id1"],
+        }
+
 
 class TestSearchLanguages(AsyncSearchTestsBase):
     """Functional coverage for indexing and searching text in languages other
@@ -2595,6 +2616,172 @@ class TestAggregations(AsyncSearchTestsBase):
             assert len(res.rows) == 2
             for row in res.rows:
                 len(row) == 6
+
+
+class TestProfile(AsyncSearchTestsBase):
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @pytest.mark.fixed_client
+    @skip_if_redis_enterprise()
+    @skip_if_server_version_lt("6.3.0")
+    @pytest.mark.parametrize(
+        "protocol,legacy_responses",
+        [(None, True), (None, False), (2, True), (2, False), (3, False)],
+    )
+    @pytest.mark.parametrize("limited", [False, True])
+    @pytest.mark.parametrize("with_scores", [False, True])
+    async def test_profile_field_encodings(
+        self, create_redis, stack_url, protocol, legacy_responses, limited, with_scores
+    ):
+        options = {"decode_responses": False, "legacy_responses": legacy_responses}
+        if protocol is not None:
+            options["protocol"] = protocol
+        client = await create_redis(url=stack_url, **options)
+        await client.flushdb()
+        await client.ft().create_index((TextField("title"),))
+        binary = b"\x00\x01\x82\xff"
+        await client.hset(
+            "doc:1", mapping={"title": "hello", "vector": binary, "label": b"caf\xe9"}
+        )
+        decoded_client = await create_redis(url=stack_url, decode_responses=True)
+        await self.waitForIndex(decoded_client, "idx")
+        query = (
+            Query("hello")
+            .return_field("vector", as_field="embedding", decode_field=False)
+            .return_field("label", encoding="latin-1")
+            .return_field("title")
+        )
+        if with_scores:
+            query.with_scores()
+
+        result, profile = await client.ft().profile(query, limited=limited)
+
+        assert result.total == 1
+        assert result.docs[0].embedding == binary
+        assert result.docs[0].label == "café"
+        assert result.docs[0].title == "hello"
+        if with_scores:
+            assert isinstance(result.docs[0].score, float)
+        assert profile.info
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_redis_enterprise()
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index((TextField("t"),))
+        await client.ft().client.hset("1", "t", "hello")
+        await client.ft().client.hset("2", "t", "world")
+
+        # check using Query
+        q = Query("hello|world").no_content()
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q)
+            det = det.info
+
+            assert isinstance(det, list)
+            assert len(res.docs) == 2  # check also the search result
+
+            # check using AggregateRequest
+            req = (
+                aggregations.AggregateRequest("*")
+                .load("t")
+                .apply(prefix="startswith(@t, 'hel')")
+            )
+            res, det = await client.ft().profile(req)
+            det = det.info
+            assert isinstance(det, list)
+            assert len(res.rows) == 2  # check also the search result
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q)
+            res = res.info
+
+            assert isinstance(res, dict)
+            assert len(res["results"]) == 2  # check also the search result
+
+            # check using AggregateRequest
+            req = (
+                aggregations.AggregateRequest("*")
+                .load("t")
+                .apply(prefix="startswith(@t, 'hel')")
+            )
+            res = await client.ft().profile(req)
+            res = res.info
+
+            assert isinstance(res, dict)
+            assert len(res["results"]) == 2  # check also the search result
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile_limited(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index((TextField("t"),))
+        await client.ft().client.hset("1", "t", "hello")
+        await client.ft().client.hset("2", "t", "hell")
+        await client.ft().client.hset("3", "t", "help")
+        await client.ft().client.hset("4", "t", "helowa")
+
+        q = Query("%hell% hel*")
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q, limited=True)
+            det = det.info
+            assert det[4][1][7][9] == "The number of iterators in the union is 3"
+            assert det[4][1][8][9] == "The number of iterators in the union is 4"
+            assert det[4][1][1] == "INTERSECT"
+            assert len(res.docs) == 3  # check also the search result
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q, limited=True)
+            res = res.info
+            iterators_profile = res["profile"]["Iterators profile"]
+            assert (
+                iterators_profile[0]["Child iterators"][0]["Child iterators"]
+                == "The number of iterators in the union is 3"
+            )
+            assert (
+                iterators_profile[0]["Child iterators"][1]["Child iterators"]
+                == "The number of iterators in the union is 4"
+            )
+            assert iterators_profile[0]["Type"] == "INTERSECT"
+            assert len(res["results"]) == 3  # check also the search result
+
+    @pytest.mark.redismod
+    @skip_ifmodversion_lt("2.4.3", "search")
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile_query_params(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index(
+            (
+                VectorField(
+                    "v", "HNSW", {"TYPE": "FLOAT32", "DIM": 2, "DISTANCE_METRIC": "L2"}
+                ),
+            )
+        )
+        await client.hset("a", "v", "aaaaaaaa")
+        await client.hset("b", "v", "aaaabaaa")
+        await client.hset("c", "v", "aaaaabaa")
+        query = "*=>[KNN 2 @v $vec]"
+        q = Query(query).return_field("__v_score").sort_by("__v_score", True)
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q, query_params={"vec": "aaaaaaaa"})
+            det = det.info
+            assert det[4][1][5] == 2.0
+            assert det[4][1][1] == "VECTOR"
+            assert res.total == 2
+            assert "a" == res.docs[0].id
+            assert "0" == res.docs[0].__getattribute__("__v_score")
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q, query_params={"vec": "aaaaaaaa"})
+            res = res.info
+            assert res["profile"]["Iterators profile"][0]["Counter"] == 2
+            assert res["profile"]["Iterators profile"][0]["Type"] == "VECTOR"
+            assert res["total_results"] == 2
+            assert "a" == res["results"][0]["id"]
+            assert "0" == res["results"][0]["extra_attributes"]["__v_score"]
 
 
 class TestPipeline(AsyncSearchTestsBase):
@@ -4495,5 +4682,5 @@ async def _queue_parsed_commands(ft):
         ft.sugget("ac", "he"),
         ft.sugget("ac", "he", with_scores=True),
     ]
-    # ``profile`` and ``syndump`` are inherited from the sync commands.
+    # ``profile`` and ``syndump`` queue synchronously on pipelines.
     return [await res if asyncio.iscoroutine(res) else res for res in queued]

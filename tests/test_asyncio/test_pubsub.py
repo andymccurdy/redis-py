@@ -6,6 +6,7 @@ import sys
 import time
 import weakref
 from collections import defaultdict
+from collections.abc import Coroutine
 from typing import Optional
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -2427,6 +2428,28 @@ class TestPubSubAcloseWithMocks:
         connection.disconnect.assert_awaited_once_with(nowait=True)
 
 
+class _CountingCoroutine(Coroutine):
+    """Wrap a coroutine and count how often the event loop resumes it."""
+
+    def __init__(self, coro):
+        self._coro = coro
+        self.resumes = 0
+
+    def send(self, value):
+        self.resumes += 1
+        return self._coro.send(value)
+
+    def throw(self, *args):
+        self.resumes += 1
+        return self._coro.throw(*args)
+
+    def close(self):
+        return self._coro.close()
+
+    def __await__(self):
+        return self._coro.__await__()
+
+
 @pytest.mark.onlynoncluster
 class TestPubSubAcloseCancellation:
     """
@@ -2580,6 +2603,34 @@ class TestPubSubAcloseCancellation:
             await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
         assert "PubSub teardown failed after a cancellation" in caplog.text
         await p.aclose()  # clean up the connection the failed teardown kept
+
+    async def test_repeated_cancels_wake_aclose_only_once(self, r: redis.Redis):
+        # A level-triggered canceller (e.g. an anyio cancel scope) calls
+        # task.cancel() on every loop turn while aclose() waits for its
+        # teardown; aclose() must not wake up for each of them.
+        loop = asyncio.get_running_loop()
+        p = r.pubsub()
+        await p.subscribe("foo")
+        await p._lock.acquire()  # blocks the teardown
+        coro = _CountingCoroutine(p.aclose())
+        task = loop.create_task(coro)
+        await asyncio.sleep(0)  # aclose() now waits for the teardown
+
+        def cancel_again():
+            if not task.done():
+                task.cancel()
+                loop.call_soon(cancel_again)
+
+        loop.call_soon(cancel_again)
+        for _ in range(100):
+            await asyncio.sleep(0)
+        p._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Started, woken by the first cancel, and woken once more when the
+        # teardown finished; not once per loop turn.
+        assert coro.resumes == 3
+        assert p.connection is None
 
 
 class TestClusterPubSubResubscribe:

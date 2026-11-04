@@ -1179,6 +1179,13 @@ class Monitor:
             yield await self.next_command()
 
 
+class _UncancellableFuture(asyncio.Future):
+    """A future that ignores cancel(): awaiting it is not woken by Task.cancel()."""
+
+    def cancel(self, msg: Any = None) -> bool:
+        return False
+
+
 class PubSub:
     """
     PubSub provides publish, subscribe and listen support to Redis channels.
@@ -1261,11 +1268,14 @@ class PubSub:
             await asyncio.shield(teardown)
         except asyncio.CancelledError:
             # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
-            while not teardown.done():
-                try:
-                    await asyncio.wait({teardown})
-                except asyncio.CancelledError:
-                    pass  # e.g. anyio re-cancels on every await
+            # Repeated cancels (anyio re-cancels on every loop turn) only mark
+            # this task while it waits here, so it wakes once, when done.
+            waiter = _UncancellableFuture(loop=asyncio.get_running_loop())
+            teardown.add_done_callback(lambda _: waiter.set_result(None))
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass  # the cancels marked while waiting
             if not teardown.cancelled() and teardown.exception() is not None:
                 logger.warning(
                     "PubSub teardown failed after a cancellation",

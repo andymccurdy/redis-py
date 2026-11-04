@@ -851,27 +851,26 @@ async def test_connect_missing_unix_socket_retries_without_checker(tmp_path):
 
 
 @pytest.mark.fixed_client
-async def test_lazy_reconnect_uses_retry_checker():
-    """The checker lives on the Retry object, so it also applies to the lazy
-    reconnect retry inside connect_check_health, not just connect()."""
-
-    async def connect_error():
-        try:
-            raise ConnectionError("connect failed") from OSError(
-                ENOENT, "No such file or directory"
-            )
-        except ConnectionError as exc:
-            raise exc
-
-    conn = Connection(
-        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error)
+async def test_client_connect_uses_retry_checker():
+    """The checker also applies when the client acquires a connection through
+    the pool, not only to a direct connect() call."""
+    client = Redis(
+        unix_socket_path="/nonexistent/redis.sock",
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error),
     )
-    conn._connect = mock.AsyncMock(side_effect=connect_error)
+    error = OSError(ENOENT, "No such file or directory")
+    with mock.patch.object(
+        UnixDomainSocketConnection,
+        "_connect",
+        autospec=True,
+        side_effect=error,
+    ) as connect:
+        with pytest.raises(ConnectionError) as excinfo:
+            await client.ping()
 
-    with pytest.raises(ConnectionError):
-        await conn.send_packed_command(b"PING", check_health=False)
-
-    assert conn._connect.call_count == 1
+    assert connect.call_count == 1
+    assert excinfo.value.__cause__ is error
+    await client.aclose()
 
 
 @pytest.mark.fixed_client

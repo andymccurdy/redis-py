@@ -229,6 +229,13 @@ class TestConnectionConstructorWithRetry:
         assert isinstance(client.get_retry(), Retry)
         assert client.get_retry().get_retries() == retry.get_retries()
 
+        new_retry = SyncRetry(ExponentialBackoff(), 3)
+        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
+            client.set_retry(new_retry)
+
+        assert isinstance(client.get_retry(), Retry)
+        assert client.get_retry().get_retries() == new_retry.get_retries()
+
     def test_to_async_retry_preserves_checker(self):
         retry = SyncRetry(NoBackoff(), 2, is_retryable=is_retryable_connect_error)
         with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
@@ -249,13 +256,6 @@ class TestConnectionConstructorWithRetry:
             client = Redis(retry=retry)
 
         assert client.get_retry().is_retryable is is_retryable_connect_error
-
-        new_retry = SyncRetry(ExponentialBackoff(), 3)
-        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
-            client.set_retry(new_retry)
-
-        assert isinstance(client.get_retry(), Retry)
-        assert client.get_retry().get_retries() == new_retry.get_retries()
 
     def test_redis_set_retry_converts_without_pool_write(self, monkeypatch):
         client = Redis()

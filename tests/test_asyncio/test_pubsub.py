@@ -3443,6 +3443,32 @@ class TestClusterPubSubSlotMigration:
         # re-run on every poll.
         assert stale in pubsub._poll_cool_off
 
+    async def test_moved_repair_fills_in_a_missing_redirect_host(self):
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) answers ``MOVED`` with only a port, and the repair
+        applies the redirect on the host of the node that sent it rather than
+        failing to parse an address with an empty host.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} :7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        (redirect,), _ = pubsub.cluster.nodes_manager.move_slot.call_args
+        assert redirect.node_addr == ("127.0.0.1", 7001)
+
     async def test_moved_repair_collects_the_pubsub_it_empties(self):
         """
         A node that lost its only slot answers ``MOVED`` for every channel it

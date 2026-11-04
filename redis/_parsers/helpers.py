@@ -1035,14 +1035,10 @@ def _parse_client_info_fields(value):
 
 
 def parse_client_list(response, **options):
+    clients = _client_list_iter(response)
     if options.pop("as_iter", False):
-        return _client_list_iter(response)
-    clients = []
-    for c in str_if_bytes(response).splitlines():
-        client_dict = _parse_client_info_fields(c)
-        if client_dict:
-            clients.append(client_dict)
-    return clients
+        return clients
+    return list(clients)
 
 
 def _client_list_iter(response):

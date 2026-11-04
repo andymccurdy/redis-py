@@ -1,7 +1,7 @@
 import threading
 import time
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -9,7 +9,12 @@ from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
 from redis.connection import BlockingConnectionPool, ConnectionPool
-from redis.maint_notifications import MaintNotificationsConfig
+from redis.exceptions import AuthenticationError
+from redis.maint_notifications import (
+    MaintNotificationsConfig,
+    MaintNotificationsPoolHandler,
+    NodeMovingNotification,
+)
 from redis.utils import HIREDIS_AVAILABLE
 
 from .conftest import skip_if_server_version_lt
@@ -435,3 +440,324 @@ class TestCachePoolOwnership:
             if worker.ident is not None:
                 worker.join(3)
             pool.release(borrower)
+
+    @pytest.mark.parametrize("operation", ["auth", "moving"])
+    def test_idle_drain_defers_pool_socket_operation(self, pool, r2, operation):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = owner_pool.get_connection()
+        borrower = pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        owner_pool.release(owner)
+        sock = owner._conn._sock
+        draining, finish, completed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        errors = []
+        token = Mock()
+        token.try_get.return_value = "default"
+        token.get_value.return_value = ""
+        real_can_read, real_send, real_disconnect = (
+            owner._conn.can_read,
+            owner._conn.send_command,
+            owner.disconnect,
+        )
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                draining.set()
+                assert finish.wait(5)
+            return real_can_read(*args, **kwargs)
+
+        def send(*args, **kwargs):
+            assert not draining.is_set() or finish.is_set(), (
+                "AUTH overlapped the idle drain"
+            )
+            return real_send(*args, **kwargs)
+
+        def disconnect(*args, **kwargs):
+            assert not draining.is_set() or finish.is_set(), (
+                "disconnect overlapped the idle drain"
+            )
+            return real_disconnect(*args, **kwargs)
+
+        def read_cached():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        def maintain():
+            try:
+                if operation == "auth":
+                    owner_pool.re_auth_callback(token)
+                else:
+                    owner_pool.disconnect_free_connections()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        reader = threading.Thread(target=read_cached, daemon=True)
+        worker = threading.Thread(target=maintain, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(owner._conn, "send_command", side_effect=send),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                worker.start()
+                assert completed.wait(3), (
+                    "maintenance waited for the drain under the pool lock"
+                )
+                assert not errors
+                assert owner._conn._sock is sock
+                if operation == "auth":
+                    assert owner._conn._re_auth_token is token
+                else:
+                    assert owner.should_reconnect()
+                finish.set()
+                reader.join(3)
+                worker.join(3)
+                assert not reader.is_alive() and not worker.is_alive()
+                assert not errors
+            # Deferred work runs when the connection is returned after its next use.
+            reused = owner_pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            owner_pool.release(reused)
+            assert owner._conn._re_auth_token is None
+            assert not owner.should_reconnect()
+            if operation == "moving":
+                assert owner._conn._sock is None
+        finally:
+            finish.set()
+            if reader.ident is not None:
+                reader.join(5)
+            if worker.ident is not None:
+                worker.join(5)
+            pool.release(borrower)
+            owner_pool.disconnect()
+
+    def test_idle_drain_can_dispatch_moving_during_free_disconnect(self, pool, r2):
+        owner = pool.get_connection()
+        # A separate pool keeps the borrower's own cache lock out of the lock order.
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        draining, holding_pool, dispatching, finished = (
+            threading.Event() for _ in range(4)
+        )
+        errors = []
+        handler = MaintNotificationsPoolHandler(
+            pool, MaintNotificationsConfig(proactive_reconnect=True)
+        )
+        notification = NodeMovingNotification(
+            id=19, new_node_host=None, new_node_port=None, ttl=20
+        )
+        real_can_read, real_free, real_disconnect = (
+            owner._conn.can_read,
+            pool._get_free_connections,
+            owner.disconnect,
+        )
+        dispatched = False
+
+        def can_read(*args, **kwargs):
+            nonlocal dispatched
+            if threading.current_thread() is reader and not dispatched:
+                dispatched = True
+                draining.set()
+                assert holding_pool.wait(3)
+                dispatching.set()
+                handler.handle_notification(notification)
+            return real_can_read(*args, **kwargs)
+
+        def free_connections():
+            if threading.current_thread() is worker:
+                holding_pool.set()
+                assert dispatching.wait(3)
+            return real_free()
+
+        def disconnect(*args, **kwargs):
+            assert not draining.is_set() or finished.is_set(), (
+                "disconnect touched the draining socket"
+            )
+            return real_disconnect(*args, **kwargs)
+
+        def read_cached():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        def maintain():
+            try:
+                pool.disconnect_free_connections()
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_cached, daemon=True)
+        worker = threading.Thread(target=maintain, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(
+                    pool, "_get_free_connections", side_effect=free_connections
+                ),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+                patch.object(handler, "_schedule"),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                worker.start()
+                reader.join(5)
+                worker.join(5)
+                assert not reader.is_alive() and not worker.is_alive(), (
+                    "MOVING and idle drain deadlocked"
+                )
+                assert not errors
+                assert owner.should_reconnect()
+                assert notification in handler._processed_notifications
+            reused = pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            pool.release(reused)
+            assert not owner.should_reconnect()
+            assert owner._conn._sock is None
+        finally:
+            holding_pool.set()
+            dispatching.set()
+            if reader.ident is not None:
+                reader.join(5)
+            if worker.ident is not None:
+                worker.join(5)
+            peers.release(borrower)
+            peers.disconnect()
+
+    @pytest.mark.parametrize("auth_fails", [False, True])
+    def test_release_event_retains_ownership_without_locking_socket_io(
+        self, pool, r2, auth_fails
+    ):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = owner_pool.get_connection()
+        borrower = pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        token = Mock()
+        token.try_get.return_value = (
+            "missing-" + str(uuid.uuid4()) if auth_fails else "default"
+        )
+        token.get_value.return_value = ""
+        owner.set_re_auth_token(token)
+        pending = threading.Event()
+        finish = threading.Event()
+        reader_done = threading.Event()
+        auth_errors, read_errors, replies = [], [], []
+        real_read = owner._conn.read_response
+        real_can_read = owner._conn.can_read
+
+        def auth_read(*args, **kwargs):
+            if threading.current_thread() is worker:
+                pending.set()
+                assert finish.wait(5)
+                result = real_read(*args, **kwargs)
+                replies.append(result)
+                return result
+            return real_read(*args, **kwargs)
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                assert not pending.is_set() or finish.is_set(), (
+                    "peer touched the socket with an AUTH reply outstanding"
+                )
+            return real_can_read(*args, **kwargs)
+
+        def release():
+            try:
+                owner_pool.release(owner)
+            except BaseException as exc:
+                auth_errors.append(exc)
+
+        def cached_read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                read_errors.append(exc)
+            finally:
+                reader_done.set()
+
+        worker = threading.Thread(target=release, daemon=True)
+        reader = threading.Thread(target=cached_read, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "read_response", side_effect=auth_read),
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+            ):
+                worker.start()
+                assert pending.wait(3)
+                # A peer must be able to inspect ownership while AUTH is paused.
+                unlocked = owner._in_use_lock.acquire(blocking=False)
+                if unlocked:
+                    owner._in_use_lock.release()
+                assert unlocked, "release event held the drain lock across socket I/O"
+                assert owner._in_use, (
+                    "release event exposed its outstanding AUTH reply as idle"
+                )
+                reader.start()
+                assert reader_done.wait(3), "peer cache access blocked on idle AUTH"
+                assert not read_errors
+                finish.set()
+                worker.join(5)
+                reader.join(5)
+                assert not worker.is_alive() and not reader.is_alive()
+                assert not owner._in_use
+                assert owner in owner_pool._available_connections
+                assert owner not in owner_pool._in_use_connections
+                if auth_fails:
+                    assert len(auth_errors) == 1 and isinstance(
+                        auth_errors[0], AuthenticationError
+                    )
+                    assert owner._conn._re_auth_token is token
+                    assert replies == []
+                else:
+                    assert auth_errors == []
+                    assert owner._conn._re_auth_token is None
+                    assert replies == [b"OK"]
+            # Clear only the intentionally invalid test token before reusing the
+            # connection. The library must not have swallowed its original error.
+            owner.set_re_auth_token(None)
+            reused = owner_pool.get_connection()
+            try:
+                assert reused is owner
+                reused.send_command("PING")
+                assert reused.read_response() == b"PONG"
+            finally:
+                owner_pool.release(reused)
+        finally:
+            finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+            if reader.ident is not None:
+                reader.join(5)
+            owner.set_re_auth_token(None)
+            pool.release(borrower)
+            owner_pool.disconnect()

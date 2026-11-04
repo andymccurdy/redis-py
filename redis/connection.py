@@ -2078,7 +2078,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self.credential_provider = conn.credential_provider
         self._pool_lock = pool_lock
         # Checkout and peer invalidation drains share this connection's lock.
-        # Release clears _in_use after the last socket access, before enqueueing.
+        # Release keeps _in_use set through the last socket access.
         self._in_use_lock = threading.Lock()
         self._in_use = True
         self._busy_cache_deadline = 0.0
@@ -2669,6 +2669,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def set_re_auth_token(self, token: TokenInterface):
         self._conn.set_re_auth_token(token)
+
+    def _try_acquire_idle(self):
+        # A drain can dispatch MOVING and acquire the pool lock. Never wait for
+        # it while holding that lock, or keep its lock across socket I/O.
+        if not self._in_use_lock.acquire(blocking=False):
+            return False
+        try:
+            if self._in_use:
+                return False
+            self._in_use = True
+            return True
+        finally:
+            self._in_use_lock.release()
 
     def re_auth(self):
         self._conn.re_auth()
@@ -3798,7 +3811,15 @@ class MaintNotificationsAbstractConnectionPool:
                             f"Disconnecting free connection: {conn}, "
                             f"{conn.extract_connection_details()}"
                         )
-                    conn.disconnect()
+                    cached = isinstance(conn, CacheProxyConnection)
+                    if cached and not conn._try_acquire_idle():
+                        conn.mark_for_reconnect()
+                        continue
+                    try:
+                        conn.disconnect()
+                    finally:
+                        if cached:
+                            conn._in_use = False
 
 
 class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInterface):
@@ -4340,12 +4361,14 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                             f"{connection}, {connection.extract_connection_details()}"
                         )
                     connection.disconnect()
-                if isinstance(connection, CacheProxyConnection):
-                    connection._in_use = False
                 self._available_connections.append(connection)
-                self._event_dispatcher.dispatch(
-                    AfterConnectionReleasedEvent(connection)
-                )
+                try:
+                    self._event_dispatcher.dispatch(
+                        AfterConnectionReleasedEvent(connection)
+                    )
+                finally:
+                    if isinstance(connection, CacheProxyConnection):
+                        connection._in_use = False
 
                 # Record state transition: USED -> IDLE
                 pool_name = get_pool_name(self)
@@ -4427,6 +4450,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         first_error = None
         with self._lock:
             for conn in self._available_connections:
+                cached = isinstance(conn, CacheProxyConnection)
+                if cached and not conn._try_acquire_idle():
+                    conn.set_re_auth_token(token)
+                    continue
                 try:
                     conn.retry.call_with_retry(
                         lambda: conn.send_command(
@@ -4446,6 +4473,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 except Exception as e:
                     if first_error is None:
                         first_error = e
+                finally:
+                    if cached:
+                        conn._in_use = False
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
         if first_error is not None:

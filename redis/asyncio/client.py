@@ -1995,12 +1995,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             # sure we're no longer WATCHing anything. Detach self.connection
             # before awaiting release: if a second cancel aborts the await,
             # the pipeline must not be left holding a reference to a
-            # connection that is being returned to the pool. Shield the
-            # release itself so a second cancel cannot split the pool's
-            # internal in-use/available bookkeeping mid-update.
+            # connection that is being returned to the pool. release() itself
+            # is cancel-safe, so it needs no shield.
             if self.connection:
                 connection, self.connection = self.connection, None
-                await asyncio.shield(self.connection_pool.release(connection))
+                await self.connection_pool.release(connection)
 
     async def aclose(self) -> None:
         """Alias for reset(), a standard method name for cleanup"""

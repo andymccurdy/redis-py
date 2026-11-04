@@ -85,7 +85,7 @@ class TSInfo:
             response = {nativestr(k): v for k, v in args.items()}
             rules = response.get("rules") or {}
             if unified:
-                self.rules = dict(rules)
+                self.rules = rules
             else:
                 # Match the RESP2 list of [dest_key, bucket, aggregator, alignment].
                 self.rules = [[key, *rule] for key, rule in rules.items()]

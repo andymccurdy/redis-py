@@ -5715,9 +5715,14 @@ class TestResponsePolicies:
             await busy.execute_command("FUNCTION DELETE", "spinlib")
 
     @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
+        "error",
+        [
+            TryAgainError("TRYAGAIN"),
+            AskError("1 127.0.0.1:7001"),
+            ConnectionError("lost"),
+        ],
     )
-    async def test_one_succeeded_still_fails_on_an_error_that_leaves_it_in_doubt(
+    async def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r: RedisCluster, error: Exception
     ) -> None:
         busy, doubtful = r.get_primaries()[-1], r.get_primaries()[0]
@@ -5726,9 +5731,25 @@ class TestResponsePolicies:
             return error if node.name == doubtful.name else None
 
         with _busy_node(busy, "EVAL", "while true do end", 0):
-            with _sent_commands(fail):
-                with pytest.raises(type(error)):
-                    await r.script_kill()
+            with _sent_commands(fail) as sent:
+                assert await r.script_kill() is True
+
+        assert len(sent) == len(r.get_primaries())
+
+    @pytest.mark.parametrize(
+        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
+    )
+    async def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
+        self, r: RedisCluster, error: Exception
+    ) -> None:
+        doubtful = r.get_primaries()[-1]
+
+        def fail(node: ClusterNode, args: tuple) -> Optional[Exception]:
+            return error if node.name == doubtful.name else None
+
+        with _sent_commands(fail):
+            with pytest.raises(type(error)):
+                await r.script_kill()
 
     async def test_info_keeps_each_shard_s_reply(
         self, r: RedisCluster, monkeypatch
@@ -5795,6 +5816,46 @@ class TestResponsePolicies:
         assert results[1] == dbsize
         assert isinstance(results[2], ResponseError)
         assert isinstance(results[3], ResponseError) and "NOTBUSY" in str(results[3])
+
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
+    @pytest.mark.parametrize("targets", ["flag", "nodes"])
+    async def test_a_pipeline_retry_keeps_the_targets_of_a_fanned_out_command(
+        self, r: RedisCluster, error: Exception, targets: str
+    ) -> None:
+        """
+        A connection error retries the whole pipeline, and TRYAGAIN the one command, and
+        both send it to all of its targets again rather than route it by its own policy -
+        DBSIZE's is the default node alone, which holds only some of the keys.
+        """
+        await r.mset_nonatomic(
+            {key: 1 for key in _keys_on_every_shard(r, "pipetargets")}
+        )
+        dbsize = 0
+        for node in r.get_primaries():
+            dbsize += await node.execute_command("DBSIZE")
+        target_nodes = r.PRIMARIES if targets == "flag" else r.get_primaries()
+        execute_pipeline = ClusterNode.execute_pipeline
+        failed: List[Any] = []
+
+        async def fail_once(self: ClusterNode, commands: List[Any]) -> bool:
+            # The first node's DBSIZE is not sent once, and answers with ``error`` instead
+            held = [c for c in commands if c.args == ("DBSIZE",)]
+            held = held if not failed else []
+            failed.extend(held)
+            rest = [c for c in commands if c not in held]
+            ret = await execute_pipeline(self, rest) if rest else False
+            for c in held:
+                c.result = error
+            return ret or bool(held)
+
+        with mock.patch.object(ClusterNode, "execute_pipeline", fail_once):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("DBSIZE", target_nodes=target_nodes)
+                assert await pipe.execute() == [dbsize]
+
+        assert failed
 
 
 @pytest.mark.onlycluster
@@ -5913,6 +5974,35 @@ class TestMultiShardRequests:
         with _sent_commands() as sent:
             assert await r.execute_command("EXISTS", *keys) == len(keys)
 
+        assert len(sent) == len({r.keyslot(key) for key in keys})
+
+    async def test_a_pipeline_retry_of_a_split_command_holds_one_connection(
+        self, r: RedisCluster, monkeypatch
+    ) -> None:
+        """
+        The slots of a split command that failed in the pipeline are resent one at a time,
+        so a node with more of them than connections does not raise ``MaxConnectionsError``.
+        """
+        keys = [f"{{conn{index}}}key" for index in range(60)]
+        await r.mset_nonatomic({key: 1 for key in keys})
+        for node in r.get_primaries():
+            monkeypatch.setattr(node, "max_connections", 1)
+        failed: Set[str] = set()
+
+        async def fail_once(self: ClusterNode, commands: List[Any]) -> bool:
+            # Every slot answers TRYAGAIN once, so each is resent individually
+            failed.add(self.name)
+            for c in commands:
+                c.result = TryAgainError("TRYAGAIN")
+            return True
+
+        with mock.patch.object(ClusterNode, "execute_pipeline", fail_once):
+            with _sent_commands() as sent:
+                async with r.pipeline() as pipe:
+                    pipe.execute_command("EXISTS", *keys)
+                    assert await pipe.execute() == [len(keys)]
+
+        assert failed
         assert len(sent) == len({r.keyslot(key) for key in keys})
 
     async def test_a_pipeline_merges_a_split_command_per_slot(

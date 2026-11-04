@@ -4115,14 +4115,20 @@ class TestResponsePolicies:
             busy.redis_connection.function_delete("spinlib")
 
     @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
+        "error",
+        [
+            TryAgainError("TRYAGAIN"),
+            AskError("1 127.0.0.1:7001"),
+            ConnectionError("lost"),
+        ],
     )
-    def test_one_succeeded_still_fails_on_an_error_that_leaves_it_in_doubt(
+    def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r, error
     ):
         """
-        The busy shard's success does not hide an error that leaves another shard in doubt:
-        that shard may have been running the script.
+        As the ``one_succeeded`` tip asks, the busy shard's success is the reply even when
+        another shard leaves the command in doubt - and that shard is asked first, so every
+        shard after it is still asked.
         """
         busy, doubtful = r.get_primaries()[-1], r.get_primaries()[0]
 
@@ -4130,9 +4136,29 @@ class TestResponsePolicies:
             return error if node.name == doubtful.name else None
 
         with _busy_node(busy, "EVAL", "while true do end", 0):
-            with _sent_commands(fail):
-                with pytest.raises(type(error)):
-                    r.script_kill()
+            with _sent_commands(fail) as sent:
+                assert r.script_kill() is True
+
+        assert len(sent) == len(r.get_primaries())
+
+    @pytest.mark.parametrize(
+        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
+    )
+    def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
+        self, r, error
+    ):
+        """
+        With no success, the error that leaves a shard in doubt is reported over the NOTBUSY
+        of the others: that shard may have been running the script.
+        """
+        doubtful = r.get_primaries()[-1]
+
+        def fail(node, args):
+            return error if node.name == doubtful.name else None
+
+        with _sent_commands(fail):
+            with pytest.raises(type(error)):
+                r.script_kill()
 
     def test_info_keeps_each_shard_s_reply(self, r, monkeypatch):
         """INFO: all_shards / special with no handler, so nothing is merged."""
@@ -4190,6 +4216,46 @@ class TestResponsePolicies:
         assert results[1] == dbsize
         assert isinstance(results[2], ResponseError)
         assert isinstance(results[3], ResponseError) and "NOTBUSY" in str(results[3])
+
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
+    @pytest.mark.parametrize("targets", ["flag", "nodes"])
+    def test_a_pipeline_retry_keeps_the_targets_of_a_fanned_out_command(
+        self, r, error, targets
+    ):
+        """
+        A fanned-out command that fails on one node is retried on all of its targets, not
+        routed by its own policy - DBSIZE's is the default node alone.
+        """
+        r.mset_nonatomic({key: 1 for key in _keys_on_every_shard(r, "pipetargets")})
+        dbsize = sum(node.redis_connection.dbsize() for node in r.get_primaries())
+        target_nodes = r.PRIMARIES if targets == "flag" else r.get_primaries()
+        write = redis.cluster.NodeCommands.write
+        failed = []
+
+        def fail_once(self):
+            # The first node's DBSIZE is not sent once, and answers with ``error`` instead
+            held = [c for c in self.commands if c.args == ("DBSIZE",)]
+            held = held if not failed else []
+            failed.extend(held)
+            self.commands = [c for c in self.commands if c not in held]
+            if self.commands:
+                write(self)
+            for c in held:
+                c.result = error
+                self.commands.append(c)
+
+        with patch.object(redis.cluster.NodeCommands, "write", fail_once):
+            with _sent_commands() as sent:
+                with r.pipeline() as pipe:
+                    pipe.execute_command("DBSIZE", target_nodes=target_nodes)
+                    assert pipe.execute() == [dbsize]
+
+        assert failed
+        assert {node.name for node, _, _ in sent} == {
+            node.name for node in r.get_primaries()
+        }
 
 
 @pytest.mark.onlycluster
@@ -4253,6 +4319,13 @@ class TestMultiShardRequests:
             assert r.execute_command("EXISTS", *keys) == 2
 
         assert [args for _, args, _ in sent] == [("EXISTS", *keys)]
+
+    def test_a_single_key_is_not_split(self, r):
+        """It has nothing to split, so its slot is left to the keyed routing to compute."""
+        with patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert r._split_multi_shard_command("EXISTS", "single") is None
+
+        keyslot.assert_not_called()
 
     def test_keys_that_cannot_be_located_are_not_split(self, r, monkeypatch):
         """MSETEX names its key count first, so its keys are not at fixed positions."""

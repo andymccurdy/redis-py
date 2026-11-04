@@ -3677,6 +3677,9 @@ class PipelineCommand:
         # The replies of the slots of a split MULTI_SHARD command that already succeeded,
         # kept across the attempts so a retry resends only the slots that failed
         self.slot_replies: Optional[Dict[int, Any]] = None
+        # The ``target_nodes`` a retry must route by again - see
+        # ``PipelineStrategy._execute``
+        self.target_nodes: Any = None
 
     def __repr__(self) -> str:
         return f"[{self.position}] {self.args} ({self.kwargs})"
@@ -3968,7 +3971,7 @@ class PipelineStrategy(AbstractStrategy):
             ]
         ] = []
         for cmd in todo:
-            passed_targets = cmd.kwargs.pop("target_nodes", None)
+            passed_targets = cmd.kwargs.pop("target_nodes", cmd.target_nodes)
             target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
                 passed_targets
             )
@@ -4001,6 +4004,13 @@ class PipelineStrategy(AbstractStrategy):
                             f"No targets were found to execute {cmd.args} command on"
                         )
             cmd.command_policies = command_policies
+            # Kept for a retry, which would otherwise route the command by its own policy:
+            # a nodes flag is resolved again, and a command sent to several named nodes is
+            # sent to them again. A single named node is not kept, so a retry routes a keyed
+            # command by its keys - which the per-slot commands of ``mget_nonatomic``,
+            # ``delete`` and the other multi-key helpers rely on after a failover.
+            if passed_targets and (not target_nodes_specified or len(target_nodes) > 1):
+                cmd.target_nodes = passed_targets
 
             # A command sent to several nodes - or split into one command per slot of its
             # keys - is queued as copies that each carry one reply, and the replies are
@@ -4120,9 +4130,16 @@ class PipelineStrategy(AbstractStrategy):
                             )
                             continue
                         try:
-                            cmd.result = await client.execute_command(
-                                *cmd.args, **cmd.kwargs
-                            )
+                            if cmd.target_nodes is None:
+                                cmd.result = await client.execute_command(
+                                    *cmd.args, **cmd.kwargs
+                                )
+                            else:
+                                cmd.result = await client.execute_command(
+                                    *cmd.args,
+                                    target_nodes=cmd.target_nodes,
+                                    **cmd.kwargs,
+                                )
                         except Exception as e:
                             cmd.result = e
 
@@ -4221,28 +4238,21 @@ class PipelineStrategy(AbstractStrategy):
         Send each slot of a split MULTI_SHARD command that failed individually, like the
         main client does, and merge the replies once every slot has succeeded. A slot that
         already succeeded is not sent again - see ``redis.cluster._record_slot_replies``.
+
+        The slots are sent one at a time. Sending them in parallel would take one
+        connection per slot, and raise ``MaxConnectionsError`` once a node holds more of
+        the failed slots than its ``max_connections`` - see
+        ``RedisCluster._execute_multi_shard_command``.
         """
-        pending = [
-            (slot, slot_command)
-            for slot, slot_command in copies.items()
-            if slot not in cmd.slot_replies
-        ]
-        # Every slot runs to completion, so the ones that succeed are kept even when
-        # another fails.
-        values = await asyncio.gather(
-            *(
-                asyncio.create_task(
-                    client.execute_command(*slot_command.args, **slot_command.kwargs)
+        for slot, slot_command in copies.items():
+            if slot in cmd.slot_replies:
+                continue
+            try:
+                cmd.slot_replies[slot] = await client.execute_command(
+                    *slot_command.args, **slot_command.kwargs
                 )
-                for _, slot_command in pending
-            ),
-            return_exceptions=True,
-        )
-        error = _record_slot_replies(
-            cmd.slot_replies, zip((slot for slot, _ in pending), values)
-        )
-        if error is not None:
-            return error
+            except RedisError as e:
+                return e
 
         return _merge_multi_shard_replies(
             cmd.slot_replies, splits, cmd.command_policies.response_policy

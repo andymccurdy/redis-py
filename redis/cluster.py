@@ -270,12 +270,10 @@ _RESPONSE_POLICY_CALLBACKS: Dict[ResponsePolicy, Callable[[Dict[str, Any]], Any]
 
 def _is_expected_node_error(error: BaseException) -> bool:
     """
-    Whether a ``ONE_SUCCEEDED`` command may drop the error one of its nodes answered with.
-
-    An error reply is the expected answer from every shard but the one that succeeds: SCRIPT
-    KILL is answered NOTBUSY by each shard that runs no script. An error that leaves the
-    command in doubt - a connection error, CLUSTERDOWN, a redirection - is not, so it still
-    fails the command, which keeps it eligible for the retry it would otherwise get.
+    Whether the error is the answer a ``ONE_SUCCEEDED`` command expects from the shards
+    that do not succeed: SCRIPT KILL is answered NOTBUSY by each shard that runs no script.
+    An error that leaves the command in doubt - a connection error, CLUSTERDOWN, a
+    redirection - is not.
     """
     return isinstance(error, ResponseError) and not isinstance(
         error, (ClusterDownError, AskError, TryAgainError)
@@ -291,6 +289,19 @@ def _is_idle_node_error(error: BaseException) -> bool:
     return str(error).startswith("NOTBUSY")
 
 
+def _one_succeeded_error_rank(error: BaseException) -> int:
+    """
+    How well an error explains why no node of a ``ONE_SUCCEEDED`` command succeeded, lowest
+    first. An error that leaves the command in doubt comes first, as it keeps the command
+    eligible for the retry it would otherwise get. An error from the node that runs the
+    script - UNKILLABLE, as the script already wrote - comes next, as it says why the command
+    failed. NOTBUSY comes last: it says only that the node had nothing to stop.
+    """
+    if not _is_expected_node_error(error):
+        return 0
+    return 2 if _is_idle_node_error(error) else 1
+
+
 def _split_successes_and_failure(
     res: Dict[str, Any], response_policy: ResponsePolicy
 ) -> Tuple[Dict[str, Any], Optional[BaseException]]:
@@ -298,27 +309,24 @@ def _split_successes_and_failure(
     Separate the replies of a command sent to several nodes from the errors some answered with.
 
     Returns the replies to process and the error that fails the command instead, if any. Any
-    error fails it, except under ``ONE_SUCCEEDED``, which fails only when no node succeeded:
-    there the expected errors of the other nodes are dropped, and the first one is reported if
-    nothing else is left. A NOTBUSY is reported only when every node answered one: an error
-    from the node that runs the script - UNKILLABLE, as the script already wrote - says why
-    the command failed, where NOTBUSY says only that another node had nothing to stop.
+    error fails it, except under ``ONE_SUCCEEDED``, which fails only when no node succeeded,
+    as the server's ``one_succeeded`` tip asks: there the Redis errors of the other nodes are
+    dropped, even one that leaves its node in doubt, and when nothing else is left the error
+    that best explains the failure is reported - see ``_one_succeeded_error_rank``. An error
+    that is not a Redis error is a client fault, and fails the command either way.
     """
     replies = {}
     reported_error = None
+    one_succeeded = response_policy is ResponsePolicy.ONE_SUCCEEDED
     for node_name, reply in res.items():
         if not isinstance(reply, BaseException):
             replies[node_name] = reply
-        elif (
-            response_policy is ResponsePolicy.ONE_SUCCEEDED
-            and _is_expected_node_error(reply)
-        ):
-            if reported_error is None or (
-                _is_idle_node_error(reported_error) and not _is_idle_node_error(reply)
-            ):
-                reported_error = reply
-        else:
+        elif not one_succeeded or not isinstance(reply, RedisError):
             return replies, reply
+        elif reported_error is None or _one_succeeded_error_rank(
+            reply
+        ) < _one_succeeded_error_rank(reported_error):
+            reported_error = reply
 
     return replies, None if replies else reported_error
 
@@ -364,7 +372,8 @@ def _split_by_slot(
 
     Returns None when the keys cannot be located that way - a ``movablekeys`` command, whose
     ``first_key_pos`` is 0, or a command the parser does not know - which leaves the command
-    to be routed by its keys as a whole.
+    to be routed by its keys as a whole. Returns None for a single key too, which has nothing
+    to split, before its slot is computed.
     """
     if not command_details:
         return None
@@ -377,7 +386,7 @@ def _split_by_slot(
 
     last_index = last if last >= 0 else len(args) + last
     positions = range(first, last_index + 1, step)
-    if not positions or positions[-1] + step > len(args):
+    if len(positions) < 2 or positions[-1] + step > len(args):
         return None
 
     prefix = args[:first]
@@ -2273,7 +2282,7 @@ class RedisCluster(
                 for node in target_nodes:
                     try:
                         res[node.name] = self._execute_command(node, *args, **kwargs)
-                    except ResponseError as e:
+                    except RedisError as e:
                         # Every node is asked: the one that succeeds is not known up front.
                         # SCRIPT KILL succeeds only on the shard running the script.
                         if not one_succeeded:
@@ -5375,6 +5384,7 @@ class ClusterPipeline(RedisCluster):
         self.read_from_replicas = read_from_replicas
         self.load_balancing_strategy = load_balancing_strategy
         self.command_flags = self.__class__.COMMAND_FLAGS.copy()
+        self.node_flags = self.__class__.NODE_FLAGS.copy()
         self.cluster_response_callbacks = cluster_response_callbacks
         self.reinitialize_counter = 0
         self.reinitialize_steps = reinitialize_steps
@@ -5695,6 +5705,9 @@ class PipelineCommand:
         # The replies of the slots of a split MULTI_SHARD command that already succeeded,
         # kept across the attempts so a retry resends only the slots that failed
         self.slot_replies: Optional[Dict[int, Any]] = None
+        # The ``target_nodes`` a retry must route by again - see
+        # ``PipelineStrategy._send_cluster_commands``
+        self.target_nodes: Any = None
 
 
 class NodeCommands:
@@ -6118,7 +6131,7 @@ class PipelineStrategy(AbstractStrategy):
                 # tells us where a given command should route to.
                 # (it might be possible we have a cached node that no longer
                 # exists in the cluster, which is why we do this in a loop)
-                passed_targets = c.options.pop("target_nodes", None)
+                passed_targets = c.options.pop("target_nodes", c.target_nodes)
                 splits = None
                 if passed_targets and not self._is_nodes_flag(passed_targets):
                     target_nodes = self._parse_target_nodes(passed_targets)
@@ -6185,6 +6198,16 @@ class PipelineStrategy(AbstractStrategy):
                                 f"No targets were found to execute {c.args} command on"
                             )
                 c.command_policies = command_policies
+                # Kept for a retry, which would otherwise route the command by its own
+                # policy: a nodes flag is resolved again, and a command sent to several
+                # named nodes is sent to them again. A single named node is not kept, so a
+                # retry routes a keyed command by its keys - which the per-slot commands of
+                # ``mget_nonatomic``, ``delete`` and the other multi-key helpers rely on
+                # after a failover.
+                if passed_targets and (
+                    self._is_nodes_flag(passed_targets) or len(target_nodes) > 1
+                ):
+                    c.target_nodes = passed_targets
 
                 # A command sent to several nodes - or split into one command per slot of
                 # its keys - is queued as copies that each carry one reply, and the replies
@@ -6388,7 +6411,14 @@ class PipelineStrategy(AbstractStrategy):
                 try:
                     # send each command individually like we
                     # do in the main client.
-                    c.result = self._pipe.parent_execute_command(*c.args, **c.options)
+                    if c.target_nodes is None:
+                        c.result = self._pipe.parent_execute_command(
+                            *c.args, **c.options
+                        )
+                    else:
+                        c.result = self._pipe.parent_execute_command(
+                            *c.args, target_nodes=c.target_nodes, **c.options
+                        )
                 except RedisError as e:
                     c.result = e
 

@@ -4,7 +4,7 @@ import time
 import pytest
 import redis
 from redis.commands.timeseries.commands import TimeSeriesCommands
-from redis.commands.timeseries.info import TSInfo
+from redis.commands.timeseries.info import TSInfo, parse_info_unified
 from redis.utils import SENTINEL
 
 from .conftest import (
@@ -234,8 +234,8 @@ def test_create_and_delete_rule(client):
     client.ts().add(1, time * 2, 1.5)
     assert round(client.ts().get(2)[1], 5) == 1.5
     info = client.ts().info(1)
-    if is_resp2_connection(client):
-        assert info.rules[0][1] == 100
+    if expects_resp2_shape(client):
+        assert info.rules[0][:2] == ["2", 100]
     else:
         assert info["rules"]["2"][0] == 100
 
@@ -1311,6 +1311,27 @@ def test_info_resp3_bytes_keys():
         assert info.chunk_size == 4096
         assert info.duplicate_policy == "block"
         assert info.labels == {"currentLabel": "currentData"}
+
+
+@pytest.mark.fixed_client
+def test_info_resp3_rules():
+    # Server-free: the RESP3 rules map must parse like the RESP2 list.
+    resp2 = TSInfo([b"rules", [[b"dst", 100, b"AVG", 0]], b"labels", []])
+    resp3 = TSInfo({b"rules": {b"dst": [100, b"AVG", 0]}, b"labels": {}})
+    for info in (resp2, resp3):
+        assert info.rules == [[b"dst", 100, b"AVG", 0]]
+    assert TSInfo({b"rules": {}, b"labels": {}}).rules == []
+
+
+@pytest.mark.fixed_client
+def test_info_unified_rules():
+    # Server-free: unified responses key the rules by destination on both wires.
+    resp2 = parse_info_unified([b"rules", [[b"dst", 100, b"AVG", 0]], b"labels", []])
+    resp3 = parse_info_unified({b"rules": {b"dst": [100, b"AVG", 0]}, b"labels": {}})
+    for info in (resp2, resp3):
+        assert info.rules == {b"dst": [100, b"AVG", 0]}
+    assert parse_info_unified([b"rules", [], b"labels", []]).rules == {}
+    assert parse_info_unified({b"rules": {}, b"labels": {}}).rules == {}
 
 
 @pytest.mark.fixed_client

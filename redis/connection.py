@@ -1335,8 +1335,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 # Use the passed function redis_connect_func
                 self.redis_connect_func(self)
-        except RedisError:
-            # clean up after any error in on_connect
+        except BaseException:
+            # clean up after any error in on_connect, which includes whatever a
+            # credential provider raises. A socket left in place reads as
+            # connected, so the next command would run without AUTH and SELECT.
             self.disconnect()
             raise
 
@@ -2282,9 +2284,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                 self._conn.send_command(*args, **kwargs)
             return
 
-        # Creates cache key.
+        # Creates cache key. An invalidation names a key by the bytes it was sent as,
+        # which ``DefaultCache.delete_by_redis_keys`` matches to a ``str`` or ``bytes``
+        # key but never to a number, so a numeric key is indexed by its encoded form.
+        redis_keys = keys
+        for key in keys:
+            if isinstance(key, (int, float)):
+                encode = self._conn.encoder.encode
+                redis_keys = tuple(
+                    encode(k) if isinstance(k, (int, float)) else k for k in keys
+                )
+                break
         self._current_command_cache_key = CacheKey(
-            command=command, redis_keys=keys, redis_args=args
+            command=command, redis_keys=redis_keys, redis_args=args
         )
 
         is_hit = False
@@ -3328,6 +3340,14 @@ class MaintNotificationsAbstractConnectionPool:
         if handler is not None:
             handler.cancel_scheduled_tasks()
 
+    def _on_reset_after_fork(self) -> None:
+        """Hook invoked by ``reset()``; acts only in a forked child process."""
+        handler = getattr(self, "_maint_notifications_pool_handler", None)
+        # reset() also runs from __init__, where there is no pid yet
+        pid = getattr(self, "pid", None)
+        if handler is not None and pid is not None and pid != os.getpid():
+            handler.reset_after_fork()
+
     @property
     @abstractmethod
     def connection_kwargs(self) -> Dict[str, Any]:
@@ -4046,6 +4066,14 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         if is_fork:
             # Inherited connections were counted by the parent, not this process.
             self._pool_id = secrets.token_hex(4)
+            # A parent thread may have held the lock at fork time, and the
+            # handler reset below takes it to revert an active MOVING.
+            self._lock = threading.RLock()
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Record metrics for connections being removed before clearing
         # (only if attributes exist - they won't during __init__)
@@ -4075,6 +4103,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._created_connections = 0
         self._available_connections = []
         self._in_use_connections = set()
+
+        self._on_reset_after_fork()
 
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
@@ -4363,6 +4393,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
+        # A forked child must not touch the handler state inherited from the
+        # parent: reset it first (the lock may be held by a parent thread).
+        self._checkpid()
         try:
             self._on_close()
         finally:
@@ -4506,6 +4539,19 @@ class BlockingConnectionPool(ConnectionPool):
         if is_fork:
             # Inherited connections were counted by the parent, not this process.
             self._pool_id = secrets.token_hex(4)
+            # A parent thread may have held the lock at fork time, and the
+            # handler reset below takes it to revert an active MOVING.
+            self._lock = threading.RLock()
+            # The thread applying a MOVING in the parent does not exist here
+            # to clear these, and a stale flag makes a checkout nest on the
+            # lock and leak it.
+            self._in_maintenance = False
+            self._locked = False
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Create and fill up a thread safe queue with ``None`` values.
         try:
@@ -4558,6 +4604,8 @@ class BlockingConnectionPool(ConnectionPool):
                 except Exception:
                     pass
                 self._locked = False
+
+        self._on_reset_after_fork()
 
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process

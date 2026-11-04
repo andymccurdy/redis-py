@@ -192,6 +192,9 @@ python -m benchmarks.measure_read_path.mem_probe --trees $TREES
 
 # Parser only, no network: every parser, sync and async, reading from memory
 python -m benchmarks.measure_read_path.parser_micro --trees $TREES
+
+# Observability recorder, disabled, no network: sync and async
+python -m benchmarks.measure_read_path.recorder_micro --trees $TREES
 ```
 
 `run_bench` covers the pure-Python parser and hiredis, each on RESP3 and RESP2,
@@ -233,21 +236,31 @@ GET moves by up to about 3.5% between runs of the same code, because it
 depends on how the reply arrives in socket reads, so `mem_probe` runs every
 config `--passes` times per tree (default 5) and reports the median.
 
+`recorder_micro` times what the metrics recorder costs while observability is
+not enabled, which every command pays whether or not the client opts in. It
+runs `record_operation_duration` on its own and `Redis.get()` through a
+`ConnectionPool` whose connections keep their I/O in memory, so the command
+path, the pool's checkout and release and every recorder call on that path
+run the tree's own code without a server. Both run on the sync and the async
+client. The recorder's cost is a fraction of a microsecond per command, which
+the round-trip scenarios cannot resolve.
+
 Every tool reports how long each test took, and writes JSON and Markdown
 results under `benchmarks/measure_read_path/results/` (ignored by git), with the
 tree SHAs in the file name. Use `--output-dir` to write them elsewhere.
 
 ### Regression gate
 
-`run_bench`, `mem_probe`, `parser_micro` and `csc_bench` end with a
-regression summary for every `--compare candidate:baseline` pair: whether
+`run_bench`, `mem_probe`, `parser_micro`, `recorder_micro` and `csc_bench`
+end with a regression summary for every `--compare candidate:baseline`
+pair: whether
 the gate passed, and for every regressed or inconclusive cell the baseline
 and candidate numbers and the delta. A cell regresses when the candidate
 is worse by more than `--allowed-regression` percent (default 5) and by
 more than the uncertainty of the delta. The delta compares the two trees'
 medians over rounds (`run_bench`) or passes (`mem_probe`, `parser_micro`,
-`csc_bench`), so its uncertainty is how far those medians could move, not
-how much one round varies: 1.5 times half the 95% bootstrap interval of the
+`recorder_micro`, `csc_bench`), so its uncertainty is how far those medians
+could move, not how much one round varies: 1.5 times half the 95% bootstrap interval of the
 delta. More rounds narrow it, and with fewer than 4 per tree a cell gets no
 verdict. The
 uncertainty may raise the limit only up to `--max-limit` percent (default
@@ -285,9 +298,10 @@ gates on request, not on every pull request:
   commit it was merged onto, so only the PR's own effect is measured.
 
 `ci_matrix.py` generates the jobs: one each for peak memory, the
-parser-only benchmark and the client-side cache on each topology, and one
+parser-only benchmark, the observability recorder benchmark and the
+client-side cache on each topology, and one
 `run_bench` job per config, every client, topology, pool class, parser,
-protocol and socket timeout combination (60 jobs). The `run_bench` jobs
+protocol and socket timeout combination (61 jobs). The `run_bench` jobs
 leave out `get_small_seq` and `set_small_seq`: they send one small command
 per round trip, so on a shared runner they time the network more than the
 client. They also run `get_200kb` instead of

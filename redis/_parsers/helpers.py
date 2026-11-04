@@ -33,7 +33,15 @@ def parse_debug_object(response):
     return response
 
 
-def parse_info(response):
+def decode_info(response, encoder):
+    """Decode a raw INFO reply, replacing any bytes the encoder can't decode"""
+    try:
+        return encoder.decode(response)
+    except UnicodeDecodeError:
+        return response.decode(encoder.encoding, errors="replace")
+
+
+def parse_info(response, **options):
     """Parse the result of Redis's INFO command into a Python dict"""
     info = {}
     response = str_if_bytes(response)
@@ -98,13 +106,21 @@ def parse_memory_stats(response, **kwargs):
 def parse_memory_stats_unified(response, **kwargs):
     """Parse MEMORY STATS for unified RESP2 output.
 
-    Unified responses decode structural keys while preserving string-like
-    values as delivered, matching the approved RESP2/RESP3 unification shape.
+    Unified responses decode structural keys and use native numeric values.
+    The RESP2 reply holds the ratios and percentages, such as
+    ``fragmentation``, as bulk strings, while RESP3 sends doubles. Convert
+    them to ``float`` so both wires give the same values; the integer
+    replies, and any string that isn't a number, are left as they are.
     """
     stats = pairs_to_dict(response, decode_keys=True)
     for key, value in stats.items():
         if key.startswith("db.") and isinstance(value, list):
             stats[key] = pairs_to_dict(value, decode_keys=True)
+        elif isinstance(value, (bytes, str)):
+            try:
+                stats[key] = float(value)
+            except ValueError:
+                pass
     return stats
 
 
@@ -1019,14 +1035,10 @@ def _parse_client_info_fields(value):
 
 
 def parse_client_list(response, **options):
+    clients = _client_list_iter(response)
     if options.pop("as_iter", False):
-        return _client_list_iter(response)
-    clients = []
-    for c in str_if_bytes(response).splitlines():
-        client_dict = _parse_client_info_fields(c)
-        if client_dict:
-            clients.append(client_dict)
-    return clients
+        return clients
+    return list(clients)
 
 
 def _client_list_iter(response):

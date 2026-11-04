@@ -31,7 +31,10 @@ from redis.observability.attributes import (
     PubSubDirection,
 )
 from redis.observability.metrics import CloseReason, RedisMetricsCollector
-from redis.observability.providers import get_observability_instance
+from redis.observability.providers import (
+    _register_reset_hook,
+    get_observability_instance,
+)
 from redis.observability.registry import get_observables_registry_instance
 from redis.utils import deprecated_args, deprecated_function, str_if_bytes
 
@@ -42,6 +45,20 @@ if TYPE_CHECKING:
 
 # Global metrics collector instance (lazy-initialized)
 _metrics_collector: Optional[RedisMetricsCollector] = None
+# Whether the collector above has been looked up already. A *miss* is cached
+# too: resolving it walks the observability singleton, and while observability
+# is disabled the helpers below run on every command. ObservabilityInstance.
+# init() clears both this flag and the collector, so enabling observability
+# after a recording call still starts collecting. The helpers check the
+# collector and this flag inline and only then call _get_or_create_collector(),
+# so the disabled path never pays for a call.
+_collector_resolved = False
+# Bumped by reset_collector() every time the caches below are dropped. A
+# resolution that spans a reset can see the fields it owns cleared underneath
+# it, so it records the generation it started from and hands the cache back
+# rather than publishing an answer that belongs to the configuration the
+# reset replaced.
+_collector_generation = 0
 
 CSC_ITEMS_REGISTRY_KEY = "csc_items"
 CONNECTION_COUNT_REGISTRY_KEY = "connection_count"
@@ -85,18 +102,17 @@ def record_operation_duration(
         >>> # ... execute command ...
         >>> record_operation_duration('SET', time.monotonic() - start, 'localhost', 6379, '0')
     """
-    global _metrics_collector
-
-    # Fast path: if collector not initialized, observability is disabled
-    if _metrics_collector is None:
-        # Try to initialize (only once)
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return  # Observability not enabled
+        collector = _get_or_create_collector()
+        if collector is None:
             return  # Observability not enabled
 
     # Record the metric
     try:
-        _metrics_collector.record_operation_duration(
+        collector.record_operation_duration(
             command_name=command_name,
             duration_seconds=duration_seconds,
             server_address=server_address,
@@ -129,16 +145,16 @@ def record_connection_create_time(
         >>> # ... create connection ...
         >>> record_connection_create_time('ConnectionPool<localhost:6379>', time.monotonic() - start)
     """
-    global _metrics_collector
-
-    # Fast path: if collector not initialized, observability is disabled
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_create_time(
+        collector.record_connection_create_time(
             connection_pool=connection_pool,
             duration_seconds=duration_seconds,
         )
@@ -174,15 +190,16 @@ def record_connection_count(
         # Pool disconnect 5 idle connections
         >>> record_connection_count('pool_abc123', ConnectionState.IDLE, -5)
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_count(
+        collector.record_connection_count(
             pool_name=pool_name,
             connection_state=connection_state,
             counter=counter,
@@ -200,9 +217,13 @@ def init_connection_count() -> None:
     """
     Initialize observable gauge for connection count metric.
     """
-    collector = _get_or_create_collector()
+    collector = _metrics_collector
     if collector is None:
-        return
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     def observable_callback(__):
         observables_registry = get_observables_registry_instance()
@@ -233,9 +254,13 @@ def register_pools_connection_count(
     """
     Add connection pools to connection count observable registry.
     """
-    collector = _get_or_create_collector()
+    collector = _metrics_collector
     if collector is None:
-        return
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
+            return
 
     try:
         # Lazy import
@@ -268,15 +293,16 @@ def record_connection_timeout(
     Example:
         >>> record_connection_timeout('ConnectionPool<localhost:6379>')
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_timeout(
+        collector.record_connection_timeout(
             pool_name=pool_name,
         )
     except Exception:
@@ -299,15 +325,16 @@ def record_connection_wait_time(
         >>> # ... wait for connection from pool ...
         >>> record_connection_wait_time('ConnectionPool<localhost:6379>', time.monotonic() - start)
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_wait_time(
+        collector.record_connection_wait_time(
             pool_name=pool_name,
             duration_seconds=duration_seconds,
         )
@@ -329,15 +356,16 @@ def record_connection_closed(
     Example:
         >>> record_connection_closed('ConnectionPool<localhost:6379>', 'idle_timeout')
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_closed(
+        collector.record_connection_closed(
             close_reason=close_reason,
             error_type=error_type,
         )
@@ -361,15 +389,16 @@ def record_connection_relaxed_timeout(
     Example:
         >>> record_connection_relaxed_timeout('localhost:6379_a1b2c3d4', 'MOVING', True)
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_relaxed_timeout(
+        collector.record_connection_relaxed_timeout(
             connection_name=connection_name,
             maint_notification=maint_notification,
             relaxed=relaxed,
@@ -390,15 +419,16 @@ def record_connection_handoff(
     Example:
         >>> record_connection_handoff('ConnectionPool<localhost:6379>')
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_connection_handoff(
+        collector.record_connection_handoff(
             pool_name=pool_name,
         )
     except Exception:
@@ -429,15 +459,16 @@ def record_error_count(
     Example:
         >>> record_error_count('localhost', 6379, 'localhost', 6379, ConnectionError(), 3)
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_error_count(
+        collector.record_error_count(
             server_address=server_address,
             server_port=server_port,
             network_peer_address=network_peer_address,
@@ -466,11 +497,12 @@ def record_pubsub_message(
     Example:
         >>> record_pubsub_message(PubSubDirection.PUBLISH, 'channel', False)
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     # Check if channel names should be hidden
@@ -481,7 +513,7 @@ def record_pubsub_message(
             effective_channel = None
 
     try:
-        _metrics_collector.record_pubsub_message(
+        collector.record_pubsub_message(
             direction=direction,
             channel=effective_channel,
             sharded=sharded,
@@ -510,11 +542,12 @@ def record_streaming_lag(
         consumer_group: Consumer group name
         consumer_name: Consumer name
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     # Check if stream names should be hidden
@@ -525,7 +558,7 @@ def record_streaming_lag(
             effective_stream_name = None
 
     try:
-        _metrics_collector.record_streaming_lag(
+        collector.record_streaming_lag(
             lag_seconds=lag_seconds,
             stream_name=effective_stream_name,
             consumer_group=consumer_group,
@@ -555,11 +588,12 @@ def record_streaming_lag_from_response(
         consumer_name: Consumer name (for XREADGROUP)
     """
 
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     if not response:
@@ -589,7 +623,7 @@ def record_streaming_lag_from_response(
                         # Ensure lag is non-negative (clock skew can cause negative values)
                         lag_seconds = max(0.0, now - int(timestamp) / 1000)
 
-                        _metrics_collector.record_streaming_lag(
+                        collector.record_streaming_lag(
                             lag_seconds=lag_seconds,
                             stream_name=effective_stream_name,
                             consumer_group=consumer_group,
@@ -607,7 +641,7 @@ def record_streaming_lag_from_response(
                     # Ensure lag is non-negative (clock skew can cause negative values)
                     lag_seconds = max(0.0, now - int(timestamp) / 1000)
 
-                    _metrics_collector.record_streaming_lag(
+                    collector.record_streaming_lag(
                         lag_seconds=lag_seconds,
                         stream_name=effective_stream_name,
                         consumer_group=consumer_group,
@@ -636,15 +670,16 @@ def record_maint_notification_count(
     Example:
         >>> record_maint_notification_count('localhost', 6379, 'localhost', 6379, 'MOVING')
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_maint_notification_count(
+        collector.record_maint_notification_count(
             server_address=server_address,
             server_port=server_port,
             network_peer_address=network_peer_address,
@@ -664,15 +699,16 @@ def record_csc_request(
     Args:
         result: CSC result ('hit' or 'miss')
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_csc_request(
+        collector.record_csc_request(
             result=result,
         )
     except Exception:
@@ -683,11 +719,12 @@ def init_csc_items() -> None:
     """
     Initialize observable gauge for CSC items metric.
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     def observable_callback(__):
@@ -701,7 +738,7 @@ def init_csc_items() -> None:
         return observations
 
     try:
-        _metrics_collector.init_csc_items(
+        collector.init_csc_items(
             callback=observable_callback,
         )
     except Exception:
@@ -719,11 +756,12 @@ def register_csc_items_callback(
         callback: Callback function that returns the cache size
         pool_name: Connection pool name for observability
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     # Lazy import
@@ -755,15 +793,16 @@ def record_csc_eviction(
         count: Number of evictions
         reason: Reason for eviction
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_csc_eviction(
+        collector.record_csc_eviction(
             count=count,
             reason=reason,
         )
@@ -780,15 +819,16 @@ def record_csc_network_saved(
     Args:
         bytes_saved: Number of bytes saved
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_csc_network_saved(
+        collector.record_csc_network_saved(
             bytes_saved=bytes_saved,
         )
     except Exception:
@@ -808,15 +848,16 @@ def record_geo_failover(
         fail_to: Database failed to
         reason: Reason for the failover
     """
-    global _metrics_collector
-
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
-        if _metrics_collector is None:
+    collector = _metrics_collector
+    if collector is None:
+        if _collector_resolved:
+            return
+        collector = _get_or_create_collector()
+        if collector is None:
             return
 
     try:
-        _metrics_collector.record_geo_failover(
+        collector.record_geo_failover(
             fail_from=fail_from,
             fail_to=fail_to,
             reason=reason,
@@ -829,9 +870,29 @@ def _get_or_create_collector() -> Optional[RedisMetricsCollector]:
     """
     Get or create the global metrics collector.
 
+    Called only from the unresolved-miss branch of a recording helper, or from
+    is_enabled(). The "resolved" flag is set *before* the lookup and the global
+    is assigned only on a hit, so a lookup that races
+    ``ObservabilityInstance.init()`` cannot publish a stale miss over the caches
+    ``init()`` just reset: if the race is lost, the outcome is one completed
+    lookup that returns ``None`` while observability is in fact enabled, and the
+    next call resolves again. This mirrors
+    ``redis.asyncio.observability.recorder._get_or_create_collector``.
+
     Returns:
         RedisMetricsCollector instance if observability is enabled, None otherwise
     """
+    global _metrics_collector, _collector_resolved, _collector_generation
+
+    if _metrics_collector is not None:
+        return _metrics_collector
+    if _collector_resolved:
+        # A previous lookup found observability disabled; keep the miss cached
+        return None
+
+    generation = _collector_generation
+    _collector_resolved = True
+
     try:
         manager = get_observability_instance().get_provider_manager()
         if manager is None or not manager.config.enabled_telemetry:
@@ -842,7 +903,14 @@ def _get_or_create_collector() -> Optional[RedisMetricsCollector]:
             RedisMetricsCollector.METER_NAME, RedisMetricsCollector.METER_VERSION
         )
 
-        return RedisMetricsCollector(meter, manager.config)
+        _metrics_collector = RedisMetricsCollector(meter, manager.config)
+        if _collector_generation != generation:
+            # A reset landed while this resolution was in flight: the value
+            # above describes the configuration that was just replaced, so
+            # hand the cache back instead of publishing it.
+            _metrics_collector = None
+            _collector_resolved = False
+        return _metrics_collector
 
     except ImportError:
         # Observability module not available
@@ -872,8 +940,11 @@ def reset_collector() -> None:
     """
     Reset the global collector (used for testing or re-initialization).
     """
-    global _metrics_collector
+    global _metrics_collector, _collector_resolved, _collector_generation
+
     _metrics_collector = None
+    _collector_resolved = False
+    _collector_generation += 1
 
 
 def is_enabled() -> bool:
@@ -883,9 +954,9 @@ def is_enabled() -> bool:
     Returns:
         True if metrics are being collected, False otherwise
     """
-    global _metrics_collector
+    return _get_or_create_collector() is not None
 
-    if _metrics_collector is None:
-        _metrics_collector = _get_or_create_collector()
 
-    return _metrics_collector is not None
+# Register this module's cache invalidation with the observability singleton, so
+# ObservabilityInstance.init() drops the cached collector (see providers.py).
+_register_reset_hook(reset_collector)

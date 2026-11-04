@@ -2,7 +2,6 @@ import asyncio
 import collections
 import logging
 import random
-import socket
 import threading
 import time
 import warnings
@@ -48,7 +47,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers import AsyncCommandsParser, Encoder
-from redis._parsers.helpers import get_response_callbacks
+from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import PubSub, ResponseCallbackT
 from redis.asyncio.connection import (
@@ -78,6 +77,8 @@ from redis.cluster import (
     LoadBalancer,
     LoadBalancingStrategy,
     _error_to_raise,
+    _fill_missing_redirect_host,
+    _resolve_localhost,
     _should_request_refresh,
     _topology_refresh_delay,
     block_pipeline_command,
@@ -1688,7 +1689,7 @@ class RedisCluster(
             ask_himport = False
             try:
                 if asking:
-                    target_node = self.get_node(node_name=redirect_addr)
+                    target_node = self.get_node(*redirect_addr)
                     if parse_himport_set_args(args) is not None:
                         # ASKING must sit on the same connection as the SET,
                         # immediately before it. HIMPORT SET's own executor folds
@@ -1833,6 +1834,7 @@ class RedisCluster(
                 )
                 raise
             except MovedError as e:
+                _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
                 # refresh of the whole topology, run by the next attempt of any
@@ -1849,7 +1851,9 @@ class RedisCluster(
                 ):
                     # The refresh also queries the node the error pointed to
                     self._request_refresh(
-                        additional_startup_nodes_info=[(e.host, e.port)]
+                        additional_startup_nodes_info=[
+                            self.nodes_manager.remap_host_port(e.host, e.port)
+                        ]
                     )
                     # Reset the counter
                     self.reinitialize_counter = 0
@@ -1865,7 +1869,8 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
-                redirect_addr = get_node_name(host=e.host, port=e.port)
+                _fill_missing_redirect_host(e, target_node.host)
+                redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
                 await self._record_command_metric(
                     command_name=command,
@@ -2127,7 +2132,7 @@ class ClusterNode:
         **connection_kwargs: Any,
     ) -> None:
         if host == "localhost":
-            host = socket.gethostbyname(host)
+            host = _resolve_localhost()
 
         connection_kwargs["host"] = host
         connection_kwargs["port"] = port
@@ -2351,6 +2356,8 @@ class ClusterNode:
             if NEVER_DECODE in kwargs:
                 response = await connection.read_response(disable_decoding=True)
                 kwargs.pop(NEVER_DECODE)
+                if command == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = await connection.read_response()
         except ResponseError:
@@ -2632,7 +2639,7 @@ class NodesManager:
         if host and port:
             # the user passed host and port
             if host == "localhost":
-                host = socket.gethostbyname(host)
+                host = _resolve_localhost()
             return self.nodes_cache.get(get_node_name(host=host, port=port))
         elif node_name:
             return self.nodes_cache.get(node_name)
@@ -2699,7 +2706,10 @@ class NodesManager:
 
     async def move_slot(self, e: AskError | MovedError):
         node_changed = False
-        redirected_node = self.get_node(host=e.host, port=e.port)
+        # The redirect carries the address the node advertises, like
+        # CLUSTER SLOTS does, so it needs the same remapping to be reachable
+        host, port = self.remap_host_port(e.host, e.port)
+        redirected_node = self.get_node(host=host, port=port)
         if redirected_node:
             # The node already exists
             if redirected_node.server_type != PRIMARY:
@@ -2707,9 +2717,7 @@ class NodesManager:
                 redirected_node.server_type = PRIMARY
         else:
             # This is a new node, we will add it to the nodes cache
-            redirected_node = ClusterNode(
-                e.host, e.port, PRIMARY, **self.connection_kwargs
-            )
+            redirected_node = ClusterNode(host, port, PRIMARY, **self.connection_kwargs)
             self.set_nodes(self.nodes_cache, {redirected_node.name: redirected_node})
         slot_nodes = self.slots_cache[e.slot_id]
         if redirected_node not in slot_nodes:
@@ -2937,11 +2945,15 @@ class NodesManager:
                 # all reinitialize through the same node.
                 random.shuffle(startup_nodes)
             # An address that is already a startup node is queried through that
-            # node, so no temporary node is built for it
+            # node, so no temporary node is built for it. Startup nodes are
+            # named after the resolved localhost, like ClusterNode names them.
             additional_startup_nodes = [
                 ClusterNode(host, port, **self.connection_kwargs)
                 for host, port in additional_startup_nodes_info
-                if get_node_name(host, port) not in self.startup_nodes
+                if get_node_name(
+                    _resolve_localhost() if host == "localhost" else host, port
+                )
+                not in self.startup_nodes
             ]
             temporary_nodes.extend(additional_startup_nodes)
             if last_failed_node_name is not None:
@@ -3011,7 +3023,11 @@ class NodesManager:
                         slot[i] = [str_if_bytes(val) for val in slot[i]]
                     primary_node = slot[2]
                     host = primary_node[0]
-                    if host == "":
+                    # A node that does not know its own address sends an empty
+                    # host, and one whose endpoint is unknown
+                    # (cluster-preferred-endpoint-type unknown-endpoint) a null
+                    # one: both are reached on the host that answered
+                    if not host:
                         host = startup_node.host
                     port = int(primary_node[1])
                     host, port = self.remap_host_port(host, port)
@@ -3030,6 +3046,8 @@ class NodesManager:
                     replica_nodes = slot[3:]
                     for replica_node in replica_nodes:
                         host = replica_node[0]
+                        if not host:
+                            host = startup_node.host
                         port = replica_node[1]
                         host, port = self.remap_host_port(host, port)
 
@@ -4038,6 +4056,19 @@ class TransactionStrategy(AbstractStrategy):
             if initialize_here
             else ()
         )
+        parser_node = (
+            None
+            if initialize_here or args[0] in self.NO_SLOTS_COMMANDS
+            else cluster_client.commands_parser.node
+        )
+        if parser_node is not None:
+            # Parser I/O during slot resolution belongs to this private loop,
+            # not to the caller's node or its connection pool.
+            cluster_client.commands_parser.node = ClusterNode(
+                parser_node.host,
+                parser_node.port,
+                **cluster_client.nodes_manager.connection_kwargs,
+            )
         slot_number: Optional[int] = None
         try:
             if initialize_here:
@@ -4056,6 +4087,12 @@ class TransactionStrategy(AbstractStrategy):
                 await asyncio.gather(
                     *(node.disconnect() for node in nodes.values()),
                     return_exceptions=True,
+                )
+            elif parser_node is not None:
+                temporary_node = cluster_client.commands_parser.node
+                cluster_client.commands_parser.node = parser_node
+                await asyncio.gather(
+                    temporary_node.disconnect(), return_exceptions=True
                 )
 
         if (
@@ -4245,6 +4282,8 @@ class TransactionStrategy(AbstractStrategy):
                 # MovedError is an AskError, so a MOVED slot is patched too, and
                 # the retry goes to the node that owns it now. The refresh is
                 # only asked for, run by the next command once due.
+                if self._transaction_node is not None:
+                    _fill_missing_redirect_host(error, self._transaction_node.host)
                 await self._pipe.cluster_client.nodes_manager.move_slot(error)
                 if should_request_refresh:
                     self._pipe.cluster_client._request_refresh()
@@ -4444,6 +4483,9 @@ class TransactionStrategy(AbstractStrategy):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
                 if command_name in self._pipe.cluster_client.response_callbacks:
+                    # The keys option is only for the client cache and is
+                    # not an option of the callbacks
+                    cmd.kwargs.pop("keys", None)
                     r = self._pipe.cluster_client.response_callbacks[command_name](
                         r, **cmd.kwargs
                     )
@@ -5265,6 +5307,10 @@ class ClusterPubSub(PubSub):
         # move_slot indexes slots_cache by the redirected slot, so an
         # as-yet-uncovered slot raises: log and still reconcile rather than let
         # a repair attempt break a pubsub read.
+        if node_name is not None:
+            # A redirect without a host is relative to the node that sent it,
+            # and a node's name is its host and port
+            _fill_missing_redirect_host(error, node_name.rsplit(":", 1)[0])
         try:
             await self.cluster.nodes_manager.move_slot(error)
         except Exception as exc:

@@ -1,9 +1,9 @@
 ---
 x-client-libs-stack-image: &client-libs-stack-image
-  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_STACK_IMAGE_TAG:-8.6.1}"
+  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_STACK_IMAGE_TAG:-8.10.3}"
 
 x-client-libs-image: &client-libs-image
-  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_IMAGE_TAG:-8.6.1}"
+  image: "redislabs/client-libs-test:${CLIENT_LIBS_TEST_IMAGE_TAG:-8.10.3}"
 
 networks:
   redis-net:

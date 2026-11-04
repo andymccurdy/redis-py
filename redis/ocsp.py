@@ -1,7 +1,7 @@
 import base64
 import datetime
 import ssl
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urlparse
 
 import cryptography.hazmat.primitives.hashes
 import requests
@@ -292,7 +292,11 @@ class OCSPVerifier:
         path = base64.b64encode(
             request.public_bytes(hazmat.primitives.serialization.Encoding.DER)
         )
-        url = urljoin(server, path.decode("ascii"))
+        # RFC 6960 Appendix A.1: the base64 is url-encoded and appended to the
+        # responder url.
+        if not server.endswith("/"):
+            server += "/"
+        url = server + quote(path.decode("ascii"), safe="")
         return url
 
     def check_certificate(self, server, cert, issuer_url):
@@ -324,14 +328,10 @@ class OCSPVerifier:
         the validity of OCSP revocation status.
         """
 
-        # validate the certificate
-        try:
-            cert, issuer_url, ocsp_server = self.components_from_socket()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
-        except AuthorizationError:
-            cert, issuer_url, ocsp_server = self.components_from_direct_connection()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
+        # validate the certificate. An UNAUTHORIZED response fails closed:
+        # OCSP error statuses are unsigned, and asking again about the same
+        # certificate would send the responder the identical request.
+        cert, issuer_url, ocsp_server = self.components_from_socket()
+        if issuer_url is None:
+            raise ConnectionError("no issuers found in certificate chain")
+        return self.check_certificate(ocsp_server, cert, issuer_url)

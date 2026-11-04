@@ -44,6 +44,7 @@ from redis.cluster import (
     PRIMARY,
     REPLICA,
     LoadBalancingStrategy,
+    _resolve_localhost,
     get_node_name,
 )
 from redis.commands.cluster import AsyncClusterMultiKeyCommands
@@ -71,6 +72,7 @@ from redis.exceptions import (
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
+    ExecAbortError,
     MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
@@ -229,6 +231,7 @@ async def get_mocked_redis_client(
         ) as cmd_parser_initialize:
 
             def cmd_init_mock(self, r: ClusterNode) -> None:
+                self.node = r
                 self.commands = {
                     "get": {
                         "name": "get",
@@ -2152,6 +2155,46 @@ class TestTopologyRefreshKeepsConnections:
         assert disconnect.await_args_list == []
 
     @pytest.mark.fixed_client
+    async def test_refresh_queries_a_localhost_remapped_startup_node_once(
+        self,
+    ) -> None:
+        """
+        With a remap to localhost, the refresh hint of a MOVED redirect is
+        localhost:port, while the startup node is named after the resolved
+        address. It is the same node, so no temporary ClusterNode is built to
+        query it a second time.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return "localhost", port + 1000
+
+        startup_node = ClusterNode("localhost", 8000)
+        nodes_manager = NodesManager(
+            startup_nodes=[startup_node],
+            require_full_coverage=False,
+            connection_kwargs={},
+            address_remap=address_remap,
+        )
+        # Half of the slots, so every startup node is queried
+        slots = [[0, 8191, [default_host, 7000, "node_0"]]]
+        with (
+            mock.patch.object(
+                ClusterNode, "execute_command", autospec=True, return_value=slots
+            ) as execute_command,
+            mock.patch.object(ClusterNode, "disconnect", autospec=True) as disconnect,
+        ):
+            # The hint _execute_command passes on for a MOVED to 7000
+            await nodes_manager.initialize(
+                additional_startup_nodes_info=[
+                    nodes_manager.remap_host_port(default_host, 7000)
+                ]
+            )
+
+        assert [c.args[0] for c in execute_command.await_args_list] == [startup_node]
+        assert disconnect.await_args_list == []
+
+    @pytest.mark.fixed_client
     async def test_refresh_closes_temporary_startup_nodes(self) -> None:
         """
         An additional startup node is queried through a ClusterNode built only
@@ -2917,6 +2960,68 @@ class TestRedisClusterObj:
         n_used = sum((1 if p.n_connections else 0) for p in proxies)
         assert n_used > 1
 
+    @pytest.mark.parametrize(
+        "remap_host, offset",
+        # Not the ports of the other remap tests: their listeners may still be open
+        [("127.0.0.1", 3000), ("localhost", 3100)],
+    )
+    async def test_address_remap_applies_to_redirects(
+        self, create_redis, master_host, remap_host, offset
+    ):
+        """
+        A MOVED or ASK redirect names the address the node advertises, so the
+        retry must go through address_remap like the CLUSTER SLOTS addresses do.
+        A remap to localhost is cached under the resolved address, so the retry
+        must look the node up the same way.
+        """
+        n = 6
+        hostname, master_port = master_host
+        ports = [master_port + i for i in range(n)]
+
+        def address_remap(address):
+            host, port = address
+            if int(port) in ports:
+                host, port = remap_host, int(port) + offset
+            return host, port
+
+        proxies = [
+            NodeProxy(("127.0.0.1", port + offset), (hostname, port)) for port in ports
+        ]
+        await asyncio.gather(*[p.start() for p in proxies])
+        try:
+            r = await create_redis(
+                cls=RedisCluster, flushdb=False, address_remap=address_remap
+            )
+            try:
+                slot = r.keyslot("foo")
+                owner = r.nodes_manager.get_node_from_slot(slot)
+                other = next(p for p in r.get_primaries() if p.name != owner.name)
+                # The address the redirected-to node advertises, not its proxy
+                redirect_port = other.port - offset
+                for redirect_error in (AskError, MovedError):
+                    with mock.patch.object(
+                        ClusterNode, "execute_command", autospec=True
+                    ) as execute_command:
+
+                        def redirect_effect(self, *args, **options):
+                            def ok_response(self, *args, **options):
+                                assert (self.host, self.port) == (
+                                    "127.0.0.1",
+                                    other.port,
+                                )
+                                return "MOCK_OK"
+
+                            execute_command.side_effect = ok_response
+                            raise redirect_error(f"{slot} {hostname}:{redirect_port}")
+
+                        execute_command.side_effect = redirect_effect
+
+                        assert await r.execute_command("SET", "foo", "bar") == "MOCK_OK"
+            finally:
+                await r.aclose()
+        finally:
+            await asyncio.gather(*[p.aclose() for p in proxies])
+
 
 @pytest.mark.fixed_client
 class TestRedisClusterObjMocked:
@@ -3116,6 +3221,124 @@ class TestRedisClusterObjMocked:
 
                 await read_cluster.aclose()
 
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    async def test_redirect_without_host(self, error) -> None:
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) redirects with only a port, and the command follows
+        the redirect to that port on the host of the node that sent it.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+        redirects = []
+
+        async def execute_command(node, *args, **kwargs):
+            calls.append((node, args[0]))
+            if node is origin:
+                redirects.append(error(f"{slot} :{target.port}"))
+                raise redirects[-1]
+            return b"value"
+
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=execute_command
+        ):
+            assert await rc.get("foo") == b"value"
+
+        expected = [(origin, "GET"), (target, "GET")]
+        if error is AskError:
+            expected.insert(1, (target, "ASKING"))
+        assert calls == expected
+        assert [redirect.node_addr for redirect in redirects] == [
+            (origin.host, target.port)
+        ]
+
+        await rc.aclose()
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    async def test_redirect_without_host_with_address_remap(self, error) -> None:
+        """
+        The host filled in for a redirect without one has already been through
+        address_remap, and following the redirect remaps it again. With a remap
+        that only picks the port, as for a proxy, the command still reaches the
+        remapped address of the node the redirect names.
+        """
+        offset = 1000
+
+        def address_remap(address):
+            host, port = address
+            return host, port + offset
+
+        rc = await get_mocked_redis_client(
+            host=default_host, port=default_port, address_remap=address_remap
+        )
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+
+        async def execute_command(node, *args, **kwargs):
+            calls.append((node, args[0]))
+            if node is origin:
+                # A node redirects to the port it advertises, not the remapped one
+                raise error(f"{slot} :{target.port - offset}")
+            return b"value"
+
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=execute_command
+        ):
+            assert await rc.get("foo") == b"value"
+
+        expected = [(origin, "GET"), (target, "GET")]
+        if error is AskError:
+            expected.insert(1, (target, "ASKING"))
+        assert calls == expected
+
+        await rc.aclose()
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    async def test_transaction_redirect_without_host(self, error) -> None:
+        """
+        A transaction redirected with only a port is retried on that port of the
+        host of the node that sent the redirect.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        for node in (origin, target):
+            connection = mock_node_resp(node, None)._free[0]
+            connection.host, connection.port = node.host, node.port
+        calls = []
+
+        async def parse_response(node, connection, command, **kwargs):
+            calls.append((node, command))
+            if node is origin:
+                if command == "_":
+                    raise error(f"{slot} :{target.port}")
+                if command == "EXEC":
+                    raise ExecAbortError()
+            if command == "EXEC":
+                return [b"bar"]
+            return b"QUEUED" if command == "_" else b"OK"
+
+        with mock.patch.object(
+            ClusterNode, "parse_response", autospec=True, side_effect=parse_response
+        ):
+            async with rc.pipeline(transaction=True) as pipe:
+                pipe.get("foo")
+                assert await pipe.execute() == [b"bar"]
+
+        assert calls == [
+            (node, command)
+            for node in (origin, target)
+            for command in ("MULTI", "_", "EXEC")
+        ]
+
+        await rc.aclose()
+
 
 @pytest.mark.onlycluster
 class TestClusterRedisCommands:
@@ -3251,6 +3474,14 @@ class TestClusterRedisCommands:
     async def test_cluster_myshardid(self, r: RedisCluster) -> None:
         node = r.get_random_node()
         myshardid = await r.cluster_myshardid(node)
+        assert len(myshardid) == 40
+
+    @skip_if_server_version_lt("7.2.0")
+    @skip_if_redis_enterprise()
+    async def test_cluster_myshardid_decoded(self, decoded_r: RedisCluster) -> None:
+        node = decoded_r.get_random_node()
+        myshardid = await decoded_r.cluster_myshardid(node)
+        assert isinstance(myshardid, str)
         assert len(myshardid) == 40
 
     @skip_if_redis_enterprise()
@@ -3512,6 +3743,11 @@ class TestClusterRedisCommands:
         info = await r.info(target_nodes=node)
         assert isinstance(info, dict)
         assert info["db0"]["keys"] == 3
+
+    async def test_info_with_custom_callback(self, decoded_r: RedisCluster) -> None:
+        decoded_r.set_response_callback("INFO", lambda response: response)
+        info = await decoded_r.info("server", target_nodes=decoded_r.get_random_node())
+        assert "redis_version" in info
 
     async def _init_slowlog_test(self, r: RedisCluster, node: ClusterNode) -> str:
         slowlog_lim = await r.config_get("slowlog-log-slower-than", target_nodes=node)
@@ -5895,13 +6131,14 @@ class TestNodesManager:
             ), str(ex.value)
 
     @pytest.mark.fixed_client
-    async def test_cluster_one_instance(self) -> None:
+    @pytest.mark.parametrize("host", ["", None])
+    async def test_cluster_one_instance(self, host) -> None:
         """
         If the cluster exists of only 1 node then there is some hacks that must
         be validated they work.
         """
         node = ClusterNode(default_host, default_port)
-        cluster_slots = [[0, 16383, ["", default_port]]]
+        cluster_slots = [[0, 16383, [host, default_port]]]
         rc = await get_mocked_redis_client(
             startup_nodes=[node], cluster_slots=cluster_slots
         )
@@ -5915,6 +6152,34 @@ class TestNodesManager:
         assert len(n.slots_cache) == REDIS_CLUSTER_HASH_SLOTS
         for i in range(0, REDIS_CLUSTER_HASH_SLOTS):
             assert n.slots_cache[i] == [n_node]
+
+        await rc.aclose()
+
+    @pytest.mark.fixed_client
+    async def test_init_slots_cache_without_hosts(self) -> None:
+        """
+        A cluster whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) sends null hosts in CLUSTER SLOTS, and its nodes are
+        reached on the host of the startup node that answered.
+        """
+        cluster_slots = [
+            [0, 8191, [None, 7000, "node_0"], [None, 7003, "node_3"]],
+            [8192, 16383, [None, 7001, "node_1"], [None, 7002, "node_2"]],
+        ]
+        rc = await get_mocked_redis_client(
+            host=default_host, port=default_port, cluster_slots=cluster_slots
+        )
+
+        n = rc.nodes_manager
+        assert [node.name for node in n.slots_cache[0]] == [
+            f"{default_host}:7000",
+            f"{default_host}:7003",
+        ]
+        assert [node.name for node in n.slots_cache[16383]] == [
+            f"{default_host}:7001",
+            f"{default_host}:7002",
+        ]
+        assert len(n.nodes_cache) == 4
 
         await rc.aclose()
 
@@ -6602,6 +6867,64 @@ class TestNodesManager:
         listener.listen.assert_not_called()
         await r.aclose()
 
+    @pytest.mark.fixed_client
+    async def test_move_slot_remaps_redirect_address(self) -> None:
+        """
+        move_slot() must apply address_remap to the redirect address, which is
+        the one the node advertises, and never cache the unmapped address.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return host, port + 1000
+
+        r = await get_mocked_redis_client(
+            host=default_host, port=default_port, address_remap=address_remap
+        )
+        nm = r.nodes_manager
+        # Default layout: slot 0 -> 127.0.0.1:7000, cached as 127.0.0.1:8000.
+        # Redirect to the primary of a different shard, by its advertised address.
+        await nm.move_slot(MovedError("0 127.0.0.1:7001"))
+
+        assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8001"]
+        assert "127.0.0.1:7001" not in nm.nodes_cache
+
+        # A node not in the cache yet is added under its remapped address.
+        await nm.move_slot(MovedError("0 127.0.0.1:7006"))
+
+        assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8006"]
+        assert "127.0.0.1:7006" not in nm.nodes_cache
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    async def test_move_slot_resolves_localhost_once(self) -> None:
+        """
+        A remap to localhost must be resolved once and reused, not on every
+        node created or redirect looked up.
+        """
+
+        def address_remap(address):
+            host, port = address
+            return "localhost", port + 1000
+
+        _resolve_localhost.cache_clear()
+        try:
+            with mock.patch(
+                "socket.gethostbyname", return_value="127.0.0.1"
+            ) as resolve:
+                r = await get_mocked_redis_client(
+                    host=default_host, port=default_port, address_remap=address_remap
+                )
+                nm = r.nodes_manager
+                await nm.move_slot(MovedError("0 127.0.0.1:7001"))
+                await nm.move_slot(MovedError("0 127.0.0.1:7002"))
+
+            assert [node.name for node in nm.slots_cache[0]] == ["127.0.0.1:8002"]
+            resolve.assert_called_once_with("localhost")
+            await r.aclose()
+        finally:
+            _resolve_localhost.cache_clear()
+
 
 @pytest.mark.fixed_client
 class TestClusterNodeConnectionHandling:
@@ -7231,7 +7554,18 @@ class TestClusterPipeline:
             assert pipe.set(key, "updated") is pipe
             assert await pipe.execute() == [True]
             assert await client.get(key) == b"updated"
-            await client.delete(key)
+            # Queuing movablekeys commands (COMMAND GETKEYS) on an initialized
+            # transaction pipeline must neither reuse caller-loop sockets on the
+            # private worker loop nor leave private-loop sockets open afterward.
+            zset_a = f"{{{key}}}:zset-a"
+            zset_b = f"{{{key}}}:zset-b"
+            zset_out = f"{{{key}}}:zset-out"
+            await client.zadd(zset_a, {"member": 1})
+            await client.zadd(zset_b, {"member": 2})
+            assert pipe.zunionstore(zset_out, [zset_a, zset_b]) is pipe
+            assert await pipe.execute() == [1]
+            assert await client.zscore(zset_out, "member") == 3.0
+            await client.delete(key, zset_a, zset_b, zset_out)
         finally:
             await client.aclose()
 
@@ -7653,6 +7987,7 @@ class TestClusterPipelineMocked:
             connections.append(connection)
 
         def set_topology():
+            client.commands_parser.node = cached_node
             client.nodes_manager.default_node = cached_node
             client.nodes_manager.nodes_cache[cached_node.name] = cached_node
             client._initialize = False
@@ -7695,6 +8030,139 @@ class TestClusterPipelineMocked:
                 assert connection.is_connected is initialized
             if not initialized:
                 assert all(loop is initialize_loops[0] for loop in disconnect_loops)
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("caller_connected", [False, True])
+    @pytest.mark.parametrize("slot_error", [False, True])
+    @pytest.mark.parametrize("disconnect_error", [False, True])
+    async def test_transaction_movablekeys_isolates_caller_and_private_loop_connections(
+        self, caller_connected, slot_error, disconnect_error
+    ) -> None:
+        client = RedisCluster(host=default_host, port=default_port, max_connections=3)
+        parser_node = ClusterNode(
+            default_host, default_port, **client.nodes_manager.connection_kwargs
+        )
+        caller_loop = asyncio.get_running_loop()
+        parser_io_nodes = []
+        parser_io_loops = []
+        disconnect_nodes = []
+        disconnect_loops = []
+        private_connections = []
+
+        for _ in range(parser_node.max_connections):
+            connection = mock.AsyncMock(spec=Connection)
+            connection.is_connected = caller_connected
+            connection.should_reconnect.return_value = False
+            connection.pack_command.return_value = [b"COMMAND GETKEYS"]
+            connection.read_response.return_value = ["{tag}a", "{tag}b"]
+
+            async def disconnect_caller(connection=connection):
+                connection.is_connected = False
+
+            connection.disconnect.side_effect = disconnect_caller
+            parser_node._connections.append(connection)
+        parser_node._free.extend(reversed(parser_node._connections))
+        caller_connections = list(parser_node._connections)
+        caller_free = list(parser_node._free)
+        connections_pool = parser_node._connections
+        free_pool = parser_node._free
+
+        def make_private_connection(**kwargs):
+            connection = mock.AsyncMock(spec=Connection)
+            connection.is_connected = False
+            connection.should_reconnect.return_value = False
+
+            async def send_packed_command(*args, **kwargs):
+                parser_io_nodes.append(client.commands_parser.node)
+                parser_io_loops.append(asyncio.get_running_loop())
+                connection.is_connected = True
+
+            async def disconnect():
+                disconnect_loops.append(asyncio.get_running_loop())
+                connection.is_connected = False
+                if disconnect_error:
+                    raise TimeoutError("close timed out")
+
+            connection.send_packed_command.side_effect = send_packed_command
+            connection.disconnect.side_effect = disconnect
+            connection.pack_command.return_value = [b"COMMAND GETKEYS"]
+            if slot_error:
+                connection.read_response.side_effect = RedisClusterException(
+                    "slot resolution failed"
+                )
+            else:
+                connection.read_response.return_value = ["{tag}a", "{tag}b"]
+            private_connections.append(connection)
+            return connection
+
+        node_disconnect = ClusterNode.disconnect
+
+        async def disconnect_node(node):
+            disconnect_nodes.append(node)
+            # Restore the caller's parser before cleanup, even if cleanup raises.
+            assert client.commands_parser.node is parser_node
+            await node_disconnect(node)
+
+        client.nodes_manager.connection_kwargs["connection_class"] = (
+            make_private_connection
+        )
+        parser_node.connection_class = make_private_connection
+        client.nodes_manager.default_node = parser_node
+        client.nodes_manager.nodes_cache[parser_node.name] = parser_node
+        client._initialize = False
+        client._topology_ready = True
+        client.commands_parser.node = parser_node
+        client.commands_parser.commands = {
+            "zunionstore": {"name": "zunionstore", "flags": ["movablekeys"]}
+        }
+
+        try:
+            with mock.patch.object(ClusterNode, "disconnect", disconnect_node):
+                pipe = client.pipeline(transaction=True)
+                if slot_error:
+                    with pytest.raises(
+                        RedisClusterException, match="slot resolution failed"
+                    ):
+                        pipe.zunionstore("{tag}out", ["{tag}a", "{tag}b"])
+                    assert not pipe._execution_strategy._command_queue
+                else:
+                    assert pipe.zunionstore("{tag}out", ["{tag}a", "{tag}b"]) is pipe
+                    assert pipe._execution_strategy._command_queue[0].args == (
+                        "ZUNIONSTORE",
+                        "{tag}out",
+                        2,
+                        "{tag}a",
+                        "{tag}b",
+                    )
+
+            assert client.commands_parser.node is parser_node
+            assert client.get_default_node() is parser_node
+            assert parser_node._connections is connections_pool
+            assert parser_node._connections == caller_connections
+            assert parser_node._free is free_pool
+            assert list(parser_node._free) == caller_free
+            assert parser_node._free.maxlen == parser_node.max_connections
+            for connection in caller_connections:
+                assert connection.is_connected is caller_connected
+                connection.send_packed_command.assert_not_awaited()
+                connection.disconnect.assert_not_awaited()
+
+            assert len(parser_io_nodes) == 1
+            temporary_node = parser_io_nodes[0]
+            assert temporary_node is not parser_node
+            assert temporary_node.host == parser_node.host
+            assert temporary_node.port == parser_node.port
+            assert temporary_node.max_connections == parser_node.max_connections
+            assert temporary_node.connection_class is make_private_connection
+            assert len(disconnect_nodes) == 1
+            assert disconnect_nodes[0] is temporary_node
+            assert len(parser_io_loops) == 1
+            assert parser_io_loops[0] is not caller_loop
+            assert disconnect_loops == parser_io_loops
+            assert len(private_connections) == 1
+            private_connections[0].disconnect.assert_awaited_once()
+            assert not private_connections[0].is_connected
         finally:
             await client.aclose()
 
@@ -8199,15 +8667,7 @@ class TestAsyncClusterMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
-            # Also set the collector directly to ensure it's used
-            async_recorder._async_metrics_collector = collector
-
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher
@@ -8399,15 +8859,7 @@ class TestAsyncClusterPipelineMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        # Note: _get_or_create_collector is now sync
-        with patch.object(
-            async_recorder,
-            "_get_or_create_collector",
-            return_value=collector,
-        ):
-            # Also set the collector directly to ensure it's used
-            async_recorder._async_metrics_collector = collector
-
+        with patch.object(async_recorder, "_async_metrics_collector", collector):
             # Create a new event dispatcher and attach it to the cluster
             event_dispatcher = EventDispatcher()
             r._event_dispatcher = event_dispatcher

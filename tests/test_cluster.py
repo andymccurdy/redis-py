@@ -72,6 +72,7 @@ from redis.exceptions import (
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
+    ExecAbortError,
     MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
@@ -1371,6 +1372,123 @@ class TestRedisClusterObjMocked:
             cluster.get_node(host=default_host, port=port_1) is not None
             and cluster.get_node(host=default_host, port=port_2) is not None
         )
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    def test_redirect_without_host(self, error):
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) redirects with only a port, and the command follows
+        the redirect to that port on the host of the node that sent it.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+        redirects = []
+
+        def parse_response(redis_node, connection, command, **kwargs):
+            calls.append((redis_node, command))
+            if redis_node is origin.redis_connection:
+                redirects.append(error(f"{slot} :{target.port}"))
+                raise redirects[-1]
+            return b"value"
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+        ):
+            assert rc.get("foo") == b"value"
+
+        expected = [(origin.redis_connection, "GET"), (target.redis_connection, "GET")]
+        if error is AskError:
+            expected.insert(1, (target.redis_connection, "ASKING"))
+        assert calls == expected
+        assert [redirect.node_addr for redirect in redirects] == [
+            (origin.host, target.port)
+        ]
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    def test_redirect_without_host_with_address_remap(self, error):
+        """
+        The host filled in for a redirect without one has already been through
+        address_remap, and following the redirect remaps it again. With a remap
+        that only picks the port, as for a proxy, the command still reaches the
+        remapped address of the node the redirect names.
+        """
+        offset = 1000
+
+        def address_remap(address):
+            host, port = address
+            return host, port + offset
+
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, address_remap=address_remap
+        )
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+
+        def parse_response(redis_node, connection, command, **kwargs):
+            calls.append((redis_node, command))
+            if redis_node is origin.redis_connection:
+                # A node redirects to the port it advertises, not the remapped one
+                raise error(f"{slot} :{target.port - offset}")
+            return b"value"
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+        ):
+            assert rc.get("foo") == b"value"
+
+        expected = [(origin.redis_connection, "GET"), (target.redis_connection, "GET")]
+        if error is AskError:
+            expected.insert(1, (target.redis_connection, "ASKING"))
+        assert calls == expected
+
+    @pytest.mark.parametrize("error", [AskError, MovedError])
+    def test_transaction_redirect_without_host(self, error):
+        """
+        A transaction redirected with only a port is retried on that port of the
+        host of the node that sent the redirect.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        slot = rc.keyslot("foo")
+        origin = rc.get_node_from_key("foo")
+        target = next(node for node in rc.get_primaries() if node is not origin)
+        calls = []
+
+        def parse_response(redis_node, connection, command, **kwargs):
+            calls.append((redis_node, command))
+            if redis_node is origin.redis_connection:
+                if command == "_":
+                    raise error(f"{slot} :{target.port}")
+                if command == "EXEC":
+                    raise ExecAbortError()
+            if command == "EXEC":
+                return [b"bar"]
+            return b"QUEUED" if command == "_" else b"OK"
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+        ):
+            with rc.pipeline(transaction=True) as pipe:
+                assert pipe.get("foo").execute() == [b"bar"]
+
+        assert calls == [
+            (node.redis_connection, command)
+            for node in (origin, target)
+            for command in ("MULTI", "_", "EXEC")
+        ]
 
 
 @pytest.mark.onlycluster
@@ -5849,13 +5967,14 @@ class TestNodesManager:
             ), str(ex.value)
 
     @pytest.mark.fixed_client
-    def test_cluster_one_instance(self):
+    @pytest.mark.parametrize("host", ["", None])
+    def test_cluster_one_instance(self, host):
         """
         If the cluster exists of only 1 node then there is some hacks that must
         be validated they work.
         """
         node = ClusterNode(default_host, default_port)
-        cluster_slots = [[0, 16383, ["", default_port]]]
+        cluster_slots = [[0, 16383, [host, default_port]]]
         rc = get_mocked_redis_client(startup_nodes=[node], cluster_slots=cluster_slots)
 
         n = rc.nodes_manager
@@ -5867,6 +5986,32 @@ class TestNodesManager:
         assert len(n.slots_cache) == REDIS_CLUSTER_HASH_SLOTS
         for i in range(0, REDIS_CLUSTER_HASH_SLOTS):
             assert n.slots_cache[i] == [n_node]
+
+    @pytest.mark.fixed_client
+    def test_init_slots_cache_without_hosts(self):
+        """
+        A cluster whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) sends null hosts in CLUSTER SLOTS, and its nodes are
+        reached on the host of the startup node that answered.
+        """
+        cluster_slots = [
+            [0, 8191, [None, 7000, "node_0"], [None, 7003, "node_3"]],
+            [8192, 16383, [None, 7001, "node_1"], [None, 7002, "node_2"]],
+        ]
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, cluster_slots=cluster_slots
+        )
+
+        n = rc.nodes_manager
+        assert [node.name for node in n.slots_cache[0]] == [
+            f"{default_host}:7000",
+            f"{default_host}:7003",
+        ]
+        assert [node.name for node in n.slots_cache[16383]] == [
+            f"{default_host}:7001",
+            f"{default_host}:7002",
+        ]
+        assert len(n.nodes_cache) == 4
 
     @pytest.mark.fixed_client
     def test_init_with_down_node(self):

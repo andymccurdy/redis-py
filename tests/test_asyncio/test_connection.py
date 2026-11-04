@@ -1729,3 +1729,31 @@ async def test_send_packed_command_os_level_timeout_is_a_connection_error():
         await conn.send_packed_command(b"PING", check_health=False)
     conn.disconnect.assert_awaited_once()
     conn._reader = conn._writer = None  # disconnect was mocked out
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("rotation_stage", [None, "send", "read"])
+async def test_re_auth_preserves_newer_token(rotation_stage):
+    connection = Connection()
+    token = mock.Mock()
+    token.try_get.return_value = "first-user"
+    token.get_value.return_value = "first-token"
+    newer_token = mock.Mock()
+    connection.set_re_auth_token(token)
+
+    async def send(*args):
+        if rotation_stage == "send":
+            connection.set_re_auth_token(newer_token)
+
+    async def read():
+        if rotation_stage == "read":
+            connection.set_re_auth_token(newer_token)
+        return b"OK"
+
+    connection.send_command = mock.AsyncMock(side_effect=send)
+    connection.read_response = mock.AsyncMock(side_effect=read)
+    await connection.re_auth()
+    connection.send_command.assert_awaited_once_with(
+        "AUTH", "first-user", "first-token"
+    )
+    assert connection._re_auth_token is (newer_token if rotation_stage else None)

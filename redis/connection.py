@@ -1782,14 +1782,16 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self._re_auth_token = token
 
     def re_auth(self):
-        if self._re_auth_token is not None:
+        token = self._re_auth_token
+        if token is not None:
             self.send_command(
                 "AUTH",
-                self._re_auth_token.try_get("oid"),
-                self._re_auth_token.get_value(),
+                token.try_get("oid"),
+                token.get_value(),
             )
             self.read_response()
-            self._re_auth_token = None
+            if self._re_auth_token is token:
+                self._re_auth_token = None
 
     def _get_socket(self) -> Optional[socket.socket]:
         return self._sock

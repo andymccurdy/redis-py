@@ -1698,14 +1698,16 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self._re_auth_token = token
 
     async def re_auth(self):
-        if self._re_auth_token is not None:
+        token = self._re_auth_token
+        if token is not None:
             await self.send_command(
                 "AUTH",
-                self._re_auth_token.try_get("oid"),
-                self._re_auth_token.get_value(),
+                token.try_get("oid"),
+                token.get_value(),
             )
             await self.read_response()
-            self._re_auth_token = None
+            if self._re_auth_token is token:
+                self._re_auth_token = None
 
 
 class Connection(AbstractConnection):
@@ -3258,37 +3260,38 @@ class ConnectionPool(
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool"""
-        # Connections should always be returned to the correct pool,
-        # not doing so is an error that will cause an exception here.
-        async with self._lock:
-            self._in_use_connections.remove(connection)
+        try:
+            await self._event_dispatcher.dispatch_async(
+                AsyncAfterConnectionReleasedEvent(connection)
+            )
+        finally:
+            # Connections should always be returned to the correct pool,
+            # not doing so is an error that will cause an exception here.
+            async with self._lock:
+                self._in_use_connections.remove(connection)
 
-            if connection.should_reconnect():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Disconnecting released connection marked for reconnect: "
-                        f"{connection}, {connection.extract_connection_details()}"
-                    )
-                await connection.disconnect()
+                if connection.should_reconnect():
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Disconnecting released connection marked for reconnect: "
+                            f"{connection}, {connection.extract_connection_details()}"
+                        )
+                    await connection.disconnect()
 
-            self._available_connections.append(connection)
+                self._available_connections.append(connection)
 
-        await self._event_dispatcher.dispatch_async(
-            AsyncAfterConnectionReleasedEvent(connection)
-        )
-
-        # Record state transition: USED -> IDLE
-        pool_name = get_pool_name(self)
-        await record_connection_count(
-            pool_name=pool_name,
-            connection_state=ConnectionState.USED,
-            counter=-1,
-        )
-        await record_connection_count(
-            pool_name=pool_name,
-            connection_state=ConnectionState.IDLE,
-            counter=1,
-        )
+            # Record state transition: USED -> IDLE
+            pool_name = get_pool_name(self)
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.USED,
+                counter=-1,
+            )
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.IDLE,
+                counter=1,
+            )
 
     async def disconnect(self, inuse_connections: bool = True):
         """

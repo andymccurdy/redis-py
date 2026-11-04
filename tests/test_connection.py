@@ -4670,3 +4670,29 @@ def test_send_packed_command_os_level_timeout_is_a_connection_error():
     with pytest.raises(ConnectionError):
         conn.send_packed_command(b"PING", check_health=False)
     conn.disconnect.assert_called_once()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("rotation_stage", [None, "send", "read"])
+def test_re_auth_preserves_newer_token(rotation_stage):
+    connection = Connection()
+    token = mock.Mock()
+    token.try_get.return_value = "first-user"
+    token.get_value.return_value = "first-token"
+    newer_token = mock.Mock()
+    connection.set_re_auth_token(token)
+
+    def send(*args):
+        if rotation_stage == "send":
+            connection.set_re_auth_token(newer_token)
+
+    def read():
+        if rotation_stage == "read":
+            connection.set_re_auth_token(newer_token)
+        return b"OK"
+
+    connection.send_command = mock.Mock(side_effect=send)
+    connection.read_response = mock.Mock(side_effect=read)
+    connection.re_auth()
+    connection.send_command.assert_called_once_with("AUTH", "first-user", "first-token")
+    assert connection._re_auth_token is (newer_token if rotation_stage else None)

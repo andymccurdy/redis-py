@@ -249,6 +249,81 @@ class TestConnectionPool:
             assert c1 == c2
 
     @pytest.mark.fixed_client
+    @pytest.mark.parametrize("operation", ["acquire", "refresh"])
+    async def test_release_reserves_connection_during_re_auth(self, operation):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            connection = await pool.get_connection()
+            re_auth_started = asyncio.Event()
+            finish_re_auth = asyncio.Event()
+
+            async def re_auth():
+                re_auth_started.set()
+                await finish_re_auth.wait()
+
+            connection.re_auth = AsyncMock(side_effect=re_auth)
+            connection.set_re_auth_token = MagicMock()
+            connection.retry = MagicMock()
+            connection.retry.call_with_retry = AsyncMock()
+            token = MagicMock(spec=TokenInterface)
+            release_task = asyncio.create_task(pool.release(connection))
+            other = None
+            try:
+                await re_auth_started.wait()
+                assert connection in pool._in_use_connections
+                assert connection not in pool._available_connections
+                if operation == "acquire":
+                    other = await asyncio.wait_for(pool.get_connection(), timeout=1)
+                    assert other is not connection
+                else:
+                    await asyncio.wait_for(pool.re_auth_callback(token), timeout=1)
+                    connection.set_re_auth_token.assert_called_once_with(token)
+                    connection.retry.call_with_retry.assert_not_awaited()
+            finally:
+                finish_re_auth.set()
+                await release_task
+                if other is not None:
+                    await pool.release(other)
+            assert connection not in pool._in_use_connections
+            assert connection in pool._available_connections
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    async def test_release_listener_can_take_pool_lock(self, pool_class):
+        async with pool_class(connection_class=DummyConnection) as pool:
+            connection = await pool.get_connection()
+            connection.should_reconnect = MagicMock(return_value=False)
+            connection.disconnect = AsyncMock()
+
+            async def re_auth():
+                async with pool._lock:
+                    assert connection in pool._in_use_connections
+                    connection.should_reconnect.return_value = True
+
+            connection.re_auth = AsyncMock(side_effect=re_auth)
+            await asyncio.wait_for(pool.release(connection), timeout=1)
+            connection.disconnect.assert_awaited_once()
+            assert connection not in pool._in_use_connections
+            assert connection in pool._available_connections
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "error", [RuntimeError("listener failed"), asyncio.CancelledError()]
+    )
+    async def test_release_listener_failure_returns_connection(self, error):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            connection = await pool.get_connection()
+            connection.re_auth = AsyncMock(side_effect=error)
+            with patch(
+                "redis.asyncio.connection.record_connection_count",
+                new_callable=AsyncMock,
+            ) as record:
+                with pytest.raises(type(error)):
+                    await pool.release(connection)
+                assert record.await_count == 2
+            assert connection not in pool._in_use_connections
+            assert pool._available_connections == [connection]
+
+    @pytest.mark.fixed_client
     async def test_repr_contains_db_info_tcp(self):
         connection_kwargs = {
             "host": "localhost",

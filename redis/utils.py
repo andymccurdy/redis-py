@@ -56,15 +56,14 @@ SENTINEL = object()
 _SHARED_SSL_CONTEXTS: "weakref.WeakValueDictionary[Any, ssl.SSLContext]" = (
     weakref.WeakValueDictionary()
 )
-# Reentrant: an ssl_password callback runs during the build and can open a connection.
-_SHARED_SSL_CONTEXTS_LOCK = threading.RLock()
+_SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
 
 
 def _reset_shared_ssl_contexts_lock() -> None:
     # A fork while another thread builds a context would leave the child with a lock
     # that nothing can release.
     global _SHARED_SSL_CONTEXTS_LOCK
-    _SHARED_SSL_CONTEXTS_LOCK = threading.RLock()
+    _SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -111,13 +110,17 @@ def get_shared_ssl_context(
         # An unhashable setting, such as ssl_ca_data given as a bytearray or a
         # writable memoryview
         return build()
-    # Held across the build: a socket keeps the context it was wrapped with, so a
-    # second build for the same key would stay in memory as long as that socket.
     with _SHARED_SSL_CONTEXTS_LOCK:
         context = _SHARED_SSL_CONTEXTS.get(key)
-        if context is None:
-            context = build()
-            _SHARED_SSL_CONTEXTS[key] = context
+    if context is None:
+        # Built outside the lock, so a slow CA load or ssl_password callback does not
+        # stall other connects. A build that loses the race is dropped before any
+        # socket wraps it.
+        built = build()
+        with _SHARED_SSL_CONTEXTS_LOCK:
+            context = _SHARED_SSL_CONTEXTS.get(key)
+            if context is None:
+                context = _SHARED_SSL_CONTEXTS[key] = built
     return context
 
 

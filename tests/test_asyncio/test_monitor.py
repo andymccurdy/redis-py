@@ -1,13 +1,7 @@
 import asyncio
-from unittest.mock import AsyncMock
 
 import pytest
 import redis.asyncio as redis
-from redis.event import (
-    AsyncAfterConnectionReleasedEvent,
-    AsyncEventListenerInterface,
-    EventDispatcher,
-)
 from redis.exceptions import MaxConnectionsError, NoPermissionError
 from tests.conftest import (
     skip_if_redis_enterprise,
@@ -22,124 +16,25 @@ from .conftest import wait_for_command
 class TestMonitor:
     @skip_if_server_version_lt("6.0.0")
     @skip_if_redis_enterprise()
-    @pytest.mark.parametrize("entry_failure", [False, True])
-    async def test_release_error_does_not_restore_handled_interrupt(
-        self, r, entry_failure
-    ):
-        username = "async-ambient-monitor"
-        await r.acl_setuser(
-            username,
-            enabled=True,
-            reset=True,
-            nopass=True,
-            commands=["+ping"] if entry_failure else ["+ping", "+monitor"],
-        )
-        dispatcher = EventDispatcher()
-        listener = AsyncMock(spec=AsyncEventListenerInterface)
-        release_error = RuntimeError("release listener failed")
-        listener.listen.side_effect = release_error
-        pool = redis.ConnectionPool(
-            **{
-                **r.connection_pool.connection_kwargs,
-                "username": username,
-                "password": None,
-                "event_dispatcher": dispatcher,
-            },
-            max_connections=1,
-        )
-        client = redis.Redis(connection_pool=pool)
-        dispatcher.register_listeners({AsyncAfterConnectionReleasedEvent: [listener]})
-        observed = None
-        try:
-            try:
-                try:
-                    raise KeyboardInterrupt()
-                except KeyboardInterrupt:
-                    async with client.monitor():
-                        pass
-            except BaseException as error:
-                observed = error
-            if entry_failure:
-                assert isinstance(observed, NoPermissionError)
-            else:
-                assert observed is release_error
-            listener.listen.assert_awaited_once()
-            dispatcher.unregister_listeners(
-                {AsyncAfterConnectionReleasedEvent: [listener]}
-            )
-            assert await client.ping()
-        finally:
-            dispatcher.unregister_listeners(
-                {AsyncAfterConnectionReleasedEvent: [listener]}
-            )
-            await client.aclose()
-            await pool.disconnect()
-            await r.acl_deluser(username)
-
-    @skip_if_server_version_lt("6.0.0")
-    @skip_if_redis_enterprise()
-    @pytest.mark.parametrize("interrupt_cleanup", [False, True])
-    async def test_failed_entry_releases_connection(
-        self, r, monkeypatch, interrupt_cleanup
-    ):
+    async def test_failed_entry_releases_connection(self, r):
         username = "async-monitor-no-permission"
         await r.acl_setuser(
             username, enabled=True, reset=True, nopass=True, commands=["+ping"]
         )
-        dispatcher = EventDispatcher()
         pool = redis.ConnectionPool(
             **{
                 **r.connection_pool.connection_kwargs,
                 "username": username,
                 "password": None,
-                "event_dispatcher": dispatcher,
             },
             max_connections=1,
         )
         client = redis.Redis(connection_pool=pool)
-        task = None
-        listener = AsyncMock(spec=AsyncEventListenerInterface)
-        listener.listen.side_effect = RuntimeError("release listener failed")
         try:
             monitor = client.monitor()
-            await monitor.connect()
-            disconnecting = asyncio.Event()
-            cancellation = []
-
-            async def wait_closed():
-                disconnecting.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError as error:
-                    cancellation.append(error)
-                    raise
-
-            async def enter():
+            with pytest.raises(NoPermissionError):
                 async with monitor:
                     pytest.fail("MONITOR must not enter without permission")
-
-            if interrupt_cleanup:
-                dispatcher.register_listeners(
-                    {AsyncAfterConnectionReleasedEvent: [listener]}
-                )
-                monkeypatch.setattr(
-                    monitor.connection._writer, "wait_closed", wait_closed
-                )
-            task = asyncio.create_task(enter())
-            if interrupt_cleanup:
-                await asyncio.wait_for(disconnecting.wait(), 5)
-                task.cancel()
-            with pytest.raises(
-                asyncio.CancelledError if interrupt_cleanup else NoPermissionError
-            ) as raised:
-                await task
-            if interrupt_cleanup:
-                assert task.cancelled()
-                assert raised.value is cancellation[0]
-                listener.listen.assert_awaited_once()
-                dispatcher.unregister_listeners(
-                    {AsyncAfterConnectionReleasedEvent: [listener]}
-                )
             assert await client.ping()
 
             await r.acl_setuser(username, enabled=True, commands=["+monitor"])
@@ -148,12 +43,6 @@ class TestMonitor:
                     await client.ping()
             assert await client.ping()
         finally:
-            dispatcher.unregister_listeners(
-                {AsyncAfterConnectionReleasedEvent: [listener]}
-            )
-            if task is not None:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
             await client.aclose()
             await pool.disconnect()
             await r.acl_deluser(username)

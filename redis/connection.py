@@ -2080,6 +2080,8 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # Checkout and peer invalidation drains share this connection's lock.
         # Release keeps _in_use set through the last socket access.
         self._in_use_lock = threading.Lock()
+        self._idle_maintenance_done = threading.Condition(self._in_use_lock)
+        self._idle_maintenance = False
         self._in_use = True
         self._busy_cache_deadline = 0.0
         self._cache = cache
@@ -2329,9 +2331,15 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # two connections draining each other.
             owner = candidate.connection_ref
             can_serve = False
-            if isinstance(owner, CacheProxyConnection):
+            # A cache shared across pools can retain owners from before a fork.
+            # Their locks may have been held by threads that do not exist here.
+            if isinstance(owner, CacheProxyConnection) and owner.pid == self.pid:
                 with owner._in_use_lock:
-                    if owner is self or not owner._in_use:
+                    if not owner._conn.is_connected:
+                        # Pool disconnect may have closed this owner while we
+                        # waited. can_read() would reconnect its raw connection.
+                        pass
+                    elif owner is self or not owner._in_use:
                         self._drain_invalidations(owner._conn)
                         can_serve = True
                     elif time.monotonic() < owner._busy_cache_deadline:
@@ -2679,9 +2687,32 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             if self._in_use:
                 return False
             self._in_use = True
+            self._idle_maintenance = True
             return True
         finally:
             self._in_use_lock.release()
+
+    def _release_idle(self):
+        with self._in_use_lock:
+            self._in_use = False
+            self._idle_maintenance = False
+            self._idle_maintenance_done.notify_all()
+
+    def _acquire(self):
+        with self._in_use_lock:
+            # BlockingConnectionPool can dequeue a connection while a pool
+            # maintenance operation owns it. Wait without holding the pool lock.
+            while self._idle_maintenance:
+                self._idle_maintenance_done.wait()
+            self._in_use = True
+
+    def _disconnect_from_pool(self, inuse_connections):
+        # Called outside the pool lock: a drain can dispatch MOVING and need it.
+        with self._in_use_lock:
+            while self._idle_maintenance:
+                self._idle_maintenance_done.wait()
+            if inuse_connections or not self._in_use:
+                self.disconnect()
 
     def re_auth(self):
         self._conn.re_auth()
@@ -3819,7 +3850,7 @@ class MaintNotificationsAbstractConnectionPool:
                         conn.disconnect()
                     finally:
                         if cached:
-                            conn._in_use = False
+                            conn._release_idle()
 
 
 class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInterface):
@@ -4244,8 +4275,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
         if isinstance(connection, CacheProxyConnection):
             # Wait only for this connection's drain, without holding the pool lock.
-            with connection._in_use_lock:
-                connection._in_use = True
+            connection._acquire()
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4415,6 +4445,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         connections that are idle in the pool.
         """
         self._checkpid()
+        cached_connections = []
         with self._lock:
             if inuse_connections:
                 connections = chain(
@@ -4424,7 +4455,13 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 connections = self._available_connections
 
             for connection in connections:
-                connection.disconnect()
+                if isinstance(connection, CacheProxyConnection):
+                    cached_connections.append(connection)
+                else:
+                    connection.disconnect()
+
+        for connection in cached_connections:
+            connection._disconnect_from_pool(inuse_connections)
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
@@ -4475,7 +4512,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                         first_error = e
                 finally:
                     if cached:
-                        conn._in_use = False
+                        conn._release_idle()
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
         if first_error is not None:
@@ -4762,8 +4799,7 @@ class BlockingConnectionPool(ConnectionPool):
 
         if isinstance(connection, CacheProxyConnection):
             # Join this connection's drain before connect/can_read uses the socket.
-            with connection._in_use_lock:
-                connection._in_use = True
+            connection._acquire()
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4881,6 +4917,7 @@ class BlockingConnectionPool(ConnectionPool):
         Disconnects either all connections in the pool or just the free connections.
         """
         self._checkpid()
+        cached_connections = []
         try:
             if self._in_maintenance:
                 self._lock.acquire()
@@ -4892,7 +4929,10 @@ class BlockingConnectionPool(ConnectionPool):
                 connections = self._get_free_connections()
 
             for connection in connections:
-                connection.disconnect()
+                if isinstance(connection, CacheProxyConnection):
+                    cached_connections.append(connection)
+                else:
+                    connection.disconnect()
         finally:
             if self._locked:
                 try:
@@ -4900,6 +4940,9 @@ class BlockingConnectionPool(ConnectionPool):
                 except Exception:
                     pass
                 self._locked = False
+
+        for connection in cached_connections:
+            connection._disconnect_from_pool(inuse_connections)
 
     def _get_free_connections(self):
         with self._lock:

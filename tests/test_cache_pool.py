@@ -1,3 +1,4 @@
+import multiprocessing
 import threading
 import time
 import uuid
@@ -36,6 +37,348 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    def test_concurrent_owner_invalidations_remove_shared_entries(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owners = [pool.get_connection() for _ in range(2)]
+        borrowers = [pool.get_connection() for _ in range(2)]
+        commands = ["GET", "STRLEN"]
+        for owner, command, value in zip(owners, commands, [b"old", 3]):
+            owner.send_command(command, key, keys=[key])
+            assert owner.read_response() == value
+            pool.release(owner)
+        r2.set(key, "new-value")
+        for owner in owners:
+            assert owner._conn.can_read(timeout=1)
+
+        entries = pool.cache.collection
+        real_lock, real_holders = entries._lock, entries.holders_of
+        real_invalidate = pool.cache.delete_by_redis_keys
+        snapshot, finish, attempted, unblocked, second_done = (
+            threading.Event() for _ in range(5)
+        )
+        errors, callback_errors, replies = [], [], [None, None]
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread() is second and not attempted.is_set():
+                    acquired = real_lock.acquire(blocking=False)
+                    if acquired:
+                        unblocked.set()
+                    attempted.set()
+                    if acquired:
+                        return self
+                real_lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                real_lock.release()
+
+        def holders(redis_key):
+            result = real_holders(redis_key)
+            if result and threading.current_thread() is first and not snapshot.is_set():
+                snapshot.set()
+                assert finish.wait(5)
+            return result
+
+        def invalidate(redis_keys):
+            try:
+                return real_invalidate(redis_keys)
+            except Exception as exc:
+                # The parser logs callback errors and continues the read, so
+                # check that the invalidation itself completed as well.
+                callback_errors.append(exc)
+                raise
+
+        def read(index):
+            try:
+                borrowers[index].send_command(commands[index], key, keys=[key])
+                replies[index] = borrowers[index].read_response()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if index == 1:
+                    second_done.set()
+
+        first = threading.Thread(target=read, args=(0,), daemon=True)
+        second = threading.Thread(target=read, args=(1,), daemon=True)
+        try:
+            with (
+                patch.object(entries, "_lock", ObservedLock()),
+                patch.object(entries, "holders_of", side_effect=holders),
+                patch.object(
+                    pool.cache, "delete_by_redis_keys", side_effect=invalidate
+                ),
+            ):
+                first.start()
+                assert snapshot.wait(3)
+                second.start()
+                assert attempted.wait(3)
+                # If the second invalidation can mutate the snapshot, finish it
+                # first. Otherwise let the first atomic invalidation complete.
+                if unblocked.is_set():
+                    assert second_done.wait(3)
+                finish.set()
+                first.join(3)
+                second.join(3)
+                assert not first.is_alive() and not second.is_alive()
+                assert not errors
+                assert not callback_errors
+                assert replies == [b"new-value", 9]
+        finally:
+            finish.set()
+            for thread in [first, second]:
+                if thread.ident is not None:
+                    thread.join(5)
+            for borrower in borrowers:
+                pool.release(borrower)
+
+    @pytest.mark.skipif(
+        "fork" not in multiprocessing.get_all_start_methods(),
+        reason="requires fork",
+    )
+    def test_fork_does_not_wait_for_inherited_owner_drain(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = peers.get_connection()
+        borrower = pool.get_connection()
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        peers.release(owner)
+        draining, finish = threading.Event(), threading.Event()
+        errors = []
+        real_can_read = owner._conn.can_read
+        context = multiprocessing.get_context("fork")
+        parent, child = context.Pipe()
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                draining.set()
+                assert finish.wait(10)
+            return real_can_read(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        def read_in_child():
+            try:
+                child.send(Redis(connection_pool=pool).get(key))
+            except BaseException as exc:
+                child.send(repr(exc))
+            finally:
+                child.close()
+
+        reader = threading.Thread(target=read, daemon=True)
+        process = context.Process(target=read_in_child)
+        try:
+            with patch.object(owner._conn, "can_read", side_effect=can_read):
+                reader.start()
+                assert draining.wait(3)
+                process.start()
+                assert parent.poll(3), "child waited on an inherited drain lock"
+                assert parent.recv() == b"value"
+                process.join(3)
+                assert process.exitcode == 0
+                finish.set()
+                reader.join(3)
+                assert not reader.is_alive() and not errors
+        finally:
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(5)
+            finish.set()
+            if reader.ident is not None:
+                reader.join(5)
+            parent.close()
+            child.close()
+            pool.release(borrower)
+            peers.disconnect()
+
+    def test_checkout_waits_for_idle_maintenance(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner = pool.get_connection()
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        maintaining, finish, attempted = (threading.Event() for _ in range(3))
+        errors, acquired = [], []
+        real_disconnect, real_ensure = owner.disconnect, pool.ensure_connection
+        real_get = pool.get_connection
+
+        def disconnect(*args, **kwargs):
+            maintaining.set()
+            assert finish.wait(5)
+            return real_disconnect(*args, **kwargs)
+
+        def ensure(connection):
+            assert finish.is_set(), "checkout used a socket during idle maintenance"
+            return real_ensure(connection)
+
+        def maintain():
+            try:
+                pool.disconnect_free_connections()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def checkout():
+            attempted.set()
+            try:
+                acquired.append(real_get())
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=maintain, daemon=True)
+        checkout_thread = threading.Thread(target=checkout, daemon=True)
+        try:
+            with (
+                patch.object(owner, "disconnect", side_effect=disconnect),
+                patch.object(pool, "ensure_connection", side_effect=ensure),
+            ):
+                worker.start()
+                assert maintaining.wait(3)
+                checkout_thread.start()
+                assert attempted.wait(3)
+                # Leave the maintenance socket operation suspended until checkout
+                # has either reached its wait or exposed an overlap.
+                checkout_thread.join(0.1)
+                finish.set()
+                worker.join(3)
+                checkout_thread.join(3)
+                assert not worker.is_alive() and not checkout_thread.is_alive()
+                assert not errors
+                assert acquired == [owner]
+                assert owner._in_use
+                owner.send_command("PING")
+                assert owner.read_response() == b"PONG"
+        finally:
+            finish.set()
+            for thread in [worker, checkout_thread]:
+                if thread.ident is not None:
+                    thread.join(5)
+            for connection in acquired:
+                pool.release(connection)
+
+    @pytest.mark.parametrize("inuse_connections", [False, True])
+    def test_pool_disconnect_joins_idle_owner_drain(self, pool, r2, inuse_connections):
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        draining, finish, attempted = (threading.Event() for _ in range(3))
+        errors = []
+        real_can_read, real_disconnect = owner._conn.can_read, owner.disconnect
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                draining.set()
+                assert finish.wait(5)
+                # A drain can dispatch maintenance that needs the pool lock.
+                with pool._lock:
+                    pass
+            return real_can_read(*args, **kwargs)
+
+        def disconnect(*args, **kwargs):
+            assert finish.is_set(), "pool closed a socket during its idle drain"
+            return real_disconnect(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        def close():
+            attempted.set()
+            try:
+                pool.disconnect(inuse_connections=inuse_connections)
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        closer = threading.Thread(target=close, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                closer.start()
+                assert attempted.wait(3)
+                closer.join(0.1)
+                finish.set()
+                reader.join(3)
+                closer.join(3)
+                assert not reader.is_alive() and not closer.is_alive()
+                assert not errors
+                assert not owner.is_connected
+        finally:
+            finish.set()
+            for thread in [reader, closer]:
+                if thread.ident is not None:
+                    thread.join(5)
+            peers.release(borrower)
+            peers.disconnect()
+
+    def test_cached_candidate_does_not_reconnect_disconnected_owner(self, pool, r2):
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        found, finish = threading.Event(), threading.Event()
+        errors, replies = [], []
+        real_get = pool.cache.get
+
+        def get(cache_key):
+            entry = real_get(cache_key)
+            if threading.current_thread() is reader and not found.is_set():
+                assert entry is not None and entry.connection_ref is owner
+                found.set()
+                assert finish.wait(5)
+            return entry
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                replies.append(borrower.read_response())
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        try:
+            with patch.object(pool.cache, "get", side_effect=get):
+                reader.start()
+                assert found.wait(3)
+                pool.disconnect()
+                assert not owner.is_connected
+                finish.set()
+                reader.join(3)
+                assert not reader.is_alive() and not errors
+                assert replies == [b"value"]
+                assert not owner.is_connected
+        finally:
+            finish.set()
+            if reader.ident is not None:
+                reader.join(5)
+            peers.release(borrower)
+            peers.disconnect()
+
     @pytest.fixture
     def pool(self, request, pool_class, parser_class, tracking_mode):
         config = CacheConfig(

@@ -2560,6 +2560,27 @@ class TestPubSubAcloseCancellation:
         assert not leased.is_connected
         assert len(pool._in_use_connections) == in_use_before
 
+    async def test_teardown_failure_after_cancel_is_logged(
+        self, r: redis.Redis, caplog
+    ):
+        # A teardown that fails while the caller is cancelled must not be
+        # swallowed silently behind the CancelledError.
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        started = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failing_disconnect(*_args, **_kwargs):
+            started.set()
+            await resume.wait()
+            raise RuntimeError("disconnect failed")
+
+        with mock.patch.object(leased, "disconnect", side_effect=failing_disconnect):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+        assert "PubSub teardown failed after a cancellation" in caplog.text
+        await p.aclose()  # clean up the connection the failed teardown kept
+
 
 class TestClusterPubSubResubscribe:
     """

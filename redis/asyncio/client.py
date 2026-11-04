@@ -1266,8 +1266,11 @@ class PubSub:
                     await asyncio.wait({teardown})
                 except asyncio.CancelledError:
                     pass  # e.g. anyio re-cancels on every await
-            if not teardown.cancelled():
-                teardown.exception()
+            if not teardown.cancelled() and teardown.exception() is not None:
+                logger.warning(
+                    "PubSub teardown failed after a cancellation",
+                    exc_info=teardown.exception(),
+                )
             raise
 
     async def _aclose(self) -> None:

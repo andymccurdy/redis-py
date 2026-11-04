@@ -4884,6 +4884,38 @@ def test_ssl_context_keeps_certificate_file_roles_apart(tmp_path):
 
 
 @pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
+def test_ssl_context_with_callable_password_does_not_keep_its_owner_alive():
+    class Owner:
+        def __init__(self):
+            self.conn = SSLConnection(
+                ssl_cert_reqs="none",
+                ssl_certfile="client.crt",
+                ssl_password=self.password,
+            )
+
+        def password(self):
+            return "password"
+
+    def wrap_socket(context, sock, **kwargs):
+        return types.SimpleNamespace(context=context, settimeout=lambda timeout: None)
+
+    owner = Owner()
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            owner.conn._sock = owner.conn._wrap_socket_with_ssl(MagicMock())
+    owner_ref = weakref.ref(owner)
+
+    del owner
+    gc.collect()
+
+    assert owner_ref() is None
+
+
+@pytest.mark.fixed_client
 @pytest.mark.parametrize("ca_data", [bytearray(b"ca"), memoryview(bytearray(b"ca"))])
 def test_ssl_context_with_unhashable_ca_data_is_not_shared(ca_data):
     conn = SSLConnection(ssl_cert_reqs="none", ssl_ca_data=ca_data)

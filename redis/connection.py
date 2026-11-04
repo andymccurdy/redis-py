@@ -2994,21 +2994,26 @@ class SSLConnection(Connection):
         Returns:
             An SSL wrapped socket.
         """
-        context = get_shared_ssl_context(
-            self._build_ssl_context,
-            (
-                type(self),
-                self.cert_reqs,
-                self.check_hostname,
-                tuple(self.ssl_include_verify_flags or ()),
-                tuple(self.ssl_exclude_verify_flags or ()),
-                self.certificate_password,
-                self.ca_data,
-                self.ssl_min_version,
-                self.ssl_ciphers,
-            ),
-            (self.certfile, self.keyfile, self.ca_certs, self.ca_path),
-        )
+        if callable(self.certificate_password):
+            # Not shared: the cache key would hold the callback and, through it,
+            # whatever owns this connection, so the context could not be freed.
+            context = self._build_ssl_context()
+        else:
+            context = get_shared_ssl_context(
+                self._build_ssl_context,
+                (
+                    type(self),
+                    self.cert_reqs,
+                    self.check_hostname,
+                    tuple(self.ssl_include_verify_flags or ()),
+                    tuple(self.ssl_exclude_verify_flags or ()),
+                    self.certificate_password,
+                    self.ca_data,
+                    self.ssl_min_version,
+                    self.ssl_ciphers,
+                ),
+                (self.certfile, self.keyfile, self.ca_certs, self.ca_path),
+            )
         if self.ssl_validate_ocsp is True and CRYPTOGRAPHY_AVAILABLE is False:
             raise RedisError("cryptography is not installed.")
 

@@ -1965,21 +1965,26 @@ class RedisSSLContext:
 
     def get(self) -> SSLContext:
         if not self.context:
-            self.context = get_shared_ssl_context(
-                self._build,
-                (
-                    type(self),
-                    self.cert_reqs,
-                    self.check_hostname,
-                    tuple(self.include_verify_flags or ()),
-                    tuple(self.exclude_verify_flags or ()),
-                    self.password,
-                    self.ca_data,
-                    self.min_version,
-                    self.ciphers,
-                ),
-                (self.certfile, self.keyfile, self.ca_certs, self.ca_path),
-            )
+            if callable(self.password):
+                # Not shared: the cache key would hold the callback and, through it,
+                # whatever owns this connection, so the context could not be freed.
+                self.context = self._build()
+            else:
+                self.context = get_shared_ssl_context(
+                    self._build,
+                    (
+                        type(self),
+                        self.cert_reqs,
+                        self.check_hostname,
+                        tuple(self.include_verify_flags or ()),
+                        tuple(self.exclude_verify_flags or ()),
+                        self.password,
+                        self.ca_data,
+                        self.min_version,
+                        self.ciphers,
+                    ),
+                    (self.certfile, self.keyfile, self.ca_certs, self.ca_path),
+                )
         return self.context
 
 

@@ -4069,6 +4069,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # A parent thread may have held the lock at fork time, and the
             # handler reset below takes it to revert an active MOVING.
             self._lock = threading.RLock()
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Record metrics for connections being removed before clearing
         # (only if attributes exist - they won't during __init__)
@@ -4542,6 +4547,11 @@ class BlockingConnectionPool(ConnectionPool):
             # lock and leak it.
             self._in_maintenance = False
             self._locked = False
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Create and fill up a thread safe queue with ``None`` values.
         try:

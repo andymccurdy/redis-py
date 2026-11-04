@@ -1,11 +1,86 @@
+import asyncio
+
 import pytest
-from tests.conftest import skip_if_redis_enterprise, skip_ifnot_redis_enterprise
+import redis.asyncio as redis
+from redis.exceptions import MaxConnectionsError, NoPermissionError
+from tests.conftest import (
+    skip_if_redis_enterprise,
+    skip_ifnot_redis_enterprise,
+    skip_if_server_version_lt,
+)
 
 from .conftest import wait_for_command
 
 
 @pytest.mark.onlynoncluster
 class TestMonitor:
+    @skip_if_server_version_lt("6.0.0")
+    @skip_if_redis_enterprise()
+    async def test_failed_entry_releases_connection(self, r):
+        username = "async-monitor-no-permission"
+        await r.acl_setuser(
+            username, enabled=True, reset=True, nopass=True, commands=["+ping"]
+        )
+        pool = redis.ConnectionPool(
+            **{
+                **r.connection_pool.connection_kwargs,
+                "username": username,
+                "password": None,
+            },
+            max_connections=1,
+        )
+        client = redis.Redis(connection_pool=pool)
+        try:
+            monitor = client.monitor()
+            with pytest.raises(NoPermissionError):
+                async with monitor:
+                    pytest.fail("MONITOR must not enter without permission")
+            assert await client.ping()
+
+            await r.acl_setuser(username, enabled=True, commands=["+monitor"])
+            async with monitor:
+                with pytest.raises(MaxConnectionsError):
+                    await client.ping()
+            assert await client.ping()
+        finally:
+            await client.aclose()
+            await pool.disconnect()
+            await r.acl_deluser(username)
+
+    async def test_cancelled_entry_releases_connection(self, r, monkeypatch):
+        pool = redis.ConnectionPool(
+            **r.connection_pool.connection_kwargs, max_connections=1
+        )
+        client = redis.Redis(connection_pool=pool)
+        monitor = client.monitor()
+        await monitor.connect()
+        connection = monitor.connection
+        reading = asyncio.Event()
+        read_response = connection.read_response
+
+        async def wait_for_response(*args, **kwargs):
+            # MONITOR was sent on the real connection; hold its reply for cancellation.
+            reading.set()
+            await asyncio.Event().wait()
+            return await read_response(*args, **kwargs)
+
+        monkeypatch.setattr(connection, "read_response", wait_for_response)
+        task = asyncio.create_task(monitor.__aenter__())
+        try:
+            await asyncio.wait_for(reading.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            monkeypatch.setattr(connection, "read_response", read_response)
+            assert await client.ping()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            monkeypatch.setattr(connection, "read_response", read_response)
+            await monitor.__aexit__()
+            await client.aclose()
+            await pool.disconnect()
+
     async def test_wait_command_not_found(self, r):
         """Make sure the wait_for_command func works when command is not found"""
         async with r.monitor() as m:

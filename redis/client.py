@@ -1111,12 +1111,26 @@ class Monitor:
         self.connection = self.connection_pool.get_connection()
 
     def __enter__(self):
-        self._start_monitor()
+        if self.connection is None:
+            self.connection = self.connection_pool.get_connection()
+        try:
+            self._start_monitor()
+        except BaseException:
+            try:
+                self.__exit__()
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):
-        self.connection.disconnect()
-        self.connection_pool.release(self.connection)
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            connection.disconnect()
+        finally:
+            self.connection_pool.release(connection)
 
     def next_command(self):
         """Parse the response from a monitor command"""

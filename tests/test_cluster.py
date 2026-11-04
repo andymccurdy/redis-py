@@ -3945,6 +3945,35 @@ def _sent_commands(fail=None):
 
 
 @contextmanager
+def _pipelined_commands(fail=None):
+    """
+    Record the commands of each pipelined write the cluster client makes to a node - one
+    round trip - still sending them to the server.
+
+    ``fail(args)`` may return an error for a command to answer with instead of sending it,
+    which leaves that command for the pipeline to retry on its own.
+    """
+    batches = []
+    write = redis.cluster.NodeCommands.write
+
+    def record(self):
+        held = []
+        for c in self.commands:
+            error = fail(c.args) if fail is not None else None
+            if error is not None:
+                c.result = error
+                held.append(c)
+        self.commands = [c for c in self.commands if c not in held]
+        batches.append([(c.args, c.options) for c in self.commands])
+        if self.commands:
+            write(self)
+        self.commands.extend(held)
+
+    with patch.object(redis.cluster.NodeCommands, "write", record):
+        yield batches
+
+
+@contextmanager
 def _busy_node(node, *command):
     """
     Keep ``node`` busy running ``command`` - a looping script or function - until a KILL stops
@@ -4271,11 +4300,12 @@ class TestMultiShardRequests:
         keys = _keys_on_every_shard(r, "sum")
         r.mset_nonatomic({key: 1 for key in keys})
 
-        with _sent_commands() as sent:
+        with _pipelined_commands() as batches, _sent_commands() as sent:
             assert r.execute_command("EXISTS", *keys, keys[0] + "missing") == len(keys)
             assert r.execute_command("TOUCH", *keys) == len(keys)
 
-        assert len(sent) == 2 * len(keys)
+        assert sum(len(batch) for batch in batches) == 2 * len(keys)
+        assert not sent
 
     def test_the_shipped_records_keep_mget_unsplit(self, r):
         """MGET documents that keys in different slots raise on a cluster."""
@@ -4292,11 +4322,11 @@ class TestMultiShardRequests:
         assert r.keyslot(first) == r.keyslot(first + "x")
         r.mset_nonatomic({key: key for key in keys})
 
-        with _sent_commands() as sent:
+        with _pipelined_commands() as batches:
             values = r.execute_command("MGET", *keys, keys=keys)
 
         assert [str_if_bytes(value) for value in values] == keys
-        assert [(args, kwargs) for _, args, kwargs in sent] == [
+        assert [command for batch in batches for command in batch] == [
             (("MGET", first, first + "x"), {"keys": [first, first + "x"]}),
             (("MGET", second), {"keys": [second]}),
             (("MGET", third), {"keys": [third]}),
@@ -4335,7 +4365,26 @@ class TestMultiShardRequests:
         with pytest.raises(RedisClusterException, match="same key slot"):
             r.execute_command("MSETEX", 2, first, "a", second, "b")
 
-    def test_a_retry_resends_only_the_slots_that_failed(self, r, monkeypatch):
+    def test_a_split_command_costs_one_round_trip_per_node(self, r):
+        """Each node is sent the commands of all its slots in one pipelined write."""
+        keys = [f"{{trip{index}}}key" for index in range(60)]
+        r.mset_nonatomic({key: 1 for key in keys})
+        nodes = {r.get_node_from_key(key).name for key in keys}
+        assert len({r.keyslot(key) for key in keys}) > len(nodes)
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert len(batches) == len(nodes)
+        assert sum(len(batch) for batch in batches) == len(
+            {r.keyslot(key) for key in keys}
+        )
+        assert not sent
+
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
+    def test_a_retry_resends_only_the_slots_that_failed(self, r, monkeypatch, error):
         """
         A slot that already succeeded is not sent again: the resent DEL would find its keys
         gone and the summed count would be wrong.
@@ -4345,16 +4394,23 @@ class TestMultiShardRequests:
         r.mset_nonatomic({key: 1 for key in keys})
         failed = []
 
-        def fail(node, args):
-            if args[1] == keys[-1] and not failed:
-                failed.append(args[1])
-                return ConnectionError("lost")
+        def fail(args):
+            if args == ("DEL", keys[-1]) and not failed:
+                failed.append(args)
+                return error
             return None
 
-        with _sent_commands(fail) as sent:
+        with _pipelined_commands(fail) as batches, _sent_commands() as sent:
             assert r.execute_command("DEL", *keys) == len(keys)
 
-        assert [args[1] for _, args, _ in sent] == [*keys, keys[-1]]
+        assert failed
+        # The failed slot reached the server only on the retry, and no other slot twice
+        assert sorted(
+            [
+                *(args for batch in batches for args, _ in batch),
+                *(args for _, args, _ in sent),
+            ]
+        ) == sorted(("DEL", key) for key in keys)
         assert r.exists(*keys) == 0
 
     def test_a_pipeline_merges_a_split_command_per_slot(self, r, monkeypatch):

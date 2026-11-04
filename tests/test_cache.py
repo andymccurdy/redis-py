@@ -1480,6 +1480,40 @@ class TestClusterCache:
         indirect=True,
     )
     @pytest.mark.onlycluster
+    def test_a_split_command_caches_each_slot_s_reply(self, r):
+        """
+        A pipeline never reads the cache, so with a cache the slots of a split MULTI_SHARD
+        command are sent on their own, each cached under its own keys.
+        """
+        cache = r.nodes_manager.get_node_from_slot(12000).redis_connection.get_cache()
+        # A connection's first reconnect empties the cache - see
+        # ``test_topology_refresh_keeps_cached_entries`` - so use every node once first.
+        r.ping(target_nodes=r.ALL_NODES)
+        keys = ["{a}foo", "{b}foo"]
+        assert r.keyslot(keys[0]) != r.keyslot(keys[1])
+        r.set(keys[0], 1)
+
+        assert r.execute_command("EXISTS", *keys, keys=keys) == 1
+
+        for key in keys:
+            assert (
+                cache.get(
+                    CacheKey(
+                        command="EXISTS", redis_keys=(key,), redis_args=("EXISTS", key)
+                    )
+                )
+                is not None
+            )
+        with patch.object(redis.cluster.NodeCommands, "write") as write:
+            assert r.execute_command("EXISTS", *keys, keys=keys) == 1
+        write.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "r",
+        [{"cache": DefaultCache(CacheConfig(max_size=128))}],
+        indirect=True,
+    )
+    @pytest.mark.onlycluster
     def test_topology_refresh_keeps_cached_entries(self, r):
         """
         The cache is shared by every node pool and is emptied whenever one of

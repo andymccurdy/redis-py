@@ -8,7 +8,18 @@ import platform
 import ssl
 import warnings
 import weakref
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Type, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 from unittest import mock
 from urllib.parse import urlparse
 
@@ -5624,6 +5635,30 @@ def _sent_commands(
         yield sent
 
 
+@contextlib.contextmanager
+def _pipelined_commands(
+    fail: Optional[Callable[[tuple], Optional[Exception]]] = None,
+):
+    """Async mirror of ``tests.test_cluster._pipelined_commands``."""
+    batches: List[List[Tuple[tuple, Dict[str, Any]]]] = []
+    execute_pipeline = ClusterNode.execute_pipeline
+
+    async def record(self: ClusterNode, commands: List[Any]) -> bool:
+        held = []
+        for c in commands:
+            error = fail(c.args) if fail is not None else None
+            if error is not None:
+                c.result = error
+                held.append(c)
+        rest = [c for c in commands if c not in held]
+        batches.append([(c.args, c.kwargs) for c in rest])
+        ret = await execute_pipeline(self, rest) if rest else False
+        return ret or bool(held)
+
+    with mock.patch.object(ClusterNode, "execute_pipeline", record):
+        yield batches
+
+
 @pytest.mark.onlycluster
 @skip_if_server_version_lt("8.0.0")
 @skip_if_redis_enterprise()
@@ -5869,13 +5904,14 @@ class TestMultiShardRequests:
         keys = _keys_on_every_shard(r, "sum")
         await r.mset_nonatomic({key: 1 for key in keys})
 
-        with _sent_commands() as sent:
+        with _pipelined_commands() as batches, _sent_commands() as sent:
             assert await r.execute_command("EXISTS", *keys, keys[0] + "missing") == len(
                 keys
             )
             assert await r.execute_command("TOUCH", *keys) == len(keys)
 
-        assert len(sent) == 2 * len(keys)
+        assert sum(len(batch) for batch in batches) == 2 * len(keys)
+        assert not sent
 
     async def test_the_shipped_records_keep_mget_unsplit(self, r: RedisCluster) -> None:
         with pytest.raises(RedisClusterException, match="same key slot"):
@@ -5890,11 +5926,13 @@ class TestMultiShardRequests:
         assert r.keyslot(first) == r.keyslot(first + "x")
         await r.mset_nonatomic({key: key for key in keys})
 
-        with _sent_commands() as sent:
+        with _pipelined_commands() as batches:
             values = await r.execute_command("MGET", *keys, keys=keys)
 
         assert [str_if_bytes(value) for value in values] == keys
-        assert sorted((args, kwargs["keys"]) for _, args, kwargs in sent) == sorted(
+        assert sorted(
+            (args, kwargs["keys"]) for batch in batches for args, kwargs in batch
+        ) == sorted(
             [
                 (("MGET", first, first + "x"), [first, first + "x"]),
                 (("MGET", second), [second]),
@@ -5934,32 +5972,43 @@ class TestMultiShardRequests:
         with pytest.raises(RedisClusterException, match="same key slot"):
             await r.execute_command("MSETEX", 2, first, "a", second, "b")
 
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
     async def test_a_retry_resends_only_the_slots_that_failed(
-        self, r: RedisCluster, monkeypatch
+        self, r: RedisCluster, monkeypatch, error: Exception
     ) -> None:
         await _route_by_live_tips(r, monkeypatch)
         keys = _keys_on_every_shard(r, "retry")
         await r.mset_nonatomic({key: 1 for key in keys})
-        failed: List[str] = []
+        failed: List[tuple] = []
 
-        def fail(node: ClusterNode, args: tuple) -> Optional[Exception]:
-            if args[1] == keys[-1] and not failed:
-                failed.append(args[1])
-                return ConnectionError("lost")
+        def fail(args: tuple) -> Optional[Exception]:
+            if args == ("DEL", keys[-1]) and not failed:
+                failed.append(args)
+                return error
             return None
 
-        with _sent_commands(fail) as sent:
+        with _pipelined_commands(fail) as batches, _sent_commands() as sent:
             assert await r.execute_command("DEL", *keys) == len(keys)
 
-        assert sorted(args[1] for _, args, _ in sent) == sorted([*keys, keys[-1]])
+        assert failed
+        # The failed slot reached the server only on the retry, and no other slot twice
+        assert sorted(
+            [
+                *(args for batch in batches for args, _ in batch),
+                *(args for _, args, _ in sent),
+            ]
+        ) == sorted(("DEL", key) for key in keys)
         assert await r.exists(*keys) == 0
 
-    async def test_a_split_command_holds_one_connection_per_node(
+    async def test_a_split_command_costs_one_round_trip_per_node(
         self, r: RedisCluster, monkeypatch
     ) -> None:
         """
-        Each node is sent its slots one at a time, so keys over more slots than a node has
-        connections do not exhaust its pool with ``MaxConnectionsError``.
+        Each node is sent the commands of all its slots in one pipelined write, on one
+        connection, so keys over more slots than a node has connections do not exhaust
+        its pool with ``MaxConnectionsError``.
         """
         keys = [f"{{conn{index}}}key" for index in range(60)]
         await r.mset_nonatomic({key: 1 for key in keys})
@@ -5971,10 +6020,14 @@ class TestMultiShardRequests:
         for node in r.get_primaries():
             monkeypatch.setattr(node, "max_connections", 1)
 
-        with _sent_commands() as sent:
+        with _pipelined_commands() as batches, _sent_commands() as sent:
             assert await r.execute_command("EXISTS", *keys) == len(keys)
 
-        assert len(sent) == len({r.keyslot(key) for key in keys})
+        assert len(batches) == len(slots_per_node)
+        assert sum(len(batch) for batch in batches) == len(
+            {r.keyslot(key) for key in keys}
+        )
+        assert not sent
 
     async def test_a_pipeline_retry_of_a_split_command_holds_one_connection(
         self, r: RedisCluster, monkeypatch

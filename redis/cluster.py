@@ -1636,8 +1636,6 @@ class RedisCluster(
         """
         # get the node that holds the key's slot
         slot = self.determine_slot(*args)
-        # ``_get_node_from_slot``, inlined: this is every keyed command's path, and the
-        # call would add a function call to it
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and self._is_replica_safe(command)
@@ -1648,20 +1646,6 @@ class RedisCluster(
                 self.load_balancing_strategy if replica_safe else None,
             )
         ]
-
-    def _get_node_from_slot(self, command: str, slot: int) -> "ClusterNode":
-        """
-        Returns the node a command for the given slot is sent to, a replica when the
-        command is replica safe and the client reads from replicas.
-        """
-        replica_safe = (
-            self.read_from_replicas or self.load_balancing_strategy is not None
-        ) and self._is_replica_safe(command)
-        return self.nodes_manager.get_node_from_slot(
-            slot,
-            replica_safe,
-            self.load_balancing_strategy if replica_safe else None,
-        )
 
     def _split_multi_shard_command(self, *args) -> Optional[List[MultiShardSplit]]:
         """
@@ -1677,12 +1661,57 @@ class RedisCluster(
         command: str,
         splits: List[MultiShardSplit],
         response_policy: ResponsePolicy,
+        **kwargs,
+    ):
+        """
+        Sends the commands of a split MULTI_SHARD command in one pipeline and merges the
+        replies - see ``_merge_multi_shard_replies``.
+
+        The pipeline batches the commands per node, so the command costs one round trip
+        per node rather than one per slot. Each command names the node holding its slot,
+        so the pipeline does not split it again, and the pipeline retries a command that
+        fails on its own, routed by its keys. A slot that succeeded is therefore not sent
+        again, which would run a write twice and change what a summed reply counts.
+        """
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and self._is_replica_safe(command)
+        load_balancing_strategy = self.load_balancing_strategy if replica_safe else None
+        pipe = self.pipeline()
+        for slot, slot_args, _, keys in splits:
+            pipe.execute_command(
+                *slot_args,
+                target_nodes=[
+                    self.nodes_manager.get_node_from_slot(
+                        slot, replica_safe, load_balancing_strategy
+                    )
+                ],
+                **_with_keys(kwargs, keys),
+            )
+
+        slot_replies: Dict[int, Any] = {}
+        error = _record_slot_replies(
+            slot_replies,
+            zip((split[0] for split in splits), pipe.execute(raise_on_error=False)),
+        )
+        if error is not None:
+            raise error
+        return _merge_multi_shard_replies(slot_replies, splits, response_policy)
+
+    def _execute_multi_shard_command_per_slot(
+        self,
+        command: str,
+        splits: List[MultiShardSplit],
+        response_policy: ResponsePolicy,
         slot_replies: Dict[int, Any],
         **kwargs,
     ):
         """
-        Sends each command of a split MULTI_SHARD command to the node holding its slot and
-        merges the replies - see ``_merge_multi_shard_replies``.
+        Sends each command of a split MULTI_SHARD command to the node holding its slot on
+        its own, and merges the replies - see ``_merge_multi_shard_replies``. Used instead
+        of ``_execute_multi_shard_command`` when the client caches replies: a pipeline
+        never reads the client-side cache, while a command sent on its own may be answered
+        from it.
 
         ``slot_replies`` holds the replies of the slots that already succeeded. The caller
         keeps it across its retry attempts, so a retry resends only the slots that failed:
@@ -1690,10 +1719,16 @@ class RedisCluster(
         counts. A slot is fixed by its keys, so it names the same command on every attempt,
         while its node is looked up again in case the topology changed.
         """
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and self._is_replica_safe(command)
+        load_balancing_strategy = self.load_balancing_strategy if replica_safe else None
         for slot, slot_args, _, keys in splits:
             if slot in slot_replies:
                 continue
-            node = self._get_node_from_slot(command, slot)
+            node = self.nodes_manager.get_node_from_slot(
+                slot, replica_safe, load_balancing_strategy
+            )
             slot_replies[slot] = self._execute_command(
                 node, *slot_args, **_with_keys(kwargs, keys)
             )
@@ -2226,6 +2261,24 @@ class RedisCluster(
         last_error: Optional[Exception] = None
         last_refresh_at: Optional[float] = None
 
+        # A MULTI_SHARD command whose keys span several slots is split once, as a slot is
+        # fixed by its keys. Without a client-side cache the split is sent in one pipeline,
+        # which retries the failed slots itself, so it is not retried here as well.
+        splits = None
+        if (
+            not target_nodes_specified
+            and command_policies.request_policy == RequestPolicy.MULTI_SHARD
+            and not self._is_nodes_flag(passed_targets)
+        ):
+            splits = self._split_multi_shard_command(*args)
+            if splits is not None and len(splits) < 2:
+                # One slot: routed by its keys as a whole, as it is sent.
+                splits = None
+            elif splits is not None and self.nodes_manager._cache is None:
+                return self._execute_multi_shard_command(
+                    command, splits, command_policies.response_policy, **kwargs
+                )
+
         # The replies of the slots of a split MULTI_SHARD command that already succeeded,
         # kept across the attempts so a retry resends only the slots that failed
         slot_replies: Dict[int, Any] = {}
@@ -2244,25 +2297,19 @@ class RedisCluster(
             try:
                 res = {}
                 if not target_nodes_specified:
-                    request_policy = command_policies.request_policy
-                    if (
-                        request_policy == RequestPolicy.MULTI_SHARD
-                        and not self._is_nodes_flag(passed_targets)
-                    ):
-                        splits = self._split_multi_shard_command(*args)
-                        if splits is not None and len(splits) > 1:
-                            return self._execute_multi_shard_command(
-                                command,
-                                splits,
-                                command_policies.response_policy,
-                                slot_replies,
-                                **kwargs,
-                            )
+                    if splits is not None:
+                        return self._execute_multi_shard_command_per_slot(
+                            command,
+                            splits,
+                            command_policies.response_policy,
+                            slot_replies,
+                            **kwargs,
+                        )
 
                     # Determine the nodes to execute the command on
                     target_nodes = self._determine_nodes(
                         *args,
-                        request_policy=request_policy,
+                        request_policy=command_policies.request_policy,
                         nodes_flag=passed_targets,
                     )
 
@@ -6220,6 +6267,13 @@ class PipelineStrategy(AbstractStrategy):
                     copies: Dict[Any, PipelineCommand] = {}
                     fanned_out.append((c, copies, splits))
                     queued = []
+                    replica_safe = (
+                        self._pipe.read_from_replicas
+                        or self._pipe.load_balancing_strategy is not None
+                    ) and self._pipe._is_replica_safe(c.args[0])
+                    load_balancing_strategy = (
+                        self._pipe.load_balancing_strategy if replica_safe else None
+                    )
                     for slot, slot_args, _, keys in splits:
                         if slot in c.slot_replies:
                             continue
@@ -6228,7 +6282,9 @@ class PipelineStrategy(AbstractStrategy):
                         )
                         queued.append(
                             (
-                                self._pipe._get_node_from_slot(c.args[0], slot),
+                                self._nodes_manager.get_node_from_slot(
+                                    slot, replica_safe, load_balancing_strategy
+                                ),
                                 copies[slot],
                             )
                         )
@@ -6527,7 +6583,7 @@ class PipelineStrategy(AbstractStrategy):
         )
 
     def _is_nodes_flag(self, target_nodes):
-        return isinstance(target_nodes, str) and target_nodes in self._pipe.NODE_FLAGS
+        return isinstance(target_nodes, str) and target_nodes in self._pipe.node_flags
 
     def _parse_target_nodes(self, target_nodes):
         if isinstance(target_nodes, list):

@@ -2715,7 +2715,8 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                 while self._idle_maintenance:
                     self._idle_maintenance_done.wait()
                 if inuse_connections or not self._in_use:
-                    event = self._reset_maintenance_on_disconnect()
+                    if isinstance(self._conn, MaintNotificationsAbstractConnection):
+                        event = self._reset_maintenance_on_disconnect()
                     self.disconnect()
         finally:
             # A completion listener may close the pool again. Dispatch only

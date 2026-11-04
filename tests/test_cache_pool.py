@@ -10,7 +10,7 @@ import pytest
 from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
-from redis.connection import BlockingConnectionPool, ConnectionPool
+from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.event import (
     EventDispatcher,
     EventListenerInterface,
@@ -44,6 +44,55 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("shutdown", ["close", "disconnect", "disconnect_idle"])
+    def test_custom_connection_without_maintenance_can_close(
+        self, pool, pool_class, r2, shutdown
+    ):
+        class CustomConnection:
+            # Delegate real socket I/O without inheriting the maintenance mixin.
+            def __init__(self, **kwargs):
+                self.connection = Connection(
+                    maint_notifications_config=MaintNotificationsConfig(enabled=False),
+                    **kwargs,
+                )
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        custom_pool = pool_class(
+            connection_class=CustomConnection,
+            cache_config=pool.cache.config,
+            **pool.connection_kwargs,
+        )
+        assert not custom_pool.maint_notifications_enabled()
+        idle, active = custom_pool.get_connection(), custom_pool.get_connection()
+        key = str(uuid.uuid4())
+        try:
+            r2.set(key, "value")
+            idle.send_command("GET", key, keys=[key])
+            assert idle.read_response() == b"value"
+            assert custom_pool.cache.size == 1
+            custom_pool.release(idle)
+            active.send_command("PING")
+
+            if shutdown == "disconnect_idle":
+                custom_pool.disconnect(inuse_connections=False)
+            else:
+                getattr(custom_pool, shutdown)()
+
+            assert not idle.is_connected
+            assert custom_pool.cache.size == 0
+            if shutdown == "disconnect_idle":
+                assert active.is_connected
+                assert active.read_response() == b"PONG"
+            else:
+                assert not active.is_connected
+        finally:
+            # Direct disconnect also cleans up when the pool shutdown fails.
+            idle.disconnect()
+            active.disconnect()
+            custom_pool.release(active)
+
     def test_maintenance_config_disconnect_joins_owner_drain(self, pool, r2):
         key = str(uuid.uuid4())
         r2.set(key, "value")

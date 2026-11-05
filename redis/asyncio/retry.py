@@ -75,6 +75,12 @@ class Retry(AbstractRetry[Exception]):
                 return await do()
             except self._supported_errors as error:
                 if self._is_retryable is not None and not self._is_retryable(error):
+                    # Run the failure handler before raising so connection-scoped
+                    # cleanup (for example a pipeline's WATCH state) still happens.
+                    if with_failure_count:
+                        await fail(error, failures + 1)
+                    else:
+                        await fail(error)
                     raise
                 if is_retryable is not None and not is_retryable(error):
                     raise

@@ -189,7 +189,7 @@ class TestRetry:
             retry.call_with_retry(self._do, self._fail)
 
         assert self.actual_attempts == 1
-        assert self.actual_failures == 0
+        assert self.actual_failures == 1
         assert backoff.calls == 0
 
     def test_retry_checker_returning_true_keeps_default_behavior(self):
@@ -215,6 +215,8 @@ class TestRetry:
                 self._do, self._fail, is_retryable=lambda error: False
             )
         assert self.actual_attempts == 1
+        # The per-call predicate only stops retries; it does not run the handler.
+        assert self.actual_failures == 0
 
     def test_retry_checker_defaults_to_none(self):
         assert Retry(NoBackoff(), 1).is_retryable is None

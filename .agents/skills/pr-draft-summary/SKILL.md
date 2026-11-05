@@ -14,6 +14,9 @@ After eligible work is complete, produce exactly two things for redis-py:
    the GitHub PR UI with all formatting preserved. Keep it to **5–6 short
    paragraphs** that explain what the changes do.
 
+After the two blocks, add one line with the **suggested PR label** (see
+workflow step 3).
+
 By default, emit both as text in the chat. Write them to a `.md` file **only**
 if the user explicitly asks for a file.
 
@@ -64,6 +67,14 @@ Classify the change from the touched paths: runtime (`redis/`,
 3. Infer change type from touched paths (feature, fix, refactor, perf, or
    docs-with-impact). Pick the commit-message prefix accordingly: `feat:`,
    `fix:`, `refactor:`, `perf:`, `docs:`, `test:`, `build:`, `chore:`.
+   Also pick the category label the PR should carry, using
+   `.agents/skills/generate-release-notes/references/pr-labels-guide.md` as the
+   authoritative mapping. Judge it from the diff, not from the branch name. For
+   example, a new opt-in public option is `feature`, even when it was written
+   to fix a reported problem. Keep the commit prefix consistent with the label.
+   If more than one category applies (for example `deprecation` and
+   `breakingchange`), list every matching label. Only suggest labels; never
+   apply them.
 4. Flag **backward-compatibility risk** in the description only when the diff
    changes the public API (signatures, argument names, defaults, return types),
    command semantics, error/exception types, wire-protocol (RESP2/RESP3)
@@ -119,6 +130,12 @@ testable or no tests were added, say so briefly and explain why.>
 Resolves #<number>.   <!-- include only when an issue number is known -->
 ```
 ````
+
+### Suggested label
+
+```
+Suggested label: <label(s) per pr-labels-guide.md>
+```
 
 Keep it tight — 5–6 paragraphs total across both sections, no redundant prose
 around the blocks, and no repeating the same detail in both sections.

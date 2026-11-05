@@ -1097,17 +1097,24 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             )
             raise e
         except OSError as e:
-            e = ConnectionError(self._error_message(e))
+            conn_error = ConnectionError(self._error_message(e))
             await record_error_count(
                 server_address=getattr(self, "host", None),
                 server_port=getattr(self, "port", None),
                 network_peer_address=getattr(self, "host", None),
                 network_peer_port=getattr(self, "port", None),
-                error_type=e,
+                error_type=conn_error,
                 retry_attempts=actual_retry_attempts,
                 is_internal=False,
             )
-            raise e
+            # Preserve the original OSError (with its errno) as the cause so
+            # the retry policy can tell unrecoverable failures apart. Clear the
+            # local afterwards so its traceback does not form a reference cycle
+            # with this frame.
+            try:
+                raise conn_error from e
+            finally:
+                conn_error = None
         except Exception as exc:
             raise ConnectionError(exc) from exc
 
@@ -1476,7 +1483,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def can_read(self) -> bool:
         """Check the socket to see if there's data loaded in the buffer."""
@@ -1487,7 +1496,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def read_response(
         self,
@@ -1561,7 +1572,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                     await self.disconnect(nowait=True)
                 raise ConnectionError(
                     f"Error while reading from {host_error} : {e.args}"
-                )
+                ) from e
             if timeout is not None:
                 # user requested timeout, return None. Operation can be retried
                 return None
@@ -1574,7 +1585,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # See the sync Connection.read_response and #4291. The async parser
             # re-parses from self._pos = 0 rather than rewinding a socket

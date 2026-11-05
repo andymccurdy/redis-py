@@ -3,7 +3,7 @@ import logging
 import re
 import threading
 import time
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -50,7 +50,7 @@ from redis.connection import (
     SSLConnection,
     UnixDomainSocketConnection,
 )
-from redis.credentials import CredentialProvider
+from redis.credentials import CredentialProvider, StreamingCredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
@@ -461,9 +461,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             Argument is ignored when connection_pool is provided - configure it on the pool
             instead.
         """
-        if event_dispatcher is None:
-            self._event_dispatcher = EventDispatcher()
-        else:
+        if event_dispatcher is not None:
             self._event_dispatcher = event_dispatcher
         if not connection_pool:
             if not retry_on_error:
@@ -584,14 +582,18 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                     }
                 )
             connection_pool = ConnectionPool(**kwargs)
-            self._event_dispatcher.dispatch(
-                AfterPooledConnectionsInstantiationEvent(
-                    [connection_pool], ClientType.SYNC, credential_provider
-                )
-            )
             self.auto_close_connection_pool = True
         else:
             self.auto_close_connection_pool = False
+
+        # A user-supplied dispatcher always gets the event, for its own
+        # listeners. The default one is private to this client, so its only
+        # listener is the built-in re-auth one, which acts on a
+        # StreamingCredentialProvider alone: skip the no-op dispatch (and
+        # building the dispatcher) for any other provider.
+        if event_dispatcher is not None or isinstance(
+            credential_provider, StreamingCredentialProvider
+        ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
                     [connection_pool], ClientType.SYNC, credential_provider
@@ -621,6 +623,12 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             connection_kwargs.get("protocol"),
             connection_kwargs.get("legacy_responses", True),
         )
+
+    @cached_property
+    def _event_dispatcher(self) -> EventDispatcher:
+        # Built on first use when the client was given no dispatcher; a
+        # dispatcher passed to __init__ is stored on the instance instead.
+        return EventDispatcher()
 
     def __repr__(self) -> str:
         return (

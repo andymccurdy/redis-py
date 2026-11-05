@@ -266,24 +266,19 @@ def deprecated_args(
     warned = tuple(args_to_warn) if args_to_warn is not None else ("*",)
     allowed = tuple(allowed_args) if allowed_args is not None else ()
 
-    def _check_deprecated_args(func, filterable_args):
-        """Check and warn about deprecated arguments."""
-        for arg in warned:
-            if arg == "*" and len(filterable_args) > 0:
-                warn_deprecated_arg_usage(
-                    list(filterable_args.keys()),
-                    func.__name__,
-                    reason,
-                    version,
-                    stacklevel=5,
-                )
-            elif arg in filterable_args:
-                warn_deprecated_arg_usage(
-                    arg, func.__name__, reason, version, stacklevel=5
-                )
-
     def decorator(func: C) -> C:
-        min_idx, keys_ok, names = _get_warn_check(func, warned, allowed)
+        # Stacked @deprecated_args decorators collapse into one wrapper, so a
+        # call pays for a single extra frame however many layers there are.
+        # Layers are kept outermost first, which is the order they warn in.
+        layers = ((warned, allowed, reason, version),)
+        stacked = getattr(func, "_deprecated_args_layers", None)
+        # functools.wraps copies the tag onto any decorator wrapping ours, so
+        # merge only when func is our wrapper of the recorded target.
+        if stacked is not None and getattr(func, "__wrapped__", None) is stacked[0]:
+            func = stacked[0]
+            layers += stacked[1]
+        checks = _get_layer_checks(func, layers)
+        min_idx, keys_ok, names = _merge_warn_checks(checks)
 
         if inspect.iscoroutinefunction(func):
 
@@ -292,10 +287,10 @@ def deprecated_args(
                 if len(args) > min_idx or (
                     kwargs and not keys_ok(kwargs.keys(), names)
                 ):
-                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
-                    _check_deprecated_args(func, filterable_args)
+                    _check_deprecated_layers(func, checks, args, kwargs)
                 return await func(*args, **kwargs)
 
+            async_wrapper._deprecated_args_layers = (func, layers)
             return async_wrapper
         else:
 
@@ -304,13 +299,76 @@ def deprecated_args(
                 if len(args) > min_idx or (
                     kwargs and not keys_ok(kwargs.keys(), names)
                 ):
-                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
-                    _check_deprecated_args(func, filterable_args)
+                    _check_deprecated_layers(func, checks, args, kwargs)
                 return func(*args, **kwargs)
 
+            wrapper._deprecated_args_layers = (func, layers)
             return wrapper
 
     return decorator
+
+
+def _get_layer_checks(func: Callable, layers: tuple) -> tuple:
+    """
+    Build the per-layer checks of a (possibly merged) @deprecated_args wrapper.
+    A layer with i layers stacked above it warns with stacklevel 5 - i, the
+    frame it would point at if every layer were its own wrapper.
+    """
+    return tuple(
+        (
+            *_get_warn_check(func, warned, allowed),
+            warned,
+            allowed,
+            reason,
+            version,
+            5 - i,
+        )
+        for i, (warned, allowed, reason, version) in enumerate(layers)
+    )
+
+
+def _merge_warn_checks(
+    checks: tuple,
+) -> tuple[int, Callable[[Any, frozenset], bool], frozenset]:
+    """
+    Combine the per-layer pre-checks into one that passes exactly when every
+    layer's would: below every layer's positional index, and kwargs disjoint
+    from every named layer's names and within every wildcard layer's allowed
+    names.
+    """
+    if len(checks) == 1:
+        return checks[0][:3]
+    min_idx = min(check[0] for check in checks)
+    named = frozenset().union(
+        *(check[2] for check in checks if check[1] is _DictKeys.isdisjoint)
+    )
+    wildcard = [check[2] for check in checks if check[1] is not _DictKeys.isdisjoint]
+    if wildcard:
+        return min_idx, _DictKeys.__le__, frozenset.intersection(*wildcard) - named
+    return min_idx, _DictKeys.isdisjoint, named
+
+
+def _check_deprecated_layers(
+    func: Callable, checks: tuple, args: tuple, kwargs: dict
+) -> None:
+    """Check and warn about deprecated arguments, one layer at a time."""
+    for min_idx, keys_ok, names, warned, allowed, reason, version, stacklevel in checks:
+        if len(args) <= min_idx and (not kwargs or keys_ok(kwargs.keys(), names)):
+            continue
+        filterable_args = _get_filterable_args(func, args, kwargs, allowed)
+        for arg in warned:
+            if arg == "*" and len(filterable_args) > 0:
+                warn_deprecated_arg_usage(
+                    list(filterable_args.keys()),
+                    func.__name__,
+                    reason,
+                    version,
+                    stacklevel=stacklevel,
+                )
+            elif arg in filterable_args:
+                warn_deprecated_arg_usage(
+                    arg, func.__name__, reason, version, stacklevel=stacklevel
+                )
 
 
 def _set_info_logger():

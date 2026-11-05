@@ -3,7 +3,10 @@ from unittest import mock
 import pytest
 
 import redis
+from redis.credentials import StreamingCredentialProvider
 from redis.event import (
+    AfterPooledConnectionsInstantiationEvent,
+    ClientType,
     EventDispatcher,
 )
 from redis.observability import recorder
@@ -500,3 +503,53 @@ class TestRedisClientMetricsRecording:
             assert "error.type" in error_attrs
 
         recorder.reset_collector()
+
+
+@pytest.mark.fixed_client
+class TestRedisClientEventDispatcher:
+    """
+    Unit tests for the event dispatcher a client builds or is given. No
+    connection is made: constructing a client does not connect.
+    """
+
+    @pytest.fixture
+    def pool_kwargs(self, request):
+        # Without a pool the client builds one; with one it is passed in.
+        if request.param:
+            return {"connection_pool": redis.ConnectionPool()}
+        return {}
+
+    @pytest.mark.parametrize("pool_kwargs", [True, False], indirect=True)
+    def test_default_dispatcher_is_built_lazily(self, pool_kwargs):
+        client = redis.Redis(**pool_kwargs)
+        assert "_event_dispatcher" not in vars(client)
+
+        first = client.pubsub()
+        second = client.pubsub()
+        assert isinstance(client._event_dispatcher, EventDispatcher)
+        assert first._event_dispatcher is client._event_dispatcher
+        assert second._event_dispatcher is client._event_dispatcher
+
+    @pytest.mark.parametrize("pool_kwargs", [True, False], indirect=True)
+    def test_passed_dispatcher_receives_pooled_connections_event(self, pool_kwargs):
+        dispatcher = mock.Mock(spec=EventDispatcher)
+        client = redis.Redis(event_dispatcher=dispatcher, **pool_kwargs)
+
+        assert client._event_dispatcher is dispatcher
+        dispatcher.dispatch.assert_called_once()
+        event = dispatcher.dispatch.call_args.args[0]
+        assert isinstance(event, AfterPooledConnectionsInstantiationEvent)
+        assert event.connection_pools == [client.connection_pool]
+        assert event.client_type == ClientType.SYNC
+        assert event.credential_provider is None
+
+    @pytest.mark.parametrize("pool_kwargs", [True, False], indirect=True)
+    def test_default_dispatcher_registers_re_auth_for_streaming_provider(
+        self, pool_kwargs
+    ):
+        provider = mock.Mock(spec=StreamingCredentialProvider)
+        client = redis.Redis(credential_provider=provider, **pool_kwargs)
+
+        assert "_event_dispatcher" in vars(client)
+        provider.on_next.assert_called_once()
+        provider.on_error.assert_called_once()

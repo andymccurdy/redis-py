@@ -353,14 +353,14 @@ _SPECIAL_RESPONSE_CALLBACKS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
 # One command of a ``MULTI_SHARD`` command split by hash slot: the slot, the arguments of the
 # command that carries that slot's keys, the ordinals of those keys among the keys of the whole
 # command, and the keys themselves.
-MultiShardSplit = Tuple[int, Tuple[Any, ...], List[int], List[Any]]
+_MultiShardSplit = Tuple[int, Tuple[Any, ...], List[int], List[Any]]
 
 
 def _split_by_slot(
     args: Tuple[Any, ...],
     command_details: Optional[Dict[str, Any]],
     keyslot: Callable[[Any], int],
-) -> Optional[List[MultiShardSplit]]:
+) -> Optional[List[_MultiShardSplit]]:
     """
     Split a ``MULTI_SHARD`` command into one command per hash slot its keys map to.
 
@@ -421,7 +421,7 @@ def _split_by_slot(
 
 def _merge_multi_shard_replies(
     res: Dict[int, Any],
-    splits: List[MultiShardSplit],
+    splits: List[_MultiShardSplit],
     response_policy: ResponsePolicy,
 ) -> Any:
     """
@@ -1677,7 +1677,7 @@ class RedisCluster(
             self.load_balancing_strategy if replica_safe else None,
         )
 
-    def _split_multi_shard_command(self, *args) -> Optional[List[MultiShardSplit]]:
+    def _split_multi_shard_command(self, *args) -> Optional[List[_MultiShardSplit]]:
         """
         Splits a command with the MULTI_SHARD request policy into one command per hash
         slot of its keys - see ``_split_by_slot``.
@@ -1689,7 +1689,7 @@ class RedisCluster(
     def _execute_multi_shard_command(
         self,
         command: str,
-        splits: List[MultiShardSplit],
+        splits: List[_MultiShardSplit],
         response_policy: ResponsePolicy,
         **kwargs,
     ):
@@ -1764,7 +1764,7 @@ class RedisCluster(
     def _execute_multi_shard_command_per_slot(
         self,
         command: str,
-        splits: List[MultiShardSplit],
+        splits: List[_MultiShardSplit],
         response_policy: ResponsePolicy,
         slot_replies: Dict[int, Any],
         **kwargs,
@@ -6246,7 +6246,7 @@ class PipelineStrategy(AbstractStrategy):
             Tuple[
                 PipelineCommand,
                 Dict[Any, PipelineCommand],
-                Optional[List[MultiShardSplit]],
+                Optional[List[_MultiShardSplit]],
             ]
         ] = []
         nodes_written = 0
@@ -6604,7 +6604,7 @@ class PipelineStrategy(AbstractStrategy):
         self,
         command: PipelineCommand,
         copies: Dict[Any, PipelineCommand],
-        splits: Optional[List[MultiShardSplit]] = None,
+        splits: Optional[List[_MultiShardSplit]] = None,
     ) -> Any:
         """
         Fold the per-node replies of a command the pipeline sent to several nodes into the
@@ -6714,7 +6714,7 @@ class PipelineStrategy(AbstractStrategy):
         self,
         command: PipelineCommand,
         copies: Dict[Any, PipelineCommand],
-        splits: List[MultiShardSplit],
+        splits: List[_MultiShardSplit],
     ) -> Any:
         """
         Send each slot of a split MULTI_SHARD command that failed individually, like the

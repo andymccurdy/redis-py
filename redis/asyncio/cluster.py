@@ -79,10 +79,10 @@ from redis.cluster import (
     AbstractRedisCluster,
     LoadBalancer,
     LoadBalancingStrategy,
-    MultiShardSplit,
     _error_to_raise,
     _fill_missing_redirect_host,
     _merge_multi_shard_replies,
+    _MultiShardSplit,
     _record_replies,
     _resolve_localhost,
     _should_request_refresh,
@@ -1287,7 +1287,9 @@ class RedisCluster(
             self.load_balancing_strategy if replica_safe else None,
         )
 
-    def _split_multi_shard_command(self, *args: Any) -> Optional[List[MultiShardSplit]]:
+    def _split_multi_shard_command(
+        self, *args: Any
+    ) -> Optional[List[_MultiShardSplit]]:
         """
         Splits a command with the MULTI_SHARD request policy into one command per hash
         slot of its keys - see ``redis.cluster._split_by_slot``.
@@ -1301,7 +1303,7 @@ class RedisCluster(
     async def _execute_multi_shard_command(
         self,
         command: str,
-        splits: List[MultiShardSplit],
+        splits: List[_MultiShardSplit],
         response_policy: ResponsePolicy,
         **kwargs: Any,
     ) -> Any:
@@ -4011,7 +4013,7 @@ class PipelineStrategy(AbstractStrategy):
                 PipelineCommand,
                 str,
                 Dict[Any, PipelineCommand],
-                Optional[List[MultiShardSplit]],
+                Optional[List[_MultiShardSplit]],
             ]
         ] = []
         for cmd in todo:
@@ -4265,7 +4267,7 @@ class PipelineStrategy(AbstractStrategy):
         cmd: PipelineCommand,
         command: str,
         copies: Dict[Any, PipelineCommand],
-        splits: Optional[List[MultiShardSplit]] = None,
+        splits: Optional[List[_MultiShardSplit]] = None,
     ) -> Any:
         """
         Fold the per-node replies of a command the pipeline sent to several nodes into the
@@ -4351,7 +4353,7 @@ class PipelineStrategy(AbstractStrategy):
         client: "RedisCluster",
         cmd: PipelineCommand,
         copies: Dict[Any, PipelineCommand],
-        splits: List[MultiShardSplit],
+        splits: List[_MultiShardSplit],
     ) -> Any:
         """
         Send each slot of a split MULTI_SHARD command that failed individually, like the

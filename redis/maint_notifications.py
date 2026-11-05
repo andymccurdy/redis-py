@@ -1,11 +1,14 @@
 import enum
 import ipaddress
 import logging
+import os
 import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -796,11 +799,35 @@ def _should_skip_connection_timeout_update(
 PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT = 1.0
 
 _maintenance_event_state = threading.local()
+_maintenance_event_lock = threading.Lock()
+_maintenance_event_queues = {}
+_maintenance_event_dispatching = set()
+
+
+@dataclass
+class _PendingMaintenanceEvent:
+    config: MaintNotificationsConfig
+    event: MaintenanceEvent
+    ready: bool
+
+
+def _reset_maintenance_events_after_fork():
+    # Do not inherit a held lock or another thread's pending events.
+    global _maintenance_event_state, _maintenance_event_lock
+    global _maintenance_event_queues, _maintenance_event_dispatching
+    _maintenance_event_state = threading.local()
+    _maintenance_event_lock = threading.Lock()
+    _maintenance_event_queues = {}
+    _maintenance_event_dispatching = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_maintenance_events_after_fork)
 
 
 @contextmanager
 def _defer_maintenance_events():
-    """Keep listener callbacks outside synchronous ownership and handler locks."""
+    """Release locks before callbacks, without overtaking another thread's events."""
     previous = getattr(_maintenance_event_state, "pending", None)
     if previous is not None:
         yield
@@ -810,11 +837,55 @@ def _defer_maintenance_events():
     try:
         yield
     finally:
-        # A listener may reenter the pool. Restore immediate dispatch before
-        # calling it, including when the drain failed or was interrupted.
+        # All events in this scope become eligible together, including when
+        # the drain failed or was interrupted. A later completion on a timer
+        # thread must wait for its earlier start to become eligible too.
         _maintenance_event_state.pending = previous
-        for config, event in pending:
-            _dispatch_maintenance_event(config, event)
+        if pending:
+            with _maintenance_event_lock:
+                for _, delivery in pending:
+                    delivery.ready = True
+            for source in dict.fromkeys(source for source, _ in pending):
+                _drain_maintenance_events(source)
+
+
+def _drain_maintenance_events(source):
+    pid = os.getpid()
+    with _maintenance_event_lock:
+        if source in _maintenance_event_dispatching:
+            return
+        _maintenance_event_dispatching.add(source)
+    try:
+        while True:
+            with _maintenance_event_lock:
+                queue = _maintenance_event_queues.get(source)
+                if not queue or not queue[0].ready:
+                    _maintenance_event_dispatching.remove(source)
+                    if not queue:
+                        _maintenance_event_queues.pop(source, None)
+                    return
+                delivery = queue.popleft()
+            # No queue, handler or ownership lock is held during callbacks.
+            # Reentrant events append to this queue and follow the current
+            # event's listeners instead of recursively overtaking them.
+            dispatcher = delivery.config.event_dispatcher
+            if dispatcher is not None:
+                try:
+                    dispatcher.dispatch(delivery.event)
+                except Exception:
+                    logger.exception(
+                        f"Error dispatching maintenance event: {delivery.event}"
+                    )
+            if os.getpid() != pid:
+                # A listener forked: the child has a fresh dispatch queue.
+                return
+    except BaseException:
+        if os.getpid() == pid:
+            with _maintenance_event_lock:
+                _maintenance_event_dispatching.discard(source)
+                if not _maintenance_event_queues.get(source):
+                    _maintenance_event_queues.pop(source, None)
+        raise
 
 
 def _dispatch_maintenance_event(
@@ -827,17 +898,23 @@ def _dispatch_maintenance_event(
     handling that emitted the event: the push parser swallows exceptions
     silently, so letting one out would abort the remaining handling instead.
     """
-    dispatcher = config.event_dispatcher
-    if dispatcher is None:
+    if config.event_dispatcher is None:
         return
     pending = getattr(_maintenance_event_state, "pending", None)
+    # Serialize per pool, also across connection-level and handoff events:
+    # MOVING starts before it completes any connection's previous relaxation.
+    # Standalone connections have their own queue. Queued events retain the
+    # source until delivery, so its identity cannot be reused while pending.
+    source = id(
+        event.connection_pool if event.connection_pool is not None else event.connection
+    )
+    delivery = _PendingMaintenanceEvent(config, event, ready=pending is None)
     if pending is not None:
-        pending.append((config, event))
-        return
-    try:
-        dispatcher.dispatch(event)
-    except Exception:
-        logger.exception(f"Error dispatching maintenance event: {event}")
+        pending.append((source, delivery))
+    with _maintenance_event_lock:
+        _maintenance_event_queues.setdefault(source, deque()).append(delivery)
+    if pending is None:
+        _drain_maintenance_events(source)
 
 
 def _build_moving_connection_kwargs(
@@ -957,7 +1034,7 @@ class MaintNotificationsPoolHandler:
         ):
             return
 
-        with self._lock:
+        with _defer_maintenance_events(), self._lock:
             if notification in self._processed_notifications:
                 # nothing to do in the connection pool handling
                 # the notification has already been handled or is expired

@@ -341,7 +341,7 @@ class TestCachePoolOwnership:
             peers.release(borrower)
             peers.disconnect()
 
-    @pytest.mark.parametrize("cleanup", ["timer", "direct", "cancel"])
+    @pytest.mark.parametrize("cleanup", ["timer", "direct", "cancel", "start"])
     @pytest.mark.parametrize("listener_error", [False, True])
     def test_moving_cleanup_listener_can_close_during_peer_drain(
         self, pool, r2, cleanup, listener_error
@@ -379,7 +379,7 @@ class TestCachePoolOwnership:
                     worker.join(2)
                     # Fail before close() waits for the owner on the old code,
                     # so a negative control cannot leave deadlocked threads.
-                    assert unlocked == [True], "completion holds the handler lock"
+                    assert unlocked == [True], "maintenance callback holds handler lock"
                     events.append(event)
                     resume.set()
                     pool.close()
@@ -393,7 +393,15 @@ class TestCachePoolOwnership:
         config = MaintNotificationsConfig(
             enabled=True,
             proactive_reconnect=False,
-            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+            event_dispatcher=EventDispatcher(
+                {
+                    (
+                        MaintenanceStartedEvent
+                        if cleanup == "start"
+                        else MaintenanceCompletedEvent
+                    ): [Listener()]
+                }
+            ),
         )
         handler = MaintNotificationsPoolHandler(pool, config)
         pool._maint_notifications_pool_handler = handler
@@ -437,8 +445,9 @@ class TestCachePoolOwnership:
                 # AF_UNIX socket pairs have no IP address to match against.
                 patch.object(owner._conn, "getpeername", return_value="127.0.0.1"),
             ):
-                handler.handle_notification(first)
-                expire = timer.call_args.args[1]
+                if cleanup != "start":
+                    handler.handle_notification(first)
+                    expire = timer.call_args.args[1]
                 server.sendall(b">4\r\n+MOVING\r\n:72\r\n:60\r\n_\r\n")
                 with patch.object(owner._conn, "can_read", side_effect=can_read):
                     reader.start()
@@ -447,6 +456,8 @@ class TestCachePoolOwnership:
                         expire()
                     elif cleanup == "direct":
                         assert handler.handle_node_moved_notification(first)
+                    elif cleanup == "start":
+                        handler.handle_notification(first)
                     else:
                         handler.cancel_scheduled_tasks()
                     reader.join(3)
@@ -460,6 +471,124 @@ class TestCachePoolOwnership:
                 assert borrower.can_read(timeout=1)
             borrower.send_command("GET", key, keys=[key])
             assert borrower.read_response() == b"new"
+        finally:
+            resume.set()
+            if reader.ident is not None:
+                reader.join(5)
+            handler.cancel_scheduled_tasks()
+            server.close()
+            client.close()
+            peers.release(borrower)
+            peers.disconnect()
+
+    @pytest.mark.parametrize("cleanup", ["timer", "direct", "cancel"])
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    @pytest.mark.parametrize("listener_error", [False, True])
+    def test_moving_events_keep_order_across_peer_drain_and_cleanup(
+        self, pool, r2, cleanup, outcome, listener_error
+    ):
+        class DrainCancelled(BaseException):
+            pass
+
+        events, errors, pushes = [], [], []
+        moving, resume = threading.Event(), threading.Event()
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                events.append(event)
+                if listener_error:
+                    raise RuntimeError("application listener failed")
+
+        config = MaintNotificationsConfig(
+            enabled="auto",
+            proactive_reconnect=False,
+            event_dispatcher=EventDispatcher(
+                {
+                    MaintenanceStartedEvent: [Listener()],
+                    MaintenanceCompletedEvent: [Listener()],
+                }
+            ),
+        )
+        pool.update_maint_notifications_config(config)
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        handler = MaintNotificationsPoolHandler(pool, config)
+        pool._maint_notifications_pool_handler = handler
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        owner.set_maint_notifications_pool_handler_for_connection(handler)
+
+        def handle_push(notification):
+            owner._conn._maint_notifications_pool_handler.handle_notification(
+                notification
+            )
+            pushes.append(notification)
+
+        owner._conn._parser.set_node_moving_push_handler(handle_push)
+        real_can_read = owner._conn.can_read
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader and pushes:
+                moving.set()
+                assert resume.wait(5)
+                if outcome == "error":
+                    raise InvalidResponse("interrupted owner drain")
+                if outcome == "cancel":
+                    raise DrainCancelled()
+            return real_can_read(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        try:
+            with (
+                patch("redis.maint_notifications.threading.Timer") as timer,
+                patch.object(owner._conn, "getpeername", return_value="127.0.0.1"),
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+            ):
+                server.sendall(b">4\r\n+MOVING\r\n:81\r\n:60\r\n_\r\n")
+                reader.start()
+                assert moving.wait(3)
+                assert len(pushes) == 1
+                if cleanup == "timer":
+                    timer.call_args.args[1]()
+                elif cleanup == "direct":
+                    assert handler.handle_node_moved_notification(pushes[0])
+                else:
+                    handler.cancel_scheduled_tasks()
+                assert (
+                    pool.connection_kwargs["maintenance_state"] == MaintenanceState.NONE
+                )
+                resume.set()
+                reader.join(3)
+                assert not reader.is_alive()
+                if outcome == "success":
+                    assert not errors
+                else:
+                    expected = InvalidResponse if outcome == "error" else DrainCancelled
+                    assert len(errors) == 1 and isinstance(errors[0], expected)
+                assert [type(event) for event in events] == [
+                    MaintenanceStartedEvent,
+                    MaintenanceCompletedEvent,
+                ]
+                assert all(event.notification == pushes[0] for event in events)
+                assert all(event.connection_pool is pool for event in events)
+                assert not handler._pending_handoffs
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
         finally:
             resume.set()
             if reader.ident is not None:

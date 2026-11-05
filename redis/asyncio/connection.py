@@ -2060,6 +2060,7 @@ URL_QUERY_ARGUMENT_PARSERS: Mapping[str, Callable[..., object]] = MappingProxyTy
         "timeout": float,
         "protocol": int,
         "legacy_responses": to_bool,
+        "dynamic_startup_nodes": to_bool,
     }
 )
 

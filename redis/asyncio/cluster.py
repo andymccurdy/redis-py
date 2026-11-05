@@ -448,6 +448,9 @@ class RedisCluster(
         their corresponding characters. Querystring values are decoded by
         ``urllib.parse.parse_qs`` and are not unquoted again.
 
+        The cluster option ``dynamic_startup_nodes`` can be supplied as a
+        boolean querystring option.
+
         All querystring options are cast to their appropriate Python types. Boolean
         arguments can be specified with string values "True"/"False" or "Yes"/"No".
         Values that cannot be properly cast cause a ``ValueError`` to be raised. Once

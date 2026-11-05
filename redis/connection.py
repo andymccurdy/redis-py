@@ -2077,8 +2077,6 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._conn = conn
         self.retry = self._conn.retry
         self.host = self._conn.host
-        # A UnixDomainSocketConnection has no port
-        self.port = getattr(self._conn, "port", None)
         self.db = self._conn.db
         self._event_dispatcher = self._conn._event_dispatcher
         self.credential_provider = conn.credential_provider
@@ -2738,20 +2736,13 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def _disconnect_from_pool(self, inuse_connections):
         # Called outside the pool lock: a drain can dispatch MOVING and need it.
-        event = None
-        try:
-            with self._in_use_lock:
-                while self._idle_maintenance:
-                    self._idle_maintenance_done.wait()
-                if inuse_connections or not self._in_use:
-                    if isinstance(self._conn, MaintNotificationsAbstractConnection):
-                        event = self._reset_maintenance_on_disconnect()
-                    self.disconnect()
-        finally:
-            # A completion listener may close the pool again. Dispatch only
-            # after releasing the connection lock and closing its socket.
-            if event is not None:
-                _dispatch_maintenance_event(event.config, event)
+        # Reserve completion's position before checkout can start a new window,
+        # but invoke listeners only after closing the socket and releasing ownership.
+        with _defer_maintenance_events(), self._in_use_lock:
+            while self._idle_maintenance:
+                self._idle_maintenance_done.wait()
+            if inuse_connections or not self._in_use:
+                self.disconnect()
 
     def re_auth(self):
         self._conn.re_auth()
@@ -2772,6 +2763,16 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     @host.setter
     def host(self, value: str):
         self._conn.host = value
+
+    @property
+    def port(self) -> int | None:
+        # Sentinel can change the endpoint when the wrapped connection connects.
+        # A UnixDomainSocketConnection has no port.
+        return getattr(self._conn, "port", None)
+
+    @port.setter
+    def port(self, value: int | None):
+        self._conn.port = value
 
     @property
     def socket_timeout(self) -> Optional[Union[float, int]]:
@@ -3889,8 +3890,7 @@ class MaintNotificationsAbstractConnectionPool:
         :param moving_address_src: The address of the node that is being moved.
         """
         debug = logger.isEnabledFor(logging.DEBUG)
-        events = []
-        try:
+        with _defer_maintenance_events() if self.cache is not None else nullcontext():
             with self._get_pool_lock():
                 for conn in self._get_free_connections():
                     if self._should_update_connection(
@@ -3906,21 +3906,12 @@ class MaintNotificationsAbstractConnectionPool:
                             conn.mark_for_reconnect()
                             continue
                         try:
-                            if cached and isinstance(
-                                conn._conn, MaintNotificationsAbstractConnection
-                            ):
-                                event = conn._reset_maintenance_on_disconnect()
-                                if event is not None:
-                                    events.append(event)
+                            # Queue completion while still owning the connection;
+                            # callbacks run after both idle and pool locks release.
                             conn.disconnect()
                         finally:
                             if cached:
                                 conn._release_idle()
-        finally:
-            # A completion listener may close the pool. Release both idle
-            # ownership and the pool lock before invoking application code.
-            for event in events:
-                _dispatch_maintenance_event(event.config, event)
 
 
 class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInterface):
@@ -4539,48 +4530,44 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # recursive release and retain any newer token until listeners finish.
             self._releasing_connections[connection] = None
 
-        event = None
         try:
-            try:
-                if connection.should_reconnect():
-                    with _defer_maintenance_events():
+            if connection.should_reconnect():
+                with _defer_maintenance_events():
+                    connection.disconnect()
+            # A listener can close the pool and join a peer's idle drain.
+            # That drain may process MOVING and need the pool lock.
+            self._event_dispatcher.dispatch(AfterConnectionReleasedEvent(connection))
+        finally:
+            with _defer_maintenance_events(), self._lock:
+                token = self._releasing_connections.pop(connection)
+                if token is not None:
+                    connection.set_re_auth_token(token)
+                # Sentinel discovery during a listener can change which master
+                # this pool owns while the connection is still active.
+                owned = self.owns_connection(connection)
+                try:
+                    if not owned or connection.should_reconnect():
                         connection.disconnect()
-                # A listener can close the pool and join a peer's idle drain.
-                # That drain may process MOVING and need the pool lock.
-                self._event_dispatcher.dispatch(
-                    AfterConnectionReleasedEvent(connection)
-                )
-            finally:
-                with self._lock:
-                    token = self._releasing_connections.pop(connection)
-                    if token is not None:
-                        connection.set_re_auth_token(token)
-                    try:
-                        # Maintenance can mark it while the listener is running.
-                        if connection.should_reconnect():
-                            if isinstance(
-                                connection._conn, MaintNotificationsAbstractConnection
-                            ):
-                                event = connection._reset_maintenance_on_disconnect()
-                            connection.disconnect()
-                    finally:
-                        self._in_use_connections.remove(connection)
-                        connection._in_use = False
+                finally:
+                    self._in_use_connections.remove(connection)
+                    connection._in_use = False
+                    if owned:
                         self._available_connections.append(connection)
-                        pool_name = get_pool_name(self)
+                    elif connection.pid == self.pid:
+                        self._created_connections -= 1
+                    pool_name = get_pool_name(self)
+                    if owned or connection.pid == self.pid:
                         record_connection_count(
                             pool_name=pool_name,
                             connection_state=ConnectionState.USED,
                             counter=-1,
                         )
+                    if owned:
                         record_connection_count(
                             pool_name=pool_name,
                             connection_state=ConnectionState.IDLE,
                             counter=1,
                         )
-        finally:
-            if event is not None:
-                _dispatch_maintenance_event(event.config, event)
         return True
 
     def owns_connection(self, connection: "Connection") -> int:

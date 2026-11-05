@@ -26,6 +26,7 @@ from redis.maint_notifications import (
     MaintNotificationsConnectionHandler,
     MaintNotificationsPoolHandler,
     MaintenanceState,
+    NodeMigratingNotification,
     NodeMovingNotification,
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
@@ -255,6 +256,148 @@ class TestCachePoolOwnership:
         assert len(events) == 2
         assert {event.connection for event in events} == set(owners)
         assert all(not owner.is_connected for owner in owners)
+
+    @pytest.mark.parametrize(
+        "shutdown", ["disconnect_idle", "disconnect_free_connections"]
+    )
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    @pytest.mark.parametrize("listener_fails", [False, True])
+    def test_disconnect_completion_precedes_reconnected_maintenance(
+        self, pool, r2, shutdown, outcome, listener_fails
+    ):
+        events, checkout_errors, worker_errors, acquired = [], [], [], []
+        unlocked, finish, checked_out = (threading.Event() for _ in range(3))
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                events.append(event)
+                if listener_fails:
+                    raise RuntimeError("application listener failed")
+
+        config = MaintNotificationsConfig(
+            enabled="auto",
+            event_dispatcher=EventDispatcher(
+                {
+                    MaintenanceStartedEvent: [Listener()],
+                    MaintenanceCompletedEvent: [Listener()],
+                }
+            ),
+        )
+        pool.update_maint_notifications_config(config)
+        owner = pool.get_connection()
+        owner.maint_notifications_config = config
+        handler = MaintNotificationsConnectionHandler(owner, config)
+        first, second = (
+            NodeMigratingNotification(1, 10),
+            NodeMigratingNotification(2, 10),
+        )
+        handler.handle_notification(first)
+        pool.release(owner)
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        real_disconnect = owner._conn.disconnect
+        # Pause after the lock that makes checkout possible is actually released.
+        # No sleeps or callback hooks are needed to force the competing checkout.
+        target = owner if shutdown == "disconnect_idle" else pool
+        lock_name = "_in_use_lock" if shutdown == "disconnect_idle" else "_lock"
+        real_lock = getattr(target, lock_name)
+
+        class PausingLock:
+            def __getattr__(self, name):
+                return getattr(real_lock, name)
+
+            def __enter__(self):
+                return real_lock.__enter__()
+
+            def __exit__(self, *args):
+                result = real_lock.__exit__(*args)
+                if (
+                    threading.current_thread() is worker
+                    and not owner.is_connected
+                    and not owner._idle_maintenance
+                    and not unlocked.is_set()
+                ):
+                    unlocked.set()
+                    assert finish.wait(5)
+                return result
+
+        def disconnect(*args, **kwargs):
+            real_disconnect(*args, **kwargs)
+            if threading.current_thread() is worker:
+                if outcome == "error":
+                    raise OSError("disconnect failed after closing the socket")
+                if outcome == "cancel":
+                    raise Cancelled
+
+        def close_idle():
+            try:
+                if shutdown == "disconnect_idle":
+                    pool.disconnect(inuse_connections=False)
+                else:
+                    pool.disconnect_free_connections()
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        def checkout():
+            try:
+                reused = pool.get_connection()
+                acquired.append(reused)
+                assert reused is owner and reused.is_connected
+                handler.handle_notification(second)
+                reused.send_command("GET", key, keys=[key])
+                assert reused.read_response() == b"value"
+                reused.send_command("PING")
+                assert reused.read_response() == b"PONG"
+            except BaseException as exc:
+                checkout_errors.append(exc)
+            finally:
+                checked_out.set()
+
+        worker = threading.Thread(target=close_idle, daemon=True)
+        borrower = threading.Thread(target=checkout, daemon=True)
+        try:
+            with (
+                patch.object(target, lock_name, PausingLock()),
+                patch.object(owner._conn, "disconnect", side_effect=disconnect),
+            ):
+                worker.start()
+                assert unlocked.wait(3)
+                borrower.start()
+                assert checked_out.wait(3), "checkout waited for deferred callbacks"
+                finish.set()
+                worker.join(3)
+                borrower.join(3)
+                assert not worker.is_alive() and not borrower.is_alive()
+                assert not checkout_errors
+                if outcome == "success":
+                    assert not worker_errors
+                else:
+                    assert len(worker_errors) == 1
+                    assert isinstance(
+                        worker_errors[0], OSError if outcome == "error" else Cancelled
+                    )
+                assert [type(event) for event in events] == [
+                    MaintenanceStartedEvent,
+                    MaintenanceCompletedEvent,
+                    MaintenanceStartedEvent,
+                ]
+                assert [event.notification for event in events] == [first, None, second]
+                assert all(event.connection is owner for event in events)
+                assert all(
+                    event.state == MaintenanceState.MAINTENANCE for event in events
+                )
+                assert owner.maintenance_state == MaintenanceState.MAINTENANCE
+        finally:
+            finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+            if borrower.ident is not None:
+                borrower.join(5)
+            for connection in acquired:
+                pool.release(connection)
 
     @pytest.mark.parametrize("outcome", ["close", "listener_error", "parse_error"])
     def test_idle_owner_push_listeners_run_after_drain(self, pool, r2, outcome):

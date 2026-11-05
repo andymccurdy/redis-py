@@ -737,12 +737,15 @@ class TestMultiDbClient:
         db2_became_unhealthy = threading.Event()
         db_became_unhealthy = threading.Event()
         counter_lock = asyncio.Lock()
+        # Keep every database in round 0 until the first call has run, so a
+        # slow runner can't start round 1 (mock_db1 unhealthy) before it.
+        first_call_done = threading.Event()
 
         async def mock_check_health(database, connection=None):
             async with counter_lock:
                 db_probes_in_round[id(database)] += 1
                 # After 3 probes, increment the round counter
-                if db_probes_in_round[id(database)] > 3:
+                if db_probes_in_round[id(database)] > 3 and first_call_done.is_set():
                     db_rounds[id(database)] += 1
                     db_probes_in_round[id(database)] = 1
                 current_round = db_rounds[id(database)]
@@ -795,6 +798,7 @@ class TestMultiDbClient:
             client = MultiDBClient(mock_multi_db_config)
             try:
                 assert client.set("key", "value") == "OK1"
+                first_call_done.set()
 
                 # Wait for mock_db1 to become unhealthy
                 assert db1_became_unhealthy.wait(timeout=1.0), (
@@ -869,11 +873,14 @@ class TestMultiDbClient:
         db_probes_in_round = {id(mock_db): 0, id(mock_db1): 0, id(mock_db2): 0}
         db1_became_unhealthy = threading.Event()
         counter_lock = asyncio.Lock()
+        # Keep every database in round 0 until the first call has run, so a
+        # slow runner can't start round 1 (mock_db1 unhealthy) before it.
+        first_call_done = threading.Event()
 
         async def mock_check_health(database, connection=None):
             async with counter_lock:
                 db_probes_in_round[id(database)] += 1
-                if db_probes_in_round[id(database)] > 3:
+                if db_probes_in_round[id(database)] > 3 and first_call_done.is_set():
                     db_rounds[id(database)] += 1
                     db_probes_in_round[id(database)] = 1
                 current_round = db_rounds[id(database)]
@@ -906,6 +913,7 @@ class TestMultiDbClient:
             client = MultiDBClient(mock_multi_db_config)
             try:
                 assert client.set("key", "value") == "OK1"
+                first_call_done.set()
 
                 # Wait for mock_db1 to become unhealthy
                 assert db1_became_unhealthy.wait(timeout=1.0), (
@@ -960,11 +968,14 @@ class TestMultiDbClient:
         db_probes_in_round = {id(mock_db): 0, id(mock_db1): 0, id(mock_db2): 0}
         db1_became_unhealthy = threading.Event()
         counter_lock = asyncio.Lock()
+        # Keep every database in round 0 until the first call has run, so a
+        # slow runner can't start round 1 (mock_db1 unhealthy) before it.
+        first_call_done = threading.Event()
 
         async def mock_check_health(database, connection=None):
             async with counter_lock:
                 db_probes_in_round[id(database)] += 1
-                if db_probes_in_round[id(database)] > 3:
+                if db_probes_in_round[id(database)] > 3 and first_call_done.is_set():
                     db_rounds[id(database)] += 1
                     db_probes_in_round[id(database)] = 1
                 current_round = db_rounds[id(database)]
@@ -994,6 +1005,7 @@ class TestMultiDbClient:
             client = MultiDBClient(mock_multi_db_config)
             try:
                 assert client.set("key", "value") == "OK1"
+                first_call_done.set()
 
                 # Wait for mock_db1 to become unhealthy
                 assert db1_became_unhealthy.wait(timeout=1.0), (

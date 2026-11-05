@@ -10,6 +10,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from itertools import chain
 from queue import Empty, Full, LifoQueue
 from typing import (
@@ -4534,7 +4535,12 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def re_auth_callback(self, token: TokenInterface):
         first_error = None
-        with self._lock:
+        # Parser callbacks may close the pool. Release idle ownership and the
+        # pool lock before dispatching them, including when AUTH fails.
+        with (
+            _defer_maintenance_events() if self.cache is not None else nullcontext(),
+            self._lock,
+        ):
             for conn in self._available_connections:
                 cached = isinstance(conn, CacheProxyConnection)
                 if cached and not conn._try_acquire_idle():

@@ -11,6 +11,7 @@ import pytest
 from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
+from redis.cluster import NodesManager
 from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.event import (
     EventDispatcher,
@@ -25,6 +26,8 @@ from redis.maint_notifications import (
     MaintNotificationsPoolHandler,
     MaintenanceState,
     NodeMovingNotification,
+    OSSMaintNotificationsHandler,
+    OSSNodeMigratedNotification,
 )
 from redis.utils import HIREDIS_AVAILABLE
 
@@ -365,6 +368,272 @@ class TestCachePoolOwnership:
             assert owner.read_response() == b"PONG"
         finally:
             pool.release(owner)
+
+    def test_smigrated_removed_node_preserves_idle_owner_drain(self, pool, r2):
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        pool.release(owner)
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        r2.set(key, "new")
+        server.sendall(
+            b">2\r\n+invalidate\r\n*1\r\n$"
+            + str(len(key)).encode()
+            + b"\r\n"
+            + key.encode()
+            + b"\r\n"
+        )
+        node = Mock(redis_connection=Redis(connection_pool=pool))
+        cluster = Mock()
+        cluster.nodes_manager._initialization_lock = threading.RLock()
+        cluster.nodes_manager.get_node.return_value = node
+        cluster.nodes_manager.nodes_cache = {"source": node}
+
+        def initialize(**kwargs):
+            NodesManager._free_pool_connections(pool)
+            cluster.nodes_manager.nodes_cache = {}
+
+        cluster.nodes_manager.initialize.side_effect = initialize
+        handler = OSSMaintNotificationsHandler(cluster, MaintNotificationsConfig())
+        notification = OSSNodeMigratedNotification(
+            id=31,
+            nodes_to_slots_mapping={"127.0.0.1:6379": [{"127.0.0.1:6380": "0-10"}]},
+        )
+        draining, finish = threading.Event(), threading.Event()
+        errors = []
+        real_can_read = owner._conn.can_read
+
+        def can_read(*args, **kwargs):
+            readable = real_can_read(*args, **kwargs)
+            if threading.current_thread() is reader and not draining.is_set():
+                assert readable
+                draining.set()
+                assert finish.wait(5)
+            return readable
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"new"
+                borrower.send_command("PING")
+                assert borrower.read_response() == b"PONG"
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        try:
+            with patch.object(owner._conn, "can_read", side_effect=can_read):
+                reader.start()
+                assert draining.wait(3)
+                handler.handle_notification(notification)
+                finish.set()
+                reader.join(3)
+                assert not reader.is_alive()
+                assert not errors
+                assert owner._conn._sock is client
+                assert owner.should_reconnect()
+                assert notification in handler._processed_notifications
+            # The removed node's connection closes on its next release, without
+            # destroying a parser another pool was using for invalidations.
+            acquired = pool.get_connection()
+            assert acquired is owner
+            pool.release(acquired)
+            assert not owner.is_connected
+        finally:
+            finish.set()
+            if reader.ident is not None:
+                reader.join(5)
+            server.close()
+            client.close()
+            peers.release(borrower)
+            peers.disconnect()
+
+    @pytest.mark.parametrize("cleanup_during_refresh", [False, True])
+    def test_smigrated_removed_idle_node_listener_can_close_pool(
+        self, pool, cleanup_during_refresh
+    ):
+        pool.update_maint_notifications_config(MaintNotificationsConfig(enabled="auto"))
+        owner = pool.get_connection()
+        pool.release(owner)
+        events, errors = [], []
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    unlocked = []
+
+                    def probe():
+                        for lock in [
+                            pool._lock,
+                            cluster.nodes_manager._initialization_lock,
+                            handler._lock,
+                        ]:
+                            acquired = lock.acquire(blocking=False)
+                            unlocked.append(acquired)
+                            if acquired:
+                                lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    assert unlocked == [True, True, True], (
+                        "listener holds a pool or topology lock"
+                    )
+                    assert not owner._idle_maintenance
+                    assert not owner.is_connected
+                    events.append(event)
+                    pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        owner.maint_notifications_config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+        )
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        node = Mock(redis_connection=Redis(connection_pool=pool))
+        cluster = Mock()
+        cluster.nodes_manager._initialization_lock = threading.RLock()
+        cluster.nodes_manager.get_node.return_value = node
+        cluster.nodes_manager.nodes_cache = {}
+        if cleanup_during_refresh:
+            cluster.nodes_manager.initialize.side_effect = (
+                lambda **_: NodesManager._free_pool_connections(pool)
+            )
+        handler = OSSMaintNotificationsHandler(cluster, MaintNotificationsConfig())
+        handler.handle_notification(
+            OSSNodeMigratedNotification(
+                id=32,
+                nodes_to_slots_mapping={"127.0.0.1:6379": [{"127.0.0.1:6380": "0-10"}]},
+            )
+        )
+        assert not errors
+        assert len(events) == 1 and events[0].connection is owner
+        assert not owner.is_connected
+
+    @pytest.mark.parametrize(
+        "outcome", ["close", "auth_error", "listener_error", "cancel"]
+    )
+    def test_reauthentication_push_listeners_release_idle_owner(
+        self, pool, r2, outcome
+    ):
+        # Token refresh uses ConnectionPool; exercise shared-cache borrowers
+        # from both pool implementations while its completion listener closes it.
+        auth_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        auth_pool.update_maint_notifications_config(
+            MaintNotificationsConfig(enabled="auto")
+        )
+        owner = auth_pool.get_connection()
+        borrower = pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        auth_pool.release(owner)
+        events, errors = [], []
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    assert not owner._idle_maintenance, "listener holds idle ownership"
+                    unlocked = []
+
+                    def probe():
+                        acquired = auth_pool._lock.acquire(blocking=False)
+                        unlocked.append(acquired)
+                        if acquired:
+                            auth_pool._lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    assert unlocked == [True], "listener holds the pool lock"
+                    events.append(event)
+                    if isinstance(event, MaintenanceCompletedEvent):
+                        auth_pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                if outcome == "listener_error":
+                    raise RuntimeError("application listener failed")
+
+        config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher(
+                {
+                    MaintenanceStartedEvent: [Listener()],
+                    MaintenanceCompletedEvent: [Listener()],
+                }
+            ),
+        )
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        server.settimeout(3)
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        handler = MaintNotificationsConnectionHandler(owner, config)
+        owner._conn._parser.set_maintenance_push_handler(handler.handle_notification)
+        owner.maint_notifications_config = config
+        server.sendall(b">3\r\n+MIGRATING\r\n:1\r\n:10\r\n>2\r\n+MIGRATED\r\n:1\r\n")
+        token = Mock()
+        token.try_get.return_value = "default"
+        token.get_value.return_value = "test-token"
+        command = b"".join(owner._conn.pack_command("AUTH", "default", "test-token"))
+
+        def authenticate():
+            try:
+                received = b""
+                while len(received) < len(command):
+                    received += server.recv(len(command) - len(received))
+                assert received == command
+                if outcome != "cancel":
+                    server.sendall(
+                        b"-WRONGPASS invalid token\r\n"
+                        if outcome == "auth_error"
+                        else b"+OK\r\n"
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=authenticate, daemon=True)
+        try:
+            worker.start()
+            if outcome == "cancel":
+                with patch.object(owner, "read_response", side_effect=Cancelled):
+                    with pytest.raises(Cancelled):
+                        auth_pool.re_auth_callback(token)
+            elif outcome == "auth_error":
+                with pytest.raises(AuthenticationError, match="invalid token"):
+                    auth_pool.re_auth_callback(token)
+            else:
+                auth_pool.re_auth_callback(token)
+            worker.join(3)
+            assert not worker.is_alive()
+            assert not errors
+            assert [type(event) for event in events] == [
+                MaintenanceStartedEvent,
+                MaintenanceCompletedEvent,
+            ]
+            assert not owner._idle_maintenance and not owner.is_connected
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"value"
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            server.close()
+            client.close()
+            worker.join(5)
+            pool.release(borrower)
+            auth_pool.disconnect()
 
     @pytest.mark.skipif(
         not hasattr(signal, "setitimer"), reason="requires interval-timer signals"

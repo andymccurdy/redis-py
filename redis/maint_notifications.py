@@ -1363,7 +1363,13 @@ class OSSMaintNotificationsHandler:
         # thread and needs _lock - so a thread holding _lock must never wait for
         # _initialization_lock. See the _initialization_lock comment in
         # NodesManager.__init__ for the full ordering rule.
-        with self.cluster_client.nodes_manager._initialization_lock, self._lock:
+        # Topology cleanup can emit completion events. Listeners may reenter a
+        # pool, so defer them until all topology and pool locks are released.
+        with (
+            _defer_maintenance_events(),
+            self.cluster_client.nodes_manager._initialization_lock,
+            self._lock,
+        ):
             if (
                 notification in self._in_progress
                 or notification in self._processed_notifications
@@ -1451,10 +1457,9 @@ class OSSMaintNotificationsHandler:
                             current_node
                             not in self.cluster_client.nodes_manager.nodes_cache.values()
                         ):
-                            # disconnect all free connections to the node - this node will be dropped
-                            # from the cluster, so we don't need to revert the timeouts
-                            for conn in current_node.redis_connection.connection_pool._get_free_connections():
-                                conn.disconnect()
+                            # A cache owner being drained must keep its parser
+                            # until the read ends; defer its disconnect to release.
+                            current_node.redis_connection.connection_pool.disconnect_free_connections()
 
                             # Only record handoff if not already recorded for this node
                             if not handoff_recorded:

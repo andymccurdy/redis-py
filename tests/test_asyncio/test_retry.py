@@ -1,3 +1,4 @@
+import copy
 import warnings
 from threading import Lock
 
@@ -8,10 +9,10 @@ from redis.asyncio.connection import (
     ConnectionPool,
     UnixDomainSocketConnection,
 )
-from redis.asyncio.retry import Retry
+from redis.asyncio.retry import Retry, _to_async_retry
 from redis.backoff import AbstractBackoff, ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError, TimeoutError
-from redis.retry import AbstractRetry
+from redis.retry import AbstractRetry, is_retryable_connect_error
 from redis.retry import Retry as SyncRetry
 
 
@@ -235,6 +236,27 @@ class TestConnectionConstructorWithRetry:
         assert isinstance(client.get_retry(), Retry)
         assert client.get_retry().get_retries() == new_retry.get_retries()
 
+    def test_to_async_retry_preserves_checker(self):
+        retry = SyncRetry(NoBackoff(), 2, is_retryable=is_retryable_connect_error)
+        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
+            async_retry = _to_async_retry(retry)
+
+        assert isinstance(async_retry, Retry)
+        assert async_retry.is_retryable is is_retryable_connect_error
+
+    def test_to_async_retry_without_checker(self):
+        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
+            async_retry = _to_async_retry(SyncRetry(NoBackoff(), 2))
+
+        assert async_retry.is_retryable is None
+
+    def test_client_conversion_preserves_checker(self):
+        retry = SyncRetry(NoBackoff(), 2, is_retryable=is_retryable_connect_error)
+        with pytest.warns(UserWarning, match="synchronous redis.retry.Retry"):
+            client = Redis(retry=retry)
+
+        assert client.get_retry().is_retryable is is_retryable_connect_error
+
     def test_redis_set_retry_converts_without_pool_write(self, monkeypatch):
         client = Redis()
         monkeypatch.setattr(client.connection_pool, "set_retry", lambda retry: None)
@@ -315,6 +337,66 @@ class TestRetry:
 
         assert self.actual_attempts == 5
         assert self.actual_failures == 5
+
+    @pytest.mark.asyncio
+    async def test_retry_checker_can_stop_retries(self):
+        """A retry-level checker returning False stops retrying immediately."""
+        backoff = BackoffMock()
+        retry = Retry(backoff, 3, is_retryable=lambda error: False)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(self._do, self._fail)
+
+        assert self.actual_attempts == 1
+        assert self.actual_failures == 1
+        assert backoff.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_checker_returning_true_keeps_default_behavior(self):
+        backoff = BackoffMock()
+        retry = Retry(backoff, 3, is_retryable=lambda error: True)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(self._do, self._fail)
+
+        assert self.actual_attempts == 4
+        assert self.actual_failures == 4
+
+    @pytest.mark.asyncio
+    async def test_retry_checker_is_and_composed_with_per_call_checker(self):
+        """Both the retry-level and the per-call checker must allow a retry."""
+        retry = Retry(BackoffMock(), 3, is_retryable=lambda error: False)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(
+                self._do, self._fail, is_retryable=lambda error: True
+            )
+        assert self.actual_attempts == 1
+
+        self.setup_method(None)
+        retry = Retry(BackoffMock(), 3, is_retryable=lambda error: True)
+        with pytest.raises(ConnectionError):
+            await retry.call_with_retry(
+                self._do, self._fail, is_retryable=lambda error: False
+            )
+        assert self.actual_attempts == 1
+        # The per-call predicate only stops retries; it does not run the handler.
+        assert self.actual_failures == 0
+
+    def test_retry_checker_defaults_to_none(self):
+        assert Retry(NoBackoff(), 1).is_retryable is None
+
+    def test_retry_checker_preserved_by_deepcopy(self):
+        retry = Retry(NoBackoff(), 2, is_retryable=is_retryable_connect_error)
+        copied = copy.deepcopy(retry)
+        assert copied.is_retryable is is_retryable_connect_error
+        assert copied == retry
+
+    def test_retry_equality_includes_checker(self):
+        def checker(error):
+            return True
+
+        same = Retry(NoBackoff(), 1, is_retryable=checker)
+        assert same == Retry(NoBackoff(), 1, is_retryable=checker)
+        assert same != Retry(NoBackoff(), 1)
+        assert same != Retry(NoBackoff(), 1, is_retryable=lambda error: True)
 
 
 class TestRedisClientRetry:

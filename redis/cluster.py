@@ -143,6 +143,24 @@ def _resolve_localhost() -> str:
     return socket.gethostbyname("localhost")
 
 
+def _fill_missing_redirect_host(error: AskError, origin_host: str) -> None:
+    """
+    Give a MOVED or ASK redirect that came without a host the host of the node
+    that sent it. A node whose endpoint is unknown
+    (``cluster-preferred-endpoint-type unknown-endpoint``) redirects with only a
+    port, as in ``MOVED 3999 :6381``, and expects the client to reach out on
+    the endpoint it sent the command to.
+
+    ``origin_host`` is the host the client connected to, which has already been
+    through ``address_remap``, so the redirect is remapped a second time when it
+    is followed. That is harmless for a remap that only picks the port, as for a
+    proxy, but not for one that changes the host.
+    """
+    if not error.host:
+        error.host = origin_host
+        error.node_addr = error.host, error.port
+
+
 @deprecated_args(
     allowed_args=["redis_node"],
     reason="Use get_connection(redis_node) instead",
@@ -2112,6 +2130,10 @@ class RedisCluster(
 
         while ttl > 0:
             ttl -= 1
+            # The previous attempt's connection was released by its finally and
+            # may already belong to another caller. Forget it, so a failed
+            # checkout below does not disconnect or release it a second time.
+            connection = None
             try:
                 if asking:
                     target_node = self.get_node(*redirect_addr)
@@ -2292,6 +2314,7 @@ class RedisCluster(
                         f"MOVED error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
+                _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
                 # refresh of the whole topology, run by the next attempt of any
@@ -2366,6 +2389,7 @@ class RedisCluster(
                         f"ASK error received for command {args_log_str}, on node {target_node.name}, "
                         f"and connection: {connection}, {connection_details}, error: {e}"
                     )
+                _fill_missing_redirect_host(e, target_node.host)
                 redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
 
@@ -3541,7 +3565,7 @@ class NodesManager:
                 # Fix it to the host in startup_nodes
                 if (
                     len(cluster_slots) == 1
-                    and len(cluster_slots[0][2][0]) == 0
+                    and not cluster_slots[0][2][0]
                     and len(self.startup_nodes) == 1
                 ):
                     cluster_slots[0][2][0] = startup_node.host
@@ -3549,7 +3573,11 @@ class NodesManager:
                 for slot in cluster_slots:
                     primary_node = slot[2]
                     host = str_if_bytes(primary_node[0])
-                    if host == "":
+                    # A node that does not know its own address sends an empty
+                    # host, and one whose endpoint is unknown
+                    # (cluster-preferred-endpoint-type unknown-endpoint) a null
+                    # one: both are reached on the host that answered
+                    if not host:
                         host = startup_node.host
                     port = int(primary_node[1])
                     host, port = self.remap_host_port(host, port)
@@ -3564,6 +3592,8 @@ class NodesManager:
                     replica_nodes = slot[3:]
                     for replica_node in replica_nodes:
                         host = str_if_bytes(replica_node[0])
+                        if not host:
+                            host = startup_node.host
                         port = int(replica_node[1])
                         host, port = self.remap_host_port(host, port)
                         target_replica_node = self._get_or_create_cluster_node(
@@ -4478,6 +4508,10 @@ class ClusterPubSub(PubSub):
         # move_slot indexes slots_cache by the redirected slot, so an
         # as-yet-uncovered slot raises: log and still reconcile rather than let
         # a repair attempt break a pubsub read.
+        if node_name is not None:
+            # A redirect without a host is relative to the node that sent it,
+            # and a node's name is its host and port
+            _fill_missing_redirect_host(error, node_name.rsplit(":", 1)[0])
         try:
             self.cluster.nodes_manager.move_slot(error)
         except Exception as exc:
@@ -6409,6 +6443,8 @@ class TransactionStrategy(AbstractStrategy):
                 # MovedError is an AskError, so a MOVED slot is patched too, and
                 # the retry goes to the node that owns it now. The refresh is
                 # only asked for, run by the next command once due.
+                if self._transaction_node is not None:
+                    _fill_missing_redirect_host(error, self._transaction_node.host)
                 self._nodes_manager.move_slot(error)
                 if should_request_refresh:
                     self._nodes_manager._request_refresh()

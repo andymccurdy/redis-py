@@ -6,6 +6,18 @@ from ._util import to_string
 from .document import Document
 
 
+def _make_document(doc_id, fields, score, with_scores, payload, has_payload):
+    # A document field named "payload" or "score" is passed through **fields,
+    # so it must not also be passed as a keyword. The reply's own score and
+    # payload take precedence when they were requested, as the id does.
+    doc = Document(doc_id, **fields)
+    if with_scores:
+        doc.score = score
+    if has_payload:
+        doc.payload = payload
+    return doc
+
+
 class Result:
     """
     Represents the result of a search query, and has an array of Document
@@ -81,12 +93,9 @@ class Result:
             except KeyError:
                 pass
 
-            doc = (
-                Document(id, score=score, payload=payload, **fields)
-                if with_scores
-                else Document(id, payload=payload, **fields)
+            self.docs.append(
+                _make_document(id, fields, score, with_scores, payload, has_payload)
             )
-            self.docs.append(doc)
 
     @classmethod
     def from_resp3(
@@ -144,12 +153,9 @@ class Result:
             except KeyError:
                 pass
 
-            doc = (
-                Document(doc_id, score=score, payload=None, **fields)
-                if with_scores
-                else Document(doc_id, payload=None, **fields)
+            instance.docs.append(
+                _make_document(doc_id, fields, score, with_scores, None, False)
             )
-            instance.docs.append(doc)
 
         return instance
 

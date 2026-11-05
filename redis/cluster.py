@@ -467,6 +467,20 @@ def _record_replies(
     return error
 
 
+def _keep_target_replies(
+    replies: Dict[str, Any], target_nodes: Iterable["ClusterNode"]
+) -> None:
+    """
+    Drop the kept replies of the nodes that are no longer among the targets of a command
+    sent to several nodes, so a retry merges the replies of the current targets only - as
+    the main path does. A node the topology refresh replaced has answered for a shard its
+    replacement is asked about again.
+    """
+    names = {node.name for node in target_nodes}
+    for name in [name for name in replies if name not in names]:
+        del replies[name]
+
+
 def _with_keys(options: Dict[str, Any], keys: List[Any]) -> Dict[str, Any]:
     """
     The options of one command of a split, which must carry that command's keys: the
@@ -2289,22 +2303,19 @@ class RedisCluster(
         is_default_node = False
         target_nodes = None
         passed_targets = kwargs.pop("target_nodes", None)
-        if (
-            passed_targets is not None
-            and not self._is_nodes_flag(passed_targets)
-            and not (
+        nodes_flag = False
+        if passed_targets is not None:
+            nodes_flag = self._is_nodes_flag(passed_targets)
+            if not nodes_flag and not (
                 isinstance(passed_targets, (list, dict, str)) and not passed_targets
-            )
-        ):
-            target_nodes = self._parse_target_nodes(passed_targets)
-            target_nodes_specified = True
+            ):
+                target_nodes = self._parse_target_nodes(passed_targets)
+                target_nodes_specified = True
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
         command, command_policies = self._resolve_command_policies(
-            *args,
-            target_nodes_specified=target_nodes_specified
-            or self._is_nodes_flag(passed_targets),
+            *args, target_nodes_specified=target_nodes_specified or nodes_flag
         )
 
         # If an error that allows retrying was thrown, a refresh of the nodes
@@ -2351,8 +2362,9 @@ class RedisCluster(
         # The replies already got, kept across the attempts so a retry sends the command
         # only where it has not been answered: sending it again would run a write twice,
         # and change what a summed reply counts. Keyed by slot for a split MULTI_SHARD
-        # command, by node name for a command sent to several nodes.
-        replies: Dict[Any, Any] = {}
+        # command, by node name for a command sent to several nodes. Allocated only for
+        # those: a command sent to one node is retried whole.
+        replies: Optional[Dict[Any, Any]] = None
 
         for _ in range(execute_attempts):
             # Run a topology refresh an earlier error asked for, once due. The
@@ -2376,6 +2388,8 @@ class RedisCluster(
                             nodes_flag=passed_targets,
                         )
                     elif len(splits) > 1:
+                        if replies is None:
+                            replies = {}
                         return self._execute_multi_shard_command_per_slot(
                             command,
                             splits,
@@ -2402,6 +2416,8 @@ class RedisCluster(
                     command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED
                 )
                 fan_out = len(target_nodes) > 1
+                if fan_out and replies is None:
+                    replies = {}
                 for node in target_nodes:
                     if fan_out and node.name in replies:
                         # Answered on an earlier attempt
@@ -6247,6 +6263,10 @@ class PipelineStrategy(AbstractStrategy):
             ),
             key=lambda x: x.position,
         )
+        # The commands whose reply is read raw below, so their cluster response callback
+        # is applied once at the end. A command answered on an earlier attempt was
+        # parsed then, and one resent on its own is parsed by ``_execute_command``.
+        parsed_here = {c.position for c in attempt}
         is_default_node = False
         # build a list of node objects based on node names we need to
         nodes: dict[str, NodeCommands] = {}
@@ -6394,9 +6414,13 @@ class PipelineStrategy(AbstractStrategy):
                             )
                         )
                 elif len(target_nodes) > 1:
-                    # A node that answered on an earlier attempt is not asked again.
+                    # A node that answered on an earlier attempt is not asked again. One
+                    # the topology refresh dropped from the targets is dropped from the
+                    # replies too, as on the main path.
                     if c.replies is None:
                         c.replies = {}
+                    else:
+                        _keep_target_replies(c.replies, target_nodes)
                     copies = {}
                     fanned_out.append((c, copies, None))
                     queued = []
@@ -6533,6 +6557,7 @@ class PipelineStrategy(AbstractStrategy):
             ),
             key=lambda x: x.position,
         )
+        parsed_here.difference_update(c.position for c in attempt)
         if attempt and allow_redirections:
             # RETRY MAGIC HAPPENS HERE!
             # send these remaining commands one at a time using `execute_command`
@@ -6594,12 +6619,13 @@ class PipelineStrategy(AbstractStrategy):
         # turn the response back into a simple flat array that corresponds
         # to the sequence of commands issued in the stack in pipeline.execute()
         # A fanned-out command had its per-node replies parsed when they were merged.
-        merged_positions = {c.position for c, _, _ in fanned_out}
+        parsed_here.difference_update(c.position for c, _, _ in fanned_out)
         response = []
         for c in sorted(stack, key=lambda x: x.position):
             if (
-                c.args[0] in self._pipe.cluster_response_callbacks
-                and c.position not in merged_positions
+                c.position in parsed_here
+                and not isinstance(c.result, Exception)
+                and c.args[0] in self._pipe.cluster_response_callbacks
             ):
                 # Remove keys entry, it needs only for cache.
                 c.options.pop("keys", None)
@@ -6697,6 +6723,7 @@ class PipelineStrategy(AbstractStrategy):
                 nodes_flag=command.target_nodes,
             )
 
+        _keep_target_replies(command.replies, target_nodes)
         res = dict(command.replies)
         for node in target_nodes:
             if node.name in command.replies:

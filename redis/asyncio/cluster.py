@@ -82,6 +82,7 @@ from redis.cluster import (
     LoadBalancingStrategy,
     _error_to_raise,
     _fill_missing_redirect_host,
+    _keep_target_replies,
     _merge_multi_shard_replies,
     _MultiShardSplit,
     _record_replies,
@@ -1681,23 +1682,20 @@ class RedisCluster(
         retry_attempts = self.retry.get_retries()
 
         passed_targets = kwargs.pop("target_nodes", None)
-        if (
-            passed_targets is not None
-            and not self._is_node_flag(passed_targets)
-            and not (
+        node_flag = False
+        if passed_targets is not None:
+            node_flag = self._is_node_flag(passed_targets)
+            if not node_flag and not (
                 isinstance(passed_targets, (list, dict, str)) and not passed_targets
-            )
-        ):
-            target_nodes = self._parse_target_nodes(passed_targets)
-            target_nodes_specified = True
-            retry_attempts = 0
+            ):
+                target_nodes = self._parse_target_nodes(passed_targets)
+                target_nodes_specified = True
+                retry_attempts = 0
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
         command, command_policies = await self._resolve_command_policies(
-            *args,
-            target_nodes_specified=target_nodes_specified
-            or self._is_node_flag(passed_targets),
+            *args, target_nodes_specified=target_nodes_specified or node_flag
         )
 
         # Add one for the first execution
@@ -1737,8 +1735,9 @@ class RedisCluster(
         # The replies of the nodes a command sent to several nodes already got, kept
         # across the attempts so a retry asks only the nodes that have not answered:
         # asking a node again would run a write twice, and change what a summed reply
-        # counts
-        replies: Dict[str, Any] = {}
+        # counts. Allocated only for such a command: one sent to one node is retried
+        # whole.
+        replies: Optional[Dict[str, Any]] = None
 
         for _ in range(execute_attempts):
             if self._initialize_due():
@@ -1783,6 +1782,8 @@ class RedisCluster(
                     # Every node is asked: the one that succeeds is not known up front.
                     # SCRIPT KILL succeeds only on the shard running the script. A node
                     # that answered on an earlier attempt is not asked again.
+                    if replies is None:
+                        replies = {}
                     asked = [node for node in target_nodes if node.name not in replies]
                     # Every task settles before an error is raised, so a retry never
                     # asks a node again while its task is still running the command
@@ -4090,9 +4091,13 @@ class PipelineStrategy(AbstractStrategy):
                         )
                     )
             elif len(target_nodes) > 1:
-                # A node that answered on an earlier attempt is not asked again.
+                # A node that answered on an earlier attempt is not asked again. One the
+                # topology refresh dropped from the targets is dropped from the replies
+                # too, as on the main path.
                 if cmd.replies is None:
                     cmd.replies = {}
+                else:
+                    _keep_target_replies(cmd.replies, target_nodes)
                 copies = {}
                 fanned_out.append((cmd, command, copies, None))
                 queued = []
@@ -4320,6 +4325,7 @@ class PipelineStrategy(AbstractStrategy):
                 node_flag=cmd.target_nodes,
             )
 
+        _keep_target_replies(cmd.replies, target_nodes)
         res = dict(cmd.replies)
         for node in target_nodes:
             if node.name in cmd.replies:

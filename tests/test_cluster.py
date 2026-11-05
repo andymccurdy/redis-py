@@ -7973,9 +7973,11 @@ class TestClusterPipeline:
         """
         An error the pipeline does not retry per command, such as CLUSTERDOWN, retries the
         whole pipeline. That retry resends only the commands no node answered: a write
-        that already succeeded would otherwise run twice.
+        that already succeeded would otherwise run twice. The reply of an answered command
+        is kept as it was parsed, so its response callback is not applied a second time.
         """
         first, second = _keys_on_every_shard(r, "stack")[:2]
+        slots = r.execute_command("CLUSTER SLOTS")
         failed = []
 
         def fail(args):
@@ -7987,13 +7989,14 @@ class TestClusterPipeline:
         with _pipelined_commands(fail) as batches:
             with r.pipeline() as pipe:
                 pipe.execute_command("INCR", first)
+                pipe.execute_command("CLUSTER SLOTS")
                 pipe.execute_command("INCR", second)
-                assert pipe.execute() == [1, 1]
+                assert pipe.execute() == [1, slots, 1]
 
         assert failed
-        # Each INCR reached the server once: the failed one only on the retry
+        # Each command reached the server once: the failed one only on the retry
         assert sorted(args for batch in batches for args, _ in batch) == sorted(
-            [("INCR", first), ("INCR", second)]
+            [("INCR", first), ("CLUSTER SLOTS",), ("INCR", second)]
         )
 
     def test_evalsha_in_pipeline(self, r):

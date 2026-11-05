@@ -72,6 +72,7 @@ from redis.cluster import (
     _REPLICAS_ONLY_STRATEGIES,
     _RESPONSE_POLICY_CALLBACKS,
     _SPECIAL_RESPONSE_CALLBACKS,
+    _UNANSWERED,
     PIPELINE_BLOCKED_COMMANDS,
     PRIMARY,
     REPLICA,
@@ -3698,11 +3699,6 @@ for command in PIPELINE_BLOCKED_COMMANDS:
 # the inherited implementation and queue CLIENT LIST like a real pipelined
 # command instead of raising.
 setattr(ClusterPipeline, "client_list_iter", block_pipeline_command("client_list_iter"))
-
-
-# The result of a pipeline command no node has answered yet. A reply can be None, so None
-# cannot tell an unanswered command from one a node answered.
-_UNANSWERED = object()
 
 
 class PipelineCommand:

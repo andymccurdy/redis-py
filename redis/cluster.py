@@ -5818,6 +5818,11 @@ for command in PIPELINE_BLOCKED_COMMANDS:
 setattr(ClusterPipeline, "client_list_iter", block_pipeline_command("client_list_iter"))
 
 
+# The result of a pipeline command no node has answered yet. A reply can be None, so None
+# cannot tell an unanswered command from one a node answered.
+_UNANSWERED = object()
+
+
 class PipelineCommand:
     """ """
 
@@ -5827,7 +5832,7 @@ class PipelineCommand:
             options = {}
         self.options = options
         self.position = position
-        self.result = None
+        self.result = _UNANSWERED
         self.node = None
         self.asking = False
         # Either record type: a policy resolver serves ``CommandPolicies``, while the
@@ -5869,7 +5874,7 @@ class NodeCommands:
         # We are going to clobber the commands with the write, so go ahead
         # and ensure that nothing is sitting there from a previous run.
         for c in commands:
-            c.result = None
+            c.result = _UNANSWERED
 
         # build up all commands into a single request to increase network perf
         # send all the commands and catch connection and timeout errors.
@@ -5903,7 +5908,7 @@ class NodeCommands:
             # the connection object back into the
             # pool and on the next write, it will
             # explicitly open the connection and all will be well.
-            if c.result is None:
+            if c.result is _UNANSWERED:
                 try:
                     c.result = self.parse_response(connection, c.args[0], **c.options)
                 except (ConnectionError, TimeoutError) as e:
@@ -6232,8 +6237,16 @@ class PipelineStrategy(AbstractStrategy):
         # the first time sending the commands we send all of
         # the commands that were queued up.
         # if we have to run through it again, we only retry
-        # the commands that failed.
-        attempt = sorted(stack, key=lambda x: x.position)
+        # the commands that failed, or that no node answered:
+        # resending one that succeeded would run a write twice.
+        attempt = sorted(
+            (
+                c
+                for c in stack
+                if c.result is _UNANSWERED or isinstance(c.result, Exception)
+            ),
+            key=lambda x: x.position,
+        )
         is_default_node = False
         # build a list of node objects based on node names we need to
         nodes: dict[str, NodeCommands] = {}

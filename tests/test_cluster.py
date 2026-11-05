@@ -7966,6 +7966,36 @@ class TestClusterPipeline:
             str(ex.value).startswith("shard_hint is deprecated in cluster mode") is True
         )
 
+    @skip_if_server_version_lt("7.0.0")
+    def test_a_retry_of_the_pipeline_resends_only_the_unanswered_commands(
+        self, r, no_cluster_retry_delay
+    ):
+        """
+        An error the pipeline does not retry per command, such as CLUSTERDOWN, retries the
+        whole pipeline. That retry resends only the commands no node answered: a write
+        that already succeeded would otherwise run twice.
+        """
+        first, second = _keys_on_every_shard(r, "stack")[:2]
+        failed = []
+
+        def fail(args):
+            if args == ("INCR", second) and not failed:
+                failed.append(args)
+                return ClusterDownError("CLUSTERDOWN The cluster is down")
+            return None
+
+        with _pipelined_commands(fail) as batches:
+            with r.pipeline() as pipe:
+                pipe.execute_command("INCR", first)
+                pipe.execute_command("INCR", second)
+                assert pipe.execute() == [1, 1]
+
+        assert failed
+        # Each INCR reached the server once: the failed one only on the retry
+        assert sorted(args for batch in batches for args, _ in batch) == sorted(
+            [("INCR", first), ("INCR", second)]
+        )
+
     def test_evalsha_in_pipeline(self, r):
         """
         EVALSHA is allowed in ClusterPipeline when keys map to one slot

@@ -4,10 +4,12 @@ from unittest import mock
 import pytest
 from redis import RedisClusterException
 import redis
+from redis.backoff import NoBackoff
 from redis.client import Pipeline
 from redis.observability import recorder
 from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
+from redis.retry import Retry
 
 from .conftest import skip_if_server_version_lt, wait_for_command
 
@@ -991,3 +993,52 @@ class TestPipelineMetricsRecording:
             assert "error.type" in error_attrs
 
         recorder.reset_collector()
+
+
+@pytest.mark.fixed_client
+class TestPipelineRetryChecker:
+    """A retry-level checker rejection must still run the pipeline's fail hook."""
+
+    class FakeConnection:
+        host = "localhost"
+        port = 6379
+        db = 0
+
+        def __init__(self, retry):
+            self.retry = retry
+            self.disconnected = False
+
+        def send_command(self, *args, **kwargs):
+            if args[0] == "GET":
+                raise redis.TimeoutError("boom")
+            return None
+
+        def read_response(self):
+            return True
+
+        def disconnect(self, *args, **kwargs):
+            self.disconnected = True
+
+    class FakeConnectionPool:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def get_connection(self):
+            return self.connection
+
+        def release(self, connection):
+            pass
+
+    def test_retry_checker_rejection_resets_watching_pipeline(self):
+        retry = Retry(NoBackoff(), 3, is_retryable=lambda error: False)
+        connection = self.FakeConnection(retry)
+        pipeline = Pipeline(self.FakeConnectionPool(connection), {}, True, None)
+
+        pipeline.watch("foo")
+        assert pipeline.watching
+
+        with pytest.raises(redis.WatchError):
+            pipeline.get("foo")
+
+        assert not pipeline.watching
+        assert connection.disconnected

@@ -2352,29 +2352,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # A cache shared across pools can retain owners from before a fork.
             # Their locks may have been held by threads that do not exist here.
             elif isinstance(owner, CacheProxyConnection) and owner.pid == self.pid:
-                # A push listener may close the pool and need this lock again.
-                # Apply notifications while owning the socket, then dispatch
-                # application events after releasing it, even on a read error.
-                with _defer_maintenance_events(), owner._in_use_lock:
-                    if not owner._conn.is_connected:
-                        # Pool disconnect may have closed this owner while we
-                        # waited. can_read() would reconnect its raw connection.
-                        pass
-                    elif not owner._in_use:
-                        try:
-                            self._drain_invalidations(owner._conn)
-                        finally:
-                            # Topology cleanup cannot close a socket while we
-                            # drain it. A removed node may never be checked out
-                            # again, so finish its deferred disconnect here.
-                            if owner.should_reconnect():
-                                owner.disconnect()
-                        can_serve = True
-                    elif time.monotonic() < owner._busy_cache_deadline:
-                        # Never touch a checked-out owner's socket. Recent cache
-                        # reads can share its value until its grace period expires.
-                        # Hits do not move ownership or extend that deadline.
-                        can_serve = True
+                can_serve = self._can_serve_cached_response(owner)
             # Custom entries without pool ownership information cannot be drained
             # safely and must use a fresh read on our connection.
 
@@ -2925,6 +2903,56 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # nothing, so the next connect has no session to flush for.
         self._connected_once = True
         conn._parser.set_invalidation_push_handler(self._on_invalidation_callback)
+
+    def _can_serve_cached_response(self, owner):
+        # A topology refresh can check out the same idle owner for CLUSTER
+        # SLOTS. Run it only after the drain releases the socket, like event
+        # listeners that can close the pool. Keep connection-local maintenance
+        # and invalidations inline while the parser is exclusively owned.
+        with _defer_maintenance_events():
+            pending = None
+            handler = None
+            try:
+                with owner._in_use_lock:
+                    if not owner._conn.is_connected:
+                        return False
+                    if owner._in_use:
+                        # Hits neither touch a busy socket nor extend its grace.
+                        return time.monotonic() < owner._busy_cache_deadline
+                    parser = getattr(owner._conn, "_parser", None)
+                    handler = getattr(
+                        parser, "oss_cluster_maint_push_handler_func", None
+                    )
+                    if handler is not None:
+                        pending = []
+
+                        def defer(notification):
+                            pending.append(notification)
+                            # A removed node's entries must not be reused in
+                            # the gap between releasing ownership and refresh.
+                            with self._cache_lock:
+                                self._cache.flush()
+
+                        parser.set_oss_cluster_maint_push_handler(defer)
+                    try:
+                        self._drain_invalidations(owner._conn)
+                    finally:
+                        if handler is not None:
+                            parser.set_oss_cluster_maint_push_handler(handler)
+                        # A removed node may never be checked out again. Finish
+                        # cleanup that could not close the socket mid-drain,
+                        # including when parsing fails or is interrupted.
+                        if owner.should_reconnect():
+                            owner.disconnect()
+                    return True
+            finally:
+                for notification in pending or ():
+                    try:
+                        handler(notification)
+                    except Exception as e:
+                        # Match inline parser handling: log ordinary handler
+                        # errors, but allow cancellation to propagate.
+                        logger.error(f"Error handling {notification}: {e}")
 
     def _drain_invalidations(self, conn: ConnectionInterface):
         while conn.can_read():

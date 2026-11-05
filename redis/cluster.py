@@ -96,6 +96,7 @@ from redis.lock import Lock
 from redis.maint_notifications import (
     MaintNotificationsConfig,
     OSSMaintNotificationsHandler,
+    _defer_maintenance_events,
 )
 from redis.observability.recorder import (
     record_error_count,
@@ -3044,7 +3045,7 @@ class NodesManager:
         closed once their current command completes, and disconnect its free
         connections.
         """
-        with pool._lock:
+        with _defer_maintenance_events(), pool._lock:
             pool.update_active_connections_for_reconnect()
             pool.disconnect_free_connections()
 
@@ -3425,6 +3426,7 @@ class NodesManager:
             additional_startup_nodes_info = []
 
         with (
+            _defer_maintenance_events(),
             self._initialization_lock,
             self._initializing_on_this_thread(),
             self._counting_failed_refresh(),

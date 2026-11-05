@@ -11,7 +11,7 @@ import pytest
 from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
-from redis.cluster import NodesManager
+from redis.cluster import ClusterNode, NodesManager
 from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.event import (
     AfterConnectionReleasedEvent,
@@ -52,6 +52,245 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_smigrated_refresh_reuses_owner_after_peer_drain(self, pool, r2, outcome):
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        pool.release(owner)
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        server.settimeout(3)
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        r2.set(key, "new")
+        node = ClusterNode(
+            owner.host, owner.port, redis_connection=Redis(connection_pool=pool)
+        )
+        # Only skip construction's initial discovery. The SMIGRATED handler
+        # below runs the real initialize, checkout and CLUSTER SLOTS exchange.
+        with patch.object(NodesManager, "initialize"):
+            manager = NodesManager(
+                [node],
+                cache=pool.cache,
+                **{
+                    k: v
+                    for k, v in pool.connection_kwargs.items()
+                    if k not in ("host", "port", "maint_notifications_config")
+                },
+            )
+        manager.nodes_cache = {node.name: node}
+        handler = OSSMaintNotificationsHandler(
+            Mock(nodes_manager=manager), MaintNotificationsConfig()
+        )
+        owner._conn._parser.set_oss_cluster_maint_push_handler(
+            handler.handle_notification
+        )
+        notification = OSSNodeMigratedNotification(
+            83, {node.name: [{node.name: "0-16383"}]}
+        )
+        push = (
+            b">3\r\n+SMIGRATED\r\n:83\r\n*1\r\n*3\r\n+"
+            + node.name.encode()
+            + b"\r\n+"
+            + node.name.encode()
+            + b"\r\n+0-16383\r\n"
+        )
+        slots = (
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n+"
+            + node.host.encode()
+            + b"\r\n:"
+            + str(node.port).encode()
+            + b"\r\n+node-id\r\n"
+        )
+        command = b"".join(owner._conn.pack_command("CLUSTER SLOTS"))
+        commands, errors = [], []
+        real_acquire = owner._acquire
+        real_read_response = owner._conn.read_response
+        interrupted = False
+
+        class Cancelled(BaseException):
+            pass
+
+        def read_response(*args, **kwargs):
+            nonlocal interrupted
+            reply = real_read_response(*args, **kwargs)
+            if kwargs.get("push_request") and not interrupted:
+                interrupted = True
+                if outcome == "error":
+                    raise RuntimeError("drain failed")
+                if outcome == "cancel":
+                    raise Cancelled
+            return reply
+
+        class NestedDrainCheckout(BaseException):
+            pass
+
+        def acquire():
+            # Fail before the old implementation blocks forever on its own
+            # non-reentrant lock; do not leave a deadlocked worker in the suite.
+            if not owner._in_use_lock.acquire(blocking=False):
+                raise NestedDrainCheckout("topology checkout holds the drain lock")
+            owner._in_use_lock.release()
+            assert pool.cache.size == 0, "SMIGRATED left entries visible before refresh"
+            return real_acquire()
+
+        def serve():
+            try:
+                received = b""
+                while len(received) < len(command):
+                    chunk = server.recv(len(command) - len(received))
+                    if not chunk:
+                        return
+                    received += chunk
+                assert received == command
+                commands.append(received)
+                # The same notification can arrive on CLUSTER SLOTS too.
+                server.sendall(push + slots)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        try:
+            invalidation = b">2\r\n+invalidate\r\n*1\r\n+" + key.encode() + b"\r\n"
+            server.sendall(push + invalidation)
+            worker.start()
+            with (
+                patch.object(owner, "_acquire", side_effect=acquire),
+                patch.object(owner._conn, "read_response", side_effect=read_response),
+            ):
+                if outcome == "success":
+                    borrower.send_command("GET", key, keys=[key])
+                    assert borrower.read_response() == b"new"
+                else:
+                    with pytest.raises(
+                        RuntimeError if outcome == "error" else Cancelled
+                    ):
+                        borrower.send_command("GET", key, keys=[key])
+                    borrower.send_command("GET", key, keys=[key])
+                    assert borrower.read_response() == b"new"
+            worker.join(3)
+            assert not worker.is_alive() and not errors
+            assert commands == [command]
+            assert notification in handler._processed_notifications
+            assert len(manager.slots_cache) == 16384
+            assert manager.default_node.redis_connection.connection_pool is pool
+            assert (
+                owner._conn._parser.oss_cluster_maint_push_handler_func
+                == handler.handle_notification
+            )
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            owner.disconnect()
+            server.close()
+            client.close()
+            if worker.ident is not None:
+                worker.join(5)
+            peers.release(borrower)
+            peers.disconnect()
+
+    @pytest.mark.parametrize("cleanup", ["direct", "removed", "queried"])
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_topology_cleanup_releases_locks_before_completion_listener(
+        self, pool, cleanup, outcome
+    ):
+        pool.update_maint_notifications_config(MaintNotificationsConfig(enabled="auto"))
+        owner = pool.get_connection()
+        pool.release(owner)
+        seed = Redis(connection_pool=pool)
+        node = ClusterNode(owner.host, owner.port, redis_connection=seed)
+        with patch.object(NodesManager, "initialize"):
+            manager = NodesManager(
+                [node],
+                cache=pool.cache,
+                **{
+                    k: v
+                    for k, v in pool.connection_kwargs.items()
+                    if k not in ("host", "port", "maint_notifications_config")
+                },
+            )
+        manager.nodes_cache = {node.name: node} if cleanup == "removed" else {}
+        events, errors = [], []
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    unlocked = []
+
+                    def probe():
+                        for lock in [
+                            pool._lock,
+                            manager._initialization_lock,
+                            manager._lock,
+                        ]:
+                            acquired = lock.acquire(blocking=False)
+                            unlocked.append(acquired)
+                            if acquired:
+                                lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    assert unlocked == [True, True, True], (
+                        "completion listener holds topology or pool lock"
+                    )
+                    assert not owner._idle_maintenance and not owner.is_connected
+                    events.append(event)
+                    pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        owner.maint_notifications_config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+        )
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        # Supply the server's slot map while retaining the real refresh,
+        # removed-node cleanup and finally-block queried-client cleanup.
+        slots = [[0, 16383, [owner.host.encode(), owner.port + 1, b"replacement"]]]
+
+        def disconnect(*args, **kwargs):
+            was_connected = owner.is_connected
+            real_disconnect(*args, **kwargs)
+            if was_connected and outcome == "error":
+                raise RuntimeError("disconnect failed")
+            if was_connected and outcome == "cancel":
+                raise Cancelled
+
+        real_disconnect = owner.disconnect
+        try:
+            with (
+                patch.object(seed, "execute_command", return_value=slots),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+            ):
+
+                def clean():
+                    if cleanup == "direct":
+                        NodesManager._free_pool_connections(pool)
+                    else:
+                        manager.initialize()
+
+                if outcome == "success":
+                    clean()
+                else:
+                    with pytest.raises(
+                        RuntimeError if outcome == "error" else Cancelled
+                    ):
+                        clean()
+            assert not errors
+            assert len(events) == 1 and events[0].connection is owner
+            assert not owner.is_connected
+        finally:
+            manager.close()
+
     @pytest.mark.parametrize(
         "shutdown",
         ["close", "disconnect", "disconnect_idle", "disconnect_free_connections"],

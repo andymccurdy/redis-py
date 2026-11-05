@@ -5794,6 +5794,7 @@ class TestRedisCommands:
         # rev
         assert r.zrange("a", 0, 1, desc=True) == [b"a5", b"a4"]
 
+    @pytest.mark.fixed_client
     def test_zrange_desc_sends_zrevrange_by_default(self):
         """Rank-only desc=True keeps ZREVRANGE unless use_rev is set."""
         r = redis.Redis()
@@ -5803,6 +5804,7 @@ class TestRedisCommands:
             "ZREVRANGE", "a", 0, -1, withscores=False, score_cast_func=float, keys=["a"]
         )
 
+    @pytest.mark.fixed_client
     def test_zrange_desc_default_withscores_sends_zrevrange(self):
         r = redis.Redis()
         with mock.patch.object(r, "execute_command", return_value=[]) as execute:
@@ -5818,6 +5820,7 @@ class TestRedisCommands:
             keys=["a"],
         )
 
+    @pytest.mark.fixed_client
     def test_zrange_desc_use_rev_sends_zrange_rev(self):
         r = redis.Redis()
         with mock.patch.object(r, "execute_command", return_value=[]) as execute:
@@ -5833,6 +5836,7 @@ class TestRedisCommands:
             keys=["a"],
         )
 
+    @pytest.mark.fixed_client
     def test_zrange_desc_use_rev_withscores_and_score_cast(self):
         def cast_score(value):
             return value
@@ -5860,6 +5864,7 @@ class TestRedisCommands:
             keys=["a"],
         )
 
+    @pytest.mark.fixed_client
     def test_zrange_use_rev_without_desc_sends_plain_zrange(self):
         """use_rev only affects the rank-based reverse path."""
         r = redis.Redis()
@@ -8416,8 +8421,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         r.xreadgroup(group, consumer_1, streams={stream: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        time.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        time.sleep(0.2)
 
         m3 = r.xadd(stream, {"key_m3": "val_m3"})
         m4 = r.xadd(stream, {"key_m4": "val_m4"})
@@ -8510,8 +8515,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         r.xreadgroup(group, consumer_1, streams={stream_1: ">", stream_2: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        time.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        time.sleep(0.2)
 
         m3_s1 = r.xadd(stream_1, {"key_m3_s1": "val_m3"})
         m4_s2 = r.xadd(stream_2, {"key_m4_s2": "val_m4"})
@@ -8608,8 +8613,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         r.xreadgroup(group, consumer_1, streams={stream_1: ">", stream_2: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        time.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        time.sleep(0.2)
 
         m3_s1 = r.xadd(stream_1, {"key_m3_s1": "val_m3"})
         m4_s2 = r.xadd(stream_2, {"key_m4_s2": "val_m4"})

@@ -4467,7 +4467,12 @@ class TestHybridSearch(AsyncSearchTestsBase):
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")
     @pytest.mark.timeout(60)
-    async def test_hybrid_search_query_with_timeout(self, decoded_r):
+    async def test_hybrid_search_query_with_timeout(self, create_redis, stack_url):
+        # the server checks its 1 ms TIMEOUT only at checkpoints, so a slow runner
+        # can answer later than the default 5 s socket timeout
+        decoded_r = await create_redis(
+            decode_responses=True, url=stack_url, socket_timeout=30
+        )
         await self._create_hybrid_search_timeout_index(decoded_r)
         await self._add_data_for_hybrid_search_timeout(decoded_r)
 

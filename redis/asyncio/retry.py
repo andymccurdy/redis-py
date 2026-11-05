@@ -6,7 +6,6 @@ from typing import (
     Any,
     Awaitable,
     Callable,
-    Optional,
     Tuple,
     Type,
     TypeVar,
@@ -33,7 +32,7 @@ class Retry(AbstractRetry[Exception]):
             ConnectionError,
             TimeoutError,
         ),
-        is_retryable: Optional[Callable[[Exception], bool]] = None,
+        is_retryable: Callable[[Exception], bool] | None = None,
     ):
         super().__init__(backoff, retries, supported_errors, is_retryable)
 
@@ -55,7 +54,7 @@ class Retry(AbstractRetry[Exception]):
             Callable[[Exception], Any],
             Callable[[Exception, int], Any],
         ],
-        is_retryable: Optional[Callable[[Exception], bool]] = None,
+        is_retryable: Callable[[Exception], bool] | None = None,
         with_failure_count: bool = False,
     ) -> T:
         """

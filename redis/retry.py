@@ -8,7 +8,6 @@ from typing import (
     Callable,
     Generic,
     Iterable,
-    Optional,
     Tuple,
     Type,
     TypeVar,
@@ -34,7 +33,7 @@ class AbstractRetry(Generic[E], abc.ABC):
         backoff: "AbstractBackoff",
         retries: int,
         supported_errors: Tuple[Type[E], ...],
-        is_retryable: Optional[Callable[[E], bool]] = None,
+        is_retryable: Callable[[E], bool] | None = None,
     ):
         """
         Initialize a `Retry` object with a `Backoff` object
@@ -53,12 +52,12 @@ class AbstractRetry(Generic[E], abc.ABC):
         self._is_retryable = is_retryable
 
     @property
-    def is_retryable(self) -> Optional[Callable[[E], bool]]:
+    def is_retryable(self) -> Callable[[E], bool] | None:
         """Optional checker applied in addition to ``supported_errors``."""
         return self._is_retryable
 
     @is_retryable.setter
-    def is_retryable(self, value: Optional[Callable[[E], bool]]) -> None:
+    def is_retryable(self, value: Callable[[E], bool] | None) -> None:
         self._is_retryable = value
 
     @abc.abstractmethod
@@ -108,7 +107,7 @@ class Retry(AbstractRetry[Exception]):
             TimeoutError,
             socket.timeout,
         ),
-        is_retryable: Optional[Callable[[Exception], bool]] = None,
+        is_retryable: Callable[[Exception], bool] | None = None,
     ):
         super().__init__(backoff, retries, supported_errors, is_retryable)
 
@@ -127,7 +126,7 @@ class Retry(AbstractRetry[Exception]):
         self,
         do: Callable[[], T],
         fail: Union[Callable[[Exception], Any], Callable[[Exception, int], Any]],
-        is_retryable: Optional[Callable[[Exception], bool]] = None,
+        is_retryable: Callable[[Exception], bool] | None = None,
         with_failure_count: bool = False,
     ) -> T:
         """

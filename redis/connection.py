@@ -4204,6 +4204,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._created_connections = 0
         self._available_connections = []
         self._in_use_connections = set()
+        self._releasing_connections = {}
 
         # this must be the last operation in this method. while reset() is
         # called when holding _fork_lock, other threads in this process
@@ -4425,6 +4426,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
     def release(self, connection: "Connection") -> None:
         "Releases the connection back to the pool"
         self._checkpid()
+        if isinstance(
+            connection, CacheProxyConnection
+        ) and self._release_cache_connection(connection):
+            return
         with self._lock:
             try:
                 self._in_use_connections.remove(connection)
@@ -4482,6 +4487,63 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                         counter=-1,
                     )
                 return
+
+    def _release_cache_connection(self, connection):
+        with self._lock:
+            if not self.owns_connection(connection):
+                return False
+            if (
+                connection not in self._in_use_connections
+                or connection in self._releasing_connections
+            ):
+                return True
+            # Keep it active for disconnect and maintenance, but prevent a
+            # recursive release and retain any newer token until listeners finish.
+            self._releasing_connections[connection] = None
+
+        event = None
+        try:
+            try:
+                if connection.should_reconnect():
+                    with _defer_maintenance_events():
+                        connection.disconnect()
+                # A listener can close the pool and join a peer's idle drain.
+                # That drain may process MOVING and need the pool lock.
+                self._event_dispatcher.dispatch(
+                    AfterConnectionReleasedEvent(connection)
+                )
+            finally:
+                with self._lock:
+                    token = self._releasing_connections.pop(connection)
+                    if token is not None:
+                        connection.set_re_auth_token(token)
+                    try:
+                        # Maintenance can mark it while the listener is running.
+                        if connection.should_reconnect():
+                            if isinstance(
+                                connection._conn, MaintNotificationsAbstractConnection
+                            ):
+                                event = connection._reset_maintenance_on_disconnect()
+                            connection.disconnect()
+                    finally:
+                        self._in_use_connections.remove(connection)
+                        connection._in_use = False
+                        self._available_connections.append(connection)
+                        pool_name = get_pool_name(self)
+                        record_connection_count(
+                            pool_name=pool_name,
+                            connection_state=ConnectionState.USED,
+                            counter=-1,
+                        )
+                        record_connection_count(
+                            pool_name=pool_name,
+                            connection_state=ConnectionState.IDLE,
+                            counter=1,
+                        )
+        finally:
+            if event is not None:
+                _dispatch_maintenance_event(event.config, event)
+        return True
 
     def owns_connection(self, connection: "Connection") -> int:
         return connection.pid == self.pid
@@ -4560,6 +4622,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                             error, AuthenticationError
                         ),
                     )
+                    conn.set_re_auth_token(None)
                 except AuthenticationError:
                     raise
                 except Exception as e:
@@ -4569,7 +4632,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                     if cached:
                         conn._release_idle()
             for conn in self._in_use_connections:
-                conn.set_re_auth_token(token)
+                if conn in self._releasing_connections:
+                    self._releasing_connections[conn] = token
+                else:
+                    conn.set_re_auth_token(token)
         if first_error is not None:
             raise first_error
 

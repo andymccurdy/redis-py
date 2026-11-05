@@ -220,6 +220,35 @@ class TestConnectionPool:
         other.send_command.assert_not_called()
         in_use.set_re_auth_token.assert_not_called()
 
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
+    def test_idle_reauth_clears_deferred_token_only_on_success(self, outcome):
+        pool = self.get_pool(connection_class=DummyConnection)
+        connection = Connection(retry=Retry(NoBackoff(), 0))
+        pool._available_connections.append(connection)
+        previous, token = mock.Mock(), mock.Mock()
+        connection.set_re_auth_token(previous)
+
+        class Cancelled(BaseException):
+            pass
+
+        error = None
+        if outcome == "auth_error":
+            error = redis.AuthenticationError("expired")
+        elif outcome == "cancel":
+            error = Cancelled()
+        with (
+            mock.patch.object(connection, "send_command") as send,
+            mock.patch.object(connection, "read_response", side_effect=error),
+        ):
+            if error is None:
+                pool.re_auth_callback(token)
+            else:
+                with pytest.raises(type(error)):
+                    pool.re_auth_callback(token)
+        send.assert_called_once_with("AUTH", token.try_get("oid"), token.get_value())
+        assert connection._re_auth_token is (None if error is None else previous)
+
     def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}
         pool = self.get_pool(connection_kwargs=connection_kwargs)

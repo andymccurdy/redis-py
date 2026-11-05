@@ -14,6 +14,7 @@ from redis.cache import CacheConfig, CacheEntryStatus, TrackingMode
 from redis.cluster import NodesManager
 from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.event import (
+    AfterConnectionReleasedEvent,
     EventDispatcher,
     EventListenerInterface,
     MaintenanceCompletedEvent,
@@ -368,6 +369,293 @@ class TestCachePoolOwnership:
             assert owner.read_response() == b"PONG"
         finally:
             pool.release(owner)
+
+    @pytest.mark.parametrize("outcome", ["close", "error", "cancel"])
+    def test_release_listener_can_close_during_idle_moving(self, pool, r2, outcome):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner, released = owner_pool.get_connection(), owner_pool.get_connection()
+        borrower = pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        owner_pool.release(owner)
+        draining, listening, dispatching, finish = (threading.Event() for _ in range(4))
+        read_errors, release_errors, calls = [], [], []
+        handler = MaintNotificationsPoolHandler(
+            owner_pool, MaintNotificationsConfig(proactive_reconnect=True)
+        )
+        notification = NodeMovingNotification(
+            id=41, new_node_host=None, new_node_port=None, ttl=20
+        )
+        real_can_read = owner._conn.can_read
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                if event.connection is not released:
+                    return
+                calls.append(event)
+                unlocked = []
+
+                def probe():
+                    acquired = owner_pool._lock.acquire(blocking=False)
+                    unlocked.append(acquired)
+                    if acquired:
+                        owner_pool._lock.release()
+
+                probe_thread = threading.Thread(target=probe, daemon=True)
+                probe_thread.start()
+                probe_thread.join(2)
+                assert unlocked == [True], "release listener holds the pool lock"
+                assert released._in_use
+                assert released not in owner_pool._available_connections
+                # Recursive release must remain a no-op, while close must still
+                # find this connection among the pool's active connections.
+                owner_pool.release(released)
+                assert len(calls) == 1
+                listening.set()
+                assert dispatching.wait(3)
+                owner_pool.close()
+                assert not released.is_connected and not owner.is_connected
+                if outcome == "error":
+                    raise RuntimeError("release listener failed")
+                if outcome == "cancel":
+                    raise Cancelled
+
+        owner_pool._event_dispatcher.register_listeners(
+            {AfterConnectionReleasedEvent: [Listener()]}
+        )
+        notified = False
+
+        def can_read(*args, **kwargs):
+            nonlocal notified
+            if threading.current_thread() is reader and not notified:
+                notified = True
+                draining.set()
+                assert listening.wait(5)
+                if not finish.is_set():
+                    dispatching.set()
+                    handler.handle_notification(notification)
+            return real_can_read(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+                borrower.send_command("PING")
+                assert borrower.read_response() == b"PONG"
+            except BaseException as exc:
+                read_errors.append(exc)
+
+        def release():
+            try:
+                owner_pool.release(released)
+            except BaseException as exc:
+                release_errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        worker = threading.Thread(target=release, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(handler, "_schedule"),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                worker.start()
+                worker.join(3)
+                # Unblock the old-head negative control after its lock guard fails.
+                finish.set()
+                listening.set()
+                reader.join(3)
+                assert not worker.is_alive() and not reader.is_alive()
+                assert not read_errors
+                if outcome == "close":
+                    assert not release_errors
+                else:
+                    expected = RuntimeError if outcome == "error" else Cancelled
+                    assert len(release_errors) == 1 and isinstance(
+                        release_errors[0], expected
+                    )
+                assert len(calls) == 1
+                assert notification in handler._processed_notifications
+                assert not released._in_use
+                assert released not in owner_pool._in_use_connections
+                assert owner_pool._available_connections.count(released) == 1
+        finally:
+            finish.set()
+            listening.set()
+            dispatching.set()
+            if reader.ident is not None:
+                reader.join(5)
+            if worker.ident is not None:
+                worker.join(5)
+            pool.release(borrower)
+            owner_pool.disconnect()
+
+    @pytest.mark.parametrize("mark_before_release", [True, False])
+    def test_release_reconnect_completion_listener_runs_outside_pool_lock(
+        self, pool, mark_before_release
+    ):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = owner_pool.get_connection()
+        events, errors = [], []
+
+        class CompletionListener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    unlocked = []
+
+                    def probe():
+                        acquired = owner_pool._lock.acquire(blocking=False)
+                        unlocked.append(acquired)
+                        if acquired:
+                            owner_pool._lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    assert unlocked == [True], "completion listener holds pool lock"
+                    assert not owner.is_connected
+                    if not mark_before_release:
+                        assert not owner._in_use
+                    events.append(event)
+                    owner_pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        class ReleaseListener(EventListenerInterface):
+            def listen(self, event):
+                if not mark_before_release:
+                    owner.mark_for_reconnect()
+
+        owner.maint_notifications_config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher(
+                {MaintenanceCompletedEvent: [CompletionListener()]}
+            ),
+        )
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        owner_pool._event_dispatcher.register_listeners(
+            {AfterConnectionReleasedEvent: [ReleaseListener()]}
+        )
+        if mark_before_release:
+            owner.mark_for_reconnect()
+        try:
+            owner_pool.release(owner)
+            assert not errors
+            assert len(events) == 1
+            assert not owner.is_connected and not owner._in_use
+            assert owner not in owner_pool._in_use_connections
+            assert owner_pool._available_connections.count(owner) == 1
+        finally:
+            owner_pool.disconnect()
+
+    @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
+    def test_new_idle_refresh_retires_deferred_token(self, pool, r2, outcome):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = owner_pool.get_connection()
+        owner_pool.release(owner)
+        username = "cache-refresh-" + str(uuid.uuid4())
+        token_a, token_b = Mock(), Mock()
+        for token, value in [(token_a, "old"), (token_b, "new")]:
+            token.try_get.return_value = username
+            token.get_value.return_value = value
+
+        class Cancelled(BaseException):
+            pass
+
+        try:
+            r2.execute_command("ACL", "SETUSER", username, "on", ">old", "~*", "+@all")
+            # Model a peer holding the idle drain lock when token A arrives.
+            with owner._in_use_lock:
+                owner_pool.re_auth_callback(token_a)
+            assert owner._conn._re_auth_token is token_a
+            if outcome == "success":
+                r2.execute_command("ACL", "SETUSER", username, "resetpass", ">new")
+                owner_pool.re_auth_callback(token_b)
+                assert owner._conn._re_auth_token is None
+            elif outcome == "auth_error":
+                with pytest.raises(AuthenticationError):
+                    owner_pool.re_auth_callback(token_b)
+                assert owner._conn._re_auth_token is token_a
+            else:
+                with patch.object(owner, "read_response", side_effect=Cancelled):
+                    with pytest.raises(Cancelled):
+                        owner_pool.re_auth_callback(token_b)
+                assert owner._conn._re_auth_token is token_a
+                owner.disconnect()
+            reused = owner_pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            # The expired token A must not undo successful authentication with B.
+            owner_pool.release(reused)
+            assert owner._conn._re_auth_token is None
+        finally:
+            owner.set_re_auth_token(None)
+            owner_pool.disconnect()
+            r2.execute_command("ACL", "DELUSER", username)
+
+    def test_token_refresh_during_release_keeps_newest_token(self, pool, r2):
+        owner_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = owner_pool.get_connection()
+        username = "cache-release-" + str(uuid.uuid4())
+        token_a, token_b = Mock(), Mock()
+        for token, value in [(token_a, "old"), (token_b, "new")]:
+            token.try_get.return_value = username
+            token.get_value.return_value = value
+        pending, finish = threading.Event(), threading.Event()
+        errors = []
+        real_read = owner._conn.read_response
+
+        def read_response(*args, **kwargs):
+            result = real_read(*args, **kwargs)
+            if threading.current_thread() is worker:
+                pending.set()
+                assert finish.wait(5)
+            return result
+
+        def release():
+            try:
+                owner_pool.release(owner)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=release, daemon=True)
+        try:
+            r2.execute_command("ACL", "SETUSER", username, "on", ">old", "~*", "+@all")
+            owner.set_re_auth_token(token_a)
+            with patch.object(owner._conn, "read_response", side_effect=read_response):
+                worker.start()
+                assert pending.wait(3)
+                acquired = owner_pool._lock.acquire(blocking=False)
+                if acquired:
+                    owner_pool._lock.release()
+                assert acquired, "release AUTH blocks a newer token refresh"
+                assert owner._in_use and owner not in owner_pool._available_connections
+                r2.execute_command("ACL", "SETUSER", username, "resetpass", ">new")
+                owner_pool.re_auth_callback(token_b)
+                finish.set()
+                worker.join(3)
+                assert not worker.is_alive() and not errors
+                assert owner._conn._re_auth_token is token_b
+            reused = owner_pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            owner_pool.release(reused)
+            assert owner._conn._re_auth_token is None
+        finally:
+            finish.set()
+            if worker.ident is not None:
+                worker.join(5)
+            owner.set_re_auth_token(None)
+            owner_pool.disconnect()
+            r2.execute_command("ACL", "DELUSER", username)
 
     def test_smigrated_removed_node_preserves_idle_owner_drain(self, pool, r2):
         owner = pool.get_connection()

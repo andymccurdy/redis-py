@@ -1482,7 +1482,7 @@ class OSSMaintNotificationsHandler:
                             not in self.cluster_client.nodes_manager.nodes_cache.values()
                         ):
                             # A cache owner being drained must keep its parser
-                            # until the read ends; defer its disconnect to release.
+                            # until the read ends; the drainer finishes disconnecting.
                             current_node.redis_connection.connection_pool.disconnect_free_connections()
 
                             # Only record handoff if not already recorded for this node

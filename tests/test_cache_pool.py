@@ -725,15 +725,111 @@ class TestCachePoolOwnership:
                 reader.join(3)
                 assert not reader.is_alive()
                 assert not errors
+                assert not owner.is_connected
+                assert not owner.should_reconnect()
+                assert notification in handler._processed_notifications
+        finally:
+            finish.set()
+            if reader.ident is not None:
+                reader.join(5)
+            server.close()
+            client.close()
+            peers.release(borrower)
+            peers.disconnect()
+
+    @pytest.mark.parametrize("cleanup", ["topology", "smigrated"])
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_removed_idle_owner_disconnects_after_drain(
+        self, pool, r2, cleanup, outcome
+    ):
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        pool.release(owner)
+        # Model a removed replica: its tracking socket remains open but never
+        # sends an invalidation for writes on the replacement node.
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        r2.set(key, "new")
+        node = Mock(redis_connection=Redis(connection_pool=pool))
+        cluster = Mock()
+        cluster.nodes_manager._initialization_lock = threading.RLock()
+        cluster.nodes_manager.get_node.return_value = node
+        cluster.nodes_manager.nodes_cache = {}
+        handler = OSSMaintNotificationsHandler(cluster, MaintNotificationsConfig())
+        notification = OSSNodeMigratedNotification(
+            id=43,
+            nodes_to_slots_mapping={"127.0.0.1:6379": [{"127.0.0.1:6380": "0-10"}]},
+        )
+        draining, finish = threading.Event(), threading.Event()
+        errors, disconnected = [], []
+        real_can_read, real_disconnect = owner._conn.can_read, owner.disconnect
+
+        class Cancelled(BaseException):
+            pass
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader:
+                draining.set()
+                assert finish.wait(5)
+                if outcome == "error":
+                    raise RuntimeError("drain failed")
+                if outcome == "cancel":
+                    raise Cancelled
+            return real_can_read(*args, **kwargs)
+
+        def disconnect(*args, **kwargs):
+            assert finish.is_set(), "cleanup interrupted the active drain"
+            acquired = owner._in_use_lock.acquire(blocking=False)
+            if acquired:
+                owner._in_use_lock.release()
+            assert not acquired, "deferred disconnect lost socket ownership"
+            disconnected.append(True)
+            return real_disconnect(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"new"
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        try:
+            with (
+                patch.object(owner._conn, "can_read", side_effect=can_read),
+                patch.object(owner, "disconnect", side_effect=disconnect),
+            ):
+                reader.start()
+                assert draining.wait(3)
+                if cleanup == "topology":
+                    NodesManager._free_pool_connections(pool)
+                else:
+                    handler.handle_notification(notification)
                 assert owner._conn._sock is client
                 assert owner.should_reconnect()
-                assert notification in handler._processed_notifications
-            # The removed node's connection closes on its next release, without
-            # destroying a parser another pool was using for invalidations.
-            acquired = pool.get_connection()
-            assert acquired is owner
-            pool.release(acquired)
-            assert not owner.is_connected
+                finish.set()
+                reader.join(3)
+                assert not reader.is_alive()
+                assert disconnected == [True]
+                assert not owner.is_connected and not owner.should_reconnect()
+                if outcome == "success":
+                    assert not errors
+                else:
+                    expected = RuntimeError if outcome == "error" else Cancelled
+                    assert len(errors) == 1 and isinstance(errors[0], expected)
+            # No checkout or release of the removed owner's pool is needed.
+            for _ in range(3):
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"new"
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
         finally:
             finish.set()
             if reader.ident is not None:
@@ -1822,7 +1918,10 @@ class TestCachePoolOwnership:
                 worker.join(3)
                 assert not reader.is_alive() and not worker.is_alive()
                 assert not errors
-            # Deferred work runs when the connection is returned after its next use.
+                if operation == "moving":
+                    assert not owner.is_connected and not owner.should_reconnect()
+            # Deferred AUTH still runs on release; MOVING already closed the
+            # socket at the end of its drain, so checkout opens a new session.
             reused = owner_pool.get_connection()
             assert reused is owner
             reused.send_command("PING")
@@ -1831,7 +1930,7 @@ class TestCachePoolOwnership:
             assert owner._conn._re_auth_token is None
             assert not owner.should_reconnect()
             if operation == "moving":
-                assert owner._conn._sock is None
+                assert owner.is_connected and owner._conn._sock is not sock
         finally:
             finish.set()
             if reader.ident is not None:
@@ -1866,6 +1965,7 @@ class TestCachePoolOwnership:
             pool._get_free_connections,
             owner.disconnect,
         )
+        real_drain = borrower._drain_invalidations
         dispatched = False
 
         def can_read(*args, **kwargs):
@@ -1890,14 +1990,19 @@ class TestCachePoolOwnership:
             )
             return real_disconnect(*args, **kwargs)
 
+        def drain(conn):
+            try:
+                return real_drain(conn)
+            finally:
+                if conn is owner._conn:
+                    finished.set()
+
         def read_cached():
             try:
                 borrower.send_command("GET", key, keys=[key])
                 assert borrower.read_response() == b"value"
             except BaseException as exc:
                 errors.append(exc)
-            finally:
-                finished.set()
 
         def maintain():
             try:
@@ -1914,6 +2019,7 @@ class TestCachePoolOwnership:
                     pool, "_get_free_connections", side_effect=free_connections
                 ),
                 patch.object(owner, "disconnect", side_effect=disconnect),
+                patch.object(borrower, "_drain_invalidations", side_effect=drain),
                 patch.object(handler, "_schedule"),
             ):
                 reader.start()
@@ -1925,7 +2031,7 @@ class TestCachePoolOwnership:
                     "MOVING and idle drain deadlocked"
                 )
                 assert not errors
-                assert owner.should_reconnect()
+                assert not owner.is_connected and not owner.should_reconnect()
                 assert notification in handler._processed_notifications
             reused = pool.get_connection()
             assert reused is owner
@@ -1933,7 +2039,7 @@ class TestCachePoolOwnership:
             assert reused.read_response() == b"PONG"
             pool.release(reused)
             assert not owner.should_reconnect()
-            assert owner._conn._sock is None
+            assert owner.is_connected
         finally:
             holding_pool.set()
             dispatching.set()

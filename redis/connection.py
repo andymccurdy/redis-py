@@ -2363,7 +2363,14 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                         # waited. can_read() would reconnect its raw connection.
                         pass
                     elif not owner._in_use:
-                        self._drain_invalidations(owner._conn)
+                        try:
+                            self._drain_invalidations(owner._conn)
+                        finally:
+                            # Topology cleanup cannot close a socket while we
+                            # drain it. A removed node may never be checked out
+                            # again, so finish its deferred disconnect here.
+                            if owner.should_reconnect():
+                                owner.disconnect()
                         can_serve = True
                     elif time.monotonic() < owner._busy_cache_deadline:
                         # Never touch a checked-out owner's socket. Recent cache

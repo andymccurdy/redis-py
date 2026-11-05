@@ -221,6 +221,8 @@ Use the matching compact report in the evaluation framework. While runtime appro
 
 For PRs, put `Need evidence` before the code recommendation. When the need is not `Demonstrated`, lead with that result, omit repository readiness, and avoid presenting patch fixes as the primary maintainer action.
 
+For every PR, suggest the category label it should carry, using `.agents/skills/generate-release-notes/references/pr-labels-guide.md` as the authoritative mapping. Judge it from the actual change, not from the PR title or its current labels. For example, a new opt-in public option is `feature`, even when the title says `fix`. Compare the suggestion with the labels the PR already has. If they differ, say which label to add and which to remove, and also suggest a matching title when the title prefix is misleading. Only suggest labels; never apply them.
+
 When existing functionality or a better alternative materially affects the decision, state it explicitly in the evidence and recommendation. Name the exact supported path, what it does and does not cover, and why it is preferable. Do not bury a `Not worth completing` or `Supersede with a simpler alternative` conclusion beneath praise for implementation quality.
 
 When recommending closure, more evidence, focused changes, or superseding a PR, append a polite, complete, copy-paste-ready English maintainer comment. Include only merge-blocking work in its required-action paragraph. Do not produce a line-by-line review unless requested, equate passing tests with merge-worthiness, or equate a logically correct patch with practical value.

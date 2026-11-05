@@ -5235,13 +5235,15 @@ class TestStaticMetadataRouting:
         await rc.aclose()
 
     @pytest.mark.fixed_client
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
     async def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(
-        self,
+        self, targets: str
     ) -> None:
         """
         A response policy resolved for the whole cluster must not apply when the caller
-        named its targets. RANDOMKEY has no result callback, so the replies are handed to the
-        response-policy callback, which must leave them keyed by node.
+        picked its targets, as named nodes or as a nodes flag. RANDOMKEY has no result
+        callback, so the replies are handed to the response-policy callback, which must
+        leave them keyed by node.
         """
         resolver = AsyncDynamicMetadataResolver(
             {
@@ -5258,11 +5260,12 @@ class TestStaticMetadataRouting:
         )
         nodes = rc.get_primaries()
         assert len(nodes) > 1
+        target_nodes = nodes if targets == "nodes" else RedisCluster.PRIMARIES
 
         with mock.patch.object(
             ClusterNode, "execute_command", new=mock.AsyncMock(return_value="k")
         ) as execute:
-            result = await rc.execute_command("RANDOMKEY", target_nodes=nodes)
+            result = await rc.execute_command("RANDOMKEY", target_nodes=target_nodes)
 
         assert execute.call_count == len(nodes)
         assert result == {node.name: "k" for node in nodes}
@@ -5786,6 +5789,46 @@ class TestResponsePolicies:
             with pytest.raises(type(error)):
                 await r.script_kill()
 
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    async def test_the_caller_s_targets_disable_the_aggregation(
+        self, r: RedisCluster, monkeypatch, targets: str
+    ) -> None:
+        await _route_by_live_tips(r, monkeypatch)
+        primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
+        expected = {}
+        for node in primaries:
+            expected[node.name] = await node.execute_command("WAITAOF", 0, 0, 0)
+
+        assert (
+            await r.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes)
+            == expected
+        )
+        async with r.pipeline() as pipe:
+            pipe.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes)
+            assert await pipe.execute() == [expected]
+
+    async def test_a_retry_asks_only_the_nodes_that_have_not_answered(
+        self, r: RedisCluster, no_cluster_retry_delay
+    ) -> None:
+        primaries = r.get_primaries()
+        failed = primaries[-1]
+        failures: List[str] = []
+
+        def fail(node: ClusterNode, args: tuple) -> Optional[Exception]:
+            if node.name == failed.name and not failures:
+                failures.append(node.name)
+                return ConnectionError("lost")
+            return None
+
+        with _sent_commands(fail) as sent:
+            assert await r.execute_command("PING", target_nodes=r.PRIMARIES) is True
+
+        assert failures
+        assert sorted(node.name for node, _, _ in sent) == sorted(
+            [*(node.name for node in primaries), failed.name]
+        )
+
     async def test_info_keeps_each_shard_s_reply(
         self, r: RedisCluster, monkeypatch
     ) -> None:
@@ -5856,29 +5899,33 @@ class TestResponsePolicies:
         "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
     )
     @pytest.mark.parametrize("targets", ["flag", "nodes"])
-    async def test_a_pipeline_retry_keeps_the_targets_of_a_fanned_out_command(
+    async def test_a_pipeline_retry_asks_only_the_node_that_failed(
         self, r: RedisCluster, error: Exception, targets: str
     ) -> None:
         """
-        A connection error retries the whole pipeline, and TRYAGAIN the one command, and
-        both send it to all of its targets again rather than route it by its own policy -
-        DBSIZE's is the default node alone, which holds only some of the keys.
+        A connection error retries the pipeline, and TRYAGAIN the one command, and both
+        ask only the node that failed, with the replies of the others kept: asking them
+        again would run a write twice. The node is picked among the targets the caller
+        passed, not by the command's own policy - DBSIZE's is the default node alone,
+        which holds only some of the keys.
         """
         await r.mset_nonatomic(
             {key: 1 for key in _keys_on_every_shard(r, "pipetargets")}
         )
+        primaries = r.get_primaries()
         dbsize = 0
-        for node in r.get_primaries():
+        for node in primaries:
             dbsize += await node.execute_command("DBSIZE")
-        target_nodes = r.PRIMARIES if targets == "flag" else r.get_primaries()
+        target_nodes = r.PRIMARIES if targets == "flag" else primaries
+        failed = primaries[-1]
         execute_pipeline = ClusterNode.execute_pipeline
-        failed: List[Any] = []
+        sends = {node.name: 0 for node in primaries}
 
         async def fail_once(self: ClusterNode, commands: List[Any]) -> bool:
-            # The first node's DBSIZE is not sent once, and answers with ``error`` instead
+            # The failed node's DBSIZE is not sent once, and answers with ``error`` instead
             held = [c for c in commands if c.args == ("DBSIZE",)]
-            held = held if not failed else []
-            failed.extend(held)
+            sends[self.name] += len(held)
+            held = held if self.name == failed.name and sends[self.name] == 1 else []
             rest = [c for c in commands if c not in held]
             ret = await execute_pipeline(self, rest) if rest else False
             for c in held:
@@ -5886,11 +5933,14 @@ class TestResponsePolicies:
             return ret or bool(held)
 
         with mock.patch.object(ClusterNode, "execute_pipeline", fail_once):
-            async with r.pipeline() as pipe:
-                pipe.execute_command("DBSIZE", target_nodes=target_nodes)
-                assert await pipe.execute() == [dbsize]
+            with _sent_commands() as sent:
+                async with r.pipeline() as pipe:
+                    pipe.execute_command("DBSIZE", target_nodes=target_nodes)
+                    assert await pipe.execute() == [dbsize]
 
-        assert failed
+        for node, _, _ in sent:
+            sends[node.name] += 1
+        assert sends == {**{node.name: 1 for node in primaries}, failed.name: 2}
 
 
 @pytest.mark.onlycluster
@@ -5912,6 +5962,23 @@ class TestMultiShardRequests:
 
         assert sum(len(batch) for batch in batches) == 2 * len(keys)
         assert not sent
+
+    async def test_a_nodes_flag_keeps_each_primary_s_count(
+        self, r: RedisCluster
+    ) -> None:
+        await r.set("{flag}foo", 1)
+        expected = {node.name: 1 for node in r.get_primaries()}
+
+        assert (
+            await r.execute_command("EXISTS", "{flag}foo", target_nodes=r.PRIMARIES)
+            == expected
+        )
+        assert (
+            await r.execute_command(
+                "EXISTS", "{flag}foo", target_nodes=r.get_primaries()
+            )
+            == expected
+        )
 
     async def test_the_shipped_records_keep_mget_unsplit(self, r: RedisCluster) -> None:
         with pytest.raises(RedisClusterException, match="same key slot"):
@@ -6233,10 +6300,14 @@ class TestSpecialResponses:
             node.name for node in r.get_primaries()
         }
 
-    async def test_named_targets_keep_each_node_s_reply(self, r: RedisCluster) -> None:
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    async def test_the_caller_s_targets_keep_each_node_s_reply(
+        self, r: RedisCluster, targets: str
+    ) -> None:
         primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
 
-        result = await r.randomkey(target_nodes=primaries)
+        result = await r.randomkey(target_nodes=target_nodes)
 
         assert result == {node.name: None for node in primaries}
 

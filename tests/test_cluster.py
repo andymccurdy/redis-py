@@ -3474,11 +3474,13 @@ class TestStaticMetadataRouting:
         assert nodes == [default_node]
 
     @pytest.mark.fixed_client
-    def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(self):
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(self, targets):
         """
         A response policy resolved for the whole cluster must not apply when the caller
-        named its targets: ``ONE_SUCCEEDED`` would stop the loop after the first node the
-        caller picked, and an ``AGG_*`` would fold the replies of the rest into it.
+        picked its targets, as named nodes or as a nodes flag: ``ONE_SUCCEEDED`` would
+        stop the loop after the first node the caller picked, and an ``AGG_*`` would fold
+        the replies of the rest into it.
         """
         resolver = DynamicMetadataResolver(
             {
@@ -3495,9 +3497,10 @@ class TestStaticMetadataRouting:
         )
         nodes = rc.get_primaries()
         assert len(nodes) > 1
+        target_nodes = nodes if targets == "nodes" else RedisCluster.PRIMARIES
 
         with patch.object(RedisCluster, "_execute_command", return_value=7) as execute:
-            result = rc.execute_command("DBSIZE", target_nodes=nodes)
+            result = rc.execute_command("DBSIZE", target_nodes=target_nodes)
 
         assert execute.call_count == len(nodes)
         assert result == 7 * len(nodes)
@@ -4189,6 +4192,55 @@ class TestResponsePolicies:
             with pytest.raises(type(error)):
                 r.script_kill()
 
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_the_caller_s_targets_disable_the_aggregation(
+        self, r, monkeypatch, targets
+    ):
+        """
+        WAITAOF is tipped agg_min, but the caller picked the targets - named nodes and a
+        nodes flag alike - so each node's reply is kept, on the main path and in a
+        pipeline.
+        """
+        _route_by_live_tips(r, monkeypatch)
+        primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
+        expected = {
+            node.name: node.redis_connection.execute_command("WAITAOF", 0, 0, 0)
+            for node in primaries
+        }
+
+        assert (
+            r.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes) == expected
+        )
+        with r.pipeline() as pipe:
+            pipe.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes)
+            assert pipe.execute() == [expected]
+
+    def test_a_retry_asks_only_the_nodes_that_have_not_answered(
+        self, r, no_cluster_retry_delay
+    ):
+        """
+        A node that answered is not asked again when another node fails: asking it again
+        would run a write twice.
+        """
+        primaries = r.get_primaries()
+        failed = primaries[-1]
+        failures = []
+
+        def fail(node, args):
+            if node.name == failed.name and not failures:
+                failures.append(node.name)
+                return ConnectionError("lost")
+            return None
+
+        with _sent_commands(fail) as sent:
+            assert r.execute_command("PING", target_nodes=r.PRIMARIES) is True
+
+        assert failures
+        assert sorted(node.name for node, _, _ in sent) == sorted(
+            [*(node.name for node in primaries), failed.name]
+        )
+
     def test_info_keeps_each_shard_s_reply(self, r, monkeypatch):
         """INFO: all_shards / special with no handler, so nothing is merged."""
         _route_by_live_tips(r, monkeypatch)
@@ -4250,24 +4302,27 @@ class TestResponsePolicies:
         "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
     )
     @pytest.mark.parametrize("targets", ["flag", "nodes"])
-    def test_a_pipeline_retry_keeps_the_targets_of_a_fanned_out_command(
-        self, r, error, targets
-    ):
+    def test_a_pipeline_retry_asks_only_the_node_that_failed(self, r, error, targets):
         """
-        A fanned-out command that fails on one node is retried on all of its targets, not
-        routed by its own policy - DBSIZE's is the default node alone.
+        A fanned-out command that fails on one node is retried on that node alone, with
+        the replies of the others kept: asking them again would run a write twice. The
+        node is picked among the targets the caller passed, not by the command's own
+        policy - DBSIZE's is the default node alone.
         """
         r.mset_nonatomic({key: 1 for key in _keys_on_every_shard(r, "pipetargets")})
-        dbsize = sum(node.redis_connection.dbsize() for node in r.get_primaries())
-        target_nodes = r.PRIMARIES if targets == "flag" else r.get_primaries()
+        primaries = r.get_primaries()
+        dbsize = sum(node.redis_connection.dbsize() for node in primaries)
+        target_nodes = r.PRIMARIES if targets == "flag" else primaries
+        failed = primaries[-1]
         write = redis.cluster.NodeCommands.write
-        failed = []
+        sends = {node.name: 0 for node in primaries}
 
         def fail_once(self):
-            # The first node's DBSIZE is not sent once, and answers with ``error`` instead
+            # The failed node's DBSIZE is not sent once, and answers with ``error`` instead
+            node = r.nodes_manager.find_connection_owner(self.connection)
             held = [c for c in self.commands if c.args == ("DBSIZE",)]
-            held = held if not failed else []
-            failed.extend(held)
+            sends[node.name] += len(held)
+            held = held if node.name == failed.name and sends[node.name] == 1 else []
             self.commands = [c for c in self.commands if c not in held]
             if self.commands:
                 write(self)
@@ -4281,10 +4336,9 @@ class TestResponsePolicies:
                     pipe.execute_command("DBSIZE", target_nodes=target_nodes)
                     assert pipe.execute() == [dbsize]
 
-        assert failed
-        assert {node.name for node, _, _ in sent} == {
-            node.name for node in r.get_primaries()
-        }
+        for node, _, _ in sent:
+            sends[node.name] += 1
+        assert sends == {**{node.name: 1 for node in primaries}, failed.name: 2}
 
 
 @pytest.mark.onlycluster
@@ -4306,6 +4360,24 @@ class TestMultiShardRequests:
 
         assert sum(len(batch) for batch in batches) == 2 * len(keys)
         assert not sent
+
+    def test_a_nodes_flag_keeps_each_primary_s_count(self, r):
+        """
+        EXISTS is tipped agg_sum, but ``target_nodes=PRIMARIES`` picks the targets, so
+        each primary's count is kept rather than summed - the answer a list of the same
+        nodes gets, and the one 8.1.0 gave. A primary that does not hold the key
+        redirects to the one that does, so every primary answers 1.
+        """
+        r.set("{flag}foo", 1)
+        expected = {node.name: 1 for node in r.get_primaries()}
+
+        assert r.execute_command("EXISTS", "{flag}foo", target_nodes=r.PRIMARIES) == (
+            expected
+        )
+        assert (
+            r.execute_command("EXISTS", "{flag}foo", target_nodes=r.get_primaries())
+            == expected
+        )
 
     def test_the_shipped_records_keep_mget_unsplit(self, r):
         """MGET documents that keys in different slots raise on a cluster."""
@@ -4572,7 +4644,7 @@ class TestSpecialResponses:
     """
     A ``response_policy:special`` command is merged by a handler of its own, which applies
     only when the command was resolved for the whole cluster - never to targets the caller
-    named.
+    picked, as named nodes or as a nodes flag.
     """
 
     def test_randomkey_answers_with_a_key_from_any_shard(self, r):
@@ -4591,10 +4663,12 @@ class TestSpecialResponses:
             node.name for node in r.get_primaries()
         }
 
-    def test_named_targets_keep_each_node_s_reply(self, r):
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_the_caller_s_targets_keep_each_node_s_reply(self, r, targets):
         primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
 
-        result = r.randomkey(target_nodes=primaries)
+        result = r.randomkey(target_nodes=target_nodes)
 
         assert result == {node.name: None for node in primaries}
 

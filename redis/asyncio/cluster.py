@@ -83,7 +83,7 @@ from redis.cluster import (
     _error_to_raise,
     _fill_missing_redirect_host,
     _merge_multi_shard_replies,
-    _record_slot_replies,
+    _record_replies,
     _resolve_localhost,
     _should_request_refresh,
     _split_by_slot,
@@ -1460,14 +1460,16 @@ class RedisCluster(
         First choice is the policy resolver. When it does not know the command, the
         fallbacks are, in order: nothing to route at all because the caller named its
         targets, the command's ``COMMAND_FLAGS`` entry, and finally whether the command
-        carries a key.
+        carries a key. ``target_nodes_specified`` says the caller picked the targets, as
+        named nodes or as a nodes flag.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
             command = f"{args[0]} {args[1]}".upper()
 
         if target_nodes_specified:
-            # The caller named its targets, so nothing is routed from here - and the
+            # The caller picked its targets - named nodes, or a nodes flag that
+            # ``_determine_nodes`` resolves - so nothing is routed from here, and the
             # command's own aggregation must not apply either. A response policy resolved
             # for the whole cluster (``ONE_SUCCEEDED``, an ``AGG_*``) would short-circuit
             # the loop over the nodes the caller picked, or fold their replies into one.
@@ -1687,8 +1689,12 @@ class RedisCluster(
             target_nodes_specified = True
             retry_attempts = 0
 
+        # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
+        # command's own aggregation must not apply to the replies
         command, command_policies = await self._resolve_command_policies(
-            *args, target_nodes_specified=target_nodes_specified
+            *args,
+            target_nodes_specified=target_nodes_specified
+            or self._is_node_flag(passed_targets),
         )
 
         # Add one for the first execution
@@ -1715,7 +1721,6 @@ class RedisCluster(
         if (
             not target_nodes_specified
             and command_policies.request_policy == RequestPolicy.MULTI_SHARD
-            and not self._is_node_flag(passed_targets)
         ):
             if self._initialize_due():
                 # The command metadata the split reads arrives with the topology
@@ -1725,6 +1730,12 @@ class RedisCluster(
                 return await self._execute_multi_shard_command(
                     command, splits, command_policies.response_policy, **kwargs
                 )
+
+        # The replies of the nodes a command sent to several nodes already got, kept
+        # across the attempts so a retry asks only the nodes that have not answered:
+        # asking a node again would run a write twice, and change what a summed reply
+        # counts
+        replies: Dict[str, Any] = {}
 
         for _ in range(execute_attempts):
             if self._initialize_due():
@@ -1766,28 +1777,37 @@ class RedisCluster(
                     ret = await self._execute_command(target_nodes[0], *args, **kwargs)
                     res = {target_nodes[0].name: ret}
                 else:
-                    one_succeeded = (
-                        command_policies.response_policy == ResponsePolicy.ONE_SUCCEEDED
-                    )
-                    keys = [node.name for node in target_nodes]
                     # Every node is asked: the one that succeeds is not known up front.
-                    # SCRIPT KILL succeeds only on the shard running the script.
+                    # SCRIPT KILL succeeds only on the shard running the script. A node
+                    # that answered on an earlier attempt is not asked again.
+                    asked = [node for node in target_nodes if node.name not in replies]
+                    # Every task settles before an error is raised, so a retry never
+                    # asks a node again while its task is still running the command
                     values = await asyncio.gather(
                         *(
                             asyncio.create_task(
                                 self._execute_command(node, *args, **kwargs)
                             )
-                            for node in target_nodes
+                            for node in asked
                         ),
-                        return_exceptions=one_succeeded,
+                        return_exceptions=True,
                     )
-                    res = dict(zip(keys, values))
-                    if one_succeeded:
-                        res, error = _split_successes_and_failure(
-                            res, command_policies.response_policy
-                        )
-                        if error is not None:
-                            raise error
+                    res = {
+                        node.name: replies[node.name]
+                        for node in target_nodes
+                        if node.name in replies
+                    }
+                    for node, value in zip(asked, values):
+                        res[node.name] = value
+                        if not isinstance(value, BaseException):
+                            replies[node.name] = value
+                    # Any error fails the command, except under ONE_SUCCEEDED, which
+                    # fails only when no node succeeded
+                    res, error = _split_successes_and_failure(
+                        res, command_policies.response_policy
+                    )
+                    if error is not None:
+                        raise error
                 return self._process_result(
                     command,
                     res,
@@ -3693,9 +3713,10 @@ class PipelineCommand:
         # fallbacks below reuse the shared ``CommandMetadata`` defaults. Only the two routing
         # policies, which both carry, are ever read.
         self.command_policies: Optional[Union[CommandPolicies, CommandMetadata]] = None
-        # The replies of the slots of a split MULTI_SHARD command that already succeeded,
-        # kept across the attempts so a retry resends only the slots that failed
-        self.slot_replies: Optional[Dict[int, Any]] = None
+        # The replies the command already got, kept across the attempts so a retry sends
+        # it only where it has not been answered - keyed by slot for a split MULTI_SHARD
+        # command, by node name for a command sent to several nodes
+        self.replies: Optional[Dict[Any, Any]] = None
         # The ``target_nodes`` a retry must route by again - see
         # ``PipelineStrategy._execute``
         self.target_nodes: Any = None
@@ -3998,8 +4019,10 @@ class PipelineStrategy(AbstractStrategy):
             target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
                 passed_targets
             )
+            # A nodes flag picks the targets too, in ``_determine_nodes`` below, and the
+            # command's own aggregation must not apply to the replies either
             command, command_policies = await client._resolve_command_policies(
-                *cmd.args, target_nodes_specified=target_nodes_specified
+                *cmd.args, target_nodes_specified=bool(passed_targets)
             )
 
             splits = None
@@ -4007,10 +4030,7 @@ class PipelineStrategy(AbstractStrategy):
                 target_nodes = client._parse_target_nodes(passed_targets)
             else:
                 request_policy = command_policies.request_policy
-                if (
-                    request_policy == RequestPolicy.MULTI_SHARD
-                    and not client._is_node_flag(passed_targets)
-                ):
+                if request_policy == RequestPolicy.MULTI_SHARD:
                     splits = client._split_multi_shard_command(*cmd.args)
 
                 if splits is not None and len(splits) < 2:
@@ -4045,8 +4065,8 @@ class PipelineStrategy(AbstractStrategy):
             # with one result per queued command.
             if splits is not None:
                 # A slot that succeeded on an earlier attempt is not sent again.
-                if cmd.slot_replies is None:
-                    cmd.slot_replies = {}
+                if cmd.replies is None:
+                    cmd.replies = {}
                 copies: Dict[Any, PipelineCommand] = {}
                 fanned_out.append((cmd, command, copies, splits))
                 queued = []
@@ -4058,7 +4078,7 @@ class PipelineStrategy(AbstractStrategy):
                     client.load_balancing_strategy if replica_safe else None
                 )
                 for slot, slot_args, _, keys in splits:
-                    if slot in cmd.slot_replies:
+                    if slot in cmd.replies:
                         continue
                     copies[slot] = PipelineCommand(
                         cmd.position, *slot_args, **_with_keys(cmd.kwargs, keys)
@@ -4072,10 +4092,15 @@ class PipelineStrategy(AbstractStrategy):
                         )
                     )
             elif len(target_nodes) > 1:
+                # A node that answered on an earlier attempt is not asked again.
+                if cmd.replies is None:
+                    cmd.replies = {}
                 copies = {}
                 fanned_out.append((cmd, command, copies, None))
                 queued = []
                 for node in target_nodes:
+                    if node.name in cmd.replies:
+                        continue
                     copies[node.name] = PipelineCommand(
                         cmd.position, *cmd.args, **cmd.kwargs
                     )
@@ -4153,20 +4178,27 @@ class PipelineStrategy(AbstractStrategy):
 
         if any(errors):
             if allow_redirections:
-                # A split MULTI_SHARD command resends only the slots that failed
-                split_copies = {
-                    cmd.position: (copies, splits)
-                    for cmd, _, copies, splits in fanned_out
-                    if splits is not None
+                # A split MULTI_SHARD command resends only the slots that failed, and a
+                # command sent to several nodes asks only the nodes that have not
+                # answered
+                fanned_out_by_position = {
+                    cmd.position: (command, copies, splits)
+                    for cmd, command, copies, splits in fanned_out
                 }
                 # send each errored command individually
                 for cmd in todo:
                     if isinstance(cmd.result, (TryAgainError, MovedError, AskError)):
-                        split = split_copies.get(cmd.position)
-                        if split is not None:
-                            cmd.result = await self._retry_failed_slots(
-                                client, cmd, *split
-                            )
+                        fan_out = fanned_out_by_position.get(cmd.position)
+                        if fan_out is not None:
+                            command, copies, splits = fan_out
+                            if splits is not None:
+                                cmd.result = await self._retry_failed_slots(
+                                    client, cmd, copies, splits
+                                )
+                            else:
+                                cmd.result = await self._retry_failed_nodes(
+                                    client, cmd, command
+                                )
                             continue
                         try:
                             if cmd.target_nodes is None:
@@ -4246,20 +4278,68 @@ class PipelineStrategy(AbstractStrategy):
         """
         response_policy = cmd.command_policies.response_policy
         if splits is not None:
-            error = _record_slot_replies(
-                cmd.slot_replies, ((slot, c.result) for slot, c in copies.items())
+            error = _record_replies(
+                cmd.replies, ((slot, c.result) for slot, c in copies.items())
             )
             if error is not None:
                 return error
-            return _merge_multi_shard_replies(cmd.slot_replies, splits, response_policy)
+            return _merge_multi_shard_replies(cmd.replies, splits, response_policy)
 
+        # The nodes that answered on an earlier attempt are merged with this one's
+        res = {node_name: c.result for node_name, c in copies.items()}
+        _record_replies(cmd.replies, res.items())
         res, error = _split_successes_and_failure(
-            {node_name: c.result for node_name, c in copies.items()},
-            response_policy,
+            {**cmd.replies, **res}, response_policy
         )
         if error is not None:
             return error
 
+        # Remove keys entry, it needs only for cache.
+        options = {key: value for key, value in cmd.kwargs.items() if key != "keys"}
+        return client._process_result(
+            command, res, response_policy=response_policy, **options
+        )
+
+    @staticmethod
+    async def _retry_failed_nodes(
+        client: "RedisCluster", cmd: PipelineCommand, command: str
+    ) -> Any:
+        """
+        Ask each node of a command sent to several nodes that has not answered, one node
+        at a time, like the main client does, and merge the replies once every node has
+        answered. A node that already answered is not asked again - see
+        ``redis.cluster._record_replies``.
+
+        The targets are resolved again, the way the first attempt resolved them, so a
+        node the topology refresh replaced is asked in its place.
+        """
+        if cmd.target_nodes is not None and not client._is_node_flag(cmd.target_nodes):
+            target_nodes = client._parse_target_nodes(cmd.target_nodes)
+        else:
+            target_nodes = await client._determine_nodes(
+                *cmd.args,
+                request_policy=cmd.command_policies.request_policy,
+                node_flag=cmd.target_nodes,
+            )
+
+        res = dict(cmd.replies)
+        for node in target_nodes:
+            if node.name in cmd.replies:
+                continue
+            try:
+                reply = await client.execute_command(
+                    *cmd.args, target_nodes=[node], **cmd.kwargs
+                )
+            except Exception as e:
+                res[node.name] = e
+                continue
+            cmd.replies[node.name] = reply
+            res[node.name] = reply
+
+        response_policy = cmd.command_policies.response_policy
+        res, error = _split_successes_and_failure(res, response_policy)
+        if error is not None:
+            return error
         # Remove keys entry, it needs only for cache.
         options = {key: value for key, value in cmd.kwargs.items() if key != "keys"}
         return client._process_result(
@@ -4276,24 +4356,24 @@ class PipelineStrategy(AbstractStrategy):
         """
         Send each slot of a split MULTI_SHARD command that failed individually, like the
         main client does, and merge the replies once every slot has succeeded. A slot that
-        already succeeded is not sent again - see ``redis.cluster._record_slot_replies``.
+        already succeeded is not sent again - see ``redis.cluster._record_replies``.
 
         The slots are sent one at a time. Sending them in parallel would take one
         connection per slot, and raise ``MaxConnectionsError`` once a node holds more of
         the failed slots than its ``max_connections``.
         """
         for slot, slot_command in copies.items():
-            if slot in cmd.slot_replies:
+            if slot in cmd.replies:
                 continue
             try:
-                cmd.slot_replies[slot] = await client.execute_command(
+                cmd.replies[slot] = await client.execute_command(
                     *slot_command.args, **slot_command.kwargs
                 )
             except RedisError as e:
                 return e
 
         return _merge_multi_shard_replies(
-            cmd.slot_replies, splits, cmd.command_policies.response_policy
+            cmd.replies, splits, cmd.command_policies.response_policy
         )
 
     async def reset(self):

@@ -617,9 +617,11 @@ def record_streaming_lag_from_response(
                     stream_messages = [stream_messages]
                 for messages in stream_messages:
                     for message in messages:
-                        message_id, _ = message
-                        message_id = str_if_bytes(message_id)
-                        timestamp, _ = message_id.split("-")
+                        message_id = message[0]
+                        # Deleted pending entries have no ID, so there is no timestamp.
+                        if message_id is None:
+                            continue
+                        timestamp, _ = str_if_bytes(message_id).split("-")
                         # Ensure lag is non-negative (clock skew can cause negative values)
                         lag_seconds = max(0.0, now - int(timestamp) / 1000)
 
@@ -635,9 +637,11 @@ def record_streaming_lag_from_response(
                 effective_stream_name = None if hide_stream_names else stream_name
 
                 for message in stream_entry[1]:
-                    message_id, _ = message
-                    message_id = str_if_bytes(message_id)
-                    timestamp, _ = message_id.split("-")
+                    message_id = message[0]
+                    # Deleted pending entries have no ID, so there is no timestamp.
+                    if message_id is None:
+                        continue
+                    timestamp, _ = str_if_bytes(message_id).split("-")
                     # Ensure lag is non-negative (clock skew can cause negative values)
                     lag_seconds = max(0.0, now - int(timestamp) / 1000)
 

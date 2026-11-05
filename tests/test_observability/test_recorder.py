@@ -766,6 +766,42 @@ class TestRecordStreamingLag:
             if group is not None:
                 assert call.kwargs["attributes"][REDIS_CLIENT_CONSUMER_GROUP] == group
 
+    @pytest.mark.parametrize("protocol", [None, 2, 3])
+    @pytest.mark.parametrize("legacy_responses", [False, True])
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    @pytest.mark.parametrize("claim", [False, True])
+    def test_streaming_lag_skips_deleted_and_reads_claimed_entries(
+        self, setup_recorder, protocol, legacy_responses, decode_responses, claim
+    ):
+        def encode(value):
+            return value if decode_responses else value.encode()
+
+        def entry(message_id):
+            fields = [encode("field"), encode("value")]
+            if claim:
+                return [encode(message_id), fields, 100, 2]
+            return [encode(message_id), fields]
+
+        # A deleted pending entry comes first, so the old code dropped the
+        # rest of the response, including the second stream.
+        first = [None, entry("1000-0")]
+        second = [entry("2000-0")]
+        first_stream, second_stream = encode("first"), encode("second")
+        if protocol == 2:
+            raw = [[first_stream, first], [second_stream, second]]
+        else:
+            raw = {first_stream: first, second_stream: second}
+        options = {"claim_min_idle_time": 100} if claim else {}
+        response = get_response_callbacks(protocol, legacy_responses)["XREADGROUP"](
+            raw, **options
+        )
+        recorder.record_streaming_lag_from_response(response, consumer_group="workers")
+        instrument = setup_recorder.stream_lag
+        assert [
+            call.kwargs["attributes"][REDIS_CLIENT_STREAM_NAME]
+            for call in instrument.record.call_args_list
+        ] == ["first", "second"]
+
 
 @pytest.mark.fixed_client
 class TestHidePubSubChannelNames:

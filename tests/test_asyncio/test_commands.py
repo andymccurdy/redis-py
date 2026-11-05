@@ -3852,6 +3852,21 @@ class TestRedisCommands:
         assert 0 < (await r.spttl("test:set", "member1"))[0] <= 5000
         assert await r.spttl("test:set", "member2") == [-1]
 
+    async def test_spexpire_timedelta_is_exact(self, r: redis.Redis):
+        # argument level only, so it needs no SPEXPIRE support on the server
+        with patch.object(r, "execute_command", AsyncMock(return_value=[1])) as cmd:
+            await r.spexpire(
+                "test:set", datetime.timedelta(milliseconds=1001), "member1"
+            )
+        assert cmd.call_args.args == (
+            "SPEXPIRE",
+            "test:set",
+            1001,
+            "MEMBERS",
+            1,
+            "member1",
+        )
+
     @skip_if_server_version_lt("8.11.240")
     async def test_spexpire_conditions(self, r: redis.Redis):
         await r.delete("test:set")

@@ -470,7 +470,10 @@ class CFCommands:
         (0, NULL) to indicate completion.
         For more information see `CF.SCANDUMP <https://redis.io/commands/cf.scandump>`_.
         """  # noqa
-        return self.execute_command(CF_SCANDUMP, key, iter)
+        params = [key, iter]
+        options = {}
+        options[NEVER_DECODE] = []
+        return self.execute_command(CF_SCANDUMP, *params, **options)
 
     @overload
     def loadchunk(self: SyncClientProtocol, key, iter, data) -> bytes | str: ...

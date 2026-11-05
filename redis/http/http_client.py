@@ -320,7 +320,9 @@ class HttpClient:
     def _is_retryable_http_error(self, error: Exception) -> bool:
         if isinstance(error, HTTPError):
             return self._should_retry_status(error.code)
-        return False
+        # URLError and ssl.SSLError are registered as supported errors above;
+        # treat them as transient transport failures rather than vetoing them.
+        return True
 
     # Internal utilities
     def _json_call(

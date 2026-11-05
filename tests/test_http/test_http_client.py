@@ -2,7 +2,7 @@ import json
 import gzip
 from io import BytesIO
 from typing import Any, Dict
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, parse_qs
 
 import pytest
@@ -158,6 +158,39 @@ class TestHttpClient:
         result = client.get(path)
 
         # Assert: should have retried twice (total 3 attempts) and finally returned parsed JSON
+        assert result == payload
+        assert call_count["n"] == retry_policy.get_retries() + 1
+
+    def test_get_retries_transport_errors_and_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        retry_policy = Retry(
+            backoff=ExponentialWithJitterBackoff(base=0, cap=0), retries=2
+        )
+        base_url = "https://api.example.com/"
+        path = "flaky-transport"
+        expected_url = f"{base_url}{path}"
+        payload = {"ok": True}
+        success_content = json.dumps(payload).encode("utf-8")
+        call_count = {"n": 0}
+
+        def flaky_urlopen(request, *, timeout=None, context=None):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                raise URLError(ConnectionRefusedError(61, "Connection refused"))
+            return FakeResponse(
+                status=200,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                url=expected_url,
+                content=success_content,
+            )
+
+        monkeypatch.setattr("redis.http.http_client.urlopen", flaky_urlopen)
+
+        client = HttpClient(base_url=base_url, retry=retry_policy)
+
+        result = client.get(path)
+
         assert result == payload
         assert call_count["n"] == retry_policy.get_retries() + 1
 

@@ -1404,7 +1404,7 @@ class TestPubSubPings:
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe("foo")
         await p.ping()
-        assert await wait_for_message(p) == make_message(
+        assert await wait_for_message(p, timeout=5) == make_message(
             type="pong", channel=None, data="", pattern=None
         )
         await p.aclose()
@@ -1414,7 +1414,7 @@ class TestPubSubPings:
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe("foo")
         await p.ping(message="hello world")
-        assert await wait_for_message(p) == make_message(
+        assert await wait_for_message(p, timeout=5) == make_message(
             type="pong", channel=None, data="hello world", pattern=None
         )
         await p.aclose()

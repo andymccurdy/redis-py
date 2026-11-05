@@ -2,7 +2,7 @@ import os
 import re
 import time
 from contextlib import closing
-from threading import Thread
+from threading import Event, Thread
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -327,37 +327,88 @@ class TestBlockingConnectionPool:
         c2 = pool.get_connection()
         assert c1 != c2
 
-    def _seed_pool_connections(self, pool, free, in_use):
-        # One connection sits in the queue (idle/free), the other is checked
-        # out (in use): tracked in ``_connections`` but absent from the queue.
-        while not pool.pool.empty():
-            pool.pool.get_nowait()
-        pool.pool.put_nowait(free)
-        pool.pool.put_nowait(None)
-        pool._connections = [free, in_use]
+    @pytest.mark.fixed_client
+    def test_checkout_during_idle_re_auth(self):
+        pool = self.get_pool(max_connections=1, timeout=0.05)
+        connection = pool.get_connection()
+        pool.release(connection)
+        token = mock.Mock()
+        token.try_get.return_value = "default"
+        token.get_value.return_value = "token"
+        auth_started = Event()
+        finish_auth = Event()
+        errors = []
+
+        def read_auth_response():
+            auth_started.set()
+            assert finish_auth.wait(timeout=5)
+            return b"OK"
+
+        def refresh():
+            try:
+                pool.re_auth_callback(token)
+            except BaseException as error:
+                errors.append(error)
+
+        connection.retry = Retry(NoBackoff(), 0)
+        connection.send_command = mock.Mock()
+        connection.read_response = mock.Mock(side_effect=read_auth_response)
+
+        refresher = Thread(target=refresh)
+        refresher.start()
+        try:
+            assert auth_started.wait(timeout=5)
+            # The connection stays out of the queue until its AUTH reply is read.
+            with pytest.raises(redis.ConnectionError, match="No connection available"):
+                pool.get_connection()
+        finally:
+            finish_auth.set()
+            refresher.join(timeout=5)
+
+        assert not errors
+        connection.send_command.assert_called_once_with("AUTH", "default", "token")
+        assert pool.get_connection() is connection
 
     @pytest.mark.fixed_client
-    def test_re_auth_callback_reauthenticates_pooled_connections(self):
-        pool = self.get_pool()
-        free = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
-        in_use = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
-        self._seed_pool_connections(pool, free, in_use)
-        token = mock.Mock()
-        token.try_get.return_value = "oid"
-        token.get_value.return_value = "value"
+    def test_release_applies_rotated_token(self, master_host):
+        with redis.BlockingConnectionPool(
+            max_connections=1, host=master_host[0], port=master_host[1]
+        ) as pool:
+            connection = pool.get_connection()
+            token = mock.Mock()
+            token.try_get.return_value = "default"
+            token.get_value.return_value = "token"
 
-        pool.re_auth_callback(token)
+            with (
+                mock.patch.object(connection, "send_command") as send_command,
+                mock.patch.object(connection, "read_response") as read_response,
+            ):
+                pool.re_auth_callback(token)
+                send_command.assert_not_called()
 
-        free.send_command.assert_called_once_with("AUTH", "oid", "value")
-        free.read_response.assert_called_once()
-        in_use.set_re_auth_token.assert_called_once_with(token)
+                pool.release(connection)
+
+            send_command.assert_called_once_with("AUTH", "default", "token")
+            read_response.assert_called_once_with()
+            assert pool.get_connection() is connection
+
+    @pytest.mark.fixed_client
+    def test_release_keeps_the_slot_when_re_auth_fails(self):
+        pool = self.get_pool(max_connections=1, timeout=0.05)
+        connection = pool.get_connection()
+        connection.re_auth = mock.Mock(side_effect=redis.ConnectionError("broken"))
+
+        with pytest.raises(redis.ConnectionError, match="broken"):
+            pool.release(connection)
+
+        assert pool.get_connection() is connection
 
     @pytest.mark.fixed_client
     def test_set_retry_updates_pooled_connections(self):
         pool = self.get_pool()
-        free = mock.Mock(spec=Connection)
-        in_use = mock.Mock(spec=Connection)
-        self._seed_pool_connections(pool, free, in_use)
+        free = pool.get_connection()
+        in_use = pool.get_connection()
+        pool.release(free)
         retry = Retry(NoBackoff(), 5)
 
         pool.set_retry(retry)

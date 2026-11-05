@@ -837,8 +837,8 @@ class RedisCluster(
 
         If none of these options are specified, the default db=0 is used.
 
-        The cluster option ``dynamic_startup_nodes`` can be supplied as a
-        boolean querystring option.
+        The cluster options ``dynamic_startup_nodes`` and ``require_full_coverage``
+        can be supplied as boolean querystring options.
 
         All querystring options are cast to their appropriate Python types.
         Boolean arguments can be specified with string values "True"/"False"
@@ -1064,6 +1064,9 @@ class RedisCluster(
             url_options = parse_url(url)
             dynamic_startup_nodes = url_options.pop(
                 "dynamic_startup_nodes", dynamic_startup_nodes
+            )
+            require_full_coverage = url_options.pop(
+                "require_full_coverage", require_full_coverage
             )
             if "path" in url_options:
                 raise RedisClusterException(

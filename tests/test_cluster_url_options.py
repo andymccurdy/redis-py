@@ -6,6 +6,7 @@ from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["dynamic_startup_nodes", "require_full_coverage"])
 @pytest.mark.parametrize(
     "client_class", [RedisCluster, AsyncRedisCluster], ids=["sync", "async"]
 )
@@ -23,17 +24,25 @@ from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
         ("yes", True),
     ],
 )
-async def test_cluster_url_dynamic_startup_nodes(client_class, scheme, value, expected):
+async def test_cluster_url_boolean_options(
+    client_class, scheme, value, expected, option
+):
     with (
         patch.object(NodesManager, "initialize"),
         patch.object(CommandsParser, "initialize"),
     ):
         client = client_class.from_url(
-            f"{scheme}://localhost:6379?dynamic_startup_nodes={value}",
-            dynamic_startup_nodes=not expected,
+            f"{scheme}://localhost:6379?{option}={value}",
+            **{option: not expected},
         )
     try:
-        assert client.nodes_manager._dynamic_startup_nodes is expected
+        attribute = (
+            option
+            if option == "require_full_coverage"
+            and isinstance(client, AsyncRedisCluster)
+            else f"_{option}"
+        )
+        assert getattr(client.nodes_manager, attribute) is expected
     finally:
         if isinstance(client, AsyncRedisCluster):
             await client.aclose()
@@ -42,20 +51,25 @@ async def test_cluster_url_dynamic_startup_nodes(client_class, scheme, value, ex
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["dynamic_startup_nodes", "require_full_coverage"])
 @pytest.mark.parametrize(
     "client_class", [RedisCluster, AsyncRedisCluster], ids=["sync", "async"]
 )
 @pytest.mark.parametrize("expected", [False, True])
-async def test_cluster_url_keeps_dynamic_startup_nodes_keyword(client_class, expected):
+async def test_cluster_url_keeps_boolean_keyword(client_class, expected, option):
     with (
         patch.object(NodesManager, "initialize"),
         patch.object(CommandsParser, "initialize"),
     ):
-        client = client_class.from_url(
-            "redis://localhost:6379", dynamic_startup_nodes=expected
-        )
+        client = client_class.from_url("redis://localhost:6379", **{option: expected})
     try:
-        assert client.nodes_manager._dynamic_startup_nodes is expected
+        attribute = (
+            option
+            if option == "require_full_coverage"
+            and isinstance(client, AsyncRedisCluster)
+            else f"_{option}"
+        )
+        assert getattr(client.nodes_manager, attribute) is expected
     finally:
         if isinstance(client, AsyncRedisCluster):
             await client.aclose()

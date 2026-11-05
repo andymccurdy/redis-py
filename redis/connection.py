@@ -3160,6 +3160,7 @@ URL_QUERY_ARGUMENT_PARSERS = {
     "legacy_responses": to_bool,
     "dynamic_startup_nodes": to_bool,
     "require_full_coverage": to_bool,
+    "reinitialize_steps": int,
 }
 
 

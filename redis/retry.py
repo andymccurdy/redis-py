@@ -65,14 +65,10 @@ class AbstractRetry(Generic[E], abc.ABC):
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(
-            (
-                self._backoff,
-                self._retries,
-                frozenset(self._supported_errors),
-                self._is_retryable,
-            )
-        )
+        # A callable checker is not necessarily hashable, and equality already
+        # allows unequal policies to share a hash. Keep the policy fields that
+        # defined the hash before the checker existed.
+        return hash((self._backoff, self._retries, frozenset(self._supported_errors)))
 
     def update_supported_errors(self, specified_errors: Iterable[Type[E]]) -> None:
         """

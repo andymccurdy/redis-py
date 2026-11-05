@@ -236,6 +236,18 @@ class TestRetry:
         assert same != Retry(NoBackoff(), 1)
         assert same != Retry(NoBackoff(), 1, is_retryable=lambda error: True)
 
+    def test_retry_checker_does_not_break_hashing(self):
+        class UnhashableChecker:
+            __hash__ = None
+
+            def __call__(self, error):
+                return True
+
+        checker = UnhashableChecker()
+        retry = Retry(NoBackoff(), 1, is_retryable=checker)
+        assert hash(retry) == hash(Retry(NoBackoff(), 1))
+        assert retry in {retry}
+
 
 @pytest.mark.fixed_client
 class TestRetryCheckerHelper:

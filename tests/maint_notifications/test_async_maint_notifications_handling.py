@@ -1543,7 +1543,7 @@ async def test_async_pool_handler_schedules_delayed_reconnect_for_unknown_target
 
 @pytest.mark.fixed_client
 @pytest.mark.asyncio
-async def test_blocking_pool_locks_get_only_during_maintenance():
+async def test_blocking_pool_locks_get_and_release_regardless_of_maintenance():
     pool = BlockingConnectionPool(
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
@@ -1563,20 +1563,19 @@ async def test_blocking_pool_locks_get_only_during_maintenance():
     fake_conn.re_auth = AsyncMock()
     pool._available_connections.append(fake_conn)
 
-    # Outside maintenance: get_connection does not acquire _lock,
-    # but release() still does (it goes through ConnectionPool.release).
+    # Both checkout and release acquire _lock outside maintenance.
     conn = await pool.get_connection()
     await pool.release(conn)
-    assert pool._lock.__aenter__.call_count == 1
+    assert pool._lock.__aenter__.call_count == 2
 
-    # Inside maintenance: get_connection now also acquires _lock.
+    # Maintenance does not change the locking behavior.
     pool.set_in_maintenance(True)
     try:
         conn = await pool.get_connection()
         await pool.release(conn)
     finally:
         pool.set_in_maintenance(False)
-    assert pool._lock.__aenter__.call_count == 3
+    assert pool._lock.__aenter__.call_count == 4
 
 
 @pytest.mark.fixed_client

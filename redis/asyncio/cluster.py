@@ -2,7 +2,6 @@ import asyncio
 import collections
 import logging
 import random
-import socket
 import threading
 import time
 import warnings
@@ -48,7 +47,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers import AsyncCommandsParser, Encoder
-from redis._parsers.helpers import get_response_callbacks
+from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import PubSub, ResponseCallbackT
 from redis.asyncio.connection import (
@@ -78,6 +77,8 @@ from redis.cluster import (
     LoadBalancer,
     LoadBalancingStrategy,
     _error_to_raise,
+    _fill_missing_redirect_host,
+    _resolve_localhost,
     _should_request_refresh,
     _topology_refresh_delay,
     block_pipeline_command,
@@ -150,10 +151,10 @@ from redis.utils import (
     SENTINEL,
     SSL_AVAILABLE,
     check_protocol_version,
+    command_text,
     deprecated_args,
     deprecated_function,
     experimental_method,
-    safe_str,
     str_if_bytes,
     truncate_text,
 )
@@ -996,9 +997,9 @@ class RedisCluster(
         try:
             # Initialize the client (i.e. establish connection, etc.)
             return await self.initialize()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # If initialization fails, decrement the counter to keep it in sync
-            await self._decrement_usage()
+            await asyncio.shield(self._decrement_usage())
             raise
 
     async def _increment_usage(self) -> int:
@@ -1019,15 +1020,24 @@ class RedisCluster(
             self._usage_counter -= 1
             return self._usage_counter
 
+    async def _release_usage(self) -> None:
+        """
+        Decrement the usage counter and close the client on the last exit.
+
+        Hold the lock through closing so a new context cannot use connections
+        that are still being disconnected by the previous context.
+        """
+        async with self._usage_lock:
+            self._usage_counter -= 1
+            if self._usage_counter == 0:
+                await self.aclose()
+
     async def __aexit__(self, exc_type, exc_value, traceback):
         """
         Async context manager exit. Decrements a usage counter. If this is the
         last exit (counter becomes zero), the client closes its connection pool.
         """
-        current_usage = await asyncio.shield(self._decrement_usage())
-        if current_usage == 0:
-            # This was the last active context, so disconnect the pool.
-            await asyncio.shield(self.aclose())
+        await asyncio.shield(self._release_usage())
 
     def __await__(self) -> Generator[Any, None, "RedisCluster"]:
         return self.initialize().__await__()
@@ -1679,7 +1689,7 @@ class RedisCluster(
             ask_himport = False
             try:
                 if asking:
-                    target_node = self.get_node(node_name=redirect_addr)
+                    target_node = self.get_node(*redirect_addr)
                     if parse_himport_set_args(args) is not None:
                         # ASKING must sit on the same connection as the SET,
                         # immediately before it. HIMPORT SET's own executor folds
@@ -1824,6 +1834,7 @@ class RedisCluster(
                 )
                 raise
             except MovedError as e:
+                _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
                 # refresh of the whole topology, run by the next attempt of any
@@ -1840,7 +1851,9 @@ class RedisCluster(
                 ):
                     # The refresh also queries the node the error pointed to
                     self._request_refresh(
-                        additional_startup_nodes_info=[(e.host, e.port)]
+                        additional_startup_nodes_info=[
+                            self.nodes_manager.remap_host_port(e.host, e.port)
+                        ]
                     )
                     # Reset the counter
                     self.reinitialize_counter = 0
@@ -1856,7 +1869,8 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
-                redirect_addr = get_node_name(host=e.host, port=e.port)
+                _fill_missing_redirect_host(e, target_node.host)
+                redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
                 await self._record_command_metric(
                     command_name=command,
@@ -2118,7 +2132,7 @@ class ClusterNode:
         **connection_kwargs: Any,
     ) -> None:
         if host == "localhost":
-            host = socket.gethostbyname(host)
+            host = _resolve_localhost()
 
         connection_kwargs["host"] = host
         connection_kwargs["port"] = port
@@ -2342,6 +2356,8 @@ class ClusterNode:
             if NEVER_DECODE in kwargs:
                 response = await connection.read_response(disable_decoding=True)
                 kwargs.pop(NEVER_DECODE)
+                if command == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = await connection.read_response()
         except ResponseError:
@@ -2623,7 +2639,7 @@ class NodesManager:
         if host and port:
             # the user passed host and port
             if host == "localhost":
-                host = socket.gethostbyname(host)
+                host = _resolve_localhost()
             return self.nodes_cache.get(get_node_name(host=host, port=port))
         elif node_name:
             return self.nodes_cache.get(node_name)
@@ -2690,7 +2706,10 @@ class NodesManager:
 
     async def move_slot(self, e: AskError | MovedError):
         node_changed = False
-        redirected_node = self.get_node(host=e.host, port=e.port)
+        # The redirect carries the address the node advertises, like
+        # CLUSTER SLOTS does, so it needs the same remapping to be reachable
+        host, port = self.remap_host_port(e.host, e.port)
+        redirected_node = self.get_node(host=host, port=port)
         if redirected_node:
             # The node already exists
             if redirected_node.server_type != PRIMARY:
@@ -2698,9 +2717,7 @@ class NodesManager:
                 redirected_node.server_type = PRIMARY
         else:
             # This is a new node, we will add it to the nodes cache
-            redirected_node = ClusterNode(
-                e.host, e.port, PRIMARY, **self.connection_kwargs
-            )
+            redirected_node = ClusterNode(host, port, PRIMARY, **self.connection_kwargs)
             self.set_nodes(self.nodes_cache, {redirected_node.name: redirected_node})
         slot_nodes = self.slots_cache[e.slot_id]
         if redirected_node not in slot_nodes:
@@ -2928,11 +2945,15 @@ class NodesManager:
                 # all reinitialize through the same node.
                 random.shuffle(startup_nodes)
             # An address that is already a startup node is queried through that
-            # node, so no temporary node is built for it
+            # node, so no temporary node is built for it. Startup nodes are
+            # named after the resolved localhost, like ClusterNode names them.
             additional_startup_nodes = [
                 ClusterNode(host, port, **self.connection_kwargs)
                 for host, port in additional_startup_nodes_info
-                if get_node_name(host, port) not in self.startup_nodes
+                if get_node_name(
+                    _resolve_localhost() if host == "localhost" else host, port
+                )
+                not in self.startup_nodes
             ]
             temporary_nodes.extend(additional_startup_nodes)
             if last_failed_node_name is not None:
@@ -3002,7 +3023,11 @@ class NodesManager:
                         slot[i] = [str_if_bytes(val) for val in slot[i]]
                     primary_node = slot[2]
                     host = primary_node[0]
-                    if host == "":
+                    # A node that does not know its own address sends an empty
+                    # host, and one whose endpoint is unknown
+                    # (cluster-preferred-endpoint-type unknown-endpoint) a null
+                    # one: both are reached on the host that answered
+                    if not host:
                         host = startup_node.host
                     port = int(primary_node[1])
                     host, port = self.remap_host_port(host, port)
@@ -3021,6 +3046,8 @@ class NodesManager:
                     replica_nodes = slot[3:]
                     for replica_node in replica_nodes:
                         host = replica_node[0]
+                        if not host:
+                            host = startup_node.host
                         port = replica_node[1]
                         host, port = self.remap_host_port(host, port)
 
@@ -3198,8 +3225,58 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         )
         # result = [True, "1", 1, {"F": "V"}, True, True, "2", "3", 1, 1, 1]
 
-    Note: For commands `DELETE`, `EXISTS`, `TOUCH`, `UNLINK`, `mset_nonatomic`, which
-    are split across multiple nodes, you'll get multiple results for them in the array.
+    Note: For commands `DELETE`, `EXISTS`, `TOUCH`, `mset_nonatomic`, which are split
+    across multiple nodes, you'll get multiple results for them in the array.
+
+    Which methods must be awaited:
+
+    Staging a command returns the pipeline itself, so commands chain and are not
+    awaited, as in the example above. The coroutines defined on this class must be
+    awaited individually::
+
+        watch, unwatch, unlink, discard, reset, execute, initialize,
+        himport_prepare, himport_discard, himport_discard_all
+
+    Of those, only ``initialize`` returns the pipeline, so it is the only one that
+    chains once awaited. ``reset``, ``discard``, ``watch``, ``unwatch`` and ``unlink``
+    return ``None``, ``execute`` returns a ``list``, ``himport_prepare`` a ``bool`` and
+    the two ``himport_discard`` methods an ``int``.
+
+    That list covers only the methods defined on this class. Inherited command
+    coroutines are not pipeline steps. ``client_tracking_on`` and
+    ``client_tracking_off`` await the pipeline itself, which re-initializes it and
+    discards everything staged so far. Others cannot run on a pipeline at all:
+    ``command_info`` and the ``hotkeys_*`` family raise ``NotImplementedError``, and
+    ``cluster_delslots`` raises ``TypeError``.
+
+    `unlink` is the surprising one, because the inherited `delete` behaves the other
+    way::
+
+        pipe = rc.pipeline()
+        pipe.delete("A")          # stages, chainable
+        await pipe.unlink("B")    # stages, must be awaited, returns None
+        await pipe.execute()
+
+    Between :meth:`watch` and :meth:`multi` a command returns a coroutine rather than
+    the pipeline. It is executed only when awaited and resolves to the response, so it
+    must be awaited. After :meth:`multi` commands are queued again and chain as usual::
+
+        async with rc.pipeline(transaction=True) as pipe:
+            await pipe.watch("a")
+            a = await pipe.get("a")     # executed when awaited
+            pipe.multi()
+            pipe.set("a", int(a) + 1)   # queued, chains
+            await pipe.execute()
+
+    The split commands from the note above and ``unlink`` are the exception: between
+    :meth:`watch` and :meth:`multi`, ``delete``, ``exists`` and ``touch`` return the
+    pipeline and ``unlink`` returns ``None``, and all four drop the command unsent, so
+    do not use them there. ``mset_nonatomic`` raises ``NotImplementedError`` in a
+    transactional pipeline.
+
+    Outside a transactional pipeline ``watch``, ``unwatch`` and ``discard`` raise
+    :class:`~.RedisClusterException`, and the ``himport_*`` methods act on the shared
+    fieldset registry rather than staging a command.
 
     Retryable errors:
         - :class:`~.ClusterDownError`
@@ -3358,7 +3435,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         self._execution_strategy.multi()
 
     async def discard(self):
-        """ """
+        """Discards the transactional block. Must be awaited."""
         await self._execution_strategy.discard()
 
     async def watch(self, *names):
@@ -3370,6 +3447,16 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         await self._execution_strategy.unwatch()
 
     async def unlink(self, *names):
+        """
+        Stages an `UNLINK` for keys ``names``. Must be awaited, and returns ``None``
+        rather than the pipeline, so unlike `delete` it does not chain::
+
+            await pipe.unlink("A")
+
+        Outside a transactional block only one key is accepted; more raises
+        :class:`~.RedisClusterException`. Between :meth:`watch` and :meth:`multi`
+        nothing is sent, so do not use it there.
+        """
         await self._execution_strategy.unlink(*names)
 
     def mset_nonatomic(
@@ -3531,7 +3618,7 @@ class AbstractStrategy(ExecutionStrategy):
         """
         Provides extra context to the exception prior to it being handled
         """
-        cmd = " ".join(map(safe_str, command))
+        cmd = command_text(command)
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) of pipeline "
             f"caused error: {exception.args[0]}"
@@ -3778,7 +3865,7 @@ class PipelineStrategy(AbstractStrategy):
                 for cmd in todo:
                     result = cmd.result
                     if isinstance(result, Exception):
-                        command = " ".join(map(safe_str, cmd.args))
+                        command = command_text(cmd.args)
                         # Errors from the redirect retry may carry no args,
                         # e.g. MaxConnectionsError() from acquire_connection().
                         error = result.args[0] if result.args else type(result).__name__
@@ -3960,15 +4047,53 @@ class TransactionStrategy(AbstractStrategy):
         # on the caller's loop: running it here would do I/O on connections
         # bound to that loop. Only a client that never initialized has no
         # topology to queue against.
-        if (
+        initialize_here = (
             cluster_client._initialize
             and cluster_client.nodes_manager.default_node is None
-        ):
-            await cluster_client.initialize()
-
+        )
+        startup_nodes = (
+            tuple(cluster_client.nodes_manager.startup_nodes.values())
+            if initialize_here
+            else ()
+        )
+        parser_node = (
+            None
+            if initialize_here or args[0] in self.NO_SLOTS_COMMANDS
+            else cluster_client.commands_parser.node
+        )
+        if parser_node is not None:
+            # Parser I/O during slot resolution belongs to this private loop,
+            # not to the caller's node or its connection pool.
+            cluster_client.commands_parser.node = ClusterNode(
+                parser_node.host,
+                parser_node.port,
+                **cluster_client.nodes_manager.connection_kwargs,
+            )
         slot_number: Optional[int] = None
-        if args[0] not in self.NO_SLOTS_COMMANDS:
-            slot_number = await self._resolve_transaction_slot(*args)
+        try:
+            if initialize_here:
+                await cluster_client.initialize()
+            if args[0] not in self.NO_SLOTS_COMMANDS:
+                slot_number = await self._resolve_transaction_slot(*args)
+        finally:
+            if initialize_here:
+                # Keep the discovered topology and metadata, but not sockets bound
+                # to the private loop that closes when this command is queued.
+                # Same-address nodes can have distinct pools; deduplicate by identity.
+                nodes = {
+                    id(node): node
+                    for node in chain(startup_nodes, cluster_client.get_nodes())
+                }
+                await asyncio.gather(
+                    *(node.disconnect() for node in nodes.values()),
+                    return_exceptions=True,
+                )
+            elif parser_node is not None:
+                temporary_node = cluster_client.commands_parser.node
+                cluster_client.commands_parser.node = parser_node
+                await asyncio.gather(
+                    temporary_node.disconnect(), return_exceptions=True
+                )
 
         if (
             self._watching or args[0] in self.IMMEDIATE_EXECUTE_COMMANDS
@@ -4157,6 +4282,8 @@ class TransactionStrategy(AbstractStrategy):
                 # MovedError is an AskError, so a MOVED slot is patched too, and
                 # the retry goes to the node that owns it now. The refresh is
                 # only asked for, run by the next command once due.
+                if self._transaction_node is not None:
+                    _fill_missing_redirect_host(error, self._transaction_node.host)
                 await self._pipe.cluster_client.nodes_manager.move_slot(error)
                 if should_request_refresh:
                     self._pipe.cluster_client._request_refresh()
@@ -4356,6 +4483,9 @@ class TransactionStrategy(AbstractStrategy):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
                 if command_name in self._pipe.cluster_client.response_callbacks:
+                    # The keys option is only for the client cache and is
+                    # not an option of the callbacks
+                    cmd.kwargs.pop("keys", None)
                     r = self._pipe.cluster_client.response_callbacks[command_name](
                         r, **cmd.kwargs
                     )
@@ -5177,6 +5307,10 @@ class ClusterPubSub(PubSub):
         # move_slot indexes slots_cache by the redirected slot, so an
         # as-yet-uncovered slot raises: log and still reconcile rather than let
         # a repair attempt break a pubsub read.
+        if node_name is not None:
+            # A redirect without a host is relative to the node that sent it,
+            # and a node's name is its host and port
+            _fill_missing_redirect_host(error, node_name.rsplit(":", 1)[0])
         try:
             await self.cluster.nodes_manager.move_slot(error)
         except Exception as exc:

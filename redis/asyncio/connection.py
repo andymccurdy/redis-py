@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import copy
 import inspect
 import logging
@@ -14,7 +13,7 @@ from itertools import chain
 from types import MappingProxyType
 from typing import (
     Any,
-    AsyncIterator,
+    Awaitable,
     Callable,
     Iterable,
     List,
@@ -923,6 +922,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             self._writer.close()
             self._writer = self._reader = None
 
+    def _force_disconnect(self) -> None:
+        """Disconnect synchronously, without waiting for the close to finish."""
+        # Same session cleanup as disconnect() does first; both are idempotent.
+        self._reset_himport_state()
+        self._complete_maintenance_on_disconnect()
+        self._parser.on_disconnect()
+        self.reset_should_reconnect()
+        self._close()
+
     def __repr__(self):
         repr_args = ",".join((f"{k}={v}" for k, v in self.repr_pieces()))
         return f"<{self.__class__.__module__}.{self.__class__.__name__}({repr_args})>"
@@ -1118,6 +1126,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             # clean up after any error in on_connect
             await self.disconnect()
             raise
+        except BaseException:
+            # Likewise for whatever a credential provider raises and for a
+            # cancelled task. A socket left in place reads as connected, so the
+            # next command would run without AUTH and SELECT.
+            await self.disconnect(nowait=True)
+            raise
 
         # run any user callbacks. right now the only internal callback
         # is for pubsub channel/pattern resubscription
@@ -1308,9 +1322,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         # callbacks).  In that context we fall back to a synchronous close.
         # See https://github.com/redis/redis-py/issues/3856
         if asyncio.current_task() is None:
-            self._parser.on_disconnect()
-            self.reset_should_reconnect()
-            self._close()
+            self._force_disconnect()
             return
 
         try:
@@ -2765,9 +2777,7 @@ class AsyncMaintNotificationsAbstractConnectionPool:
                 f"proactive reconnect: {run_proactive_reconnect}"
             )
         async with self._get_pool_lock():
-            # Opt BlockingConnectionPool into serializing its get/release
-            # with this critical section. Other pools do not define
-            # set_in_maintenance and this is a no-op for them.
+            # Record maintenance state for pools that expose the hook.
             self._set_in_maintenance(True)
             try:
                 self._update_connections_settings_without_locking(
@@ -3017,6 +3027,7 @@ class ConnectionPool(
         self._in_use_connections: Set[AbstractConnection] = set()
         self.encoder_class = self.connection_kwargs.get("encoder_class", Encoder)
         self._lock = asyncio.Lock()
+        self._background_releases: Set[asyncio.Task] = set()
         self._event_dispatcher = self.connection_kwargs.get("event_dispatcher", None)
         if self._event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -3256,26 +3267,46 @@ class ConnectionPool(
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool"""
-        # Connections should always be returned to the correct pool,
-        # not doing so is an error that will cause an exception here.
-        async with self._lock:
-            self._in_use_connections.remove(connection)
+        locked = False
+        disconnect_failed = False
+        try:
+            async with self._lock:
+                locked = True
+                # Connections should always be returned to the correct pool,
+                # not doing so is an error that will cause an exception here.
+                self._in_use_connections.remove(connection)
+                try:
+                    if connection.should_reconnect():
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "Disconnecting released connection marked for "
+                                f"reconnect: {connection}, "
+                                f"{connection.extract_connection_details()}"
+                            )
+                        await connection.disconnect()
+                except BaseException:
+                    # Not known to be closed: close it so reuse reconnects.
+                    connection._force_disconnect()
+                    disconnect_failed = True
+                    raise
+                finally:
+                    # Even if disconnect() is cancelled, don't drop it.
+                    self._available_connections.append(connection)
+        except BaseException as e:
+            if disconnect_failed:
+                # It is back in the pool: still notify listeners and metrics.
+                self._run_in_background(self._finish_release(connection))
+            elif not locked and isinstance(e, asyncio.CancelledError):
+                # Cancelled while waiting for a contended lock: don't leak.
+                self._release_in_background(connection)
+            raise
 
-            if connection.should_reconnect():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Disconnecting released connection marked for reconnect: "
-                        f"{connection}, {connection.extract_connection_details()}"
-                    )
-                await connection.disconnect()
+        await self._finish_release(connection)
 
-            self._available_connections.append(connection)
-
-        await self._event_dispatcher.dispatch_async(
-            AsyncAfterConnectionReleasedEvent(connection)
-        )
-
-        # Record state transition: USED -> IDLE
+    async def _finish_release(self, connection: AbstractConnection) -> None:
+        # Record state transition: USED -> IDLE. Done before the listeners,
+        # which may await I/O and be cancelled, so the counts always match
+        # the pool.
         pool_name = get_pool_name(self)
         await record_connection_count(
             pool_name=pool_name,
@@ -3287,6 +3318,28 @@ class ConnectionPool(
             connection_state=ConnectionState.IDLE,
             counter=1,
         )
+
+        await self._event_dispatcher.dispatch_async(
+            AsyncAfterConnectionReleasedEvent(connection)
+        )
+
+    def _release_in_background(self, connection: AbstractConnection) -> None:
+        if asyncio.current_task() in self._background_releases:
+            return  # this is the background release itself, e.g. at shutdown
+        self._run_in_background(self.release(connection))
+
+    def _run_in_background(self, release_step: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(release_step)
+        self._background_releases.add(task)
+        task.add_done_callback(self._on_background_release_done)
+
+    def _on_background_release_done(self, task: asyncio.Task) -> None:
+        self._background_releases.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "A background connection release failed",
+                exc_info=task.exception(),
+            )
 
     async def disconnect(self, inuse_connections: bool = True):
         """
@@ -3458,24 +3511,13 @@ class BlockingConnectionPool(ConnectionPool):
 
     def set_in_maintenance(self, in_maintenance: bool) -> None:
         """
-        Toggle the pool's maintenance mode.
+        Record the pool's maintenance state.
 
-        While maintenance mode is on, ``get_connection`` and ``release``
-        serialize their pool mutations through ``self._lock`` so they cannot
-        interleave with a MOVING notification handler that is currently
-        rewriting pool state under the same lock. Outside of maintenance the
-        mutations skip the lock, since their critical sections are pure-Python
-        and already atomic under asyncio's single-threaded scheduling.
+        ``get_connection`` and ``release`` always serialize their pool mutations
+        through ``self._lock``, independently of this flag, so they also wait for
+        reauthentication and maintenance handlers.
         """
         self._in_maintenance = in_maintenance
-
-    @contextlib.asynccontextmanager
-    async def _maybe_pool_lock(self) -> AsyncIterator[None]:
-        if self._in_maintenance:
-            async with self._lock:
-                yield
-        else:
-            yield
 
     @deprecated_args(
         args_to_warn=["*"],
@@ -3491,7 +3533,7 @@ class BlockingConnectionPool(ConnectionPool):
             async with self._condition:
                 async with async_timeout(self.timeout):
                     await self._condition.wait_for(self.can_get_connection)
-                    async with self._maybe_pool_lock():
+                    async with self._lock:
                         # Track connection count before to detect if a new connection is created
                         connections_before = len(self._available_connections) + len(
                             self._in_use_connections
@@ -3550,6 +3592,15 @@ class BlockingConnectionPool(ConnectionPool):
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool."""
-        async with self._condition:
-            await super().release(connection)
-            self._condition.notify()
+        locked = False
+        try:
+            async with self._condition:
+                locked = True
+                try:
+                    await super().release(connection)
+                finally:
+                    self._condition.notify()
+        except asyncio.CancelledError:
+            if not locked:
+                self._release_in_background(connection)
+            raise

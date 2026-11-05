@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 import time
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import redis
 
+from redis.backoff import NoBackoff
 from redis.cache import (
     CacheConfig,
     CacheConfigurationInterface,
@@ -34,6 +36,7 @@ from redis.event import (
 )
 from redis.exceptions import AskError, MovedError, RedisError, ResponseError
 from redis.observability.attributes import CSCReason
+from redis.retry import Retry
 from redis.utils import str_if_bytes
 from tests.conftest import (
     _get_client,
@@ -133,6 +136,16 @@ def tracked_key_count(client) -> int:
     return int(client.info("stats")["tracking_total_keys"])
 
 
+def cmdstat_get_calls(client) -> int:
+    """
+    Reads how many GET commands the server has run, across all clients.
+
+    Server-wide like ``tracked_key_count``, so callers compare a before/after delta around a
+    read to tell whether it reached the server.
+    """
+    return client.info("commandstats").get("cmdstat_get", {}).get("calls", 0)
+
+
 @pytest.fixture()
 def r(request):
     cache = request.param.get("cache")
@@ -209,6 +222,75 @@ class TestCache:
             b"barbar",
             "barbar",
         ]
+
+    @pytest.mark.parametrize(
+        "r",
+        [
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": True,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+                "decode_responses": True,
+            },
+        ],
+        ids=["single", "pool", "decoded"],
+        indirect=True,
+    )
+    @pytest.mark.onlynoncluster
+    def test_numeric_key_is_invalidated(self, r, r2):
+        # The invalidation for a key passed as an int or float names it by its
+        # encoded bytes, and must still evict the entry cached for it.
+        cache = r.get_cache()
+        for key in (1234, 12.5):
+            r.set(key, "bar")
+            size = cache.size
+            assert r.get(key) in [b"bar", "bar"]
+            assert cache.size == size + 1
+            # change key in redis (cause invalidation)
+            r2.set(key, "barbar")
+            assert wait_for_invalidated_value(r, key, [b"barbar", "barbar"]) in [
+                b"barbar",
+                "barbar",
+            ]
+
+    @pytest.mark.parametrize(
+        "r",
+        [
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": True,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+            },
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5)),
+                "single_connection_client": False,
+                "decode_responses": True,
+            },
+        ],
+        ids=["single", "pool", "decoded"],
+        indirect=True,
+    )
+    @pytest.mark.onlynoncluster
+    def test_equal_int_and_float_keys_do_not_share_an_entry(self, r):
+        # 42 == 42.0, but they are sent as the different Redis keys "42" and
+        # "42.0", so a read of one must not be served the entry of the other.
+        cache = r.get_cache()
+        r.set(42, "int")
+        r.set(42.0, "float")
+        size = cache.size
+        assert r.get(42) in [b"int", "int"]
+        assert r.get(42.0) in [b"float", "float"]
+        assert cache.size == size + 2
 
     @pytest.mark.parametrize(
         "r",
@@ -2350,6 +2432,67 @@ class TestSSLCache:
             ).cache_value
             == b"baz"
         )
+
+
+# The standalone test server also listens on this socket, see docker-compose.yml
+UNIX_SOCKET_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "dockers", "standalone", "redis.sock")
+)
+
+
+@pytest.fixture()
+def unix_socket_path():
+    """
+    Returns ``UNIX_SOCKET_PATH``, skipping the test when no server answers on it.
+
+    The socket file alone proves nothing: Docker Desktop for macOS shows the container's
+    socket in ``dockers/standalone/`` but refuses connections to it from the host, and a
+    killed container leaves its socket file behind. Pings without retries, so the skip is
+    immediate.
+    """
+    try:
+        with redis.Redis(
+            unix_socket_path=UNIX_SOCKET_PATH, retry=Retry(NoBackoff(), 0)
+        ) as client:
+            client.ping()
+    except redis.ConnectionError:
+        pytest.skip(f"No Redis server on the Unix socket {UNIX_SOCKET_PATH}")
+
+    return UNIX_SOCKET_PATH
+
+
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
+class TestUnixSocketCache:
+    def test_get_from_cache(self, unix_socket_path):
+        key = f"unix-socket-cache-{uuid.uuid4()}"
+        r = redis.Redis(
+            unix_socket_path=unix_socket_path, protocol=3, cache_config=CacheConfig()
+        )
+        r2 = redis.Redis(unix_socket_path=unix_socket_path)
+        try:
+            cache = r.get_cache()
+            r2.set(key, "bar")
+            # get key from redis and save in local cache
+            assert r.get(key) == b"bar"
+            assert (
+                cache.get(
+                    CacheKey(command="GET", redis_keys=(key,), redis_args=("GET", key))
+                ).cache_value
+                == b"bar"
+            )
+            # get key from local cache, without sending GET to the server
+            calls = cmdstat_get_calls(r2)
+            assert r.get(key) == b"bar"
+            assert cmdstat_get_calls(r2) == calls
+            # change key in redis (cause invalidation)
+            r2.set(key, "barbar")
+            assert wait_for_invalidated_value(r, key, [b"barbar"]) == b"barbar"
+        finally:
+            r2.delete(key)
+            r.close()
+            r2.close()
 
 
 @pytest.mark.fixed_client

@@ -103,8 +103,20 @@ class MultiDBClient(AsyncRedisModuleCommands, AsyncCoreCommands):
         for hc_task in self._hc_tasks:
             hc_task.cancel()
 
+        # Stop the scheduler: cancelling the tasks above does not stop the
+        # recurring timer, because run_recurring_async() returns right after
+        # scheduling. Without this, health checks keep being scheduled against
+        # the resources released below.
+        self._bg_scheduler.stop()
+
         # Close health check connection pools
         await self._health_check_policy.close()
+
+        # Release resources held by the health checks themselves
+        await asyncio.gather(
+            *(health_check.close() for health_check in self._health_checks),
+            return_exceptions=True,
+        )
 
         # Close every database client: a failover leaves the previous active
         # database's client open, so its in-flight commands can complete. A

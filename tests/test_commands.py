@@ -31,6 +31,7 @@ from redis.commands.core import (
     ArrayPredicateType,
     DataPersistOptions,
     HotkeysMetricsTypes,
+    SetDataPersistOptions,
 )
 from redis.commands.json.path import Path
 from redis.commands.search.field import TextField
@@ -1188,6 +1189,35 @@ class TestRedisCommands:
         assert isinstance(info, dict)
         assert "arch_bits" in info.keys()
         assert "redis_version" in info.keys()
+
+    @pytest.mark.onlynoncluster
+    def test_info_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response: response)
+        assert "redis_version:" in decoded_r.info("server")
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.2.0")
+    @skip_if_redis_enterprise()
+    def test_info_with_non_utf8_errorstat(self, request, r, decoded_r):
+        r.config_resetstat()
+        with pytest.raises(redis.ResponseError):
+            r.eval(b"return redis.error_reply('\xff\xfeBAD oops')", 0)
+        try:
+            info = decoded_r.info("errorstats")
+            assert info["errorstat_\ufffd\ufffdBAD"] == {"count": 1}
+            assert "redis_version" in decoded_r.info()
+
+            with _get_client(
+                redis.Redis,
+                request,
+                flushdb=False,
+                decode_responses=True,
+                encoding_errors="backslashreplace",
+            ) as client:
+                info = client.info("errorstats")
+                assert info["errorstat_\\xff\\xfeBAD"] == {"count": 1}
+        finally:
+            r.config_resetstat()
 
     @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("7.0.0")
@@ -2474,6 +2504,23 @@ class TestRedisCommands:
         result = r.increx(key, byfloat=0.25, lbound=0, ubound=2)
         assert [float(value) for value in result] == pytest.approx([1.75, 0.25])
         assert float(r[key]) == pytest.approx(1.75)
+
+    @pytest.mark.fixed_client
+    @skip_if_server_version_lt("8.7.0")
+    @pytest.mark.parametrize("protocol", [2, 3])
+    def test_increx_unified_responses(self, request, protocol):
+        r = _get_client(redis.Redis, request, protocol=protocol, legacy_responses=False)
+        key = "increx:unified"
+        assert r.set(key, "1.5")
+        assert r.increx(key, byfloat=0.25) == [1.75, 0.25]
+        # A rejected increment returns the current value and a zero increment.
+        result = r.increx(key, byfloat=0.75, ubound=2)
+        assert result == [1.75, 0.0]
+        assert all(type(value) is float for value in result)
+        assert r.set(key, 20)
+        result = r.increx(key, byint=4)
+        assert result == [24, 4]
+        assert all(type(value) is int for value in result)
 
     @skip_if_server_version_lt("8.7.0")
     def test_increx_saturating_bounds(self, r):
@@ -4719,6 +4766,479 @@ class TestRedisCommands:
         assert r.sunionstore("c", "a", "b") == 3
         assert set(r.smembers("c")) == {b"1", b"2", b"3"}
 
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_basic(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        assert r.sexpire("test:set", 1, "member1") == [1]
+        # test_spexpire_basic waits for a real expiry; here the stored TTL is enough
+        assert r.sttl("test:set", "member1", "member2") == [1, -1]
+        assert 0 < (r.spttl("test:set", "member1"))[0] <= 1000
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_with_timedelta(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        assert r.sexpire("test:set", datetime.timedelta(seconds=10), "member1") == [1]
+        # test_sexpire_basic waits for a real expiry; here the stored TTL is enough
+        assert 0 < r.spttl("test:set", "member1")[0] <= 10000
+        assert r.sttl("test:set", "member2") == [-1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_conditions(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        assert r.sexpire("test:set", 20, "member1", xx=True) == [0]
+        assert r.sexpire("test:set", 20, "member1", nx=True) == [1]
+        assert r.sexpire("test:set", 10, "member1", xx=True) == [1]
+        assert r.sexpire("test:set", 20, "member1", nx=True) == [0]
+        # the xx call lowered the TTL and the last nx call left it alone
+        assert 0 < r.spttl("test:set", "member1")[0] <= 10000
+        r.sexpire("test:set", 20, "member1")
+        assert r.sexpire("test:set", 10, "member1", gt=True) == [0]
+        assert r.sexpire("test:set", 10, "member1", lt=True) == [1]
+        assert 0 < r.spttl("test:set", "member1")[0] <= 10000
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_no_expiration_counts_as_infinite(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        # a member without an expiration never passes GT and always passes LT
+        assert r.sexpire("test:set", 100, "member1", gt=True) == [0]
+        assert r.sttl("test:set", "member1") == [-1]
+        assert r.sexpire("test:set", 100, "member2", lt=True) == [1]
+        assert 0 < r.sttl("test:set", "member2")[0] <= 100
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_nonexistent_key_or_member(self, r):
+        r.delete("test:set")
+        assert r.sexpire("test:set", 1, "member1", "member2") == [-2, -2]
+        assert r.exists("test:set") == 0
+        r.sadd("test:set", "member1")
+        assert r.sexpire("test:set", 1, "nonexistent_member") == [-2]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_multiple_members(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2", "member3")
+        r.sexpire("test:set", 100, "member1")
+        # the condition is evaluated per member, in the order of the request
+        assert r.sexpire(
+            "test:set", 50, "member1", "member2", "nonexistent", nx=True
+        ) == [
+            0,
+            1,
+            -2,
+        ]
+        ttls = r.sttl("test:set", "member1", "member2", "member3")
+        assert 50 < ttls[0] <= 100
+        assert 0 < ttls[1] <= 50
+        assert ttls[2] == -1
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_multiple_condition_flags_error(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        with pytest.raises(ValueError) as e:
+            r.sexpire("test:set", 1, "member1", nx=True, xx=True)
+        assert "Only one of" in str(e)
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpire_past_time_deletes_members_and_key(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2", "member3")
+        assert r.sexpire("test:set", 0, "member1") == [2]
+        assert r.smembers("test:set") == {b"member2", b"member3"}
+        # when the last members go, the key goes with them
+        assert r.spexpireat("test:set", 1, "member2", "member3") == [2, 2]
+        assert r.exists("test:set") == 0
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpire_basic(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        assert r.spexpire("test:set", 100, "member1") == [1]
+        # poll rather than sleep for the full TTL
+        deadline = time.monotonic() + 3.0
+        while r.sismember("test:set", "member1"):
+            assert time.monotonic() < deadline, "member1 did not expire"
+            time.sleep(0.01)
+        assert r.smembers("test:set") == {b"member2"}
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpire_with_timedelta(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        assert r.spexpire(
+            "test:set", datetime.timedelta(milliseconds=5000), "member1"
+        ) == [1]
+        assert 0 < r.spttl("test:set", "member1")[0] <= 5000
+        assert r.spttl("test:set", "member2") == [-1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpire_conditions(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        assert r.spexpire("test:set", 20000, "member1", xx=True) == [0]
+        assert r.spexpire("test:set", 20000, "member1", nx=True) == [1]
+        assert r.spexpire("test:set", 10000, "member1", gt=True) == [0]
+        assert r.spexpire("test:set", 10000, "member1", lt=True) == [1]
+        assert 0 < r.spttl("test:set", "member1")[0] <= 10000
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpire_multiple_condition_flags_error(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        with pytest.raises(ValueError) as e:
+            r.spexpire("test:set", 1000, "member1", gt=True, lt=True)
+        assert "Only one of" in str(e)
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpireat_basic(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+        )
+        assert r.sexpireat("test:set", exp_time, "member1") == [1]
+        assert r.sexpiretime("test:set", "member1", "member2") == [exp_time, -1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpireat_with_datetime(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        exp_time = (datetime.datetime.now() + datetime.timedelta(seconds=10)).replace(
+            microsecond=0
+        )
+        assert r.sexpireat("test:set", exp_time, "member1") == [1]
+        assert r.sexpiretime("test:set", "member1", "member2") == [
+            int(exp_time.timestamp()),
+            -1,
+        ]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpireat_conditions(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        future_exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+        )
+        past_exp_time = int(
+            (datetime.datetime.now() - datetime.timedelta(seconds=10)).timestamp()
+        )
+        assert r.sexpireat("test:set", future_exp_time, "member1", xx=True) == [0]
+        assert r.sexpireat("test:set", future_exp_time, "member1", nx=True) == [1]
+        assert r.sexpireat("test:set", past_exp_time, "member1", gt=True) == [0]
+        assert r.sexpireat("test:set", past_exp_time, "member1", lt=True) == [2]
+        assert r.exists("test:set") == 0
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpireat_basic(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+            * 1000
+        )
+        assert r.spexpireat("test:set", exp_time, "member1") == [1]
+        # the stored expire time is exact
+        assert r.spexpiretime("test:set", "member1", "member2") == [exp_time, -1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpireat_with_datetime(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        exp_time = datetime.datetime.now() + datetime.timedelta(seconds=10)
+        assert r.spexpireat("test:set", exp_time, "member1") == [1]
+        assert r.spexpiretime("test:set", "member1", "member2") == [
+            int(exp_time.timestamp() * 1000),
+            -1,
+        ]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpireat_multiple_condition_flags_error(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+        )
+        with pytest.raises(ValueError) as e:
+            r.sexpireat("test:set", exp_time, "member1", xx=True, gt=True)
+        assert "Only one of" in str(e)
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpireat_conditions(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        future_exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+            * 1000
+        )
+        past_exp_time = int(
+            (datetime.datetime.now() - datetime.timedelta(seconds=10)).timestamp()
+            * 1000
+        )
+        assert r.spexpireat("test:set", future_exp_time, "member1", xx=True) == [0]
+        assert r.spexpireat("test:set", future_exp_time, "member1", nx=True) == [1]
+        assert r.spexpireat("test:set", past_exp_time, "member1", gt=True) == [0]
+        assert r.spexpireat("test:set", past_exp_time, "member1", lt=True) == [2]
+        assert r.exists("test:set") == 0
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spexpireat_multiple_condition_flags_error(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        exp_time = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=10)).timestamp()
+            * 1000
+        )
+        with pytest.raises(ValueError) as e:
+            r.spexpireat("test:set", exp_time, "member1", nx=True, lt=True)
+        assert "Only one of" in str(e)
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spersist_multiple_members(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        r.sexpire("test:set", 5000, "member1")
+        assert r.spersist("test:set", "member1", "member2", "member3") == [1, -1, -2]
+        assert r.sttl("test:set", "member1") == [-1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_spersist_nonexistent_key(self, r):
+        r.delete("test:set")
+        assert r.spersist("test:set", "member1", "member2") == [-2, -2]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sttl_and_spttl_multiple_members(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        r.spexpire("test:set", 1800, "member1")
+        ttl = r.sttl("test:set", "member1", "member2", "member3")
+        # STTL rounds up, so a live member never reports 0; the exact rounding is
+        # pinned by test_sexpiretime_and_spexpiretime_multiple_members
+        assert ttl[0] in (1, 2)
+        assert ttl[1:] == [-1, -2]
+        pttl = r.spttl("test:set", "member1", "member2", "member3")
+        assert 0 < pttl[0] <= 1800
+        assert pttl[1:] == [-1, -2]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sttl_and_spttl_nonexistent_key(self, r):
+        r.delete("test:set")
+        assert r.sttl("test:set", "member1", "member2") == [-2, -2]
+        assert r.spttl("test:set", "member1", "member2") == [-2, -2]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpiretime_and_spexpiretime_multiple_members(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        exp_time_ms = int(
+            (datetime.datetime.now() + datetime.timedelta(minutes=30)).timestamp()
+            * 1000
+        )
+        r.spexpireat("test:set", exp_time_ms, "member1")
+        assert r.spexpiretime("test:set", "member1", "member2", "member3") == [
+            exp_time_ms,
+            -1,
+            -2,
+        ]
+        # SEXPIRETIME rounds up to the next second
+        assert r.sexpiretime("test:set", "member1", "member2", "member3") == [
+            (exp_time_ms + 999) // 1000,
+            -1,
+            -2,
+        ]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_sexpiretime_and_spexpiretime_nonexistent_key(self, r):
+        r.delete("test:set")
+        assert r.sexpiretime("test:set", "member1", "member2") == [-2, -2]
+        assert r.spexpiretime("test:set", "member1", "member2") == [-2, -2]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_no_expiration(self, r):
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", "member2") == 1
+        assert r.smembers("test:set") == {b"member1", b"member2"}
+        assert r.sttl("test:set", "member1", "member2") == [-1, -1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_nothing_changed(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        # 0 when no member was added, updated or deleted
+        assert r.saddex("test:set", "member1") == 0
+        assert r.saddex("test:set", "member1", keepttl=True) == 0
+        assert r.smembers("test:set") == {b"member1"}
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_without_expiration_discards_existing_one(self, r):
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", ex=100) == 1
+        assert r.saddex("test:set", "member1", "member2") == 1
+        assert r.sttl("test:set", "member1", "member2") == [-1, -1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_expiration_ex_and_keepttl(self, r):
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", "member2", ex=10) == 1
+        ttls = r.sttl("test:set", "member1", "member2")
+        for ttl in ttls:
+            assert 0 < ttl <= 10
+        # keepttl keeps the existing expiration; a new member gets none
+        assert r.saddex("test:set", "member1", "member3", keepttl=True) == 1
+        assert 0 < r.spttl("test:set", "member1")[0] <= 10000
+        assert r.sttl("test:set", "member3") == [-1]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_expiration_px(self, r):
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", "member2", px=60000) == 1
+        pttls = r.spttl("test:set", "member1", "member2")
+        for pttl in pttls:
+            assert 0 < pttl <= 60000
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_expiration_digit_strings(self, r):
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", ex="60") == 1
+        assert 0 < r.sttl("test:set", "member1")[0] <= 60
+        assert r.saddex("test:set", "member2", px="500") == 1
+        assert 0 < r.spttl("test:set", "member2")[0] <= 500
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_expiration_exat_and_pxat(self, r):
+        r.delete("test:set")
+        exat = datetime.datetime.now() + datetime.timedelta(seconds=30)
+        assert r.saddex("test:set", "member1", exat=exat) == 1
+        assert r.sexpiretime("test:set", "member1") == [int(exat.timestamp())]
+        pxat = int(
+            (datetime.datetime.now() + datetime.timedelta(seconds=30)).timestamp()
+            * 1000
+        )
+        assert r.saddex("test:set", "member2", pxat=pxat) == 1
+        assert r.spexpiretime("test:set", "member2") == [pxat]
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_mnx(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1")
+        # MNX fails as a whole when any member exists
+        assert (
+            r.saddex(
+                "test:set",
+                "member1",
+                "member2",
+                ex=10,
+                data_persist_option=SetDataPersistOptions.MNX,
+            )
+            == 0
+        )
+        assert r.smembers("test:set") == {b"member1"}
+        assert r.sttl("test:set", "member1") == [-1]
+        assert (
+            r.saddex(
+                "test:set",
+                "member2",
+                "member3",
+                ex=10,
+                data_persist_option=SetDataPersistOptions.MNX,
+            )
+            == 1
+        )
+        assert r.smembers("test:set") == {b"member1", b"member2", b"member3"}
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_mxx(self, r):
+        r.delete("test:set")
+        # MXX on a key that does not exist creates nothing
+        assert (
+            r.saddex(
+                "test:set", "member1", data_persist_option=SetDataPersistOptions.MXX
+            )
+            == 0
+        )
+        assert r.exists("test:set") == 0
+        r.sadd("test:set", "member1", "member2")
+        assert (
+            r.saddex(
+                "test:set",
+                "member1",
+                "member3",
+                ex=10,
+                data_persist_option=SetDataPersistOptions.MXX,
+            )
+            == 0
+        )
+        assert r.smembers("test:set") == {b"member1", b"member2"}
+        assert (
+            r.saddex(
+                "test:set",
+                "member1",
+                "member2",
+                ex=10,
+                data_persist_option=SetDataPersistOptions.MXX,
+            )
+            == 1
+        )
+        ttls = r.sttl("test:set", "member1", "member2")
+        for ttl in ttls:
+            assert 0 < ttl <= 10
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_past_expiration_removes_members(self, r):
+        r.delete("test:set")
+        r.sadd("test:set", "member1", "member2")
+        # 1 because member1 was deleted, even though nothing was added
+        assert r.saddex("test:set", "member1", "member3", pxat=1) == 1
+        assert r.smembers("test:set") == {b"member2"}
+        # 0 when there is nothing to delete; the key is not created
+        r.delete("test:set")
+        assert r.saddex("test:set", "member1", exat=1) == 0
+        assert r.exists("test:set") == 0
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_saddex_invalid_inputs(self, r):
+        with pytest.raises(exceptions.DataError):
+            r.saddex("test:set", "member1", ex=10.0)
+
+        with pytest.raises(exceptions.DataError):
+            r.saddex("test:set", "member1", ex=10, px=1000)
+
+        with pytest.raises(exceptions.DataError):
+            r.saddex("test:set", "member1", ex=10, keepttl=True)
+
+        # the server rejects an empty member list
+        with pytest.raises(exceptions.ResponseError):
+            r.saddex("test:set")
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_set_member_expiration_wrong_type(self, r):
+        r.delete("test:set")
+        r.set("test:set", "value")
+        with pytest.raises(exceptions.ResponseError, match="WRONGTYPE"):
+            r.sexpire("test:set", 10, "member1")
+        with pytest.raises(exceptions.ResponseError, match="WRONGTYPE"):
+            r.sttl("test:set", "member1")
+        with pytest.raises(exceptions.ResponseError, match="WRONGTYPE"):
+            r.saddex("test:set", "member1")
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_set_member_expiration_pipeline(self, r):
+        r.delete("test:set")
+        with r.pipeline() as pipe:
+            pipe.saddex("test:set", "member1", "member2", ex=100)
+            pipe.sexpire("test:set", 50, "member1", "member3", lt=True)
+            pipe.spersist("test:set", "member2")
+            pipe.sttl("test:set", "member1", "member2", "member3")
+            saddex, sexpire, spersist, sttl = pipe.execute()
+        assert saddex == 1
+        assert sexpire == [1, -2]
+        assert spersist == [1]
+        assert 0 < sttl[0] <= 50
+        assert sttl[1:] == [-1, -2]
+
     @skip_if_server_version_lt("1.0.0")
     @skip_if_redis_enterprise()
     def test_debug_segfault(self, r):
@@ -5273,6 +5793,81 @@ class TestRedisCommands:
 
         # rev
         assert r.zrange("a", 0, 1, desc=True) == [b"a5", b"a4"]
+
+    def test_zrange_desc_sends_zrevrange_by_default(self):
+        """Rank-only desc=True keeps ZREVRANGE unless use_rev is set."""
+        r = redis.Redis()
+        with mock.patch.object(r, "execute_command", return_value=[]) as execute:
+            r.zrange("a", 0, -1, desc=True)
+        execute.assert_called_once_with(
+            "ZREVRANGE", "a", 0, -1, withscores=False, score_cast_func=float, keys=["a"]
+        )
+
+    def test_zrange_desc_default_withscores_sends_zrevrange(self):
+        r = redis.Redis()
+        with mock.patch.object(r, "execute_command", return_value=[]) as execute:
+            r.zrange("a", 0, -1, desc=True, withscores=True, score_cast_func=int)
+        execute.assert_called_once_with(
+            "ZREVRANGE",
+            "a",
+            0,
+            -1,
+            b"WITHSCORES",
+            withscores=True,
+            score_cast_func=int,
+            keys=["a"],
+        )
+
+    def test_zrange_desc_use_rev_sends_zrange_rev(self):
+        r = redis.Redis()
+        with mock.patch.object(r, "execute_command", return_value=[]) as execute:
+            r.zrange("a", 0, -1, desc=True, use_rev=True)
+        execute.assert_called_once_with(
+            "ZRANGE",
+            "a",
+            0,
+            -1,
+            "REV",
+            withscores=False,
+            score_cast_func=float,
+            keys=["a"],
+        )
+
+    def test_zrange_desc_use_rev_withscores_and_score_cast(self):
+        def cast_score(value):
+            return value
+
+        r = redis.Redis()
+        with mock.patch.object(r, "execute_command", return_value=[]) as execute:
+            r.zrange(
+                "a",
+                0,
+                -1,
+                desc=True,
+                withscores=True,
+                score_cast_func=cast_score,
+                use_rev=True,
+            )
+        execute.assert_called_once_with(
+            "ZRANGE",
+            "a",
+            0,
+            -1,
+            "REV",
+            "WITHSCORES",
+            withscores=True,
+            score_cast_func=cast_score,
+            keys=["a"],
+        )
+
+    def test_zrange_use_rev_without_desc_sends_plain_zrange(self):
+        """use_rev only affects the rank-based reverse path."""
+        r = redis.Redis()
+        with mock.patch.object(r, "execute_command", return_value=[]) as execute:
+            r.zrange("a", 0, -1, use_rev=True)
+        execute.assert_called_once_with(
+            "ZRANGE", "a", 0, -1, withscores=False, score_cast_func=float, keys=["a"]
+        )
 
     @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("6.2.0")
@@ -8579,6 +9174,22 @@ class TestRedisCommands:
             if key.startswith("db."):
                 assert not isinstance(value, list)
 
+    @pytest.mark.fixed_client
+    @skip_if_server_version_lt("4.0.0")
+    @skip_if_redis_enterprise()
+    @pytest.mark.parametrize("protocol", [2, 3])
+    def test_memory_stats_unified_responses(self, request, protocol):
+        r = _get_client(redis.Redis, request, protocol=protocol, legacy_responses=False)
+        r.set("foo", "bar")
+        stats = r.memory_stats()
+        # Redis replies with doubles for these, which RESP2 sends as bulk strings.
+        for key in ("dataset.percentage", "peak.percentage", "fragmentation"):
+            assert type(stats[key]) is float
+        assert type(stats["peak.allocated"]) is int
+        for key, value in stats.items():
+            if key.startswith("db.") and isinstance(value, dict):
+                assert all(type(v) is int for v in value.values())
+
     @skip_if_server_version_lt("4.0.0")
     def test_memory_usage(self, r):
         r.set("foo", "bar")
@@ -8670,7 +9281,6 @@ class TestRedisCommands:
         assert "set" in cmds
         assert "get" in cmds
 
-    @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("7.0.0")
     @skip_if_redis_enterprise()
     def test_command_getkeysandflags(self, r: redis.Redis):

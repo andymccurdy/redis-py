@@ -2,17 +2,21 @@ import contextlib
 import gc
 import multiprocessing
 import platform
+import select
+import uuid
 import weakref
 from collections import Counter
 
 import pytest
 import redis
+from redis.cache import CacheConfig
 from redis.connection import BlockingConnectionPool, Connection, ConnectionPool
 from redis.exceptions import ConnectionError
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.observability.attributes import ConnectionState, get_pool_name
 
-from .conftest import _get_client
+from .conftest import _get_client, skip_if_server_version_lt
+from .test_cache import wait_for_invalidated_value
 
 
 @contextlib.contextmanager
@@ -23,6 +27,9 @@ def exit_callback(callback, *args):
         callback(*args)
 
 
+_has_fork = "fork" in multiprocessing.get_all_start_methods()
+
+
 @pytest.mark.skipif(
     platform.python_implementation() == "PyPy",
     reason=(
@@ -30,13 +37,21 @@ def exit_callback(callback, *args):
         "Causes processes to hang quite often"
     ),
 )
+@pytest.mark.skipif(
+    not _has_fork,
+    reason="These tests require the fork start method, which is not "
+    "available on this platform (e.g. Windows)",
+)
 class TestMultiprocessing:
     # On macOS and newly non-macOS POSIX systems (since Python 3.14),
     # the default method has been changed to forkserver.
     # The code in this module does not work with it,
     # hence the explicit change to 'fork'
     # See https://github.com/python/cpython/issues/125714
-    if multiprocessing.get_start_method() in ["forkserver", "spawn"]:
+    if not _has_fork:
+        # The class is skipped above; avoid raising at import time.
+        _mp_context = None
+    elif multiprocessing.get_start_method() in ["forkserver", "spawn"]:
         _mp_context = multiprocessing.get_context(method="fork")
     else:
         _mp_context = multiprocessing.get_context()
@@ -222,6 +237,97 @@ class TestMultiprocessing:
         assert proc.exitcode == 0
 
         assert r.ping() is True
+
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.4.0")
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    def test_child_does_not_serve_parent_cache_entries(self, pool_class, master_host):
+        """
+        A child does not serve client-side cache entries filled by its parent's
+        connections: their invalidations are delivered to the parent.
+        """
+        key = f"fork-cache-{uuid.uuid4()}"
+        writer = redis.Redis(host=master_host[0], port=master_host[1])
+        pool = pool_class(
+            host=master_host[0],
+            port=master_host[1],
+            protocol=3,
+            cache_config=CacheConfig(),
+        )
+        r = redis.Redis(connection_pool=pool)
+        writer.set(key, "before")
+        assert r.get(key) == b"before"
+
+        def target(client, ev):
+            ev.wait()
+            assert client.get(key) == b"after"
+
+        ev = multiprocessing.Event()
+        proc = self._mp_context.Process(target=target, args=(r, ev))
+        proc.start()
+        try:
+            writer.set(key, "after")
+            # The parent reads the invalidation off its own connection.
+            assert wait_for_invalidated_value(r, key, [b"after"]) == b"after"
+            ev.set()
+            proc.join(5)
+            assert proc.exitcode == 0
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+            writer.delete(key)
+            pool.disconnect()
+            writer.close()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.4.0")
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    def test_child_cache_hit_does_not_read_parent_socket(self, pool_class, master_host):
+        """
+        A child's cache lookup does not read a reply pending on a connection
+        its parent is using.
+        """
+        key = f"fork-cache-{uuid.uuid4()}"
+        writer = redis.Redis(host=master_host[0], port=master_host[1])
+        pool = pool_class(
+            host=master_host[0],
+            port=master_host[1],
+            protocol=3,
+            cache_config=CacheConfig(),
+            socket_timeout=2,
+        )
+        r = redis.Redis(connection_pool=pool)
+        writer.set(key, "value")
+        assert r.get(key) == b"value"
+        # The connection the cached entry was filled on.
+        conn = pool.get_connection()
+
+        def target(client, ev):
+            ev.wait()
+            assert client.get(key) == b"value"
+
+        ev = multiprocessing.Event()
+        proc = self._mp_context.Process(target=target, args=(r, ev))
+        proc.start()
+        try:
+            conn.send_command("PING")
+            # Wait for the reply to arrive on the socket without reading it.
+            assert select.select([conn._conn._sock], [], [], 5)[0]
+            ev.set()
+            proc.join(5)
+            assert proc.exitcode == 0
+            assert conn.read_response() == b"PONG"
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+            pool.release(conn)
+            writer.delete(key)
+            pool.disconnect()
+            writer.close()
 
     @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
     @pytest.mark.parametrize("child_action", ["reuse", "reset", "delete"])

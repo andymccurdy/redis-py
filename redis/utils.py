@@ -1,6 +1,7 @@
 import datetime
 import inspect
 import logging
+import sys
 import textwrap
 import warnings
 from collections.abc import Callable
@@ -208,7 +209,7 @@ C = TypeVar("C", bound=Callable)
 
 
 def _get_filterable_args(
-    func: Callable, args: tuple, kwargs: dict, allowed_args: Optional[List[str]] = None
+    func: Callable, args: tuple, kwargs: dict, allowed_args: tuple = ()
 ) -> dict:
     """
     Extract arguments from function call that should be checked for deprecation/experimental warnings.
@@ -224,6 +225,34 @@ def _get_filterable_args(
     return filterable_args
 
 
+_DictKeys = type({}.keys())
+
+
+def _get_warn_check(
+    func: Callable, args_to_warn: tuple, allowed_args: tuple = ()
+) -> tuple[int, Callable[[Any, frozenset], bool], frozenset]:
+    """
+    Build the call-time pre-check for the deprecated/experimental args decorators.
+    Returns the lowest positional index whose presence may need a warning
+    (sys.maxsize if none), and a dict_keys operation with the names it is
+    applied to: keys_ok(kwargs.keys(), names) is True when the passed kwargs
+    need no warning.
+    """
+    pos_names = func.__code__.co_varnames[: func.__code__.co_argcount]
+    if "*" in args_to_warn:
+        names = frozenset(allowed_args) | {"self"}
+        min_idx = next(
+            (i for i, name in enumerate(pos_names) if name not in names),
+            sys.maxsize,
+        )
+        return min_idx, _DictKeys.__le__, names
+    names = frozenset(args_to_warn) - frozenset(allowed_args) - {"self"}
+    min_idx = next(
+        (i for i, name in enumerate(pos_names) if name in names), sys.maxsize
+    )
+    return min_idx, _DictKeys.isdisjoint, names
+
+
 def deprecated_args(
     args_to_warn: Optional[List[str]] = None,
     allowed_args: Optional[List[str]] = None,
@@ -234,14 +263,12 @@ def deprecated_args(
     Decorator to mark specified args of a function as deprecated.
     If '*' is in args_to_warn, all arguments will be marked as deprecated.
     """
-    if args_to_warn is None:
-        args_to_warn = ["*"]
-    if allowed_args is None:
-        allowed_args = []
+    warned = tuple(args_to_warn) if args_to_warn is not None else ("*",)
+    allowed = tuple(allowed_args) if allowed_args is not None else ()
 
     def _check_deprecated_args(func, filterable_args):
         """Check and warn about deprecated arguments."""
-        for arg in args_to_warn:
+        for arg in warned:
             if arg == "*" and len(filterable_args) > 0:
                 warn_deprecated_arg_usage(
                     list(filterable_args.keys()),
@@ -256,12 +283,17 @@ def deprecated_args(
                 )
 
     def decorator(func: C) -> C:
+        min_idx, keys_ok, names = _get_warn_check(func, warned, allowed)
+
         if inspect.iscoroutinefunction(func):
 
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
-                filterable_args = _get_filterable_args(func, args, kwargs, allowed_args)
-                _check_deprecated_args(func, filterable_args)
+                if len(args) > min_idx or (
+                    kwargs and not keys_ok(kwargs.keys(), names)
+                ):
+                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
+                    _check_deprecated_args(func, filterable_args)
                 return await func(*args, **kwargs)
 
             return async_wrapper
@@ -269,8 +301,11 @@ def deprecated_args(
 
             @wraps(func)
             def wrapper(*args, **kwargs):
-                filterable_args = _get_filterable_args(func, args, kwargs, allowed_args)
-                _check_deprecated_args(func, filterable_args)
+                if len(args) > min_idx or (
+                    kwargs and not keys_ok(kwargs.keys(), names)
+                ):
+                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
+                    _check_deprecated_args(func, filterable_args)
                 return func(*args, **kwargs)
 
             return wrapper
@@ -417,6 +452,32 @@ def truncate_text(txt, max_length=100):
     )
 
 
+# Commands whose arguments can carry credentials.
+_CREDENTIAL_COMMANDS = frozenset(
+    {"AUTH", "HELLO", "MIGRATE", "ACL SETUSER", "CONFIG SET", "SENTINEL SET"}
+)
+
+
+def command_text(command):
+    """
+    Render a command for an error message, replacing the arguments of commands
+    that can carry credentials (AUTH, HELLO, MIGRATE, ACL SETUSER, CONFIG SET,
+    SENTINEL SET) with a placeholder, so passwords do not end up in exceptions
+    and logs.
+    """
+    parts = [safe_str(arg) for arg in command]
+    name_len = 0
+    if parts:
+        name = parts[0].upper()
+        if name in _CREDENTIAL_COMMANDS:
+            name_len = 1
+        elif len(parts) > 1 and f"{name} {parts[1].upper()}" in _CREDENTIAL_COMMANDS:
+            name_len = 2
+    if name_len and len(parts) > name_len:
+        parts[name_len:] = ["<REDACTED>"]
+    return " ".join(parts)
+
+
 def dummy_fail():
     """
     Fake function for a Retry object if you don't need to handle each failure.
@@ -508,12 +569,11 @@ def experimental_args(
     Decorator to mark specified args of a function as experimental.
     If '*' is in args_to_warn, all arguments will be marked as experimental.
     """
-    if args_to_warn is None:
-        args_to_warn = ["*"]
+    warned = tuple(args_to_warn) if args_to_warn is not None else ("*",)
 
     def _check_experimental_args(func, filterable_args):
         """Check and warn about experimental arguments."""
-        for arg in args_to_warn:
+        for arg in warned:
             if arg == "*" and len(filterable_args) > 0:
                 warn_experimental_arg_usage(
                     list(filterable_args.keys()), func.__name__, stacklevel=4
@@ -522,13 +582,18 @@ def experimental_args(
                 warn_experimental_arg_usage(arg, func.__name__, stacklevel=4)
 
     def decorator(func: C) -> C:
+        min_idx, keys_ok, names = _get_warn_check(func, warned)
+
         if inspect.iscoroutinefunction(func):
 
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
-                filterable_args = _get_filterable_args(func, args, kwargs)
-                if len(filterable_args) > 0:
-                    _check_experimental_args(func, filterable_args)
+                if len(args) > min_idx or (
+                    kwargs and not keys_ok(kwargs.keys(), names)
+                ):
+                    filterable_args = _get_filterable_args(func, args, kwargs)
+                    if len(filterable_args) > 0:
+                        _check_experimental_args(func, filterable_args)
                 return await func(*args, **kwargs)
 
             return async_wrapper
@@ -536,9 +601,12 @@ def experimental_args(
 
             @wraps(func)
             def wrapper(*args, **kwargs):
-                filterable_args = _get_filterable_args(func, args, kwargs)
-                if len(filterable_args) > 0:
-                    _check_experimental_args(func, filterable_args)
+                if len(args) > min_idx or (
+                    kwargs and not keys_ok(kwargs.keys(), names)
+                ):
+                    filterable_args = _get_filterable_args(func, args, kwargs)
+                    if len(filterable_args) > 0:
+                        _check_experimental_args(func, filterable_args)
                 return func(*args, **kwargs)
 
             return wrapper

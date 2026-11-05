@@ -1,3 +1,5 @@
+import os
+import signal
 import socket
 import threading
 import time
@@ -36,6 +38,7 @@ from redis.maint_notifications import (
     NodeMovingNotification,
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
+    _build_moving_connection_kwargs,
 )
 
 
@@ -2891,11 +2894,11 @@ class TestMaintenanceNotificationsHandlingMultipleProxies(
         # TODO validate free connections
 
 
-def _moving_pool(**config_kwargs):
+def _moving_pool(pool_class=ConnectionPool, **config_kwargs):
     config_kwargs.setdefault("enabled", True)
     config_kwargs.setdefault("proactive_reconnect", True)
     config_kwargs.setdefault("relaxed_timeout", 10)
-    return ConnectionPool(
+    return pool_class(
         protocol=3, maint_notifications_config=MaintNotificationsConfig(**config_kwargs)
     )
 
@@ -3258,3 +3261,188 @@ def test_pool_close_disconnects_even_when_moving_cleanup_fails():
     # the pool is closed regardless; the handoff stays for a retried close()
     disconnect.assert_called_once_with()
     assert handler._pending_handoffs == {notification}
+
+
+@pytest.mark.fixed_client
+def test_pool_reset_in_forked_child_gives_the_handler_fresh_state():
+    pool = _moving_pool()
+    handler = pool._maint_notifications_pool_handler
+    notification = NodeMovingNotification(
+        id=1, new_node_host="1.2.3.4", new_node_port=6379, ttl=60
+    )
+    handler.handle_notification(notification)
+    inherited_lock = handler._lock
+    assert handler._scheduled_timers and handler._pending_handoffs
+    assert pool.connection_kwargs["host"] == "1.2.3.4"
+
+    # What _checkpid() sees in a forked child
+    pool.pid = -1
+    pool._checkpid()
+
+    assert handler._lock is not inherited_lock
+    assert handler._scheduled_timers == set()
+    assert handler._pending_handoffs == set()
+    # The child starts without the temporary host and relaxed timeout
+    assert pool.connection_kwargs.get("host") != "1.2.3.4"
+    assert pool.connection_kwargs.get("socket_timeout") != 10
+    # Connections made in the child share the fresh state
+    copy = handler.get_handler_for_connection()
+    assert copy._lock is handler._lock
+    pool.close()
+
+
+@pytest.mark.fixed_client
+def test_pool_reset_in_forked_child_restores_moving_kwargs_without_pending_handoff():
+    """
+    The process forks after the MOVING kwargs were applied to the pool but
+    before the handoff was registered: there is no handoff whose cleanup would
+    restore them, so the reset has to.
+    """
+    pool = ConnectionPool(
+        host="10.0.0.1",
+        socket_timeout=5,
+        protocol=3,
+        maint_notifications_config=MaintNotificationsConfig(
+            enabled=True, proactive_reconnect=True, relaxed_timeout=10
+        ),
+    )
+    handler = pool._maint_notifications_pool_handler
+    notification = NodeMovingNotification(
+        id=1, new_node_host="1.2.3.4", new_node_port=6379, ttl=60
+    )
+    pool.update_connection_kwargs(
+        **_build_moving_connection_kwargs(notification, handler.config)
+    )
+    assert pool.connection_kwargs["host"] == "1.2.3.4"
+    assert not handler._pending_handoffs
+
+    # What _checkpid() sees in a forked child
+    pool.pid = -1
+    pool._checkpid()
+
+    assert pool.connection_kwargs["host"] == "10.0.0.1"
+    assert pool.connection_kwargs["socket_timeout"] == 5
+    assert pool.connection_kwargs["maintenance_state"] == MaintenanceState.NONE
+    pool.close()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+def test_pool_close_in_forked_child_does_not_block_on_inherited_handler_lock():
+    """
+    A parent thread holds the handler lock when the process forks: the child
+    inherits it locked and no thread there will ever release it. close() in the
+    child must reset the pool before it takes that lock.
+    """
+    pool = _moving_pool()
+    handler = pool._maint_notifications_pool_handler
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with handler._lock:
+            holding.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert holding.wait(5)
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        status = 1
+        try:
+            signal.alarm(5)
+            pool.close()
+            status = 0
+        finally:
+            os._exit(status)
+    try:
+        _, wait_status = os.waitpid(pid, 0)
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert os.WIFEXITED(wait_status) and os.WEXITSTATUS(wait_status) == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+def test_pool_close_in_forked_child_does_not_block_on_inherited_pool_lock(
+    pool_class,
+):
+    """
+    A parent thread holds the pool lock while a handoff is pending when the
+    process forks: the child inherits the lock held and no thread there will
+    ever release it, yet resetting the handler takes it to revert the handoff.
+    """
+    pool = _moving_pool(pool_class)
+    handler = pool._maint_notifications_pool_handler
+    handler.handle_notification(
+        NodeMovingNotification(
+            id=1, new_node_host="1.2.3.4", new_node_port=6379, ttl=60
+        )
+    )
+    assert handler._pending_handoffs
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with pool._lock:
+            holding.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert holding.wait(5)
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        status = 1
+        try:
+            signal.alarm(5)
+            pool.close()
+            status = 0
+        finally:
+            os._exit(status)
+    try:
+        _, wait_status = os.waitpid(pid, 0)
+    finally:
+        release.set()
+        holder.join(5)
+        # The handoff started a non-daemon timer in the parent.
+        pool.close()
+
+    assert os.WIFEXITED(wait_status) and os.WEXITSTATUS(wait_status) == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+def test_blocking_pool_fork_in_maintenance_does_not_stay_in_maintenance():
+    """
+    The process forks while a parent thread is applying a MOVING, with the
+    pool flagged as in maintenance: no thread in the child will ever clear the
+    flag, and a later checkout would nest on the pool lock and leak it.
+    """
+    pool = _moving_pool(BlockingConnectionPool)
+    pool.set_in_maintenance(True)
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        status = 1
+        try:
+            signal.alarm(5)
+            pool._checkpid()
+            free = pool._lock.acquire(blocking=False)
+            if free:
+                pool._lock.release()
+            if free and not pool._in_maintenance and not pool._locked:
+                status = 0
+        finally:
+            os._exit(status)
+    _, wait_status = os.waitpid(pid, 0)
+    pool.set_in_maintenance(False)
+    pool.disconnect()
+
+    assert os.WIFEXITED(wait_status) and os.WEXITSTATUS(wait_status) == 0

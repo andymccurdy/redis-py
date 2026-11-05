@@ -6,6 +6,7 @@ import sys
 import time
 import weakref
 from collections import defaultdict
+from collections.abc import Coroutine
 from typing import Optional
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -1364,6 +1365,40 @@ class TestPubSubSubcommands:
 
 @pytest.mark.onlynoncluster
 class TestPubSubPings:
+    @pytest.mark.fixed_client
+    @skip_if_server_version_lt("6.0.0")
+    @pytest.mark.parametrize("protocol", [2, 3])
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    @pytest.mark.parametrize("message", [None, "x", "hello\u2603"])
+    @pytest.mark.parametrize("read_method", ["get_message", "listen"])
+    async def test_ping_response_shapes(
+        self, create_redis, protocol, decode_responses, message, read_method
+    ):
+        client = await create_redis(
+            protocol=protocol, decode_responses=decode_responses
+        )
+        async with client.pubsub() as pubsub:
+            await pubsub.subscribe("foo")
+            assert (await pubsub.get_message(timeout=1))["type"] == "subscribe"
+            await pubsub.ping(message)
+
+            if read_method == "get_message":
+                response = await pubsub.get_message(timeout=1)
+            else:
+                messages = pubsub.listen()
+                try:
+                    response = await asyncio.wait_for(messages.__anext__(), timeout=1)
+                finally:
+                    await messages.aclose()
+
+            data = message if message is not None else ""
+            assert response == {
+                "type": "pong",
+                "pattern": None,
+                "channel": None,
+                "data": data if decode_responses else data.encode(),
+            }
+
     @skip_if_server_version_lt("3.0.0")
     async def test_send_pubsub_ping(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
@@ -2393,6 +2428,211 @@ class TestPubSubAcloseWithMocks:
         connection.disconnect.assert_awaited_once_with(nowait=True)
 
 
+class _CountingCoroutine(Coroutine):
+    """Wrap a coroutine and count how often the event loop resumes it."""
+
+    def __init__(self, coro):
+        self._coro = coro
+        self.resumes = 0
+
+    def send(self, value):
+        self.resumes += 1
+        return self._coro.send(value)
+
+    def throw(self, *args):
+        self.resumes += 1
+        return self._coro.throw(*args)
+
+    def close(self):
+        return self._coro.close()
+
+    def __await__(self):
+        return self._coro.__await__()
+
+
+@pytest.mark.onlynoncluster
+class TestPubSubAcloseCancellation:
+    """
+    Cancelling the task that runs PubSub.aclose() (e.g. a cancelled
+    anyio/Starlette scope tearing down an ``async with r.pubsub()``) must not
+    leak the pubsub connection: it still has to be disconnected and returned
+    to the pool.
+    """
+
+    @staticmethod
+    async def _cancel(task: asyncio.Task, started: asyncio.Event, unblock=None):
+        await started.wait()
+        task.cancel()
+        if unblock is not None:
+            await asyncio.sleep(0.01)
+            task.cancel()  # again, as a level-triggered scope would
+            await asyncio.sleep(0.01)
+            try:
+                # aclose() must not return before its teardown has finished.
+                assert not task.done()
+            finally:
+                unblock()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @staticmethod
+    def _blocking_disconnect(connection, started, resume):
+        disconnect = connection.disconnect
+
+        async def slow_disconnect(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            await disconnect(*args, **kwargs)
+
+        return mock.patch.object(connection, "disconnect", side_effect=slow_disconnect)
+
+    async def test_aclose_releases_connection_when_cancelled_in_disconnect(
+        self, r: redis.Redis
+    ):
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert leased in pool._available_connections
+        assert p.channels == {}
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_waiting_for_lock(
+        self, r: redis.Redis
+    ):
+        # PubSub._lock is also held by the streaming-credentials re-auth
+        # handler while it talks to the server, so aclose() can be cancelled
+        # while still waiting to acquire it.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await p._lock.acquire()
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, p._lock.release)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_in_release(
+        self, r: redis.Redis
+    ):
+        # A cancel that lands while release() waits for the pool's lock must
+        # neither leave the pubsub holding the connection nor split the pool's
+        # in-use/available bookkeeping.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await pool._lock.acquire()
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, pool._lock.release)
+
+        assert p.connection is None
+        assert leased in pool._available_connections
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_cancelled_subscribe_then_cancelled_aclose_does_not_leak(
+        self, r: redis.Redis
+    ):
+        # Cancel subscribe() while it waits on the socket, then tear the
+        # pubsub down from a task that is itself being cancelled: the
+        # connection leased for subscribe() must still go back to the pool.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.connect()
+        leased = p.connection
+
+        started = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with mock.patch.object(leased, "send_command", side_effect=hang):
+            await self._cancel(asyncio.ensure_future(p.subscribe("foo")), started)
+        assert p.connection is leased
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_teardown_failure_after_cancel_is_logged(
+        self, r: redis.Redis, caplog
+    ):
+        # A teardown that fails while the caller is cancelled must not be
+        # swallowed silently behind the CancelledError.
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        started = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failing_disconnect(*_args, **_kwargs):
+            started.set()
+            await resume.wait()
+            raise RuntimeError("disconnect failed")
+
+        with mock.patch.object(leased, "disconnect", side_effect=failing_disconnect):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+        assert "PubSub teardown failed after a cancellation" in caplog.text
+        await p.aclose()  # clean up the connection the failed teardown kept
+
+    async def test_repeated_cancels_wake_aclose_only_once(self, r: redis.Redis):
+        # A level-triggered canceller (e.g. an anyio cancel scope) calls
+        # task.cancel() on every loop turn while aclose() waits for its
+        # teardown; aclose() must not wake up for each of them.
+        loop = asyncio.get_running_loop()
+        p = r.pubsub()
+        await p.subscribe("foo")
+        await p._lock.acquire()  # blocks the teardown
+        coro = _CountingCoroutine(p.aclose())
+        task = loop.create_task(coro)
+        await asyncio.sleep(0)  # aclose() now waits for the teardown
+
+        def cancel_again():
+            if not task.done():
+                task.cancel()
+                loop.call_soon(cancel_again)
+
+        loop.call_soon(cancel_again)
+        for _ in range(100):
+            await asyncio.sleep(0)
+        p._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Started, woken by the first cancel, and woken once more when the
+        # teardown finished; not once per loop turn.
+        assert coro.resumes == 3
+        assert p.connection is None
+
+
 class TestClusterPubSubResubscribe:
     """
     Cluster-only tests verifying that sharded pubsub resubscription after a
@@ -3408,6 +3648,32 @@ class TestClusterPubSubSlotMigration:
         # Cooled off, so an uncorrectable slots cache cannot make the repair
         # re-run on every poll.
         assert stale in pubsub._poll_cool_off
+
+    async def test_moved_repair_fills_in_a_missing_redirect_host(self):
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) answers ``MOVED`` with only a port, and the repair
+        applies the redirect on the host of the node that sent it rather than
+        failing to parse an address with an empty host.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} :7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        (redirect,), _ = pubsub.cluster.nodes_manager.move_slot.call_args
+        assert redirect.node_addr == ("127.0.0.1", 7001)
 
     async def test_moved_repair_collects_the_pubsub_it_empties(self):
         """

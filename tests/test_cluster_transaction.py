@@ -713,7 +713,7 @@ class TestClusterTransactionMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with patch.object(recorder, "_get_or_create_collector", return_value=collector):
+        with patch.object(recorder, "_metrics_collector", collector):
             yield r, self.operation_duration
 
         # Cleanup

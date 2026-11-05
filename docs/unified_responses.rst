@@ -221,6 +221,10 @@ Core Commands
      - Flat stats become nested dictionaries.
      - ``[b"running_script", None, b"engines", [b"LUA", [...]]]``
      - ``{b"running_script": None, b"engines": {b"LUA": {...}}}``
+   * - ``INCREX`` with ``BYFLOAT``
+     - The new value and the increment are floats.
+     - ``[b"1.75", b"0.25"]``
+     - ``[1.75, 0.25]``
    * - ``MEMORY STATS``
      - Structural keys are decoded and numeric values use native types.
      - ``{b"peak.allocated": b"1024"}``
@@ -277,6 +281,10 @@ TimeSeries
      - Sorted list of dicts becomes a dict with metadata slot.
      - ``[{b"k": [labels, samples]}]``
      - ``{b"k": [labels, metadata, samples]}``
+   * - ``TS.INFO``
+     - ``rules`` list becomes a dict keyed by destination key.
+     - ``[[b"dst", 100, b"AVG", 0]]``
+     - ``{b"dst": [100, b"AVG", 0]}``
    * - ``TS.QUERYINDEX``
      - Key strings are preserved instead of coerced to numbers.
      - ``2``

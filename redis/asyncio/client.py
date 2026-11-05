@@ -38,7 +38,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_READ_SIZE,
     DEFAULT_SOCKET_TIMEOUT,
 )
-from redis._parsers.helpers import bool_ok, get_response_callbacks
+from redis._parsers.helpers import bool_ok, decode_info
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -59,7 +59,7 @@ from redis.client import (
     EMPTY_RESPONSE,
     NEVER_DECODE,
     AbstractRedis,
-    CaseInsensitiveDict,
+    default_response_callbacks,
 )
 from redis.commands import (
     AsyncCoreCommands,
@@ -101,6 +101,7 @@ from redis.utils import (
     SSL_AVAILABLE,
     _set_info_logger,
     check_protocol_version,
+    command_text,
     deprecated_args,
     deprecated_function,
     experimental_method,
@@ -525,11 +526,9 @@ class Redis(
         self.connection: Optional[Connection] = None
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
+        self.response_callbacks = default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
         )
 
         # If using a single connection client, we need to lock creation-of and use-of
@@ -795,9 +794,9 @@ class Redis(
         try:
             # Initialize the client (i.e. establish connection, etc.)
             return await self.initialize()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # If initialization fails, decrement the counter to keep it in sync
-            await self._decrement_usage()
+            await asyncio.shield(self._decrement_usage())
             raise
 
     async def _increment_usage(self) -> int:
@@ -818,15 +817,24 @@ class Redis(
             self._usage_counter -= 1
             return self._usage_counter
 
+    async def _release_usage(self) -> None:
+        """
+        Decrement the usage counter and close the client on the last exit.
+
+        Hold the lock through closing so a new context cannot use connections
+        that are still being disconnected by the previous context.
+        """
+        async with self._usage_lock:
+            self._usage_counter -= 1
+            if self._usage_counter == 0:
+                await self.aclose()
+
     async def __aexit__(self, exc_type, exc_value, traceback):
         """
         Async context manager exit. Decrements a usage counter. If this is the
         last exit (counter becomes zero), the client closes its connection pool.
         """
-        current_usage = await asyncio.shield(self._decrement_usage())
-        if current_usage == 0:
-            # This was the last active context, so disconnect the pool.
-            await asyncio.shield(self.aclose())
+        await asyncio.shield(self._release_usage())
 
     _DEL_MESSAGE = "Unclosed Redis client"
 
@@ -1021,6 +1029,8 @@ class Redis(
             if NEVER_DECODE in options:
                 response = await connection.read_response(disable_decoding=True)
                 options.pop(NEVER_DECODE)
+                if command_name == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = await connection.read_response()
         except ResponseError:
@@ -1116,16 +1126,28 @@ class Monitor:
 
     async def __aenter__(self):
         await self.connect()
-        await self.connection.send_command("MONITOR")
-        # check that monitor returns 'OK', but don't return it to user
-        response = await self.connection.read_response()
-        if not bool_ok(response):
-            raise RedisError(f"MONITOR failed: {response}")
+        try:
+            await self.connection.send_command("MONITOR")
+            # check that monitor returns 'OK', but don't return it to user
+            response = await self.connection.read_response()
+            if not bool_ok(response):
+                raise RedisError(f"MONITOR failed: {response}")
+        except BaseException:
+            try:
+                await self.__aexit__()
+            except Exception:
+                pass
+            raise
         return self
 
     async def __aexit__(self, *args):
-        await self.connection.disconnect()
-        await self.connection_pool.release(self.connection)
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            await connection.disconnect()
+        finally:
+            await asyncio.shield(self.connection_pool.release(connection))
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""
@@ -1167,6 +1189,13 @@ class Monitor:
         """Listen for commands coming to the server."""
         while True:
             yield await self.next_command()
+
+
+class _UncancellableFuture(asyncio.Future):
+    """A future that ignores cancel(): awaiting it is not woken by Task.cancel()."""
+
+    def cancel(self, msg: Any = None) -> bool:
+        return False
 
 
 class PubSub:
@@ -1241,6 +1270,32 @@ class PubSub:
         # immediately as there is nothing to clean-up.
         if not hasattr(self, "connection"):
             return
+        # Shield the teardown so that cancelling the caller (e.g. a cancelled
+        # task or anyio cancel scope exiting ``async with r.pubsub()``) cannot
+        # stop it while it waits for the lock, disconnects, or releases: the
+        # connection would otherwise never be returned to the pool. The caller
+        # still sees the CancelledError.
+        teardown = asyncio.ensure_future(self._aclose())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
+            # Repeated cancels (anyio re-cancels on every loop turn) only mark
+            # this task while it waits here, so it wakes once, when done.
+            waiter = _UncancellableFuture(loop=asyncio.get_running_loop())
+            teardown.add_done_callback(lambda _: waiter.set_result(None))
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass  # the cancels marked while waiting
+            if not teardown.cancelled() and teardown.exception() is not None:
+                logger.warning(
+                    "PubSub teardown failed after a cancellation",
+                    exc_info=teardown.exception(),
+                )
+            raise
+
+    async def _aclose(self) -> None:
         async with self._lock:
             if self.connection:
                 # Use nowait=True to avoid awaiting StreamWriter.wait_closed(),
@@ -1249,8 +1304,10 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
-                await self.connection_pool.release(self.connection)
-                self.connection = None
+                # Detach before awaiting release, as Pipeline.reset() does, so
+                # the pubsub never holds a connection that is back in the pool.
+                connection, self.connection = self.connection, None
+                await self.connection_pool.release(connection)
             self.channels = {}
             self.pending_unsubscribe_channels = set()
             self.patterns = {}
@@ -1682,6 +1739,8 @@ class PubSub:
             return None
         if isinstance(response, bytes):
             response = [b"pong", response] if response != b"PONG" else [b"pong", b""]
+        elif isinstance(response, str):
+            response = ["pong", response] if response != "PONG" else ["pong", ""]
         message_type = str_if_bytes(response[0])
         if message_type == "pmessage":
             message = {
@@ -1840,6 +1899,12 @@ PSWorkerThreadExcHandlerT = Union[
 CommandT = Tuple[Tuple[Union[str, bytes], ...], Mapping[str, Any]]
 CommandStackT = List[CommandT]
 
+# Packing at least this many commands is enough CPU work to be worth moving
+# off the event loop; ~1000 tiny commands pack in about 1ms, which already
+# outgrows the asyncio.to_thread dispatch. Smaller pipelines keep the
+# existing synchronous path and never touch the loop's default executor.
+_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
+
 
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     """
@@ -1930,12 +1995,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             # sure we're no longer WATCHing anything. Detach self.connection
             # before awaiting release: if a second cancel aborts the await,
             # the pipeline must not be left holding a reference to a
-            # connection that is being returned to the pool. Shield the
-            # release itself so a second cancel cannot split the pool's
-            # internal in-use/available bookkeeping mid-update.
+            # connection that is being returned to the pool. release() itself
+            # is cancel-safe, so it needs no shield.
             if self.connection:
                 connection, self.connection = self.connection, None
-                await asyncio.shield(self.connection_pool.release(connection))
+                await self.connection_pool.release(connection)
 
     async def aclose(self) -> None:
         """Alias for reset(), a standard method name for cleanup"""
@@ -2089,8 +2153,9 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         pre: CommandT = (("MULTI",), {})
         post: CommandT = (("EXEC",), {})
         cmds = (pre, *commands, post)
-        all_cmds = connection.pack_commands(
-            args for args, options in cmds if EMPTY_RESPONSE not in options
+        all_cmds = await self._pack_commands(
+            connection,
+            [args for args, options in cmds if EMPTY_RESPONSE not in options],
         )
         await connection.send_packed_command(all_cmds)
         errors = []
@@ -2175,7 +2240,9 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         preflight = _himport_exec.prepare_wire_commands(fieldsets)
         # build up all commands into a single request to increase network perf
-        all_cmds = connection.pack_commands(preflight + [args for args, _ in commands])
+        all_cmds = await self._pack_commands(
+            connection, preflight + [args for args, _ in commands]
+        )
         await connection.send_packed_command(all_cmds)
 
         # Drain the leading PREPARE replies (bookkeeping + capture the first error)
@@ -2210,6 +2277,20 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             self.raise_first_error(commands, response)
         return response
 
+    async def _pack_commands(
+        self, connection: Connection, commands: Sequence[Iterable[EncodableT]]
+    ) -> List[bytes]:
+        """Pack commands, off the event loop for large batches.
+
+        Packing is pure CPU work and can block the event loop for seconds on
+        very large pipelines (#3416), but handing a batch to a worker thread
+        also costs a dispatch. Small batches are packed inline; only batches
+        at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
+        """
+        if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
+            return connection.pack_commands(commands)
+        return await asyncio.to_thread(connection.pack_commands, commands)
+
     def raise_first_error(self, commands: CommandStackT, response: Iterable[Any]):
         for i, r in enumerate(response):
             if isinstance(r, ResponseError):
@@ -2219,7 +2300,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     def annotate_exception(
         self, exception: Exception, number: int, command: Iterable[object]
     ) -> None:
-        cmd = " ".join(map(safe_str, command))
+        cmd = command_text(command)
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) "
             f"of pipeline caused error: {exception.args[0]}"

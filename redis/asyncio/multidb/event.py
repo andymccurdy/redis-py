@@ -72,8 +72,7 @@ class CloseConnectionOnActiveDatabaseChanged(AsyncEventListenerInterface):
             pool = client.connection_pool
             # Mark and disconnect under one lock, so a connection acquired
             # meanwhile is either marked for reconnect or disconnected while
-            # still free. The maintenance flag makes BlockingConnectionPool
-            # honour that lock too.
+            # still free.
             async with pool._get_pool_lock():
                 pool._set_in_maintenance(True)
                 try:

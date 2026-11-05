@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 import redis
 from redis.cache import CacheConfig
+from redis.commands.metadata import StaticMetadataResolver
 from redis.connection import CacheProxyConnection, Connection, to_bool
 from redis.event import (
     AfterConnectionReleasedEvent,
@@ -838,6 +839,30 @@ class TestConnectionPoolUnixSocketURLParsing:
         assert pool.maint_notifications_enabled() is None
         assert "maint_notifications_config" not in pool.connection_kwargs
         assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_client_enables_client_side_caching(self):
+        resolver = StaticMetadataResolver()
+        client = redis.Redis(
+            unix_socket_path="/socket",
+            protocol=3,
+            cache_config=CacheConfig(),
+            metadata_resolver=resolver,
+        )
+        pool = client.connection_pool
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert client.get_cache() is not None
+        assert pool.metadata_resolver is resolver
+        assert isinstance(pool.make_connection(), CacheProxyConnection)
+
+    def test_from_url_enables_client_side_caching(self):
+        pool = redis.ConnectionPool.from_url(
+            "unix:///socket?protocol=3", cache_config=CacheConfig()
+        )
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert pool.cache is not None
+        assert isinstance(pool.make_connection(), CacheProxyConnection)
 
     def test_client_respects_disabled_maint_notifications_config(self):
         client = redis.Redis(

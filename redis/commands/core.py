@@ -435,6 +435,18 @@ class ACLCommands(CommandsProtocol):
                   access to all keys while ``'cache:*'`` grants access to all keys that
                   are prefixed with ``cache:``.
                   `keys` should not be prefixed with a ``'~'``.
+            selectors: A list of ``(command, key)`` tuples, each added as one
+                       selector. `command` must be prefixed with a '+' to add or
+                       a '-' to remove the command permission, on keys matching
+                       `key`. A ``'~'`` is prepended to `key` unless it
+                       already starts with ``'~'`` or ``'%'``.
+                       Both values are joined into a single selector string,
+                       ``(command key)``, which the server splits on whitespace
+                       and applies token by token. Several commands or key
+                       patterns can therefore be packed into one tuple, e.g.
+                       ``("+get +set", "~app:*")``, but any whitespace in either
+                       value starts a new rule. Do not build these fields from
+                       unvalidated input such as a tenant or user name.
             reset: Indicates whether the user should be fully reset prior to applying
                    the new ACL. Setting this to `True` will remove all existing
                    passwords, flags, and privileges from the user and then apply the
@@ -1746,6 +1758,9 @@ class ManagementCommands(CommandsProtocol):
 
         For more information, see https://redis.io/commands/info
         """
+        from redis.client import NEVER_DECODE
+
+        kwargs[NEVER_DECODE] = []
         if section is None:
             return self.execute_command("INFO", **kwargs)
         else:
@@ -6542,6 +6557,16 @@ class AsyncScanCommands(ScanCommands):
                 yield d
 
 
+class SetDataPersistOptions(Enum):
+    # add each provided member only if none of them
+    # already exists.
+    MNX = "MNX"
+
+    # add each provided member only if all of them
+    # already exist.
+    MXX = "MXX"
+
+
 class SetCommands(CommandsProtocol):
     """
     Redis commands for Set data type.
@@ -6938,6 +6963,627 @@ class SetCommands(CommandsProtocol):
         """
         args = list_or_args(keys, args)
         return self.execute_command("SUNIONSTORE", dest, *args)
+
+    @overload
+    def saddex(
+        self: SyncClientProtocol,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> int: ...
+
+    @overload
+    def saddex(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> Awaitable[int]: ...
+
+    def saddex(
+        self,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> int | Awaitable[int]:
+        """
+        Add ``members`` to set ``name``, optionally setting an expiration time
+        on every member in the command.
+
+        ``ex`` sets an expire flag on ``members`` for ``ex`` seconds.
+
+        ``px`` sets an expire flag on ``members`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
+
+        ``exat`` sets an expire flag on ``members`` at ``exat`` seconds,
+            specified in unix time.
+
+        ``pxat`` sets an expire flag on ``members`` at ``pxat`` milliseconds,
+            specified in unix time.
+
+        ``data_persist_option`` can be set to ``MNX`` or ``MXX`` to control the
+            behavior of the command.
+            ``MNX`` will add the members only if none of them already exists.
+            ``MXX`` will add the members only if all of them already exist.
+            A logically expired member does not exist.
+
+        ``keepttl`` if True, retain the time to live associated with the
+            members that already exist. Without any expiration option, the
+            expiration of an existing member is discarded.
+
+        Returns ``1`` if at least one member was added, updated or deleted, and
+        ``0`` otherwise, for example when the ``MNX`` or ``MXX`` condition was
+        not met. ``1`` does not mean that the members exist: an expiration time
+        in the past removes the members that exist and adds none.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/saddex
+        """
+        if not at_most_one_value_set(
+            (
+                ex is not None,
+                px is not None,
+                exat is not None,
+                pxat is not None,
+                keepttl,
+            )
+        ):
+            raise DataError(
+                "``ex``, ``px``, ``exat``, ``pxat``, "
+                "and ``keepttl`` are mutually exclusive."
+            )
+
+        exp_options: list[EncodableT] = extract_expire_flags(ex, px, exat, pxat)
+        if data_persist_option:
+            exp_options.append(data_persist_option.value)
+
+        if keepttl:
+            exp_options.append("KEEPTTL")
+
+        return self.execute_command(
+            "SADDEX", name, *exp_options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def sexpire(
+        self: SyncClientProtocol,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def sexpire(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpire(
+        self,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using
+        relative time in seconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpire
+
+        Args:
+            name: The name of the set key.
+            seconds: Expiration time in seconds, relative. Can be an integer, or a
+                     Python `timedelta` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(seconds, datetime.timedelta):
+            seconds = int(seconds.total_seconds())
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SEXPIRE", name, seconds, *options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def spexpire(
+        self: SyncClientProtocol,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def spexpire(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpire(
+        self,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using
+        relative time in milliseconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpire
+
+        Args:
+            name: The name of the set key.
+            milliseconds: Expiration time in milliseconds, relative. Can be an
+                          integer, or a Python `timedelta` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(milliseconds, datetime.timedelta):
+            milliseconds = int(milliseconds.total_seconds() * 1000)
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SPEXPIRE", name, milliseconds, *options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def sexpireat(
+        self: SyncClientProtocol,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def sexpireat(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpireat(
+        self,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using an
+        absolute Unix timestamp in seconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpireat
+
+        Args:
+            name: The name of the set key.
+            unix_time_seconds: Expiration time as Unix timestamp in seconds. Can be
+                               an integer or a Python `datetime` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(unix_time_seconds, datetime.datetime):
+            unix_time_seconds = int(unix_time_seconds.timestamp())
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SEXPIREAT",
+            name,
+            unix_time_seconds,
+            *options,
+            "MEMBERS",
+            len(members),
+            *members,
+        )
+
+    @overload
+    def spexpireat(
+        self: SyncClientProtocol,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def spexpireat(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpireat(
+        self,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using an
+        absolute Unix timestamp in milliseconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpireat
+
+        Args:
+            name: The name of the set key.
+            unix_time_milliseconds: Expiration time as Unix timestamp in
+                                    milliseconds. Can be an integer or a Python
+                                    `datetime` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(unix_time_milliseconds, datetime.datetime):
+            unix_time_milliseconds = int(unix_time_milliseconds.timestamp() * 1000)
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SPEXPIREAT",
+            name,
+            unix_time_milliseconds,
+            *options,
+            "MEMBERS",
+            len(members),
+            *members,
+        )
+
+    @overload
+    def spersist(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def spersist(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spersist(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Removes the expiration time for each specified member in a set.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spersist
+
+        Args:
+            name: The name of the set key.
+            members: A list of members within the set from which to remove the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expiration time.
+                - `1` if the expiration time was successfully removed from the
+                  member.
+        """
+        return self.execute_command("SPERSIST", name, "MEMBERS", len(members), *members)
+
+    @overload
+    def sexpiretime(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def sexpiretime(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpiretime(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the expiration times of set members as Unix timestamps in seconds,
+        rounded up to the next second.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpiretime
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A positive integer representing the expiration Unix timestamp in
+                  seconds, if the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SEXPIRETIME", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def spexpiretime(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def spexpiretime(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpiretime(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the expiration times of set members as Unix timestamps in
+        milliseconds.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpiretime
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A positive integer representing the expiration Unix timestamp in
+                  milliseconds, if the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SPEXPIRETIME", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def sttl(self: SyncClientProtocol, name: KeyT, *members: FieldT) -> list[int]: ...
+
+    @overload
+    def sttl(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def sttl(self, name: KeyT, *members: FieldT) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the TTL (Time To Live) in seconds for each specified member within a
+        set key, rounded up to the next second.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sttl
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the TTL.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A non-negative integer representing the TTL in seconds if the
+                  member has an associated expiration time.
+        """
+        return self.execute_command(
+            "STTL", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def spttl(self: SyncClientProtocol, name: KeyT, *members: FieldT) -> list[int]: ...
+
+    @overload
+    def spttl(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spttl(self, name: KeyT, *members: FieldT) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the TTL (Time To Live) in milliseconds for each specified member
+        within a set key.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spttl
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the TTL.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A non-negative integer representing the TTL in milliseconds if
+                  the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SPTTL", name, "MEMBERS", len(members), *members, keys=[name]
+        )
 
 
 AsyncSetCommands = SetCommands
@@ -8954,6 +9600,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> ZSetRangeResponse: ...
 
     @overload
@@ -8969,6 +9616,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> Awaitable[ZSetRangeResponse]: ...
 
     def zrange(
@@ -8983,6 +9631,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> ZSetRangeResponse | Awaitable[ZSetRangeResponse]:
         """
         Return a range of values from sorted set ``name`` between
@@ -8992,6 +9641,13 @@ class SortedSetCommands(CommandsProtocol):
 
         ``desc`` a boolean indicating whether to sort the results in reversed
         order.
+
+        ``use_rev`` only affects the rank-based reverse path: when True
+        together with ``desc``, it sends ``ZRANGE ... REV`` instead of the
+        deprecated ``ZREVRANGE``. It is ignored for the byscore, bylex,
+        and offset/num paths, which already send ``ZRANGE ... REV``.
+        It defaults to False so callers on servers older than Redis 6.2
+        keep the ``ZREVRANGE`` fallback.
 
         ``withscores`` indicates to return the scores along with the values.
         The return type is a list of (value, score) pairs.
@@ -9014,7 +9670,13 @@ class SortedSetCommands(CommandsProtocol):
         """
         # Need to support ``desc`` also when using old redis version
         # because it was supported in 3.5.3 (of redis-py)
-        if not byscore and not bylex and (offset is None and num is None) and desc:
+        if (
+            not byscore
+            and not bylex
+            and (offset is None and num is None)
+            and desc
+            and not use_rev
+        ):
             return self.zrevrange(name, start, end, withscores, score_cast_func)
 
         return self._zrange(

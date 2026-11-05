@@ -6,6 +6,9 @@ import select
 import selectors
 import socket
 import ssl
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 import types
@@ -298,8 +301,33 @@ def test_hiredis_socket_can_read_handles_high_file_descriptor():
             os.close(high_read_fd)
 
 
+_FD_EXHAUSTION_SCRIPT = textwrap.dedent(
+    """
+    import os
+    import resource
+    import socket
+
+    from redis._parsers.hiredis import _socket_can_read
+
+    readable, writable = socket.socketpair()
+    empty_sock, peer = socket.socketpair()
+    writable.sendall(b"x")
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 256), hard))
+    try:
+        while True:
+            os.dup(0)
+    except OSError:
+        pass  # fd table is now full
+
+    assert _socket_can_read(readable, timeout=0) is True
+    assert _socket_can_read(empty_sock, timeout=0) is False
+    """
+)
+
+
 @pytest.mark.fixed_client
-@pytest.mark.forked
 @pytest.mark.skipif(
     not hasattr(select, "poll"), reason="select.poll not available on this platform"
 )
@@ -309,34 +337,27 @@ def test_hiredis_socket_can_read_under_fd_exhaustion():
     # allocate file descriptors themselves. A per-check epoll/kqueue selector
     # raises OSError (EMFILE) here; the poll() implementation passes.
     #
-    # RLIMIT_NOFILE is process-wide, so @pytest.mark.forked runs this in its own
-    # process to avoid starving other threads/tests of file descriptors.
-    resource = pytest.importorskip("resource")
+    # RLIMIT_NOFILE is process-wide, so the check runs in a child interpreter
+    # to avoid starving other threads/tests of file descriptors.
+    pytest.importorskip("resource")
 
-    readable, writable = socket.socketpair()
-    empty_sock, peer = socket.socketpair()
-    writable.sendall(b"x")
+    # Point the child at the redis package under test, not whatever else
+    # happens to be importable from its working directory.
+    env = dict(os.environ)
+    redis_root = os.path.dirname(os.path.dirname(redis.__file__))
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [redis_root, env.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _FD_EXHAUSTION_SCRIPT],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
 
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    held_fds = []
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 256), hard))
-        try:
-            while True:
-                held_fds.append(os.dup(0))
-        except OSError:
-            pass  # fd table is now full
-
-        assert _socket_can_read(readable, timeout=0) is True
-        assert _socket_can_read(empty_sock, timeout=0) is False
-    finally:
-        for fd in held_fds:
-            os.close(fd)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-        readable.close()
-        writable.close()
-        empty_sock.close()
-        peer.close()
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.fixed_client

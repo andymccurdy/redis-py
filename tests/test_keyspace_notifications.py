@@ -349,6 +349,43 @@ class TestKeyNotification:
         assert notification.key_starts_with("cache:") is False
         assert notification.key_starts_with(b"user:") is True
 
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize("key", ["user:alice\n", "user:al\nice", "\n"])
+    def test_keyspace_key_with_newline(self, key, as_bytes):
+        """A newline in the key is part of the key, not the end of the channel."""
+        channel = f"__keyspace@0__:{key}"
+        notification = KeyNotification.try_parse(
+            channel.encode() if as_bytes else channel,
+            b"set" if as_bytes else "set",
+        )
+        assert notification is not None
+        assert notification.key == key
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize(
+        ("channel", "data", "subkeys"),
+        [
+            ("__keyspace@0__:", "set", []),
+            ("__subkeyspace@0__:", "hset|5:field", ["field"]),
+        ],
+    )
+    def test_empty_keyspace_key(self, channel, data, subkeys, as_bytes):
+        notification = KeyNotification.try_parse(
+            channel.encode() if as_bytes else channel,
+            data.encode() if as_bytes else data,
+        )
+        assert notification is not None
+        assert notification.key == ""
+        assert notification.subkeys == subkeys
+        assert notification.is_keyspace is True
+
+    def test_keyspace_key_with_trailing_newline_and_prefix(self):
+        notification = KeyNotification.try_parse(
+            "__keyspace@0__:user:alice\n", "set", key_prefix="user:"
+        )
+        assert notification is not None
+        assert notification.key == "alice\n"
+
     def test_database_wildcard(self):
         """Test parsing channel with wildcard database."""
         notification = KeyNotification.try_parse("__keyspace@*__:mykey", "set")
@@ -1587,6 +1624,19 @@ class TestSubkeyNotificationParsing:
             key_prefix="prefix:",
         )
         assert n is None
+
+    @pytest.mark.parametrize("key", ["myhash\n", "my\nhash"])
+    def test_subkey_channels_key_with_newline(self, key):
+        n = KeyNotification.try_parse(f"__subkeyspace@0__:{key}", "hset|5:field")
+        assert n is not None
+        assert n.key == key
+        assert n.subkeys == ["field"]
+
+        n = KeyNotification.try_parse(f"__subkeyspaceevent@0__:hset|{key}", "5:field")
+        assert n is not None
+        assert n.key == key
+        assert n.event_type == "hset"
+        assert n.subkeys == ["field"]
 
     # --- from_message integration ---
 

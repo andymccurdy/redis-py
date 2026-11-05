@@ -1,8 +1,11 @@
 import json
 import random
+from unittest.mock import patch
 import numpy as np
 import pytest
 import redis
+from redis._parsers import CommandsParser
+from redis.cluster import NodesManager
 from redis.commands.vectorset.commands import QuantizationOptions
 
 from .conftest import (
@@ -602,6 +605,35 @@ def test_vrem(d_client):
 
     resp = d_client.vset().vrem("myset_unexisting", "elem1")
     assert resp == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("client_factory", ["direct", "from_url", "pool", "cluster"])
+def test_vemb_raw_default_decode_responses(client_factory):
+    if client_factory == "direct":
+        r = redis.Redis()
+    elif client_factory == "from_url":
+        r = redis.Redis.from_url("redis://localhost:6379")
+    elif client_factory == "pool":
+        r = redis.Redis(connection_pool=redis.ConnectionPool())
+    else:
+        with (
+            patch.object(NodesManager, "initialize", autospec=True),
+            patch.object(CommandsParser, "initialize", autospec=True),
+        ):
+            r = redis.RedisCluster(host="localhost")
+
+    response = [b"embedding"]
+    try:
+        with patch.object(
+            r, "execute_command", return_value=response
+        ) as execute_command:
+            assert r.vset().vemb("vectors", "item", raw=True) is response
+        execute_command.assert_called_once_with(
+            "VEMB", "vectors", "item", "RAW", RESP3=True, NEVER_DECODE=True, RAW=True
+        )
+    finally:
+        r.close()
 
 
 @skip_if_server_version_lt("7.9.0")

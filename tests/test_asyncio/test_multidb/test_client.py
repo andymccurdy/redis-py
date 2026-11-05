@@ -204,6 +204,42 @@ class TestMultiDbClient:
         "mock_multi_db_config,mock_db, mock_db1, mock_db2",
         [
             (
+                {"hc_interval": 0.05},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    async def test_aclose_stops_recurring_health_checks(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        aclose() has to stop the background scheduler: cancelling
+        _recurring_hc_task alone does nothing because run_recurring_async()
+        returns right after scheduling the timer. Without stopping the
+        scheduler, health checks keep running after close against the
+        released health check resources.
+        """
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+        mock_hc.close = AsyncMock()
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            async with MultiDBClient(mock_multi_db_config) as client:
+                pass  # __aexit__ triggers aclose()
+
+        assert client._bg_scheduler._stopped
+        calls_after_close = mock_hc.check_health.call_count
+        await asyncio.sleep(0.3)
+        assert mock_hc.check_health.call_count == calls_after_close
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
                 {},
                 {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
                 {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},

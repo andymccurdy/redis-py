@@ -130,6 +130,26 @@ class AsyncHTTPClientWrapper(AsyncHTTPClient):
         self.client = client
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
+    def close(self, wait: bool = False) -> None:
+        """
+        Shut down the underlying thread pool.
+
+        Args:
+            wait: If True, block until running requests finish. The default
+                (False) lets in-flight requests complete in the background
+                while releasing the worker threads as soon as they idle out.
+        """
+        self._executor.shutdown(wait=wait)
+
+    async def aclose(self) -> None:
+        """
+        Async shutdown of the underlying thread pool.
+
+        Safe to await from the event loop: worker threads finish their
+        current request in the background and exit without blocking.
+        """
+        self.close(wait=False)
+
     async def get(
         self,
         path: str,

@@ -14,6 +14,7 @@ from redis._parsers.helpers import (
     parse_function_stats_resp3_to_resp2_legacy,
     parse_function_stats_unified,
     parse_info,
+    parse_memory_stats_unified,
     parse_sentinel_masters_resp3,
     zmpop_resp3_to_resp2_legacy,
     zpop_score_pairs,
@@ -118,6 +119,27 @@ def test_parse_client_list_as_iter():
     result = parse_client_list(response, as_iter=True)
     assert inspect.isgenerator(result)
     assert list(result) == parse_client_list(response)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "separator",
+    [chr(c) for c in (0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+def test_parse_client_list_only_splits_records_on_newline(separator):
+    # CLIENT LIST separates records with "\n" only. Characters that
+    # str.splitlines() also treats as line boundaries can appear inside a field,
+    # e.g. in an ACL username, and must not split the record.
+    response = (
+        f"id=1 addr=127.0.0.1:1 user=a{separator}b flags=N\nid=2 addr=127.0.0.1:2"
+    )
+    expected = [
+        {"id": "1", "addr": "127.0.0.1:1", "user": f"a{separator}b", "flags": "N"},
+        {"id": "2", "addr": "127.0.0.1:2"},
+    ]
+    assert parse_client_list(response) == expected
+    assert list(parse_client_list(response, as_iter=True)) == expected
 
 
 @pytest.mark.fixed_client
@@ -297,6 +319,39 @@ def test_parse_function_stats_resp3_to_resp2_legacy_gives_the_resp2_shape():
         parse_function_stats_resp3_to_resp2_legacy(_FUNCTION_STATS_RESP3)
         == _FUNCTION_STATS_RESP2
     )
+
+
+@pytest.mark.fixed_client
+def test_parse_memory_stats_unified_converts_doubles_to_floats():
+    # RESP2 sends the doubles of MEMORY STATS as bulk strings.
+    stats = parse_memory_stats_unified(
+        [
+            b"peak.allocated",
+            1024,
+            b"db.0",
+            [b"overhead.hashtable.main", 72, b"overhead.hashtable.expires", 0],
+            b"dataset.percentage",
+            b"95.5",
+            b"fragmentation",
+            b"1",
+        ]
+    )
+    assert stats == {
+        "peak.allocated": 1024,
+        "db.0": {"overhead.hashtable.main": 72, "overhead.hashtable.expires": 0},
+        "dataset.percentage": 95.5,
+        "fragmentation": 1.0,
+    }
+    assert type(stats["fragmentation"]) is float
+    assert type(stats["peak.allocated"]) is int
+    # decode_responses=True gives str values
+    assert parse_memory_stats_unified(["fragmentation", "0.5"]) == {
+        "fragmentation": 0.5
+    }
+    # a value that isn't a number is left as it is
+    assert parse_memory_stats_unified([b"allocator", b"jemalloc"]) == {
+        "allocator": b"jemalloc"
+    }
 
 
 # pairs_to_dict / pairs_to_dict_typed turn a flat [k1, v1, k2, v2] reply into a

@@ -1677,6 +1677,41 @@ class TestPubSubSubcommands:
 
 
 class TestPubSubPings:
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.0.0")
+    @pytest.mark.parametrize("protocol", [2, 3])
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    @pytest.mark.parametrize("message", [None, "x", "hello\u2603"])
+    @pytest.mark.parametrize("read_method", ["get_message", "listen"])
+    def test_ping_response_shapes(
+        self, request, protocol, decode_responses, message, read_method
+    ):
+        client = _get_client(
+            redis.Redis, request, protocol=protocol, decode_responses=decode_responses
+        )
+        with client.pubsub() as pubsub:
+            pubsub.subscribe("foo")
+            assert pubsub.get_message(timeout=1)["type"] == "subscribe"
+            pubsub.ping(message)
+
+            if read_method == "get_message":
+                response = pubsub.get_message(timeout=1)
+            else:
+                messages = pubsub.listen()
+                try:
+                    response = next(messages)
+                finally:
+                    messages.close()
+
+            data = message if message is not None else ""
+            assert response == {
+                "type": "pong",
+                "pattern": None,
+                "channel": None,
+                "data": data if decode_responses else data.encode(),
+            }
+
     @skip_if_server_version_lt("3.0.0")
     def test_send_pubsub_ping(self, r):
         p = r.pubsub(ignore_subscribe_messages=True)
@@ -2303,9 +2338,7 @@ class TestPubSubMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             # Create event dispatcher (real one, to test the full chain)
             event_dispatcher = EventDispatcher()
 
@@ -2374,9 +2407,7 @@ class TestPubSubMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             pubsub = PubSub(
@@ -2467,9 +2498,7 @@ class TestPubSubMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             pubsub = PubSub(
@@ -2555,9 +2584,7 @@ class TestPubSubMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             pubsub = PubSub(
@@ -2623,9 +2650,7 @@ class TestPubSubMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             pubsub = PubSub(
@@ -4611,6 +4636,31 @@ class TestClusterPubSubSlotMigration:
         # Cooled off, so an uncorrectable slots cache cannot make the repair
         # re-run on every poll.
         assert stale in pubsub._poll_cool_off
+
+    def test_moved_repair_fills_in_a_missing_redirect_host(self):
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) answers ``MOVED`` with only a port, and the repair
+        applies the redirect on the host of the node that sent it rather than
+        adding a node with an empty host.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} :7001")
+        pubsub.on_slots_changed = mock.MagicMock()
+
+        assert pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        (redirect,), _ = pubsub.cluster.nodes_manager.move_slot.call_args
+        assert redirect.node_addr == ("127.0.0.1", 7001)
 
     def test_moved_repair_collects_the_pubsub_it_empties(self):
         """

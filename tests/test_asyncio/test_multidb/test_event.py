@@ -62,8 +62,8 @@ class TestCloseConnectionOnActiveDatabaseChanged:
 
         old_database.client.aclose.assert_not_called()
         pool.disconnect.assert_not_called()
-        # Mark and disconnect must happen under the pool lock, with the blocking
-        # pool's maintenance flag raised so its get_connection honours that lock.
+        # Mark and disconnect under the pool lock, resetting maintenance state
+        # before releasing it.
         assert pool.mock_calls == [
             call._get_pool_lock(),
             call._get_pool_lock().__aenter__(),

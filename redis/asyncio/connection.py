@@ -1965,9 +1965,9 @@ class RedisSSLContext:
 
     def get(self) -> SSLContext:
         if not self.context:
-            if callable(self.password):
-                # Not shared: the cache key would hold the callback and, through it,
-                # whatever owns this connection, so the context could not be freed.
+            if not isinstance(self.password, (str, bytes, type(None))):
+                # Only the documented password types are shared. Anything else gets a
+                # private context, so the cache key never holds a reference to it.
                 self.context = self._build()
             else:
                 self.context = get_shared_ssl_context(

@@ -2994,9 +2994,9 @@ class SSLConnection(Connection):
         Returns:
             An SSL wrapped socket.
         """
-        if callable(self.certificate_password):
-            # Not shared: the cache key would hold the callback and, through it,
-            # whatever owns this connection, so the context could not be freed.
+        if not isinstance(self.certificate_password, (str, bytes, type(None))):
+            # Only the documented password types are shared. Anything else gets a
+            # private context, so the cache key never holds a reference to it.
             context = self._build_ssl_context()
         else:
             context = get_shared_ssl_context(

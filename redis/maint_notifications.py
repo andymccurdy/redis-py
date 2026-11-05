@@ -800,7 +800,7 @@ _maintenance_event_state = threading.local()
 
 @contextmanager
 def _defer_maintenance_events():
-    """Keep listener callbacks outside a synchronous socket ownership scope."""
+    """Keep listener callbacks outside synchronous ownership and handler locks."""
     previous = getattr(_maintenance_event_state, "pending", None)
     if previous is not None:
         yield
@@ -1070,7 +1070,10 @@ class MaintNotificationsPoolHandler:
             # cancel_scheduled_tasks(): a timer cancelled before it gets the
             # lock does nothing, and one already running finishes before
             # cancellation proceeds.
-            with self._lock:
+            # Completion listeners can close a cached owner's pool while a
+            # peer drain needs this handler lock. Dispatch after the outermost
+            # lock, including this wrapper around the cleanup callback.
+            with _defer_maintenance_events(), self._lock:
                 if timer not in self._scheduled_timers:
                     return
                 try:
@@ -1084,7 +1087,7 @@ class MaintNotificationsPoolHandler:
         timer.start()
 
     def cancel_scheduled_tasks(self) -> None:
-        with self._lock:
+        with _defer_maintenance_events(), self._lock:
             if not self._scheduled_timers and not self._pending_handoffs:
                 return
             timers = tuple(self._scheduled_timers)
@@ -1138,7 +1141,7 @@ class MaintNotificationsPoolHandler:
         """
         notification_hash = hash(notification)
 
-        with self._lock:
+        with _defer_maintenance_events(), self._lock:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"Reverting temporary changes related to notification: {notification}, "

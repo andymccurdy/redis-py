@@ -341,6 +341,135 @@ class TestCachePoolOwnership:
             peers.release(borrower)
             peers.disconnect()
 
+    @pytest.mark.parametrize("cleanup", ["timer", "direct", "cancel"])
+    @pytest.mark.parametrize("listener_error", [False, True])
+    def test_moving_cleanup_listener_can_close_during_peer_drain(
+        self, pool, r2, cleanup, listener_error
+    ):
+        pool.update_maint_notifications_config(MaintNotificationsConfig(enabled="auto"))
+        owner = pool.get_connection()
+        peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        borrower = peers.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        draining, resume = threading.Event(), threading.Event()
+        events, errors, pushes = [], [], []
+        first = NodeMovingNotification(
+            id=71, new_node_host=None, new_node_port=None, ttl=60
+        )
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                if event.notification != first:
+                    return
+                try:
+                    unlocked = []
+
+                    def probe():
+                        acquired = handler._lock.acquire(blocking=False)
+                        unlocked.append(acquired)
+                        if acquired:
+                            handler._lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    # Fail before close() waits for the owner on the old code,
+                    # so a negative control cannot leave deadlocked threads.
+                    assert unlocked == [True], "completion holds the handler lock"
+                    events.append(event)
+                    resume.set()
+                    pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    resume.set()
+                if listener_error:
+                    raise RuntimeError("application listener failed")
+
+        config = MaintNotificationsConfig(
+            enabled=True,
+            proactive_reconnect=False,
+            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+        )
+        handler = MaintNotificationsPoolHandler(pool, config)
+        pool._maint_notifications_pool_handler = handler
+        owner.maint_notifications_config = config
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        owner.set_maint_notifications_pool_handler_for_connection(handler)
+        real_can_read = owner._conn.can_read
+
+        def handle_push(notification):
+            owner._conn._maint_notifications_pool_handler.handle_notification(
+                notification
+            )
+            pushes.append(notification.id)
+
+        owner._conn._parser.set_node_moving_push_handler(handle_push)
+
+        def can_read(*args, **kwargs):
+            if threading.current_thread() is reader and not draining.is_set():
+                draining.set()
+                assert resume.wait(5)
+            return real_can_read(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"value"
+                borrower.send_command("PING")
+                assert borrower.read_response() == b"PONG"
+            except BaseException as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read, daemon=True)
+        try:
+            # Run the real scheduled wrapper deterministically, without waiting
+            # for a wall-clock TTL or changing its lock/cancellation semantics.
+            with (
+                patch("redis.maint_notifications.threading.Timer") as timer,
+                # AF_UNIX socket pairs have no IP address to match against.
+                patch.object(owner._conn, "getpeername", return_value="127.0.0.1"),
+            ):
+                handler.handle_notification(first)
+                expire = timer.call_args.args[1]
+                server.sendall(b">4\r\n+MOVING\r\n:72\r\n:60\r\n_\r\n")
+                with patch.object(owner._conn, "can_read", side_effect=can_read):
+                    reader.start()
+                    assert draining.wait(3)
+                    if cleanup == "timer":
+                        expire()
+                    elif cleanup == "direct":
+                        assert handler.handle_node_moved_notification(first)
+                    else:
+                        handler.cancel_scheduled_tasks()
+                    reader.join(3)
+                    assert not reader.is_alive()
+                    assert not errors
+                    assert len(events) == 1
+                    assert not owner.is_connected
+                    assert pushes == [72]
+            r2.set(key, "new")
+            if peers.cache.size:
+                assert borrower.can_read(timeout=1)
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"new"
+        finally:
+            resume.set()
+            if reader.ident is not None:
+                reader.join(5)
+            handler.cancel_scheduled_tasks()
+            server.close()
+            client.close()
+            peers.release(borrower)
+            peers.disconnect()
+
     def test_own_cache_hit_drains_once_and_observes_invalidations(self, pool, r2):
         key = str(uuid.uuid4())
         r2.set(key, "old")

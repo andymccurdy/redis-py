@@ -52,6 +52,226 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("push_phase", ["send", "response"])
+    @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
+    def test_idle_auth_defers_smigrated_checkout(self, pool, r2, push_phase, outcome):
+        auth_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        owner = auth_pool.get_connection()
+        borrower = pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        auth_pool.release(owner)
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        server.settimeout(3)
+        # AuthenticationError closes the connection. Supply a fresh transport
+        # for the real topology exchange after that error; handshake behavior
+        # is covered separately by the Sentinel reconnect test.
+        topology_client, topology_server = socket.socketpair()
+        topology_server.settimeout(3)
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        r2.set(key, "new")
+        node = ClusterNode(
+            owner.host, owner.port, redis_connection=Redis(connection_pool=auth_pool)
+        )
+        with patch.object(NodesManager, "initialize"):
+            manager = NodesManager(
+                [node],
+                cache=pool.cache,
+                **{
+                    k: v
+                    for k, v in pool.connection_kwargs.items()
+                    if k not in ("host", "port", "maint_notifications_config")
+                },
+            )
+        manager.nodes_cache = {node.name: node}
+        handler = OSSMaintNotificationsHandler(
+            Mock(nodes_manager=manager), MaintNotificationsConfig()
+        )
+        owner._conn._parser.set_oss_cluster_maint_push_handler(
+            handler.handle_notification
+        )
+        push = (
+            b">3\r\n+SMIGRATED\r\n:84\r\n*1\r\n*3\r\n+"
+            + node.name.encode()
+            + b"\r\n+"
+            + node.name.encode()
+            + b"\r\n+0-16383\r\n"
+        )
+        slots = (
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n+"
+            + node.host.encode()
+            + b"\r\n:"
+            + str(node.port).encode()
+            + b"\r\n+node-id\r\n"
+        )
+        token = Mock()
+        token.try_get.return_value = "default"
+        token.get_value.return_value = "test-token"
+        commands = [
+            b"".join(owner._conn.pack_command(*args))
+            for args in [("AUTH", "default", "test-token"), ("CLUSTER SLOTS",)]
+        ]
+        received, errors = [], []
+        real_acquire, real_read = owner._acquire, owner.read_response
+        real_connect = owner.connect
+
+        def connect():
+            if outcome == "auth_error" and not owner.is_connected:
+                owner._conn._sock = topology_client
+                owner._conn._parser.on_connect(owner._conn)
+            else:
+                real_connect()
+
+        class Cancelled(BaseException):
+            pass
+
+        class NestedAuthCheckout(BaseException):
+            pass
+
+        def acquire():
+            # Bound the old implementation's wait on this call's own AUTH
+            # claim; the fixed path still performs the real nested checkout.
+            if owner._idle_maintenance:
+                raise NestedAuthCheckout("topology checkout owns idle AUTH")
+            assert pool.cache.size == 0
+            assert (
+                owner._conn._parser.oss_cluster_maint_push_handler_func
+                == handler.handle_notification
+            )
+            return real_acquire()
+
+        def read(*args, **kwargs):
+            response = real_read(*args, **kwargs)
+            if outcome == "cancel" and owner._idle_maintenance:
+                raise Cancelled
+            return response
+
+        def serve():
+            try:
+                for index, expected in enumerate(commands):
+                    transport = (
+                        topology_server
+                        if index == 1 and outcome == "auth_error"
+                        else server
+                    )
+                    data = b""
+                    while len(data) < len(expected):
+                        chunk = transport.recv(len(expected) - len(data))
+                        if not chunk:
+                            return
+                        data += chunk
+                    assert data == expected
+                    received.append(data)
+                    if index == 0:
+                        reply = (
+                            b"-WRONGPASS invalid token\r\n"
+                            if outcome == "auth_error"
+                            else b"+OK\r\n"
+                        )
+                        server.sendall(
+                            (push if push_phase == "response" else b"") + reply
+                        )
+                    else:
+                        transport.sendall(push + slots)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        try:
+            if push_phase == "send":
+                server.sendall(push)
+            worker.start()
+            with (
+                patch.object(owner, "connect", side_effect=connect),
+                patch.object(owner, "_acquire", side_effect=acquire),
+                patch.object(owner, "read_response", side_effect=read),
+            ):
+                if outcome == "success":
+                    auth_pool.re_auth_callback(token)
+                else:
+                    with pytest.raises(
+                        AuthenticationError if outcome == "auth_error" else Cancelled
+                    ):
+                        auth_pool.re_auth_callback(token)
+            worker.join(3)
+            assert not worker.is_alive() and not errors
+            assert received == commands
+            if outcome == "auth_error":
+                assert client.fileno() == -1
+                assert owner._conn._sock is topology_client
+            assert not owner._idle_maintenance and not owner._in_use
+            assert len(manager.slots_cache) == 16384
+            assert manager.default_node.redis_connection.connection_pool is auth_pool
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"new"
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            owner.disconnect()
+            server.close()
+            client.close()
+            topology_server.close()
+            topology_client.close()
+            if worker.ident is not None:
+                worker.join(5)
+            pool.release(borrower)
+            auth_pool.disconnect()
+
+    @pytest.mark.parametrize("maintenance", [False, True])
+    def test_release_reconnect_completion_runs_after_socket_close(
+        self, pool, maintenance
+    ):
+        pool.update_maint_notifications_config(MaintNotificationsConfig(enabled="auto"))
+        owner = pool.get_connection()
+        errors, events = [], []
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                try:
+                    assert not owner.is_connected, "release completion precedes close"
+                    unlocked = []
+
+                    def probe():
+                        acquired = pool._lock.acquire(blocking=False)
+                        unlocked.append(acquired)
+                        if acquired:
+                            pool._lock.release()
+
+                    worker = threading.Thread(target=probe, daemon=True)
+                    worker.start()
+                    worker.join(2)
+                    assert unlocked == [True], "release completion holds pool lock"
+                    events.append(event)
+                    pool.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        owner.maint_notifications_config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+        )
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        owner.mark_for_reconnect()
+        if isinstance(pool, BlockingConnectionPool):
+            pool.set_in_maintenance(maintenance)
+        try:
+            pool.release(owner)
+            assert not errors
+            assert len(events) == 1 and events[0].connection is owner
+            assert not owner.is_connected and not owner._in_use
+            reused = pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            pool.release(reused)
+        finally:
+            if isinstance(pool, BlockingConnectionPool):
+                pool.set_in_maintenance(False)
+
     @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
     def test_smigrated_refresh_reuses_owner_after_peer_drain(self, pool, r2, outcome):
         owner = pool.get_connection()

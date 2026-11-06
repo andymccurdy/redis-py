@@ -559,6 +559,124 @@ def test_cached_master_change_during_release(
         new_master.close()
 
 
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.parametrize("tracking_mode", list(TrackingMode))
+@pytest.mark.parametrize(
+    "parser_class",
+    [
+        _RESP3Parser,
+        pytest.param(
+            _HiredisParser,
+            marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
+        ),
+    ],
+)
+def test_cached_sentinel_idle_auth_reconnect_after_failover(
+    r2, stack_url, outcome, tracking_mode, parser_class
+):
+    new_master = Redis.from_url(
+        stack_url, db=r2.connection_pool.connection_kwargs.get("db", 0)
+    )
+    addresses = [
+        (
+            client.connection_pool.connection_kwargs["host"],
+            client.connection_pool.connection_kwargs.get("port", 6379),
+        )
+        for client in [r2, new_master]
+    ]
+    assert addresses[0] != addresses[1]
+    manager = mock.Mock()
+    manager.discover_master.return_value = addresses[0]
+    kwargs = dict(r2.connection_pool.connection_kwargs)
+    kwargs.update(
+        protocol=3,
+        parser_class=parser_class,
+        decode_responses=False,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
+    pool = SentinelConnectionPool(
+        "mymaster",
+        manager,
+        max_connections=1,
+        cache_config=CacheConfig(
+            tracking_mode=tracking_mode,
+            cache_predicate=None
+            if tracking_mode is TrackingMode.PLAIN
+            else lambda *_: True,
+        ),
+        **kwargs,
+    )
+    key = str(uuid.uuid4())
+    r2.set(key, "old-master")
+    new_master.set(key, "new-master")
+    owner = pool.get_connection()
+    owner.send_command("GET", key, keys=[key])
+    assert owner.read_response() == b"old-master"
+    pool.release(owner)
+    owner.disconnect()
+    manager.discover_master.return_value = addresses[1]
+    token = mock.Mock()
+    token.try_get.return_value = (
+        "missing-" + str(uuid.uuid4()) if outcome == "error" else "default"
+    )
+    token.get_value.return_value = ""
+    real_send, real_read = owner._conn.send_command, owner._conn.read_response
+    auth_sent = False
+
+    class Cancelled(BaseException):
+        pass
+
+    class RecursiveIdleWait(BaseException):
+        pass
+
+    def send(*args, **kwargs):
+        nonlocal auth_sent
+        result = real_send(*args, **kwargs)
+        if args and args[0] == "AUTH":
+            auth_sent = True
+        return result
+
+    def read(*args, **kwargs):
+        response = real_read(*args, **kwargs)
+        if auth_sent and outcome == "cancel":
+            raise Cancelled
+        return response
+
+    try:
+        with (
+            mock.patch.object(
+                owner._idle_maintenance_done,
+                "wait",
+                side_effect=RecursiveIdleWait("free disconnect waited on its own AUTH"),
+            ),
+            mock.patch.object(owner._conn, "send_command", side_effect=send),
+            mock.patch.object(owner._conn, "read_response", side_effect=read),
+        ):
+            if outcome == "success":
+                pool.re_auth_callback(token)
+            else:
+                with pytest.raises(
+                    exceptions.AuthenticationError if outcome == "error" else Cancelled
+                ):
+                    pool.re_auth_callback(token)
+        assert auth_sent
+        assert not owner._idle_maintenance and not owner._in_use
+        assert (owner.host, owner.port) == addresses[1]
+        assert pool.owns_connection(owner)
+        assert pool._created_connections == 1
+        assert pool._available_connections == [owner]
+        with Redis(connection_pool=pool) as client:
+            assert client.get(key) == b"new-master"
+            assert client.ping()
+    finally:
+        pool.disconnect()
+        new_master.delete(key)
+        new_master.close()
+
+
 @pytest.mark.onlynoncluster
 def test_replica_round_robin(cluster, sentinel, master_ip):
     cluster.slaves = [

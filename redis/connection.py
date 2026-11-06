@@ -2717,6 +2717,11 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # Reserve completion's position before checkout can start a new window,
         # but invoke listeners only after closing the socket and releasing ownership.
         with _defer_maintenance_events(), self._in_use_lock:
+            # Idle AUTH is active socket I/O even while listed as available.
+            # Sentinel discovery can reenter free-only disconnect from that
+            # AUTH's reconnect, so exclude active owners before waiting.
+            if not inuse_connections and self._in_use:
+                return
             while self._idle_maintenance:
                 self._idle_maintenance_done.wait()
             if inuse_connections or not self._in_use:
@@ -4653,45 +4658,71 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def re_auth_callback(self, token: TokenInterface):
         first_error = None
-        # Parser callbacks may close the pool. Release idle ownership and the
-        # pool lock before dispatching them, including when AUTH fails.
-        with (
-            _defer_maintenance_events() if self.cache is not None else nullcontext(),
-            self._lock,
-        ):
-            for conn in self._available_connections:
-                cached = isinstance(conn, CacheProxyConnection)
-                if cached and not conn._try_acquire_idle():
-                    conn.set_re_auth_token(token)
-                    continue
-                try:
-                    conn.retry.call_with_retry(
-                        lambda: conn.send_command(
-                            "AUTH", token.try_get("oid"), token.get_value()
-                        ),
-                        lambda error: self._mock(error),
-                    )
-                    conn.retry.call_with_retry(
-                        lambda: conn.read_response(),
-                        lambda error: self._mock(error),
-                        is_retryable=lambda error: not isinstance(
-                            error, AuthenticationError
-                        ),
-                    )
-                    conn.set_re_auth_token(None)
-                except AuthenticationError:
-                    raise
-                except Exception as e:
-                    if first_error is None:
-                        first_error = e
-                finally:
-                    if cached:
-                        conn._release_idle()
-            for conn in self._in_use_connections:
-                if conn in self._releasing_connections:
-                    self._releasing_connections[conn] = token
-                else:
-                    conn.set_re_auth_token(token)
+        pending_topology = []
+        # Parser callbacks may close the pool or check out this same connection
+        # for CLUSTER SLOTS. Finish AUTH and release idle ownership and the pool
+        # lock before invoking them, including when AUTH fails.
+        with _defer_maintenance_events() if self.cache is not None else nullcontext():
+            try:
+                with self._lock:
+                    for conn in self._available_connections:
+                        cached = isinstance(conn, CacheProxyConnection)
+                        if cached and not conn._try_acquire_idle():
+                            conn.set_re_auth_token(token)
+                            continue
+                        parser = (
+                            getattr(conn._conn, "_parser", None) if cached else None
+                        )
+                        handler = getattr(
+                            parser, "oss_cluster_maint_push_handler_func", None
+                        )
+                        if handler is not None:
+
+                            def defer(notification, handler=handler):
+                                pending_topology.append((handler, notification))
+                                # Do not expose old entries between releasing
+                                # the AUTH claim and refreshing the slot map.
+                                self.cache.flush()
+
+                            parser.set_oss_cluster_maint_push_handler(defer)
+                        try:
+                            conn.retry.call_with_retry(
+                                lambda: conn.send_command(
+                                    "AUTH", token.try_get("oid"), token.get_value()
+                                ),
+                                lambda error: self._mock(error),
+                            )
+                            conn.retry.call_with_retry(
+                                lambda: conn.read_response(),
+                                lambda error: self._mock(error),
+                                is_retryable=lambda error: not isinstance(
+                                    error, AuthenticationError
+                                ),
+                            )
+                            conn.set_re_auth_token(None)
+                        except AuthenticationError:
+                            raise
+                        except Exception as e:
+                            if first_error is None:
+                                first_error = e
+                        finally:
+                            if handler is not None:
+                                parser.set_oss_cluster_maint_push_handler(handler)
+                            if cached:
+                                conn._release_idle()
+                    for conn in self._in_use_connections:
+                        if conn in self._releasing_connections:
+                            self._releasing_connections[conn] = token
+                        else:
+                            conn.set_re_auth_token(token)
+            finally:
+                for handler, notification in pending_topology:
+                    try:
+                        handler(notification)
+                    except Exception as e:
+                        # Match inline parser error handling; cancellation
+                        # still propagates after ownership has been released.
+                        logger.error(f"Error handling {notification}: {e}")
         if first_error is not None:
             raise first_error
 
@@ -5050,6 +5081,7 @@ class BlockingConnectionPool(ConnectionPool):
         # Make sure we haven't changed process.
         self._checkpid()
 
+        deferred_events = None
         try:
             if self._in_maintenance:
                 self._lock.acquire()
@@ -5059,6 +5091,12 @@ class BlockingConnectionPool(ConnectionPool):
                 # to the pool. instead add a None value which is a placeholder
                 # that will cause the pool to recreate the connection if
                 # its needed.
+                if self.cache is not None:
+                    # Keep the ordinary return path free of a deferral scope.
+                    # Disconnect can complete maintenance, whose listeners must
+                    # wait for queue publication and the pool lock below.
+                    deferred_events = _defer_maintenance_events()
+                    deferred_events.__enter__()
                 connection.disconnect()
                 self.pool.put_nowait(None)
                 # Subclasses can override owns_connection() with a comparison
@@ -5084,13 +5122,22 @@ class BlockingConnectionPool(ConnectionPool):
                         "Disconnecting released connection marked for reconnect: "
                         f"{connection}, {connection.extract_connection_details()}"
                     )
+                if self.cache is not None:
+                    # Keep the ordinary return path free of a deferral scope.
+                    # Disconnect can complete maintenance, whose listeners must
+                    # wait for queue publication and the pool lock below.
+                    deferred_events = _defer_maintenance_events()
+                    deferred_events.__enter__()
                 connection.disconnect()
             # Put the connection back into the pool.
-            if isinstance(connection, CacheProxyConnection):
-                connection._in_use = False
             pool_name = get_pool_name(self)
             try:
-                self.pool.put_nowait(connection)
+                if isinstance(connection, CacheProxyConnection):
+                    with connection._in_use_lock:
+                        connection._in_use = False
+                        self.pool.put_nowait(connection)
+                else:
+                    self.pool.put_nowait(connection)
 
                 # Record state transition: USED -> IDLE
                 record_connection_count(
@@ -5112,6 +5159,8 @@ class BlockingConnectionPool(ConnectionPool):
                 except Exception:
                     pass
                 self._locked = False
+            if deferred_events is not None:
+                deferred_events.__exit__(*sys.exc_info())
 
     def disconnect(self, inuse_connections: bool = True):
         """

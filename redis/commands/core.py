@@ -2875,6 +2875,65 @@ class BasicKeyCommands(CommandsProtocol):
         return self.execute_command("BITPOS", *params, keys=[key])
 
     @overload
+    def bitrangeintarray(
+        self: SyncClientProtocol,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def bitrangeintarray(
+        self: AsyncClientProtocol,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def bitrangeintarray(
+        self,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Return the offsets of the set bits in the value of ``key``, in
+        ascending order, between ``start`` and ``end`` inclusive. The range is
+        interpreted as in BITCOUNT, with negative indexes counted from the end.
+        ``mode`` is ``"BYTE"`` or ``"BIT"`` (case-insensitive) and sets
+        whether ``start`` and ``end`` count bytes or bits. When ``mode`` is
+        not set, the server uses ``"BYTE"``. Any other value is rejected by
+        the server. The returned offsets are bit offsets in both modes.
+
+        ``limit`` returns only the lowest ``limit`` offsets of the range.
+        In byte mode the server completes the byte that holds the last
+        offset, so the reply can hold up to 7 offsets more than ``limit``.
+        ``limit=0`` returns an empty list.
+
+        ``zeros`` returns the offsets of the clear bits instead. Unlike
+        BITPOS, no clear bits are assumed past the end of the value.
+
+        For more information, see https://redis.io/commands/bitrangeintarray
+        """
+        params = [key, start, end]
+        if mode is not None:
+            params.append(mode)
+        if limit is not None:
+            params.extend(["LIMIT", limit])
+        if zeros:
+            params.append("ZEROS")
+        return self.execute_command("BITRANGEINTARRAY", *params, keys=[key])
+
+    @overload
     def copy(
         self: SyncClientProtocol,
         source: str,

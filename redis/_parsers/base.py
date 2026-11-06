@@ -373,6 +373,9 @@ class PushNotificationsParser(Protocol):
     node_moving_push_handler_func: Optional[Callable] = None
     maintenance_push_handler_func: Optional[Callable] = None
     oss_cluster_maint_push_handler_func: Optional[Callable] = None
+    # Socket owners can postpone topology work without replacing the registered
+    # handler, which a concurrent pool configuration update may change.
+    _deferred_oss_cluster_handler: Optional[Callable] = None
 
     def handle_pubsub_push_response(self, response):
         """Handle pubsub push responses"""
@@ -432,8 +435,12 @@ class PushNotificationsParser(Protocol):
                 if notification is not None:
                     if self.maintenance_push_handler_func:
                         self.maintenance_push_handler_func(notification)
-                    if self.oss_cluster_maint_push_handler_func:
-                        self.oss_cluster_maint_push_handler_func(notification)
+                    handler = self.oss_cluster_maint_push_handler_func
+                    if handler:
+                        if self._deferred_oss_cluster_handler is not None:
+                            self._deferred_oss_cluster_handler(handler, notification)
+                        else:
+                            handler(notification)
         except Exception as e:
             logger.error(
                 "Error handling {} message ({}): {}".format(msg_type, response, e)

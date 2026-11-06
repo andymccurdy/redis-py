@@ -2,6 +2,7 @@ from typing import List
 
 from redis.client import Redis
 from redis.event import EventListenerInterface, OnCommandsFailEvent
+from redis.maint_notifications import _defer_maintenance_events
 from redis.multidb.database import SyncDatabase
 from redis.multidb.failure_detector import FailureDetector
 
@@ -82,7 +83,9 @@ class CloseConnectionOnActiveDatabaseChanged(EventListenerInterface):
         # is either marked for reconnect or disconnected while still free. The
         # maintenance flag makes BlockingConnectionPool honour that lock too.
         set_in_maintenance = getattr(pool, "set_in_maintenance", None)
-        with pool._get_pool_lock():
+        # Completion listeners may close this pool. Let its outer lock and
+        # maintenance flag go before dispatch, as in topology cleanup.
+        with _defer_maintenance_events(), pool._get_pool_lock():
             if set_in_maintenance is not None:
                 set_in_maintenance(True)
             try:

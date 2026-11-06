@@ -515,13 +515,19 @@ class MaintNotificationsAbstractConnection:
 
             return deferred_handler
 
+        previous_oss_defer = parser._deferred_oss_cluster_handler
+
+        def defer_oss(handler, notification):
+            if previous_oss_defer is not None:
+                deferred.append(
+                    (lambda n: previous_oss_defer(handler, n), notification)
+                )
+            else:
+                deferred.append((handler, notification))
+
         handlers = (
             (parser.node_moving_push_handler_func, parser.set_node_moving_push_handler),
             (parser.maintenance_push_handler_func, parser.set_maintenance_push_handler),
-            (
-                parser.oss_cluster_maint_push_handler_func,
-                parser.set_oss_cluster_maint_push_handler,
-            ),
             # Client-side cache invalidations are pushes too; the ones on a
             # connection that has to be reconnected are covered by the cache
             # flush its disconnect performs
@@ -533,6 +539,7 @@ class MaintNotificationsAbstractConnection:
         for handler, set_handler in handlers:
             if handler is not None:
                 set_handler(defer(handler))
+        parser._deferred_oss_cluster_handler = defer_oss
 
         alive = False
         deadline = time.monotonic() + PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT
@@ -561,6 +568,7 @@ class MaintNotificationsAbstractConnection:
         except ResponseError as e:
             raise ConnectionError("Connection has data") from e
         finally:
+            parser._deferred_oss_cluster_handler = previous_oss_defer
             for handler, set_handler in handlers:
                 set_handler(handler)
             if not alive and deferred and logger.isEnabledFor(logging.DEBUG):
@@ -2916,7 +2924,6 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # and invalidations inline while the parser is exclusively owned.
         with _defer_maintenance_events():
             pending = None
-            handler = None
             try:
                 with owner._in_use_lock:
                     if not owner._conn.is_connected:
@@ -2925,25 +2932,25 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                         # Hits neither touch a busy socket nor extend its grace.
                         return time.monotonic() < owner._busy_cache_deadline
                     parser = getattr(owner._conn, "_parser", None)
-                    handler = getattr(
-                        parser, "oss_cluster_maint_push_handler_func", None
+                    previous_defer = getattr(
+                        parser, "_deferred_oss_cluster_handler", None
                     )
-                    if handler is not None:
+                    if parser is not None:
                         pending = []
 
-                        def defer(notification):
-                            pending.append(notification)
+                        def defer(handler, notification):
+                            pending.append((handler, notification))
                             # A removed node's entries must not be reused in
                             # the gap between releasing ownership and refresh.
                             with self._cache_lock:
                                 self._cache.flush()
 
-                        parser.set_oss_cluster_maint_push_handler(defer)
+                        parser._deferred_oss_cluster_handler = defer
                     try:
                         self._drain_invalidations(owner._conn)
                     finally:
-                        if handler is not None:
-                            parser.set_oss_cluster_maint_push_handler(handler)
+                        if parser is not None:
+                            parser._deferred_oss_cluster_handler = previous_defer
                         # A removed node may never be checked out again. Finish
                         # cleanup that could not close the socket mid-drain,
                         # including when parsing fails or is interrupted.
@@ -2951,7 +2958,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                             owner.disconnect()
                     return True
             finally:
-                for notification in pending or ():
+                for handler, notification in pending or ():
                     try:
                         handler(notification)
                     except Exception as e:
@@ -4673,18 +4680,18 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                         parser = (
                             getattr(conn._conn, "_parser", None) if cached else None
                         )
-                        handler = getattr(
-                            parser, "oss_cluster_maint_push_handler_func", None
+                        previous_defer = getattr(
+                            parser, "_deferred_oss_cluster_handler", None
                         )
-                        if handler is not None:
+                        if parser is not None:
 
-                            def defer(notification, handler=handler):
+                            def defer(handler, notification):
                                 pending_topology.append((handler, notification))
                                 # Do not expose old entries between releasing
                                 # the AUTH claim and refreshing the slot map.
                                 self.cache.flush()
 
-                            parser.set_oss_cluster_maint_push_handler(defer)
+                            parser._deferred_oss_cluster_handler = defer
                         try:
                             conn.retry.call_with_retry(
                                 lambda: conn.send_command(
@@ -4706,8 +4713,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                             if first_error is None:
                                 first_error = e
                         finally:
-                            if handler is not None:
-                                parser.set_oss_cluster_maint_push_handler(handler)
+                            if parser is not None:
+                                parser._deferred_oss_cluster_handler = previous_defer
                             if cached:
                                 conn._release_idle()
                     for conn in self._in_use_connections:

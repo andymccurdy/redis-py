@@ -31,6 +31,10 @@ from redis.maint_notifications import (
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
 )
+from redis.multidb.event import (
+    ActiveDatabaseChanged,
+    CloseConnectionOnActiveDatabaseChanged,
+)
 from redis.utils import HIREDIS_AVAILABLE
 
 from .conftest import skip_if_server_version_lt
@@ -52,6 +56,127 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("initial_handler", [False, True])
+    @pytest.mark.parametrize("drain_mode", ["direct", "pending"])
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_idle_drain_preserves_concurrent_handler_update(
+        self, pool, r2, initial_handler, drain_mode, outcome
+    ):
+        config = MaintNotificationsConfig(enabled="auto")
+        old_handler = Mock(spec=OSSMaintNotificationsHandler, config=config)
+        replacement = Mock(spec=OSSMaintNotificationsHandler, config=config)
+        pool.update_maint_notifications_config(
+            config, old_handler if initial_handler else None
+        )
+        owner, borrower = pool.get_connection(), pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        pool.release(owner)
+        r2.set(key, "new")
+        owner._conn.disconnect()
+        client_socket, server = socket.socketpair()
+        owner._conn._sock = client_socket
+        owner._conn._parser.on_connect(owner._conn)
+        draining, updated = threading.Event(), threading.Event()
+        errors, delivered = [], []
+        real_disconnect = owner._disconnect_from_pool
+        real_drain = borrower._drain_invalidations
+        parser = owner._conn._parser
+
+        class Cancelled(BaseException):
+            pass
+
+        def receive(name, notification):
+            acquired = owner._in_use_lock.acquire(blocking=False)
+            if acquired:
+                owner._in_use_lock.release()
+            else:
+                errors.append("topology callback still owns the idle socket")
+            delivered.append((name, notification.id))
+
+        old_handler.handle_notification.side_effect = lambda n: receive("old", n)
+        replacement.handle_notification.side_effect = lambda n: receive("new", n)
+
+        def disconnect(*args, **kwargs):
+            # The public update has installed the new handler and released the
+            # pool lock. Its disconnect now waits for the peer's idle drain.
+            updated.set()
+            return real_disconnect(*args, **kwargs)
+
+        def reconfigure():
+            try:
+                assert draining.wait(3)
+                pool.update_maint_notifications_config(config, replacement)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def drain(conn):
+            if conn is not owner._conn:
+                return real_drain(conn)
+            if initial_handler:
+                server.sendall(b">3\r\n+SMIGRATED\r\n:91\r\n*0\r\n")
+                real_drain(conn)
+            draining.set()
+            assert updated.wait(3)
+            # Notifications read after replacement must use the new handler,
+            # but still wait for the socket claim to end.
+            server.sendall(b">3\r\n+SMIGRATED\r\n:92\r\n*0\r\n")
+            if drain_mode == "pending":
+                conn.handle_pending_push_notifications()
+            else:
+                real_drain(conn)
+            if outcome == "error":
+                raise RuntimeError("drain failed")
+            if outcome == "cancel":
+                raise Cancelled
+
+        worker = threading.Thread(target=reconfigure, daemon=True)
+        try:
+            with (
+                patch.object(owner, "_disconnect_from_pool", side_effect=disconnect),
+                patch.object(borrower, "_drain_invalidations", side_effect=drain),
+            ):
+                worker.start()
+                if outcome == "success":
+                    borrower.send_command("GET", key, keys=[key])
+                    assert borrower.read_response() == b"new"
+                else:
+                    with pytest.raises(
+                        RuntimeError if outcome == "error" else Cancelled
+                    ):
+                        borrower.send_command("GET", key, keys=[key])
+                worker.join(5)
+                assert not worker.is_alive()
+            assert (
+                parser.oss_cluster_maint_push_handler_func
+                == replacement.handle_notification
+            )
+            assert owner._conn._oss_cluster_maint_notifications_handler is replacement
+            assert not errors
+            assert delivered == ([("old", 91)] if initial_handler else []) + [
+                ("new", 92)
+            ]
+            reused = pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            pool.release(reused)
+            parser.handle_push_response([b"SMIGRATED", 93, []])
+            assert delivered[-1] == ("new", 93)
+            assert not errors
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"new"
+        finally:
+            draining.set()
+            updated.set()
+            if worker.ident is not None:
+                worker.join(5)
+            server.close()
+            client_socket.close()
+            pool.release(borrower)
+
     @pytest.mark.parametrize("push_phase", ["send", "response"])
     @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
     def test_idle_auth_defers_smigrated_checkout(self, pool, r2, push_phase, outcome):
@@ -414,7 +539,9 @@ class TestCachePoolOwnership:
             peers.release(borrower)
             peers.disconnect()
 
-    @pytest.mark.parametrize("cleanup", ["direct", "removed", "queried"])
+    @pytest.mark.parametrize(
+        "cleanup", ["direct", "removed", "queried", "multidb", "multidb_cluster"]
+    )
     @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
     def test_topology_cleanup_releases_locks_before_completion_listener(
         self, pool, cleanup, outcome
@@ -463,6 +590,7 @@ class TestCachePoolOwnership:
                         "completion listener holds topology or pool lock"
                     )
                     assert not owner._idle_maintenance and not owner.is_connected
+                    assert not getattr(pool, "_in_maintenance", False)
                     events.append(event)
                     pool.close()
                 except BaseException as exc:
@@ -495,6 +623,16 @@ class TestCachePoolOwnership:
                 def clean():
                     if cleanup == "direct":
                         NodesManager._free_pool_connections(pool)
+                    elif cleanup.startswith("multidb"):
+                        client = (
+                            seed
+                            if cleanup == "multidb"
+                            else Mock(nodes_manager=manager)
+                        )
+                        manager.nodes_cache = {node.name: node}
+                        CloseConnectionOnActiveDatabaseChanged().listen(
+                            ActiveDatabaseChanged(Mock(client=client), Mock(), Mock())
+                        )
                     else:
                         manager.initialize()
 

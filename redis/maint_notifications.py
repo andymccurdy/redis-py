@@ -7,7 +7,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -1258,6 +1258,14 @@ class MaintNotificationsPoolHandler:
             return kwargs is not None
 
 
+def _get_maintenance_state_lock(connection):
+    # An idle cached owner can process pushes outside the pool lock. Serialize
+    # its state/timeout transition with MOVING updates, without holding this
+    # lock across the parser's socket I/O or application event listeners.
+    handler = getattr(connection, "_maint_notifications_pool_handler", None)
+    return handler.pool._lock if handler is not None else nullcontext()
+
+
 class MaintNotificationsConnectionHandler:
     # 1 = "starting maintenance" notifications, 0 = "completed maintenance" notifications
     _NOTIFICATION_TYPES: dict[type["MaintenanceNotification"], int] = {
@@ -1328,89 +1336,94 @@ class MaintNotificationsConnectionHandler:
     def handle_maintenance_start_notification(
         self, maintenance_state: MaintenanceState, notification: MaintenanceNotification
     ):
-        add_debug_log_for_notification(self.connection, notification)
+        with _defer_maintenance_events(), _get_maintenance_state_lock(self.connection):
+            add_debug_log_for_notification(self.connection, notification)
 
-        if _should_skip_connection_timeout_update(
-            self.connection.maintenance_state, self.config
-        ):
-            return
+            if _should_skip_connection_timeout_update(
+                self.connection.maintenance_state, self.config
+            ):
+                return
 
-        self.connection.maintenance_state = maintenance_state
-        self.connection.set_tmp_settings(
-            tmp_relaxed_timeout=self.config.relaxed_timeout
-        )
-        # extend the timeout for all created connections
-        self.connection.update_current_socket_timeout(self.config.relaxed_timeout)
-        if isinstance(notification, OSSNodeMigratingNotification):
-            # add the notification id to the set of processed start maint notifications
-            # this is used to skip the unrelaxing of the timeouts if we have received more than
-            # one start notification before the final end notification
-            self.connection.add_maint_start_notification(notification.id)
+            self.connection.maintenance_state = maintenance_state
+            self.connection.set_tmp_settings(
+                tmp_relaxed_timeout=self.config.relaxed_timeout
+            )
+            # extend the timeout for all created connections
+            self.connection.update_current_socket_timeout(self.config.relaxed_timeout)
+            if isinstance(notification, OSSNodeMigratingNotification):
+                # add the notification id to the set of processed start maint notifications
+                # this is used to skip the unrelaxing of the timeouts if we have received more than
+                # one start notification before the final end notification
+                self.connection.add_maint_start_notification(notification.id)
 
-        maint_notification = _get_maintenance_notification_name(notification)
-        record_connection_relaxed_timeout(
-            connection_name=self._get_pool_name(),
-            maint_notification=maint_notification,
-            relaxed=True,
-        )
-
-        _dispatch_maintenance_event(
-            self.config,
-            MaintenanceStartedEvent(
-                connection_pool=self._get_pool(),
-                connection=self.connection,
-                state=maintenance_state,
-                notification=notification,
-                config=self.config,
-            ),
-        )
-
-    def handle_maintenance_completed_notification(self, **kwargs: Any) -> None:
-        # Only reset timeouts if state is not MOVING and relaxed timeouts are enabled
-        if _should_skip_connection_timeout_update(
-            self.connection.maintenance_state, self.config
-        ):
-            return
-
-        # A completion can reach a connection whose start went to another one,
-        # or none at all; only a connection that was relaxed has a start event
-        # to pair the completion with
-        was_relaxed = self.connection.maintenance_state == MaintenanceState.MAINTENANCE
-
-        notification = None
-        if kwargs.get("notification"):
-            notification = kwargs["notification"]
-        add_debug_log_for_notification(
-            self.connection, notification if notification else "MAINTENANCE_COMPLETED"
-        )
-        self.connection.reset_tmp_settings(reset_relaxed_timeout=True)
-        # Maintenance completed - reset the connection
-        # timeouts by providing -1 as the relaxed timeout
-        self.connection.update_current_socket_timeout(-1)
-        self.connection.maintenance_state = MaintenanceState.NONE
-        # reset the sets that keep track of received start maint
-        # notifications and skipped end maint notifications
-        self.connection.reset_received_notifications()
-
-        if notification:
             maint_notification = _get_maintenance_notification_name(notification)
             record_connection_relaxed_timeout(
                 connection_name=self._get_pool_name(),
                 maint_notification=maint_notification,
-                relaxed=False,
+                relaxed=True,
             )
 
-        if was_relaxed:
             _dispatch_maintenance_event(
                 self.config,
-                MaintenanceCompletedEvent(
+                MaintenanceStartedEvent(
                     connection_pool=self._get_pool(),
                     connection=self.connection,
-                    state=MaintenanceState.MAINTENANCE,
+                    state=maintenance_state,
                     notification=notification,
                     config=self.config,
                 ),
             )
+
+    def handle_maintenance_completed_notification(self, **kwargs: Any) -> None:
+        with _defer_maintenance_events(), _get_maintenance_state_lock(self.connection):
+            # Only reset timeouts if state is not MOVING and relaxed timeouts are enabled
+            if _should_skip_connection_timeout_update(
+                self.connection.maintenance_state, self.config
+            ):
+                return
+
+            # A completion can reach a connection whose start went to another one,
+            # or none at all; only a connection that was relaxed has a start event
+            # to pair the completion with
+            was_relaxed = (
+                self.connection.maintenance_state == MaintenanceState.MAINTENANCE
+            )
+
+            notification = None
+            if kwargs.get("notification"):
+                notification = kwargs["notification"]
+            add_debug_log_for_notification(
+                self.connection,
+                notification if notification else "MAINTENANCE_COMPLETED",
+            )
+            self.connection.reset_tmp_settings(reset_relaxed_timeout=True)
+            # Maintenance completed - reset the connection
+            # timeouts by providing -1 as the relaxed timeout
+            self.connection.update_current_socket_timeout(-1)
+            self.connection.maintenance_state = MaintenanceState.NONE
+            # reset the sets that keep track of received start maint
+            # notifications and skipped end maint notifications
+            self.connection.reset_received_notifications()
+
+            if notification:
+                maint_notification = _get_maintenance_notification_name(notification)
+                record_connection_relaxed_timeout(
+                    connection_name=self._get_pool_name(),
+                    maint_notification=maint_notification,
+                    relaxed=False,
+                )
+
+            if was_relaxed:
+                _dispatch_maintenance_event(
+                    self.config,
+                    MaintenanceCompletedEvent(
+                        connection_pool=self._get_pool(),
+                        connection=self.connection,
+                        state=MaintenanceState.MAINTENANCE,
+                        notification=notification,
+                        config=self.config,
+                    ),
+                )
 
 
 class OSSMaintNotificationsHandler:

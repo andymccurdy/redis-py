@@ -85,6 +85,7 @@ from .maint_notifications import (
     OSSMaintNotificationsHandler,
     _defer_maintenance_events,
     _dispatch_maintenance_event,
+    _get_maintenance_state_lock,
 )
 from .observability.attributes import (
     DB_CLIENT_CONNECTION_POOL_NAME,
@@ -452,9 +453,10 @@ class MaintNotificationsAbstractConnection:
         return parser
 
     def _complete_maintenance_on_disconnect(self) -> None:
-        event = self._reset_maintenance_on_disconnect()
-        if event is not None:
-            _dispatch_maintenance_event(event.config, event)
+        with _defer_maintenance_events(), _get_maintenance_state_lock(self):
+            event = self._reset_maintenance_on_disconnect()
+            if event is not None:
+                _dispatch_maintenance_event(event.config, event)
 
     def _reset_maintenance_on_disconnect(self) -> MaintenanceCompletedEvent | None:
         """

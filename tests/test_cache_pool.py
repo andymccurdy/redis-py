@@ -30,6 +30,7 @@ from redis.maint_notifications import (
     NodeMovingNotification,
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
+    _should_skip_connection_timeout_update,
 )
 from redis.multidb.event import (
     ActiveDatabaseChanged,
@@ -56,6 +57,162 @@ from .conftest import skip_if_server_version_lt
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("transition", ["start", "complete", "disconnect"])
+    def test_idle_maintenance_transition_preserves_concurrent_handoff(
+        self, pool, r2, transition
+    ):
+        pool.connection_kwargs.update(socket_timeout=0.1, socket_connect_timeout=0.1)
+        config = MaintNotificationsConfig(enabled="auto", proactive_reconnect=False)
+        pool.update_maint_notifications_config(config)
+        owner, borrower, peer = (
+            pool.get_connection(),
+            pool.get_connection(),
+            pool.get_connection(),
+        )
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        pool.release(owner)
+        sockets = []
+        for conn in (owner, peer):
+            conn._conn.disconnect()
+            client, server = socket.socketpair()
+            sockets.append((client, server))
+            client.settimeout(0.1)
+            conn._conn._sock = client
+            conn._conn._parser.on_connect(conn._conn)
+            # The injected socket bypasses the maintenance handshake.
+            conn._conn._parser.set_node_moving_push_handler(
+                conn._maint_notifications_pool_handler.handle_notification
+            )
+        if transition != "start":
+            owner._maint_notifications_connection_handler.handle_notification(
+                NodeMigratingNotification(101, 60)
+            )
+        checked, attempted, finished = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        blocked, errors = [], []
+        lock = pool._lock
+        reset = owner._conn.reset_tmp_settings
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread() is mover and not attempted.is_set():
+                    acquired = lock.acquire(blocking=False)
+                    blocked.append(not acquired)
+                    attempted.set()
+                    if not acquired:
+                        lock.acquire()
+                else:
+                    lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                lock.release()
+
+        def pause_after_guard():
+            checked.set()
+            assert attempted.wait(5)
+            # If the transition did not reserve the pool's state, force the
+            # handoff to finish before it resumes. Otherwise let it release
+            # that reservation before the waiting handoff can run.
+            if not blocked[0]:
+                assert finished.wait(5)
+
+        def check(state, current_config):
+            result = _should_skip_connection_timeout_update(state, current_config)
+            if threading.current_thread() is reader and not checked.is_set():
+                pause_after_guard()
+            return result
+
+        def reset_settings(*args, **kwargs):
+            if threading.current_thread() is reader and not checked.is_set():
+                pause_after_guard()
+            return reset(*args, **kwargs)
+
+        def move():
+            try:
+                assert checked.wait(5)
+                sockets[1][1].sendall(b">4\r\n+MOVING\r\n:102\r\n:60\r\n_\r\n")
+                peer._conn.read_response(push_request=True)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        def read():
+            try:
+                if transition == "disconnect":
+                    with pytest.raises(InvalidResponse):
+                        borrower.send_command("GET", key, keys=[key])
+                else:
+                    borrower.send_command("GET", key, keys=[key])
+                    assert borrower.read_response() == b"value"
+            except BaseException as exc:
+                errors.append(exc)
+
+        payload = {
+            "start": b">3\r\n+MIGRATING\r\n:101\r\n:60\r\n",
+            "complete": b">2\r\n+MIGRATED\r\n:101\r\n",
+            "disconnect": b"?invalid\r\n",
+        }[transition]
+        reader = threading.Thread(target=read, daemon=True)
+        mover = threading.Thread(target=move, daemon=True)
+        try:
+            with (
+                patch.object(pool, "_lock", ObservedLock()),
+                patch.object(peer, "getpeername", return_value=None),
+                patch.object(peer._conn, "getpeername", return_value=None),
+                patch(
+                    "redis.maint_notifications._should_skip_connection_timeout_update",
+                    side_effect=check,
+                ),
+                patch.object(
+                    owner._conn, "reset_tmp_settings", side_effect=reset_settings
+                ),
+            ):
+                sockets[0][1].sendall(payload)
+                reader.start()
+                mover.start()
+                reader.join(10)
+                mover.join(10)
+                assert not reader.is_alive() and not mover.is_alive()
+            assert not errors
+            assert checked.is_set() and attempted.is_set()
+            assert (
+                pool.connection_kwargs["maintenance_state"] is MaintenanceState.MOVING
+            )
+            assert owner.maintenance_state is MaintenanceState.MOVING
+            assert owner.socket_timeout == owner.socket_connect_timeout == 10
+            if transition != "disconnect":
+                assert owner._conn._sock.gettimeout() == 10
+                parser = owner._conn._parser
+                assert (
+                    parser._buffer.socket_timeout
+                    if isinstance(parser, _RESP3Parser)
+                    else parser._socket_timeout
+                ) == 10
+            pool._maint_notifications_pool_handler.cancel_scheduled_tasks()
+            assert owner.maintenance_state is MaintenanceState.NONE
+            assert owner.socket_timeout == owner.socket_connect_timeout == 0.1
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            checked.set()
+            for thread in (reader, mover):
+                if thread.ident is not None:
+                    thread.join(10)
+            pool._maint_notifications_pool_handler.cancel_scheduled_tasks()
+            for client, server in sockets:
+                server.close()
+                client.close()
+            pool.release(borrower)
+            pool.release(peer)
+
     @pytest.mark.parametrize("initial_handler", [False, True])
     @pytest.mark.parametrize("drain_mode", ["direct", "pending"])
     @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])

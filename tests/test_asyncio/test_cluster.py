@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from _pytest.fixtures import FixtureRequest
 from redis._parsers import AsyncCommandsParser
+from redis.asyncio.client import _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS
 from redis.asyncio.cluster import (
     ClusterNode,
     NodesManager,
@@ -7003,6 +7004,49 @@ class TestClusterNodeConnectionHandling:
         assert node._free[0] is connection
         assert connection.send_count == 2
 
+    @pytest.mark.parametrize("large", [False, True])
+    async def test_execute_pipeline_offloads_only_large_batches(self, large) -> None:
+        """
+        A batch at the offload threshold is packed in a worker thread, so a large
+        cluster pipeline does not block the event loop (#3416). Smaller batches
+        are packed inline.
+        """
+        node = ClusterNode(default_host, 7000)
+        connection = mock.MagicMock(spec=Connection)
+        connection.is_connected = False
+        connection.should_reconnect.return_value = False
+        connection.pack_commands.return_value = [b"packed"]
+        node._connections.append(connection)
+        node._free.append(connection)
+        count = _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS if large else 2
+        commands = [PipelineCommand(i, "GET", "key") for i in range(count)]
+        to_thread = mock.AsyncMock(return_value=[b"offloaded"])
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "parse_response",
+                new=mock.AsyncMock(return_value=b"value"),
+            ),
+            mock.patch("redis.asyncio.client.asyncio.to_thread", new=to_thread),
+        ):
+            assert await node.execute_pipeline(commands) is False
+
+        if large:
+            to_thread.assert_awaited_once_with(
+                connection.pack_commands, [cmd.args for cmd in commands]
+            )
+            connection.pack_commands.assert_not_called()
+            connection.send_packed_command.assert_awaited_once_with([b"offloaded"])
+        else:
+            to_thread.assert_not_called()
+            connection.pack_commands.assert_called_once_with(
+                [cmd.args for cmd in commands]
+            )
+            connection.send_packed_command.assert_awaited_once_with([b"packed"])
+        assert [cmd.result for cmd in commands] == [b"value"] * count
+        assert node._free[0] is connection
+
     async def test_execute_command_releases_connection_after_disconnect_error(
         self,
     ) -> None:
@@ -8398,6 +8442,55 @@ class TestClusterPipelineMocked:
                     pipe.set("foo", "bar")
                 assert pipe._execution_strategy._pipeline_slots == {keyed_slot}
                 assert pipe._execution_strategy._transaction_has_keyed_slot is True
+        finally:
+            await r.aclose()
+
+    @pytest.mark.parametrize("large", [False, True])
+    async def test_transaction_offloads_only_large_batches(self, large) -> None:
+        """
+        A transaction whose MULTI ... EXEC batch reaches the offload threshold is
+        packed in a worker thread, so it does not block the event loop (#3416).
+        Smaller transactions are packed inline.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            node = r.get_node(host=default_host, port=7000)
+            connection = mock.MagicMock(spec=Connection)
+            connection.should_reconnect.return_value = False
+            connection.pack_commands.return_value = [b"packed"]
+            # Stop the attempt right after the batch is packed
+            connection.send_packed_command.side_effect = RuntimeError("stop")
+            # MULTI and EXEC bring the large batch up to the threshold
+            count = _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS - 2 if large else 2
+            stack = [PipelineCommand(i, "SET", "key", i) for i in range(count)]
+            strategy = r.pipeline(transaction=True)._execution_strategy
+            to_thread = mock.AsyncMock(return_value=[b"offloaded"])
+
+            with (
+                mock.patch.object(
+                    type(strategy),
+                    "_get_client_and_connection_for_transaction",
+                    return_value=(node, connection),
+                ),
+                mock.patch("redis.asyncio.client.asyncio.to_thread", new=to_thread),
+            ):
+                with pytest.raises(RuntimeError, match="stop"):
+                    await strategy._execute_transaction(stack, raise_on_error=True)
+
+            if large:
+                to_thread.assert_awaited_once()
+                assert to_thread.await_args.args[0] == connection.pack_commands
+                packed = to_thread.await_args.args[1]
+                connection.pack_commands.assert_not_called()
+                connection.send_packed_command.assert_awaited_once_with([b"offloaded"])
+            else:
+                to_thread.assert_not_called()
+                connection.pack_commands.assert_called_once()
+                packed = connection.pack_commands.call_args.args[0]
+                connection.send_packed_command.assert_awaited_once_with([b"packed"])
+            assert packed[0] == ("MULTI",)
+            assert packed[1:-1] == [cmd.args for cmd in stack]
+            assert packed[-1] == ("EXEC",)
         finally:
             await r.aclose()
 

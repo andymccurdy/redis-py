@@ -6357,7 +6357,16 @@ class TestHybridSearch(SearchTestsBase):
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")
     @pytest.mark.timeout(60)
-    def test_hybrid_search_query_with_timeout(self, client):
+    def test_hybrid_search_query_with_timeout(self, request, stack_url):
+        # the server checks its 1 ms TIMEOUT only at checkpoints, so a slow runner
+        # can answer later than the default 5 s socket timeout
+        client = _get_client(
+            redis.Redis,
+            request,
+            decode_responses=True,
+            from_url=stack_url,
+            socket_timeout=30,
+        )
         self._create_hybrid_search_timeout_index(client)
         self._add_data_for_hybrid_search_timeout(client)
 

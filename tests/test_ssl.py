@@ -4,6 +4,8 @@ import socket
 import ssl
 import threading
 import time
+import types
+import warnings
 from urllib.parse import unquote, urlparse
 
 import pytest
@@ -619,6 +621,43 @@ class TestOCSPCertificateBinding:
         )
 
         assert _check_certificate(ca, cert, response) is True
+
+    def test_check_certificate_avoids_deprecated_naive_datetimes(self):
+        # The delegated path reads all four timestamps: this_update and
+        # next_update on the response, and the delegate's validity period.
+        from cryptography.utils import CryptographyDeprecationWarning
+        from redis.ocsp import _check_certificate
+
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ca, ca_key = self._make_certificate("Test CA", 1, ca=True)
+        cert, _ = self._make_certificate("node", 111, signing_key=ca_key)
+        responder = self._make_certificate(
+            "Test OCSP", 5, signing_key=ca_key, ocsp_signing=True
+        )
+        response = self._good_response(
+            ca,
+            ca_key,
+            cert,
+            now - datetime.timedelta(days=1),
+            now + datetime.timedelta(days=1),
+            responder=responder,
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CryptographyDeprecationWarning)
+            assert _check_certificate(ca, cert, response) is True
+
+    def test_utc_time_falls_back_to_naive_properties(self):
+        # cryptography releases before 42 / 43 only have the naive properties.
+        from redis.ocsp import _utc_time
+
+        this_update = datetime.datetime(2026, 1, 1, 12, 0)
+        legacy = types.SimpleNamespace(this_update=this_update, next_update=None)
+
+        assert _utc_time(legacy, "this_update") == this_update.replace(
+            tzinfo=datetime.timezone.utc
+        )
+        assert _utc_time(legacy, "next_update") is None
 
     def test_check_certificate_rejects_expired_delegated_responder(self):
         # A delegate is normally exempt from revocation checking, so once its

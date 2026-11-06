@@ -1316,16 +1316,23 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             )
             raise e
         except OSError as e:
-            e = ConnectionError(self._error_message(e))
+            conn_error = ConnectionError(self._error_message(e))
             record_error_count(
                 server_address=getattr(self, "host", None),
                 server_port=getattr(self, "port", None),
                 network_peer_address=getattr(self, "host", None),
                 network_peer_port=getattr(self, "port", None),
-                error_type=e,
+                error_type=conn_error,
                 retry_attempts=actual_retry_attempts[0],
             )
-            raise e
+            # Preserve the original OSError (with its errno) as the cause so
+            # the retry policy can tell unrecoverable failures apart. Clear the
+            # local afterwards so its traceback does not form a reference cycle
+            # with this frame.
+            try:
+                raise conn_error from e
+            finally:
+                conn_error = None
 
         self._sock = sock
         try:
@@ -1626,7 +1633,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 errno = e.args[0]
                 errmsg = e.args[1]
-            raise ConnectionError(f"Error {errno} while writing to socket. {errmsg}.")
+            raise ConnectionError(
+                f"Error {errno} while writing to socket. {errmsg}."
+            ) from e
         except BaseException as e:
             # BaseExceptions can be raised when a socket send operation is not
             # finished, e.g. due to a timeout.  Ideally, a caller could then re-try
@@ -1658,7 +1667,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
         except OSError as e:
             self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     def read_response(
         self,
@@ -1701,7 +1712,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # The parser failed partway through a reply, after the read cursor
             # had already passed bytes it cannot re-interpret. The rewind and
@@ -4069,6 +4082,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # A parent thread may have held the lock at fork time, and the
             # handler reset below takes it to revert an active MOVING.
             self._lock = threading.RLock()
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Record metrics for connections being removed before clearing
         # (only if attributes exist - they won't during __init__)
@@ -4542,6 +4560,11 @@ class BlockingConnectionPool(ConnectionPool):
             # lock and leak it.
             self._in_maintenance = False
             self._locked = False
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Create and fill up a thread safe queue with ``None`` values.
         try:

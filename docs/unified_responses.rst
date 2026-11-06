@@ -281,6 +281,10 @@ TimeSeries
      - Sorted list of dicts becomes a dict with metadata slot.
      - ``[{b"k": [labels, samples]}]``
      - ``{b"k": [labels, metadata, samples]}``
+   * - ``TS.INFO``
+     - ``rules`` list becomes a dict keyed by destination key.
+     - ``[[b"dst", 100, b"AVG", 0]]``
+     - ``{b"dst": [100, b"AVG", 0]}``
    * - ``TS.QUERYINDEX``
      - Key strings are preserved instead of coerced to numbers.
      - ``2``

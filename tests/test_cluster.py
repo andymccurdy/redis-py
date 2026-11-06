@@ -7281,6 +7281,19 @@ class TestClusterPipeline:
             assert len(pipe) == 1
             assert pipe.execute() == [1]
 
+    def test_touch_cross_slot(self, r):
+        """
+        Test that touch over keys in different slots is queued as one command
+        and returns the summed count
+        """
+        r["a"] = 1
+        r["b"] = 2
+        assert r.keyslot("a") != r.keyslot("b")
+        with r.pipeline(transaction=False) as pipe:
+            pipe.touch("a", "b")
+            assert len(pipe) == 1
+            assert pipe.execute() == [2]
+
     def test_unlink_single(self, r):
         """
         Test a single unlink operation

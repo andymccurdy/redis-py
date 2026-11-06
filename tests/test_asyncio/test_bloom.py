@@ -158,6 +158,29 @@ async def test_bf_scandump_and_loadchunk(decoded_r: redis.Redis):
 
 
 @pytest.mark.redismod
+async def test_cf_scandump_and_loadchunk(decoded_r: redis.Redis):
+    # The client decodes responses, but the dumped chunks are binary.
+    await decoded_r.cf().create("myCuckoo", 1000)
+    for x in range(100):
+        await decoded_r.cf().add("myCuckoo", x)
+
+    chunks = []
+    it = 0
+    while True:
+        it, data = await decoded_r.cf().scandump("myCuckoo", it)
+        if it == 0:
+            break
+        assert isinstance(data, bytes)
+        chunks.append((it, data))
+
+    await decoded_r.delete("myCuckoo")
+    for it, data in chunks:
+        await decoded_r.cf().loadchunk("myCuckoo", it, data)
+
+    assert all(await decoded_r.cf().mexists("myCuckoo", *range(100)))
+
+
+@pytest.mark.redismod
 async def test_bf_info(decoded_r: redis.Redis):
     expansion = 4
     # Store a filter

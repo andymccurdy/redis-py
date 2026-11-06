@@ -1906,6 +1906,21 @@ CommandStackT = List[CommandT]
 _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 
 
+async def _pack_pipeline_commands(
+    connection: Connection, commands: Sequence[Iterable[EncodableT]]
+) -> List[bytes]:
+    """Pack commands, off the event loop for large batches.
+
+    Packing is pure CPU work and can block the event loop for seconds on
+    very large pipelines (#3416), but handing a batch to a worker thread
+    also costs a dispatch. Small batches are packed inline; only batches
+    at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
+    """
+    if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
+        return connection.pack_commands(commands)
+    return await asyncio.to_thread(connection.pack_commands, commands)
+
+
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     """
     Pipelines provide a way to transmit multiple commands to the Redis server
@@ -2153,7 +2168,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         pre: CommandT = (("MULTI",), {})
         post: CommandT = (("EXEC",), {})
         cmds = (pre, *commands, post)
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection,
             [args for args, options in cmds if EMPTY_RESPONSE not in options],
         )
@@ -2240,7 +2255,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         preflight = _himport_exec.prepare_wire_commands(fieldsets)
         # build up all commands into a single request to increase network perf
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection, preflight + [args for args, _ in commands]
         )
         await connection.send_packed_command(all_cmds)
@@ -2276,20 +2291,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         if raise_on_error:
             self.raise_first_error(commands, response)
         return response
-
-    async def _pack_commands(
-        self, connection: Connection, commands: Sequence[Iterable[EncodableT]]
-    ) -> List[bytes]:
-        """Pack commands, off the event loop for large batches.
-
-        Packing is pure CPU work and can block the event loop for seconds on
-        very large pipelines (#3416), but handing a batch to a worker thread
-        also costs a dispatch. Small batches are packed inline; only batches
-        at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
-        """
-        if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
-            return connection.pack_commands(commands)
-        return await asyncio.to_thread(connection.pack_commands, commands)
 
     def raise_first_error(self, commands: CommandStackT, response: Iterable[Any]):
         for i, r in enumerate(response):

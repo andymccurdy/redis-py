@@ -49,7 +49,11 @@ from redis._defaults import (
 from redis._parsers import AsyncCommandsParser, Encoder
 from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis.asyncio import _himport_exec
-from redis.asyncio.client import PubSub, ResponseCallbackT
+from redis.asyncio.client import (
+    PubSub,
+    ResponseCallbackT,
+    _pack_pipeline_commands,
+)
 from redis.asyncio.connection import (
     AbstractConnection,
     Connection,
@@ -2697,7 +2701,9 @@ class ClusterNode:
 
                 # Execute command
                 await connection.send_packed_command(
-                    connection.pack_commands(cmd.args for cmd in commands)
+                    await _pack_pipeline_commands(
+                        connection, [cmd.args for cmd in commands]
+                    )
                 )
             except Exception as e:
                 self._mark_free_connections_for_reconnect_on_error(e)
@@ -4873,7 +4879,7 @@ class TransactionStrategy(AbstractStrategy):
             [PipelineCommand(0, "EXEC")],
         )
         commands = [c.args for c in stack if EMPTY_RESPONSE not in c.kwargs]
-        packed_commands = connection.pack_commands(commands)
+        packed_commands = await _pack_pipeline_commands(connection, commands)
 
         # Start timing for observability
         start_time = time.monotonic()

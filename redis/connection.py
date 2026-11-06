@@ -5008,45 +5008,44 @@ class BlockingConnectionPool(ConnectionPool):
 
         # Try and get a connection from the pool. If one isn't available within
         # self.timeout then raise a ``ConnectionError``.
-        connection = None
+        if self._in_maintenance:
+            # Wait for the current MOVING update, but never keep its lock while
+            # waiting for a slot: a checked-out connection may need that lock
+            # to complete maintenance during socket-error cleanup and release.
+            with self._lock:
+                pass
         try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                self._locked = True
-            try:
-                connection = self.pool.get(block=True, timeout=self.timeout)
-            except Empty:
-                record_connection_timeout(pool_name=get_pool_name(self))
-                # Note that this is not caught by the redis client and will be
-                # raised unless handled by application code. If you want never to
-                raise ConnectionError("No connection available.")
+            connection = self.pool.get(block=True, timeout=self.timeout)
+        except Empty:
+            record_connection_timeout(pool_name=get_pool_name(self))
+            # Note that this is not caught by the redis client and will be
+            # raised unless handled by application code. If you want never to
+            raise ConnectionError("No connection available.")
 
-            # If the ``connection`` is actually ``None`` then that's a cue to make
-            # a new connection to add to the pool.
-            if connection is None:
-                # Start timing for observability
-                start_time_created = time.monotonic()
+        # If the ``connection`` is actually ``None`` then that's a cue to make
+        # a new connection to add to the pool.
+        if connection is None:
+            # Start timing for observability
+            start_time_created = time.monotonic()
+            try:
+                connection = self.make_connection()
+            except BaseException:
+                # Hand the slot back, or the pool shrinks on every failure.
                 try:
-                    connection = self.make_connection()
-                except BaseException:
-                    # Hand the slot back, or the pool shrinks on every failure.
-                    try:
-                        self.pool.put_nowait(None)
-                    except Full:
-                        pass
-                    raise
-                is_created = True
-        finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
+                    self.pool.put_nowait(None)
+                except Full:
                     pass
-                self._locked = False
+                raise
+            is_created = True
 
         if isinstance(connection, CacheProxyConnection):
             # Join this connection's drain before connect/can_read uses the socket.
             try:
+                # A free-only disconnect may have selected this connection just
+                # before dequeue. Let it mark the socket for retirement first.
+                # Release the pool lock before waiting for an idle owner's I/O.
+                with self._lock:
+                    pass
                 connection._acquire()
             except BaseException:
                 # Maintenance may still own it; release() would clear that state
@@ -5207,10 +5206,10 @@ class BlockingConnectionPool(ConnectionPool):
             if inuse_connections:
                 connections = self._connections
             else:
-                # Queue publication/checkout uses this mutex, not _lock.
-                # Mark the idle snapshot before a caller can take its sockets.
-                with self.pool.mutex:
-                    connections = [conn for conn in self.pool.queue if conn]
+                # Cached checkout passes this lock after dequeue and before
+                # socket use. Custom queues need no stdlib-internal mutex.
+                with self._lock:
+                    connections = self._get_free_connections()
                     for connection in connections:
                         if isinstance(connection, CacheProxyConnection):
                             connection._disconnect_on_checkout = True

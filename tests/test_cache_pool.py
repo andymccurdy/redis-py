@@ -20,7 +20,7 @@ from redis.event import (
     MaintenanceCompletedEvent,
     MaintenanceStartedEvent,
 )
-from redis.exceptions import AuthenticationError, InvalidResponse
+from redis.exceptions import AuthenticationError, ConnectionError, InvalidResponse
 from redis.maint_notifications import (
     MaintNotificationsConfig,
     MaintNotificationsConnectionHandler,
@@ -39,6 +39,126 @@ from redis.multidb.event import (
 from redis.utils import HIREDIS_AVAILABLE
 
 from .conftest import skip_if_server_version_lt
+
+
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("state", list(MaintenanceState))
+@pytest.mark.parametrize(
+    "parser_class",
+    [
+        _RESP3Parser,
+        pytest.param(
+            _HiredisParser,
+            marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
+        ),
+    ],
+)
+def test_blocking_checkout_during_moving_allows_socket_error_release(
+    request, cached, state, parser_class
+):
+    pool = BlockingConnectionPool.from_url(
+        request.config.getoption("--redis-url"),
+        protocol=3,
+        parser_class=parser_class,
+        cache_config=CacheConfig() if cached else None,
+        max_connections=1,
+        timeout=None,
+        socket_timeout=1,
+        maint_notifications_config=MaintNotificationsConfig(
+            enabled="auto", proactive_reconnect=False
+        ),
+    )
+    owner = pool.get_connection()
+    raw = owner._conn if cached else owner
+    raw.disconnect()
+    client, server = socket.socketpair()
+    client.settimeout(1)
+    raw._sock = client
+    raw._parser.on_connect(raw)
+    owner.maintenance_state = state
+    attempted, waiting, read_done = (threading.Event() for _ in range(3))
+    errors, acquired = [], []
+    pool_lock, queue_get = pool._lock, pool.pool.get
+
+    class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread() is borrower:
+                attempted.set()
+            return pool_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            pool_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    def get(*args, **kwargs):
+        if threading.current_thread() is borrower:
+            waiting.set()
+        return queue_get(*args, **kwargs)
+
+    def checkout():
+        try:
+            connection = pool.get_connection()
+            acquired.append(connection)
+            connection.send_command("PING")
+            assert connection.read_response() == b"PONG"
+            pool.release(connection)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def read_closed_socket():
+        try:
+            with pytest.raises(ConnectionError):
+                owner.read_response()
+            pool.release(owner)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            read_done.set()
+
+    borrower = threading.Thread(target=checkout, daemon=True)
+    reader = threading.Thread(target=read_closed_socket, daemon=True)
+    try:
+        with (
+            patch.object(pool, "_lock", ObservedLock()),
+            patch.object(pool.pool, "get", side_effect=get),
+        ):
+            # Pause at the same boundary as a MOVING handler: a checkout sees
+            # the flag, then acquires the lock only after the handoff finishes.
+            with pool_lock:
+                pool.set_in_maintenance(True)
+                borrower.start()
+                assert attempted.wait(3)
+                pool.set_in_maintenance(False)
+            assert waiting.wait(3)
+            server.close()
+            reader.start()
+            assert read_done.wait(3), "socket-error cleanup waited for a pool slot"
+            borrower.join(3)
+            assert not borrower.is_alive()
+            assert not errors
+            assert acquired == [owner]
+            assert pool.pool.qsize() == 1
+    finally:
+        pool.set_in_maintenance(False)
+        server.close()
+        # Unstick the negative control without leaking either worker. The
+        # fixed path returns the original connection and never needs a slot.
+        if borrower.is_alive() and not read_done.is_set():
+            pool.pool.put_nowait(None)
+        for worker in (borrower, reader):
+            if worker.ident is not None:
+                worker.join(4)
+        pool.close()
+        client.close()
 
 
 @pytest.mark.fixed_client

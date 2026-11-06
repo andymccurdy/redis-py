@@ -448,7 +448,10 @@ def _is_keyless_command(
 
     A keyless command does not operate on specific keys, which is determined based
     on the first key position in the command or subcommand details. If the command
-    or subcommand's first key position is zero or negative, it is treated as keyless.
+    or subcommand's first key position is zero or negative, it is treated as keyless -
+    unless it is flagged ``movablekeys`` and its key specs report a key argument. A
+    ``movablekeys`` command reports ``first_key_pos == 0`` because its keys are found by
+    scanning the arguments, so only the key specs say that it takes keys at all.
 
     Parameters:
         commands: Dict[str, Any]
@@ -472,17 +475,29 @@ def _is_keyless_command(
     if subcommand_name:
         for subcommand in commands.get(command_name)["subcommands"]:
             if str_if_bytes(subcommand[0]) == subcommand_name:
-                parsed_subcmd = _parse_subcommand(subcommand)
-                return parsed_subcmd["first_key_pos"] <= 0
+                return _is_keyless(_parse_subcommand(subcommand))
         raise ValueError(
             f"Subcommand {subcommand_name} not found in command {command_name}"
         )
     else:
         command_details = commands.get(command_name, None)
         if command_details is not None:
-            return command_details["first_key_pos"] <= 0
+            return _is_keyless(command_details)
 
         raise ValueError(f"Command {command_name} not found in commands")
+
+
+def _is_keyless(details: Dict[str, Any]) -> bool:
+    """
+    The keyless test of :func:`_is_keyless_command`, for one command's parsed details.
+
+    ``first_key_pos`` alone decides a command that reports it, so a command whose key specs
+    are all ``not_key`` - SPUBLISH's shard channel - keeps routing by that argument's slot.
+    """
+    if details["first_key_pos"] > 0:
+        return False
+
+    return not ("movablekeys" in details["flags"] and _has_key_argument(details))
 
 
 # Slots of the two-element buffer ``_apply_policy_tips`` writes into. A list rather than a

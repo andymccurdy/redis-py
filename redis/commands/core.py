@@ -92,6 +92,7 @@ from redis.typing import (
     ZSetRangeResponse,
 )
 from redis.utils import (
+    _timedelta_to_ms,
     experimental_args,
     experimental_method,
     extract_expire_flags,
@@ -4155,7 +4156,7 @@ class BasicKeyCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/pexpire
         """
         if isinstance(time, datetime.timedelta):
-            time = int(time.total_seconds() * 1000)
+            time = _timedelta_to_ms(time)
 
         exp_option = list()
         if nx:
@@ -4261,7 +4262,7 @@ class BasicKeyCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/psetex
         """
         if isinstance(time_ms, datetime.timedelta):
-            time_ms = int(time_ms.total_seconds() * 1000)
+            time_ms = _timedelta_to_ms(time_ms)
         return self.execute_command("PSETEX", name, time_ms, value)
 
     @overload
@@ -7276,7 +7277,7 @@ class SetCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(milliseconds, datetime.timedelta):
-            milliseconds = int(milliseconds.total_seconds() * 1000)
+            milliseconds = _timedelta_to_ms(milliseconds)
 
         options = []
         if nx:
@@ -11221,7 +11222,7 @@ class HashCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(milliseconds, datetime.timedelta):
-            milliseconds = int(milliseconds.total_seconds() * 1000)
+            milliseconds = _timedelta_to_ms(milliseconds)
 
         options = []
         if nx:

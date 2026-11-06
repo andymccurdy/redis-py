@@ -353,6 +353,13 @@ def test_arrindex(client):
 
 
 @pytest.mark.redismod
+def test_arrindex_stop_without_start(client):
+    client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
+    assert -1 == client.json().arrindex("arr", Path.root_path(), 4, stop=3)
+    assert 2 == client.json().arrindex("arr", Path.root_path(), 2, stop=3)
+
+
+@pytest.mark.redismod
 def test_arrinsert(client):
     client.json().set("arr", Path.root_path(), [0, 4])
     assert 5 - -client.json().arrinsert("arr", Path.root_path(), 1, *[1, 2, 3])

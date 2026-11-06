@@ -4537,6 +4537,7 @@ class TestRedisCommands:
             [[b"a1", "1.0"], [b"a2", "2.0"]],
         )
 
+    @pytest.mark.fixed_client
     async def test_zrange_desc_sends_zrevrange_by_default(self):
         """Rank-only desc=True keeps ZREVRANGE unless use_rev is set."""
         r = redis.Redis()
@@ -4548,6 +4549,7 @@ class TestRedisCommands:
             "ZREVRANGE", "a", 0, -1, withscores=False, score_cast_func=float, keys=["a"]
         )
 
+    @pytest.mark.fixed_client
     async def test_zrange_desc_use_rev_sends_zrange_rev(self):
         r = redis.Redis()
         with patch.object(
@@ -4565,6 +4567,7 @@ class TestRedisCommands:
             keys=["a"],
         )
 
+    @pytest.mark.fixed_client
     async def test_zrange_desc_use_rev_withscores_and_score_cast(self):
         def cast_score(value):
             return value
@@ -6517,8 +6520,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         await r.xreadgroup(group, consumer_1, streams={stream: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        await asyncio.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        await asyncio.sleep(0.2)
 
         m3 = await r.xadd(stream, {"key_m3": "val_m3"})
         m4 = await r.xadd(stream, {"key_m4": "val_m4"})
@@ -6613,8 +6616,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         await r.xreadgroup(group, consumer_1, streams={stream_1: ">", stream_2: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        await asyncio.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        await asyncio.sleep(0.2)
 
         m3_s1 = await r.xadd(stream_1, {"key_m3_s1": "val_m3"})
         m4_s2 = await r.xadd(stream_2, {"key_m4_s2": "val_m4"})
@@ -6729,8 +6732,8 @@ class TestRedisCommands:
         # read all the messages - this will save the msgs in PEL
         await r.xreadgroup(group, consumer_1, streams={stream_1: ">", stream_2: ">"})
 
-        # wait for 100ms - so that the messages would have been in the PEL for long enough
-        await asyncio.sleep(0.1)
+        # wait for 200ms - so that the messages would have been in the PEL for long enough
+        await asyncio.sleep(0.2)
 
         m3_s1 = await r.xadd(stream_1, {"key_m3_s1": "val_m3"})
         m4_s2 = await r.xadd(stream_2, {"key_m4_s2": "val_m4"})

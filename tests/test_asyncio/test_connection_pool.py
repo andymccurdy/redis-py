@@ -1932,6 +1932,29 @@ class TestAsyncConnectionPoolMetricsRecording:
                 close_reason=CloseReason.APPLICATION_CLOSE
             )
 
+    async def test_concurrent_disconnects_record_connection_closed_once(self):
+        conn = Connection()
+        started = self._connect_with_blocking_close(conn)
+        writer = conn._writer
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            first = asyncio.ensure_future(conn.disconnect())
+            await started.wait()
+            # Starts while the first close is still waiting in wait_closed()
+            await conn.disconnect(nowait=True)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            assert not conn.is_connected
+            writer.close.assert_called_once()
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
     async def test_connection_disconnect_records_connection_closed_without_task(
         self,
     ):

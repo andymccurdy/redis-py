@@ -1,4 +1,5 @@
 from datetime import datetime
+import inspect
 import warnings
 import pytest
 import redis
@@ -110,6 +111,29 @@ class TestDeprecatedArgsAsync:
                 f"argument/s '{arg}'. ({reason})"
                 for arg, reason in (("b", "outer"), ("c", "inner"))
             ]
+
+    @pytest.mark.asyncio
+    async def test_async_deprecated_args_warn_at_call_site(self):
+        async def async_func(a=None, b=None):
+            return (a, b)
+
+        single = deprecated_args(args_to_warn=["b"])(async_func)
+        merged = deprecated_args(args_to_warn=["a"])(
+            deprecated_args(args_to_warn=["b"])(async_func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            single_line = inspect.currentframe().f_lineno + 1
+            await single(b=2)
+            merged_line = inspect.currentframe().f_lineno + 1
+            await merged(a=1, b=2)
+        # Every layer points at the line that called the decorated function.
+        assert [(x.filename, x.lineno) for x in w] == [
+            (__file__, single_line),
+            (__file__, merged_line),
+            (__file__, merged_line),
+        ]
 
 
 # Async tests for experimental_method decorator

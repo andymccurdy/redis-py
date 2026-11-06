@@ -311,19 +311,10 @@ def deprecated_args(
 def _get_layer_checks(func: Callable, layers: tuple) -> tuple:
     """
     Build the per-layer checks of a (possibly merged) @deprecated_args wrapper.
-    A layer with i layers stacked above it warns with stacklevel 5 - i, the
-    frame it would point at if every layer were its own wrapper.
     """
     return tuple(
-        (
-            *_get_warn_check(func, warned, allowed),
-            warned,
-            allowed,
-            reason,
-            version,
-            5 - i,
-        )
-        for i, (warned, allowed, reason, version) in enumerate(layers)
+        (*_get_warn_check(func, warned, allowed), warned, allowed, reason, version)
+        for warned, allowed, reason, version in layers
     )
 
 
@@ -351,8 +342,11 @@ def _merge_warn_checks(
 def _check_deprecated_layers(
     func: Callable, checks: tuple, args: tuple, kwargs: dict
 ) -> None:
-    """Check and warn about deprecated arguments, one layer at a time."""
-    for min_idx, keys_ok, names, warned, allowed, reason, version, stacklevel in checks:
+    """
+    Check and warn about deprecated arguments, one layer at a time. Every
+    layer warns with stacklevel 4, the caller of the single wrapper frame.
+    """
+    for min_idx, keys_ok, names, warned, allowed, reason, version in checks:
         if len(args) <= min_idx and (not kwargs or keys_ok(kwargs.keys(), names)):
             continue
         filterable_args = _get_filterable_args(func, args, kwargs, allowed)
@@ -363,11 +357,11 @@ def _check_deprecated_layers(
                     func.__name__,
                     reason,
                     version,
-                    stacklevel=stacklevel,
+                    stacklevel=4,
                 )
             elif arg in filterable_args:
                 warn_deprecated_arg_usage(
-                    arg, func.__name__, reason, version, stacklevel=stacklevel
+                    arg, func.__name__, reason, version, stacklevel=4
                 )
 
 

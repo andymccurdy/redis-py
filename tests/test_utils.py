@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import functools
+import inspect
 import warnings
 import pytest
 from redis.exceptions import DataError
@@ -410,24 +411,26 @@ class TestDeprecatedArgs:
                 for arg, reason in (("b", "outer"), ("c", "inner")) * 2
             ]
 
-    def test_stacked_layers_keep_warning_locations(self):
+    def test_deprecated_args_warn_at_call_site(self):
         def func(a=None, b=None):
             return (a, b)
 
+        single = deprecated_args(args_to_warn=["b"])(func)
         merged = deprecated_args(args_to_warn=["a"])(
             deprecated_args(args_to_warn=["b"])(func)
         )
 
-        def call_merged():
-            return merged(a=1, b=2)  # the inner layer ("b") points here
-
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            call_merged()  # the outer layer ("a") points here
-            caller_line = call_merged.__code__.co_firstlineno + 1
+            single_line = inspect.currentframe().f_lineno + 1
+            single(b=2)
+            merged_line = inspect.currentframe().f_lineno + 1
+            merged(a=1, b=2)
+        # Every layer points at the line that called the decorated function.
         assert [(x.filename, x.lineno) for x in w] == [
-            (__file__, caller_line + 4),
-            (__file__, caller_line),
+            (__file__, single_line),
+            (__file__, merged_line),
+            (__file__, merged_line),
         ]
 
     def test_stacked_wildcard_and_named_layers(self, filterable_args_calls):

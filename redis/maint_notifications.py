@@ -837,14 +837,15 @@ def _defer_maintenance_events():
     try:
         yield
     finally:
-        # All events in this scope become eligible together, including when
-        # the drain failed or was interrupted. A later completion on a timer
-        # thread must wait for its earlier start to become eligible too.
+        # Only this scope promotes its deliveries, after releasing the locks
+        # that deferred them. Queue order keeps a later completion behind its
+        # start, even if another thread drains between these promotions.
+        # Do not allocate the iterator under the queue lock: cyclic GC can
+        # disconnect an abandoned connection and enqueue its completion here.
         _maintenance_event_state.pending = previous
         if pending:
-            with _maintenance_event_lock:
-                for _, delivery in pending:
-                    delivery.ready = True
+            for _, delivery in pending:
+                delivery.ready = True
             for source in dict.fromkeys(source for source, _ in pending):
                 _drain_maintenance_events(source)
 
@@ -911,8 +912,11 @@ def _dispatch_maintenance_event(
     delivery = _PendingMaintenanceEvent(config, event, ready=pending is None)
     if pending is not None:
         pending.append((source, delivery))
+    # Allocating a deque can also trigger a connection finalizer. Keep that
+    # allocation outside the non-reentrant lock protecting queue mutations.
+    queue = deque()
     with _maintenance_event_lock:
-        _maintenance_event_queues.setdefault(source, deque()).append(delivery)
+        _maintenance_event_queues.setdefault(source, queue).append(delivery)
     if pending is None:
         _drain_maintenance_events(source)
 

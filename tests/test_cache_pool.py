@@ -44,6 +44,163 @@ from .conftest import skip_if_server_version_lt
 @pytest.mark.fixed_client
 @pytest.mark.onlynoncluster
 @skip_if_server_version_lt("7.4.0")
+@pytest.mark.parametrize("shutdown", ["disconnect", "close"])
+@pytest.mark.parametrize("tracking_mode", list(TrackingMode))
+@pytest.mark.parametrize(
+    "parser_class",
+    [
+        _RESP3Parser,
+        pytest.param(
+            _HiredisParser,
+            marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
+        ),
+    ],
+)
+def test_blocking_pool_release_during_moving_does_not_invert_owner_lock(
+    request, shutdown, tracking_mode, parser_class
+):
+    pool = BlockingConnectionPool.from_url(
+        request.config.getoption("--redis-url"),
+        protocol=3,
+        parser_class=parser_class,
+        cache_config=CacheConfig(
+            tracking_mode=tracking_mode,
+            cache_predicate=None
+            if tracking_mode is TrackingMode.PLAIN
+            else lambda *_: True,
+        ),
+        max_connections=1,
+        socket_timeout=1,
+        maint_notifications_config=MaintNotificationsConfig(
+            enabled="auto", proactive_reconnect=False
+        ),
+    )
+    owner = pool.get_connection()
+    disconnecting, moving, moved, release_started, owner_waited, finish_moving = (
+        threading.Event() for _ in range(6)
+    )
+    errors = []
+    pool_lock, owner_lock = pool._lock, owner._in_use_lock
+    real_disconnect = owner._conn.disconnect
+    real_set_maintenance = pool.set_in_maintenance
+
+    class PoolLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread() is releaser:
+                release_started.set()
+            return pool_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return pool_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    class OwnerLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread() is releaser:
+                release_started.set()
+                owner_waited.set()
+            return owner_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return owner_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    def disconnect(*args, **kwargs):
+        if threading.current_thread() is closer:
+            disconnecting.set()
+            assert owner_waited.wait(3)
+            assert moved.wait(3)
+            # Shutdown owns the connection lock and is about to complete
+            # maintenance under the pool lock. A release waiting for ownership
+            # must not keep that pool lock, or the real call below deadlocks.
+            acquired = pool_lock.acquire(blocking=False)
+            if acquired:
+                pool_lock.release()
+            assert acquired, "release holds the pool lock while waiting for ownership"
+        return real_disconnect(*args, **kwargs)
+
+    def set_maintenance(value):
+        real_set_maintenance(value)
+        if value:
+            moving.set()
+            assert finish_moving.wait(3)
+
+    def run(callback):
+        try:
+            callback()
+        except BaseException as exc:
+            errors.append(exc)
+
+    notification = NodeMovingNotification(
+        id=1, new_node_host=None, new_node_port=None, ttl=60
+    )
+    handler = pool._maint_notifications_pool_handler
+
+    def move():
+        try:
+            handler.handle_notification(notification)
+        finally:
+            moved.set()
+
+    closer = threading.Thread(target=run, args=(getattr(pool, shutdown),), daemon=True)
+    mover = threading.Thread(
+        target=run,
+        args=(move,),
+        daemon=True,
+    )
+    releaser = threading.Thread(
+        target=run, args=(lambda: pool.release(owner),), daemon=True
+    )
+    try:
+        with (
+            patch.object(pool, "_lock", PoolLock()),
+            patch.object(owner, "_in_use_lock", OwnerLock()),
+            patch.object(owner._conn, "disconnect", disconnect),
+            patch.object(pool, "set_in_maintenance", set_maintenance),
+        ):
+            closer.start()
+            assert disconnecting.wait(3)
+            mover.start()
+            assert moving.wait(3)
+            releaser.start()
+            assert release_started.wait(3)
+            finish_moving.set()
+            for worker in (mover, releaser, closer):
+                worker.join(3)
+                assert not worker.is_alive()
+            assert not errors
+        assert not owner._in_use
+        assert pool.pool.qsize() == 1
+        assert not owner.is_connected
+        handler.cancel_scheduled_tasks()
+        reused = pool.get_connection()
+        assert reused is owner
+        reused.send_command("PING")
+        assert reused.read_response() == b"PONG"
+        pool.release(reused)
+    finally:
+        finish_moving.set()
+        for worker in (mover, releaser, closer):
+            if worker.ident is not None:
+                worker.join(4)
+        pool.close()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
 @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
 @pytest.mark.parametrize(
     "parser_class",
@@ -2997,13 +3154,19 @@ class TestCachePoolOwnership:
         real_owner_lock = owner._in_use_lock
 
         class ObservedOwnerLock:
-            def __enter__(self):
+            def acquire(self, *args, **kwargs):
                 if threading.current_thread() is checkout_thread:
                     checkout_attempted.set()
-                return real_owner_lock.__enter__()
+                return real_owner_lock.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_owner_lock.release()
+
+            def __enter__(self):
+                return self.acquire()
 
             def __exit__(self, *args):
-                return real_owner_lock.__exit__(*args)
+                return self.release()
 
         def pause_drain(*args, **kwargs):
             if threading.current_thread() is reader:

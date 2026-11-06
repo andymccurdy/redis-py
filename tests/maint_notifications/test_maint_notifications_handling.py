@@ -1,6 +1,9 @@
+import gc
+import inspect
 import os
 import signal
 import socket
+import sys
 import threading
 import time
 from typing import List, Union
@@ -3283,6 +3286,117 @@ def test_deferred_maintenance_does_not_hold_up_another_pool():
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+@pytest.mark.parametrize("allocation", ["pending_iterator", "event_queue"])
+def test_maintenance_event_allocation_allows_gc_finalizer_reentry(allocation):
+    # Isolate a deadlock so a regression cannot hang the pytest process or
+    # leave the global dispatch lock held for subsequent tests.
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(5)
+        try:
+            gc.disable()
+            gc.collect()
+            events, errors = [], []
+
+            class Listener(EventListenerInterface):
+                def listen(self, event):
+                    # A same-thread RLock acquisition would miss callbacks
+                    # incorrectly running inside the queue's critical section.
+                    def check_lock():
+                        lock = maint_notifications._maintenance_event_lock
+                        acquired = lock.acquire(blocking=False)
+                        if acquired:
+                            lock.release()
+                        else:
+                            errors.append("callback holds the queue lock")
+
+                    worker = threading.Thread(target=check_lock, daemon=True)
+                    worker.start()
+                    worker.join(1)
+                    assert not worker.is_alive()
+                    events.append((type(event), id(event.connection)))
+
+            config = MaintNotificationsConfig(
+                enabled=True,
+                proactive_reconnect=False,
+                event_dispatcher=EventDispatcher(
+                    {
+                        MaintenanceStartedEvent: [Listener()],
+                        MaintenanceCompletedEvent: [Listener()],
+                    }
+                ),
+            )
+            abandoned = Connection(protocol=3, maint_notifications_config=config)
+            abandoned._maint_notifications_connection_handler.handle_notification(
+                NodeMigratingNotification(1, 60)
+            )
+            abandoned_id = id(abandoned)
+            abandoned.cycle = abandoned
+            del abandoned
+            current = Connection(protocol=3, maint_notifications_config=config)
+            collected = []
+
+            def collect_once():
+                if not collected:
+                    collected.append(True)
+                    gc.collect()
+
+            if allocation == "pending_iterator":
+                function = maint_notifications._defer_maintenance_events.__wrapped__
+                lines, start = inspect.getsourcelines(function)
+                iteration = start + next(
+                    i
+                    for i, line in enumerate(lines)
+                    if "for _, delivery in pending:" in line
+                )
+
+                def trace(frame, event, arg):
+                    if (
+                        event == "line"
+                        and frame.f_code is function.__code__
+                        and frame.f_lineno == iteration
+                    ):
+                        collect_once()
+                    return trace
+
+                sys.settrace(trace)
+                current._maint_notifications_connection_handler.handle_notification(
+                    NodeMigratingNotification(2, 60)
+                )
+                sys.settrace(None)
+            else:
+                deque = maint_notifications.deque
+
+                def collect_before_allocation(*args, **kwargs):
+                    collect_once()
+                    return deque(*args, **kwargs)
+
+                with patch.object(
+                    maint_notifications, "deque", collect_before_allocation
+                ):
+                    current._maint_notifications_connection_handler.handle_notification(
+                        NodeMigratingNotification(2, 60)
+                    )
+
+            current.disconnect()
+            assert collected and not errors
+            for connection_id in (abandoned_id, id(current)):
+                assert [kind for kind, source in events if source == connection_id] == [
+                    MaintenanceStartedEvent,
+                    MaintenanceCompletedEvent,
+                ]
+            assert not maint_notifications._maintenance_event_queues
+            assert not maint_notifications._maintenance_event_dispatching
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert status == 0
 
 
 @pytest.mark.fixed_client

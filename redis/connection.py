@@ -5105,20 +5105,35 @@ class BlockingConnectionPool(ConnectionPool):
         # Make sure we haven't changed process.
         self._checkpid()
 
+        # Shutdown takes ownership before completing maintenance under _lock.
+        # Use the same order, including when a MOVING handoff is still active.
+        # An inherited connection's owner lock may belong to a vanished thread.
+        owner_lock = (
+            connection._in_use_lock
+            if isinstance(connection, CacheProxyConnection)
+            and connection.pid == self.pid
+            else None
+        )
+        owner_locked = False
+        pool_locked = False
         deferred_events = None
         try:
+            if owner_lock is not None:
+                deferred_events = _defer_maintenance_events()
+                deferred_events.__enter__()
+                owner_lock.acquire()
+                owner_locked = True
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                pool_locked = True
             if not self.owns_connection(connection):
                 # pool doesn't own this connection. do not add it back
                 # to the pool. instead add a None value which is a placeholder
                 # that will cause the pool to recreate the connection if
                 # its needed.
-                if self.cache is not None:
-                    # Keep the ordinary return path free of a deferral scope.
-                    # Disconnect can complete maintenance, whose listeners must
-                    # wait for queue publication and the pool lock below.
+                if self.cache is not None and deferred_events is None:
+                    # An inherited connection has no local owner lock, but its
+                    # disconnect can still dispatch maintenance completion.
                     deferred_events = _defer_maintenance_events()
                     deferred_events.__enter__()
                 connection.disconnect()
@@ -5146,10 +5161,7 @@ class BlockingConnectionPool(ConnectionPool):
                         "Disconnecting released connection marked for reconnect: "
                         f"{connection}, {connection.extract_connection_details()}"
                     )
-                if self.cache is not None:
-                    # Keep the ordinary return path free of a deferral scope.
-                    # Disconnect can complete maintenance, whose listeners must
-                    # wait for queue publication and the pool lock below.
+                if self.cache is not None and deferred_events is None:
                     deferred_events = _defer_maintenance_events()
                     deferred_events.__enter__()
                 connection.disconnect()
@@ -5157,11 +5169,8 @@ class BlockingConnectionPool(ConnectionPool):
             pool_name = get_pool_name(self)
             try:
                 if isinstance(connection, CacheProxyConnection):
-                    with connection._in_use_lock:
-                        connection._in_use = False
-                        self.pool.put_nowait(connection)
-                else:
-                    self.pool.put_nowait(connection)
+                    connection._in_use = False
+                self.pool.put_nowait(connection)
 
                 # Record state transition: USED -> IDLE
                 record_connection_count(
@@ -5177,12 +5186,10 @@ class BlockingConnectionPool(ConnectionPool):
             except Full:
                 pass
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if pool_locked:
+                self._lock.release()
+            if owner_locked:
+                owner_lock.release()
             if deferred_events is not None:
                 deferred_events.__exit__(*sys.exc_info())
 

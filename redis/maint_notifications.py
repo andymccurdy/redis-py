@@ -1263,7 +1263,11 @@ def _get_maintenance_state_lock(connection):
     # its state/timeout transition with MOVING updates, without holding this
     # lock across the parser's socket I/O or application event listeners.
     handler = getattr(connection, "_maint_notifications_pool_handler", None)
-    return handler.pool._lock if handler is not None else nullcontext()
+    # Disconnect and garbage collection can run in a child before _checkpid()
+    # resets the pool. Its inherited lock may belong to a vanished thread.
+    if handler is None or handler.pool.pid != os.getpid():
+        return nullcontext()
+    return handler.pool._lock
 
 
 class MaintNotificationsConnectionHandler:

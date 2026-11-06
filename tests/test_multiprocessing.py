@@ -3,6 +3,7 @@ import gc
 import multiprocessing
 import platform
 import select
+import threading
 import uuid
 import weakref
 from collections import Counter
@@ -64,6 +65,91 @@ class TestMultiprocessing:
     @pytest.fixture()
     def r(self, request):
         return _get_client(redis.Redis, request=request, single_connection_client=False)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.4.0")
+    @pytest.mark.parametrize(
+        "pool_class,cached,cleanup",
+        [
+            (ConnectionPool, False, "collect"),
+            (ConnectionPool, True, "collect"),
+            (BlockingConnectionPool, False, "collect"),
+            (BlockingConnectionPool, True, "collect"),
+            (ConnectionPool, False, "pubsub"),
+        ],
+    )
+    def test_child_cleanup_does_not_wait_for_inherited_pool_lock(
+        self, master_host, pool_class, cached, cleanup
+    ):
+        pool = pool_class(
+            host=master_host[0],
+            port=master_host[1],
+            protocol=3,
+            cache_config=CacheConfig() if cached else None,
+        )
+        if cleanup == "pubsub":
+            resource = redis.Redis(connection_pool=pool).pubsub()
+            resource.subscribe("fork-cleanup")
+            assert resource.get_message(timeout=2)["type"] == "subscribe"
+        else:
+            connection = pool.get_connection()
+            pool.release(connection)
+            del connection
+            resource = pool
+        holder = [resource]
+        lock = pool._lock
+        del resource, pool
+        locked, finish = threading.Event(), threading.Event()
+        parent, child = self._mp_context.Pipe()
+
+        def hold_lock():
+            with lock:
+                locked.set()
+                finish.wait(10)
+
+        def target():
+            resource = holder.pop()
+            if cleanup == "pubsub":
+                resource.reset()
+                assert resource.connection is None
+            else:
+                reference = weakref.ref(resource)
+                del resource
+                gc.collect()
+                assert reference() is None
+            child.send(True)
+            child.close()
+
+        worker = threading.Thread(target=hold_lock, daemon=True)
+        process = self._mp_context.Process(target=target)
+        try:
+            worker.start()
+            assert locked.wait(2)
+            process.start()
+            assert parent.poll(3), "child cleanup waited on an inherited pool lock"
+            assert parent.recv() is True
+            process.join(3)
+            assert process.exitcode == 0
+        finally:
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(3)
+            finish.set()
+            worker.join(3)
+            parent.close()
+            child.close()
+            resource = holder.pop()
+            if cleanup == "pubsub":
+                pool = resource.connection_pool
+                resource.close()
+            else:
+                pool = resource
+            try:
+                assert redis.Redis(connection_pool=pool).ping()
+            finally:
+                pool.disconnect()
 
     def test_close_connection_in_child(self, master_host):
         """

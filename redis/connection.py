@@ -2097,6 +2097,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._idle_maintenance_done = threading.Condition(self._in_use_lock)
         self._idle_maintenance = False
         self._in_use = True
+        self._disconnect_on_checkout = False
         self._busy_cache_deadline = 0.0
         self._cache = cache
         self._cache_lock = threading.RLock()
@@ -2168,6 +2169,10 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         return self._conn.get_protocol()
 
     def connect(self):
+        # A free-only pool disconnect can lose the idle claim to checkout.
+        # Retire that socket before returning it to the next caller.
+        if self._disconnect_on_checkout:
+            self.disconnect()
         self._conn.connect()
 
         server_name = self._conn.handshake_metadata.get(b"server", None)
@@ -2209,6 +2214,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         if isinstance(self._conn, MaintNotificationsAbstractConnection):
             self._complete_maintenance_on_disconnect()
         self._conn.disconnect(*args, **kwargs)
+        self._disconnect_on_checkout = False
 
     def check_health(self):
         self._conn.check_health()
@@ -4635,6 +4641,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
             for connection in connections:
                 if isinstance(connection, CacheProxyConnection):
+                    if not inuse_connections:
+                        connection._disconnect_on_checkout = True
                     cached_connections.append(connection)
                 else:
                     connection.disconnect()
@@ -4718,7 +4726,14 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                             if parser is not None:
                                 parser._deferred_oss_cluster_handler = previous_defer
                             if cached:
-                                conn._release_idle()
+                                try:
+                                    if (
+                                        conn.should_reconnect()
+                                        or conn._disconnect_on_checkout
+                                    ):
+                                        conn.disconnect()
+                                finally:
+                                    conn._release_idle()
                     for conn in self._in_use_connections:
                         if conn in self._releasing_connections:
                             self._releasing_connections[conn] = token
@@ -5185,7 +5200,13 @@ class BlockingConnectionPool(ConnectionPool):
             if inuse_connections:
                 connections = self._connections
             else:
-                connections = self._get_free_connections()
+                # Queue publication/checkout uses this mutex, not _lock.
+                # Mark the idle snapshot before a caller can take its sockets.
+                with self.pool.mutex:
+                    connections = [conn for conn in self.pool.queue if conn]
+                    for connection in connections:
+                        if isinstance(connection, CacheProxyConnection):
+                            connection._disconnect_on_checkout = True
 
             for connection in connections:
                 if isinstance(connection, CacheProxyConnection):

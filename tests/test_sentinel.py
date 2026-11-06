@@ -1,5 +1,6 @@
 import os
 import socket
+import threading
 import uuid
 from unittest import mock
 
@@ -904,3 +905,100 @@ def test_himport_prepare_set_survives_reconnect(deployed_sentinel):
     master.delete("himport:sentinel:2")
     master.himport_set("himport:sentinel:2", "users", ["bob", "b@x.com"])
     assert master.hget("himport:sentinel:2", "email") == "b@x.com"
+
+
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
+@pytest.mark.parametrize("tracking_mode", list(TrackingMode))
+@pytest.mark.parametrize(
+    "parser_class",
+    [
+        _RESP3Parser,
+        pytest.param(
+            _HiredisParser,
+            marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
+        ),
+    ],
+)
+def test_cached_master_change_racing_with_checkout(
+    r2, stack_url, tracking_mode, parser_class
+):
+    new_master = Redis.from_url(
+        stack_url, db=r2.connection_pool.connection_kwargs.get("db", 0)
+    )
+    addresses = [
+        (
+            client.connection_pool.connection_kwargs["host"],
+            client.connection_pool.connection_kwargs.get("port", 6379),
+        )
+        for client in [r2, new_master]
+    ]
+    assert addresses[0] != addresses[1]
+    manager = mock.Mock()
+    manager.discover_master.return_value = addresses[0]
+    kwargs = dict(r2.connection_pool.connection_kwargs)
+    kwargs.update(
+        protocol=3,
+        parser_class=parser_class,
+        decode_responses=False,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
+    pool = SentinelConnectionPool(
+        "mymaster",
+        manager,
+        max_connections=1,
+        cache_config=CacheConfig(
+            tracking_mode=tracking_mode,
+            cache_predicate=None
+            if tracking_mode is TrackingMode.PLAIN
+            else lambda *_: True,
+        ),
+        **kwargs,
+    )
+    key = str(uuid.uuid4())
+    r2.set(key, "old-master")
+    new_master.set(key, "new-master")
+    owner = pool.get_connection()
+    owner.send_command("GET", key, keys=[key])
+    assert owner.read_response() == b"old-master"
+    pool.release(owner)
+    captured, finish = threading.Event(), threading.Event()
+    errors = []
+    real_disconnect = owner._disconnect_from_pool
+
+    def disconnect(inuse_connections):
+        captured.set()
+        assert finish.wait(5)
+        real_disconnect(inuse_connections)
+
+    def discover():
+        try:
+            assert pool.get_master_address() == addresses[1]
+        except BaseException as exc:
+            errors.append(exc)
+
+    manager.discover_master.return_value = addresses[1]
+    worker = threading.Thread(target=discover, daemon=True)
+    checked_out = None
+    try:
+        with mock.patch.object(owner, "_disconnect_from_pool", side_effect=disconnect):
+            worker.start()
+            assert captured.wait(3)
+            checked_out = pool.get_connection()
+            finish.set()
+            worker.join(3)
+            assert not worker.is_alive() and not errors
+            checked_out.send_command("GET", key, keys=[key])
+            assert checked_out.read_response() == b"new-master"
+            checked_out.send_command("PING")
+            assert checked_out.read_response() == b"PONG"
+            assert (checked_out.host, checked_out.port) == addresses[1]
+    finally:
+        finish.set()
+        worker.join(5)
+        if checked_out is not None:
+            pool.release(checked_out)
+        pool.disconnect()
+        new_master.delete(key)
+        new_master.close()

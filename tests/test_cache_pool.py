@@ -236,7 +236,7 @@ class TestCachePoolOwnership:
         client_socket, server = socket.socketpair()
         owner._conn._sock = client_socket
         owner._conn._parser.on_connect(owner._conn)
-        draining, updated = threading.Event(), threading.Event()
+        draining, updated, inspected = (threading.Event() for _ in range(3))
         errors, delivered = [], []
         real_disconnect = owner._disconnect_from_pool
         real_drain = borrower._drain_invalidations
@@ -258,8 +258,10 @@ class TestCachePoolOwnership:
 
         def disconnect(*args, **kwargs):
             # The public update has installed the new handler and released the
-            # pool lock. Its disconnect now waits for the peer's idle drain.
+            # pool lock. Let the callback inspect ownership before this other
+            # thread can acquire the lock for its own disconnect.
             updated.set()
+            assert inspected.wait(5)
             return real_disconnect(*args, **kwargs)
 
         def reconfigure():
@@ -304,6 +306,7 @@ class TestCachePoolOwnership:
                         RuntimeError if outcome == "error" else Cancelled
                     ):
                         borrower.send_command("GET", key, keys=[key])
+                inspected.set()
                 worker.join(5)
                 assert not worker.is_alive()
             assert (
@@ -326,6 +329,7 @@ class TestCachePoolOwnership:
             borrower.send_command("GET", key, keys=[key])
             assert borrower.read_response() == b"new"
         finally:
+            inspected.set()
             draining.set()
             updated.set()
             if worker.ident is not None:
@@ -2056,6 +2060,146 @@ class TestCachePoolOwnership:
         assert not errors
         assert len(events) == 1 and events[0].connection is owner
         assert not owner.is_connected
+
+    def test_free_disconnect_retires_socket_before_concurrent_checkout(self, pool):
+        owner = pool.get_connection()
+        owner.send_command("CLIENT", "ID")
+        old_id = owner.read_response()
+        pool.release(owner)
+        captured, finish = threading.Event(), threading.Event()
+        errors = []
+        real_disconnect = owner._disconnect_from_pool
+
+        def disconnect(inuse_connections):
+            captured.set()
+            assert finish.wait(5)
+            real_disconnect(inuse_connections)
+
+        def retire():
+            try:
+                pool.disconnect(inuse_connections=False)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=retire, daemon=True)
+        checked_out = None
+        try:
+            with patch.object(owner, "_disconnect_from_pool", side_effect=disconnect):
+                worker.start()
+                assert captured.wait(3)
+                checked_out = pool.get_connection()
+                finish.set()
+                worker.join(3)
+                assert not worker.is_alive() and not errors
+                checked_out.send_command("CLIENT", "ID")
+                assert checked_out.read_response() != old_id
+                checked_out.send_command("PING")
+                assert checked_out.read_response() == b"PONG"
+        finally:
+            finish.set()
+            worker.join(5)
+            if checked_out is not None:
+                pool.release(checked_out)
+
+    @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
+    def test_idle_auth_finishes_moving_reconnect(self, pool, r2, outcome):
+        auth_pool = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+        auth_pool.update_maint_notifications_config(
+            MaintNotificationsConfig(enabled="auto")
+        )
+        owner = auth_pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "value")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"value"
+        auth_pool.release(owner)
+        events, errors = [], []
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                events.append((owner._idle_maintenance, owner.is_connected))
+
+        config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher({MaintenanceStartedEvent: [Listener()]}),
+        )
+        handler = MaintNotificationsPoolHandler(auth_pool, config)
+        auth_pool._maint_notifications_pool_handler = handler
+        owner.maint_notifications_config = config
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        server.settimeout(3)
+        owner._conn._sock = client
+        owner._conn._parser.on_connect(owner._conn)
+        owner.set_maint_notifications_pool_handler_for_connection(handler)
+        owner._conn._parser.set_node_moving_push_handler(handler.handle_notification)
+        token = Mock()
+        token.try_get.return_value = "default"
+        token.get_value.return_value = "test-token"
+        command = b"".join(owner._conn.pack_command("AUTH", "default", "test-token"))
+        port = auth_pool.connection_kwargs.get("port", 6379)
+        moving = f">4\r\n+MOVING\r\n:103\r\n:60\r\n+127.0.0.1:{port}\r\n".encode()
+
+        def authenticate():
+            try:
+                received = b""
+                while len(received) < len(command):
+                    part = server.recv(len(command) - len(received))
+                    assert part, "AUTH socket closed before sending the command"
+                    received += part
+                assert received == command
+                server.sendall(
+                    moving
+                    + (
+                        b"-WRONGPASS invalid token\r\n"
+                        if outcome == "auth_error"
+                        else b"+OK\r\n"
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        real_read = owner.read_response
+
+        def read(*args, **kwargs):
+            result = real_read(*args, **kwargs)
+            if outcome == "cancel":
+                raise Cancelled
+            return result
+
+        worker = threading.Thread(target=authenticate, daemon=True)
+        try:
+            with (
+                patch.object(handler, "_schedule"),
+                patch.object(owner._conn, "getpeername", return_value="127.0.0.1"),
+                patch.object(owner, "read_response", side_effect=read),
+            ):
+                worker.start()
+                if outcome == "success":
+                    auth_pool.re_auth_callback(token)
+                else:
+                    with pytest.raises(
+                        AuthenticationError if outcome == "auth_error" else Cancelled
+                    ):
+                        auth_pool.re_auth_callback(token)
+                worker.join(3)
+                assert not worker.is_alive() and not errors
+                assert not owner._idle_maintenance and not owner._in_use
+                assert not owner.is_connected, (
+                    "idle AUTH returned the pre-MOVING socket"
+                )
+                assert events == [(False, False)]
+            with Redis(connection_pool=auth_pool) as client:
+                assert client.get(key) == b"value"
+                assert client.ping()
+        finally:
+            server.close()
+            worker.join(5)
+            handler.cancel_scheduled_tasks()
+            auth_pool.disconnect()
 
     @pytest.mark.parametrize(
         "outcome", ["close", "auth_error", "listener_error", "cancel"]

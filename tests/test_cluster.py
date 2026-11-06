@@ -7271,6 +7271,16 @@ class TestClusterPipeline:
             pipe.delete("{key}:a", "{key}:b")
             assert pipe.execute()
 
+    def test_touch_single(self, r):
+        """
+        Test that touch is queued and executed with the pipeline
+        """
+        r["a"] = 1
+        with r.pipeline(transaction=False) as pipe:
+            assert pipe.touch("a") is pipe
+            assert len(pipe) == 1
+            assert pipe.execute() == [1]
+
     def test_unlink_single(self, r):
         """
         Test a single unlink operation

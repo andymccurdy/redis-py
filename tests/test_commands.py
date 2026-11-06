@@ -3044,6 +3044,15 @@ class TestRedisCommands:
         assert r.persist("a")
         assert r.pttl("a") == -1
 
+    @skip_if_server_version_lt("2.6.0")
+    def test_pexpire_timedelta_is_exact(self, r):
+        r["a"] = "foo"
+        with mock.patch.object(r, "execute_command", return_value=True) as cmd:
+            r.pexpire("a", datetime.timedelta(milliseconds=1001))
+        assert cmd.call_args.args == ("PEXPIRE", "a", 1001)
+        assert r.pexpire("a", datetime.timedelta(milliseconds=1001)) is True
+        assert 0 < r.pttl("a") <= 1001
+
     @skip_if_server_version_lt("7.0.0")
     def test_pexpire_option_nx(self, r):
         assert r.set("key", "val") is True
@@ -3144,6 +3153,14 @@ class TestRedisCommands:
         assert r.psetex("a", expire_at, "value")
         assert r["a"] == b"value"
         assert 0 < r.pttl("a") <= 1000
+
+    @skip_if_server_version_lt("2.6.0")
+    def test_psetex_timedelta_is_exact(self, r):
+        with mock.patch.object(r, "execute_command", return_value=True) as cmd:
+            r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert cmd.call_args.args == ("PSETEX", "a", 1001, "value")
+        assert r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert 0 < r.pttl("a") <= 1001
 
     @skip_if_server_version_lt("2.6.0")
     def test_pttl(self, r):
@@ -4874,6 +4891,19 @@ class TestRedisCommands:
         ) == [1]
         assert 0 < r.spttl("test:set", "member1")[0] <= 5000
         assert r.spttl("test:set", "member2") == [-1]
+
+    def test_spexpire_timedelta_is_exact(self, r):
+        # argument level only, so it needs no SPEXPIRE support on the server
+        with mock.patch.object(r, "execute_command", return_value=[1]) as cmd:
+            r.spexpire("test:set", datetime.timedelta(milliseconds=1001), "member1")
+        assert cmd.call_args.args == (
+            "SPEXPIRE",
+            "test:set",
+            1001,
+            "MEMBERS",
+            1,
+            "member1",
+        )
 
     @skip_if_server_version_lt("8.11.240")
     def test_spexpire_conditions(self, r):

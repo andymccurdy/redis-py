@@ -1324,61 +1324,70 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         # Likewise the relaxation a maintenance applied to it: restored and
         # reported here, ahead of a close that may time out or be skipped
         self._complete_maintenance_on_disconnect()
-        # On Python 3.13+, asyncio.timeout() raises RuntimeError when called
-        # outside a running Task (e.g. during GC finalization or event-loop
-        # callbacks).  In that context we fall back to a synchronous close.
-        # See https://github.com/redis/redis-py/issues/3856
-        if asyncio.current_task() is None:
-            self._force_disconnect()
+        self._parser.on_disconnect()
+        # Reset the reconnect flag
+        self.reset_should_reconnect()
+        if not self.is_connected:
             return
-
         try:
-            async with async_timeout(self.socket_connect_timeout):
-                self._parser.on_disconnect()
-                # Reset the reconnect flag
-                self.reset_should_reconnect()
-                if not self.is_connected:
-                    return
-                try:
-                    self._writer.close()  # type: ignore[union-attr]
-                    # wait for close to finish, except when handling errors and
-                    # forcefully disconnecting.
-                    if not nowait:
-                        await self._writer.wait_closed()  # type: ignore[union-attr]
-                except OSError:
-                    pass
-                finally:
-                    self._reader = None
-                    self._writer = None
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"Timed out closing connection after {self.socket_connect_timeout}"
-            ) from None
+            # On Python 3.13+, asyncio.timeout() raises RuntimeError when called
+            # outside a running Task (e.g. during GC finalization or event-loop
+            # callbacks).  In that context we fall back to a synchronous close.
+            # See https://github.com/redis/redis-py/issues/3856
+            if asyncio.current_task() is None:
+                self._close()
+                return
 
-        if error:
-            if health_check_failed:
-                close_reason = CloseReason.HEALTHCHECK_FAILED
-            else:
-                close_reason = CloseReason.ERROR
+            # Taken before the first await, as sync does, so a concurrent
+            # disconnect() finds no socket to close and records nothing.
+            writer = self._writer
+            self._reader = None
+            self._writer = None
+            try:
+                async with async_timeout(self.socket_connect_timeout):
+                    try:
+                        writer.close()  # type: ignore[union-attr]
+                        # wait for close to finish, except when handling errors
+                        # and forcefully disconnecting.
+                        if not nowait:
+                            await writer.wait_closed()  # type: ignore[union-attr]
+                    except OSError:
+                        pass
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"Timed out closing connection after {self.socket_connect_timeout}"
+                ) from None
+        finally:
+            # Reached on every close, including one that times out or is
+            # cancelled. The recorders never suspend, so awaiting them here is
+            # safe even while a cancellation propagates.
+            if error:
+                if health_check_failed:
+                    close_reason = CloseReason.HEALTHCHECK_FAILED
+                else:
+                    close_reason = CloseReason.ERROR
 
-            if failure_count is not None and failure_count > self.retry.get_retries():
-                await record_error_count(
-                    server_address=getattr(self, "host", None),
-                    server_port=getattr(self, "port", None),
-                    network_peer_address=getattr(self, "host", None),
-                    network_peer_port=getattr(self, "port", None),
+                if (
+                    failure_count is not None
+                    and failure_count > self.retry.get_retries()
+                ):
+                    await record_error_count(
+                        server_address=getattr(self, "host", None),
+                        server_port=getattr(self, "port", None),
+                        network_peer_address=getattr(self, "host", None),
+                        network_peer_port=getattr(self, "port", None),
+                        error_type=error,
+                        retry_attempts=failure_count,
+                    )
+
+                await record_connection_closed(
+                    close_reason=close_reason,
                     error_type=error,
-                    retry_attempts=failure_count,
                 )
-
-            await record_connection_closed(
-                close_reason=close_reason,
-                error_type=error,
-            )
-        else:
-            await record_connection_closed(
-                close_reason=CloseReason.APPLICATION_CLOSE,
-            )
+            else:
+                await record_connection_closed(
+                    close_reason=CloseReason.APPLICATION_CLOSE,
+                )
 
     async def _send_ping(self):
         """Send PING, expect PONG in return"""

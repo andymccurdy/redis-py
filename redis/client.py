@@ -1267,6 +1267,16 @@ class PubSub:
         if self.connection:
             self.connection.disconnect()
             self.connection.deregister_connect_callback(self.on_connect)
+            if self.push_handler_func is not None:
+                # The handler is set on the parser of a pooled connection: put
+                # the parser's own back, or the next PubSub that gets this
+                # connection has its messages handed to ours
+                parser = self.connection._get_parser()
+                if (
+                    getattr(parser, "pubsub_push_handler_func", None)
+                    is self.push_handler_func
+                ):
+                    parser.set_pubsub_push_handler(parser.handle_pubsub_push_response)
             self.connection_pool.release(self.connection)
             self.connection = None
         self.health_check_response_counter = 0

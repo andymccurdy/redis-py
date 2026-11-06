@@ -1,4 +1,5 @@
 from datetime import datetime
+import inspect
 import warnings
 import pytest
 import redis
@@ -86,6 +87,53 @@ class TestDeprecatedArgsAsync:
             assert result == ("a", "b")
             assert len(w) == 1
             assert "param1" in str(w[0].message) or "param2" in str(w[0].message)
+
+    @pytest.mark.asyncio
+    async def test_async_stacked_layers_merge_into_one_wrapper(self):
+        async def async_func(a=None, b=None, c=None):
+            return (a, b, c)
+
+        inner = deprecated_args(args_to_warn=["c"], reason="inner")(async_func)
+        outer = deprecated_args(args_to_warn=["b"], reason="outer")(inner)
+        assert outer.__wrapped__ is async_func
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert await outer(1) == (1, None, None)
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert await outer(1, 2, 3) == (1, 2, 3)
+            # Each layer keeps its own message, outermost first.
+            assert [str(x.message) for x in w] == [
+                "Call to 'async_func' function with deprecated usage of input "
+                f"argument/s '{arg}'. ({reason})"
+                for arg, reason in (("b", "outer"), ("c", "inner"))
+            ]
+
+    @pytest.mark.asyncio
+    async def test_async_deprecated_args_warn_at_call_site(self):
+        async def async_func(a=None, b=None):
+            return (a, b)
+
+        single = deprecated_args(args_to_warn=["b"])(async_func)
+        merged = deprecated_args(args_to_warn=["a"])(
+            deprecated_args(args_to_warn=["b"])(async_func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            single_line = inspect.currentframe().f_lineno + 1
+            await single(b=2)
+            merged_line = inspect.currentframe().f_lineno + 1
+            await merged(a=1, b=2)
+        # Every layer points at the line that called the decorated function.
+        assert [(x.filename, x.lineno) for x in w] == [
+            (__file__, single_line),
+            (__file__, merged_line),
+            (__file__, merged_line),
+        ]
 
 
 # Async tests for experimental_method decorator

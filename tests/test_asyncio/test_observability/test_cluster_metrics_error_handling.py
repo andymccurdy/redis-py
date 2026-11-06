@@ -383,8 +383,6 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
         In async cluster, the execute_command is called on target_node directly,
         so we use target_node's connection_kwargs for db lookup.
         """
-        from redis.commands.metadata import ResponsePolicy
-
         target_node = ClusterNode(
             host="192.168.50.10", port=7008, server_type="primary", db=3
         )
@@ -401,10 +399,6 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
             cluster._policy_resolver.resolve = AsyncMock(return_value=None)
             cluster.command_flags = {}
             cluster.result_callbacks = {}
-            cluster._policies_callback_mapping = {
-                ResponsePolicy.DEFAULT_KEYLESS: lambda x: x,
-                ResponsePolicy.DEFAULT_KEYED: lambda x: x,
-            }
 
             with patch.object(
                 ClusterNode,

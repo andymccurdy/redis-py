@@ -124,8 +124,10 @@ class JSONCommands:
         For more information see `JSON.ARRINDEX <https://redis.io/commands/json.arrindex>`_.
         """  # noqa
         pieces = [name, str(path), self._encode(scalar)]
-        if start is not None:
-            pieces.append(start)
+        if start is not None or stop is not None:
+            # ``stop`` is positional, so a ``stop`` without ``start`` needs the
+            # server's default start (0) in front of it.
+            pieces.append(0 if start is None else start)
             if stop is not None:
                 pieces.append(stop)
 

@@ -2,6 +2,7 @@ import asyncio
 import math
 import time
 from datetime import datetime, timedelta
+from unittest import mock
 
 import pytest
 
@@ -94,6 +95,19 @@ async def test_hpexpire_with_timedelta(r):
     assert await r.hpexpire("test:hash", timedelta(milliseconds=50), "field1") == [1]
     await _wait_for_fields_expired(r, "test:hash", "field1")
     assert await r.hexists("test:hash", "field2") is True
+
+
+@skip_if_server_version_lt("7.3.240")
+async def test_hpexpire_timedelta_is_exact(r):
+    await r.delete("test:hash")
+    await r.hset("test:hash", "field1", "value1")
+    with mock.patch.object(
+        r, "execute_command", mock.AsyncMock(return_value=[1])
+    ) as cmd:
+        await r.hpexpire("test:hash", timedelta(milliseconds=1001), "field1")
+    assert cmd.call_args.args == ("HPEXPIRE", "test:hash", 1001, "FIELDS", 1, "field1")
+    assert await r.hpexpire("test:hash", timedelta(milliseconds=1001), "field1") == [1]
+    assert 0 < (await r.hpttl("test:hash", "field1"))[0] <= 1001
 
 
 @skip_if_server_version_lt("7.3.240")

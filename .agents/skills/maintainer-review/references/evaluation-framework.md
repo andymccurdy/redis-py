@@ -325,6 +325,7 @@ Use `Maintainer decision` for a concluded review. Use `Preliminary assessment` w
 - Need evidence: <Demonstrated / Plausible but unproven / Already covered / Unsupported>
 - Code recommendation: <code disposition>
 - Repository readiness: <one allowed status; only when useful for a merge-worthy recommendation>
+- Suggested label: <category label per pr-labels-guide.md; note current labels and any add/remove>
 
 ## Evidence
 

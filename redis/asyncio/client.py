@@ -6,6 +6,7 @@ import math
 import re
 import time
 import warnings
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -68,7 +69,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.commands.helpers import parse_pubsub_subscriptions, pubsub_subscription_args
-from redis.credentials import CredentialProvider
+from redis.credentials import CredentialProvider, StreamingCredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
@@ -393,9 +394,7 @@ class Redis(
             Argument is ignored when connection_pool is provided.
         """
         kwargs: Dict[str, Any]
-        if event_dispatcher is None:
-            self._event_dispatcher = EventDispatcher()
-        else:
+        if event_dispatcher is not None:
             self._event_dispatcher = event_dispatcher
         # auto_close_connection_pool only has an effect if connection_pool is
         # None. It is assumed that if connection_pool is not None, the user
@@ -507,14 +506,19 @@ class Redis(
             # This arg only used if no pool is passed in
             self.auto_close_connection_pool = auto_close_connection_pool
             connection_pool = ConnectionPool(**kwargs)
-            self._event_dispatcher.dispatch(
-                AfterPooledConnectionsInstantiationEvent(
-                    [connection_pool], ClientType.ASYNC, credential_provider
-                )
-            )
         else:
             # If a pool is passed in, do not close it
             self.auto_close_connection_pool = False
+
+        # A user-supplied dispatcher always gets the event, for its own
+        # listeners. The default one is private to this client, so its only
+        # listener is the built-in re-auth one, which acts on a
+        # StreamingCredentialProvider alone: skip the no-op dispatch (and
+        # building the dispatcher) for any other provider.
+        if event_dispatcher is not None or (
+            credential_provider is not None
+            and isinstance(credential_provider, StreamingCredentialProvider)
+        ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
                     [connection_pool], ClientType.ASYNC, credential_provider
@@ -541,6 +545,12 @@ class Redis(
         # using the client.
         self._usage_counter = 0
         self._usage_lock = asyncio.Lock()
+
+    @cached_property
+    def _event_dispatcher(self) -> EventDispatcher:
+        # Built on first use when the client was given no dispatcher; a
+        # dispatcher passed to __init__ is stored on the instance instead.
+        return EventDispatcher()
 
     def __repr__(self):
         return (
@@ -1126,16 +1136,28 @@ class Monitor:
 
     async def __aenter__(self):
         await self.connect()
-        await self.connection.send_command("MONITOR")
-        # check that monitor returns 'OK', but don't return it to user
-        response = await self.connection.read_response()
-        if not bool_ok(response):
-            raise RedisError(f"MONITOR failed: {response}")
+        try:
+            await self.connection.send_command("MONITOR")
+            # check that monitor returns 'OK', but don't return it to user
+            response = await self.connection.read_response()
+            if not bool_ok(response):
+                raise RedisError(f"MONITOR failed: {response}")
+        except BaseException:
+            try:
+                await self.__aexit__()
+            except Exception:
+                pass
+            raise
         return self
 
     async def __aexit__(self, *args):
-        await self.connection.disconnect()
-        await self.connection_pool.release(self.connection)
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            await connection.disconnect()
+        finally:
+            await asyncio.shield(self.connection_pool.release(connection))
 
     async def next_command(self) -> MonitorCommandInfo:
         """Parse the response from a monitor command"""
@@ -1177,6 +1199,13 @@ class Monitor:
         """Listen for commands coming to the server."""
         while True:
             yield await self.next_command()
+
+
+class _UncancellableFuture(asyncio.Future):
+    """A future that ignores cancel(): awaiting it is not woken by Task.cancel()."""
+
+    def cancel(self, msg: Any = None) -> bool:
+        return False
 
 
 class PubSub:
@@ -1251,6 +1280,32 @@ class PubSub:
         # immediately as there is nothing to clean-up.
         if not hasattr(self, "connection"):
             return
+        # Shield the teardown so that cancelling the caller (e.g. a cancelled
+        # task or anyio cancel scope exiting ``async with r.pubsub()``) cannot
+        # stop it while it waits for the lock, disconnects, or releases: the
+        # connection would otherwise never be returned to the pool. The caller
+        # still sees the CancelledError.
+        teardown = asyncio.ensure_future(self._aclose())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # Finish first so callers' locks (e.g. ClusterPubSub) outlive it.
+            # Repeated cancels (anyio re-cancels on every loop turn) only mark
+            # this task while it waits here, so it wakes once, when done.
+            waiter = _UncancellableFuture(loop=asyncio.get_running_loop())
+            teardown.add_done_callback(lambda _: waiter.set_result(None))
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass  # the cancels marked while waiting
+            if not teardown.cancelled() and teardown.exception() is not None:
+                logger.warning(
+                    "PubSub teardown failed after a cancellation",
+                    exc_info=teardown.exception(),
+                )
+            raise
+
+    async def _aclose(self) -> None:
         async with self._lock:
             if self.connection:
                 # Use nowait=True to avoid awaiting StreamWriter.wait_closed(),
@@ -1259,8 +1314,10 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
-                await self.connection_pool.release(self.connection)
-                self.connection = None
+                # Detach before awaiting release, as Pipeline.reset() does, so
+                # the pubsub never holds a connection that is back in the pool.
+                connection, self.connection = self.connection, None
+                await self.connection_pool.release(connection)
             self.channels = {}
             self.pending_unsubscribe_channels = set()
             self.patterns = {}
@@ -1859,6 +1916,21 @@ CommandStackT = List[CommandT]
 _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 
 
+async def _pack_pipeline_commands(
+    connection: Connection, commands: Sequence[Iterable[EncodableT]]
+) -> List[bytes]:
+    """Pack commands, off the event loop for large batches.
+
+    Packing is pure CPU work and can block the event loop for seconds on
+    very large pipelines (#3416), but handing a batch to a worker thread
+    also costs a dispatch. Small batches are packed inline; only batches
+    at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
+    """
+    if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
+        return connection.pack_commands(commands)
+    return await asyncio.to_thread(connection.pack_commands, commands)
+
+
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     """
     Pipelines provide a way to transmit multiple commands to the Redis server
@@ -1948,12 +2020,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             # sure we're no longer WATCHing anything. Detach self.connection
             # before awaiting release: if a second cancel aborts the await,
             # the pipeline must not be left holding a reference to a
-            # connection that is being returned to the pool. Shield the
-            # release itself so a second cancel cannot split the pool's
-            # internal in-use/available bookkeeping mid-update.
+            # connection that is being returned to the pool. release() itself
+            # is cancel-safe, so it needs no shield.
             if self.connection:
                 connection, self.connection = self.connection, None
-                await asyncio.shield(self.connection_pool.release(connection))
+                await self.connection_pool.release(connection)
 
     async def aclose(self) -> None:
         """Alias for reset(), a standard method name for cleanup"""
@@ -2107,7 +2178,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         pre: CommandT = (("MULTI",), {})
         post: CommandT = (("EXEC",), {})
         cmds = (pre, *commands, post)
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection,
             [args for args, options in cmds if EMPTY_RESPONSE not in options],
         )
@@ -2194,7 +2265,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         preflight = _himport_exec.prepare_wire_commands(fieldsets)
         # build up all commands into a single request to increase network perf
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection, preflight + [args for args, _ in commands]
         )
         await connection.send_packed_command(all_cmds)
@@ -2230,20 +2301,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         if raise_on_error:
             self.raise_first_error(commands, response)
         return response
-
-    async def _pack_commands(
-        self, connection: Connection, commands: Sequence[Iterable[EncodableT]]
-    ) -> List[bytes]:
-        """Pack commands, off the event loop for large batches.
-
-        Packing is pure CPU work and can block the event loop for seconds on
-        very large pipelines (#3416), but handing a batch to a worker thread
-        also costs a dispatch. Small batches are packed inline; only batches
-        at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
-        """
-        if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
-            return connection.pack_commands(commands)
-        return await asyncio.to_thread(connection.pack_commands, commands)
 
     def raise_first_error(self, commands: CommandStackT, response: Iterable[Any]):
         for i, r in enumerate(response):

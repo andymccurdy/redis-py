@@ -3,7 +3,10 @@ from unittest import mock
 import pytest
 
 import redis
-from redis.credentials import StreamingCredentialProvider
+from redis.credentials import (
+    StreamingCredentialProvider,
+    UsernamePasswordCredentialProvider,
+)
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
     ClientType,
@@ -542,6 +545,13 @@ class TestRedisClientEventDispatcher:
         assert event.connection_pools == [client.connection_pool]
         assert event.client_type == ClientType.SYNC
         assert event.credential_provider is None
+
+    @pytest.mark.parametrize("pool_kwargs", [True, False], indirect=True)
+    def test_default_dispatcher_skipped_for_non_streaming_provider(self, pool_kwargs):
+        provider = UsernamePasswordCredentialProvider("user", "pass")
+        client = redis.Redis(credential_provider=provider, **pool_kwargs)
+
+        assert "_event_dispatcher" not in vars(client)
 
     @pytest.mark.parametrize("pool_kwargs", [True, False], indirect=True)
     def test_default_dispatcher_registers_re_auth_for_streaming_provider(

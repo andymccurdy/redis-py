@@ -591,8 +591,9 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         # listener is the built-in re-auth one, which acts on a
         # StreamingCredentialProvider alone: skip the no-op dispatch (and
         # building the dispatcher) for any other provider.
-        if event_dispatcher is not None or isinstance(
-            credential_provider, StreamingCredentialProvider
+        if event_dispatcher is not None or (
+            credential_provider is not None
+            and isinstance(credential_provider, StreamingCredentialProvider)
         ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(

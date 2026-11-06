@@ -662,7 +662,7 @@ class TestRecordStreamingLag:
     @pytest.mark.parametrize("legacy_responses", [False, True])
     @pytest.mark.parametrize("decode_responses", [False, True])
     @pytest.mark.parametrize("claim", [False, True])
-    async def test_streaming_lag_skips_deleted_and_reads_claimed_entries(
+    async def test_streaming_lag_reads_deleted_and_claimed_entries(
         self,
         setup_async_recorder,
         protocol,
@@ -679,10 +679,14 @@ class TestRecordStreamingLag:
                 return [encode(message_id), fields, 100, 2]
             return [encode(message_id), fields]
 
-        # A deleted pending entry comes first, so the old code dropped the
-        # rest of the response, including the second stream.
-        first = [None, entry("1000-0")]
+        first = [entry("1000-0")]
         second = [entry("2000-0")]
+        expected = ["first", "second"]
+        if not claim:
+            # A deleted pending entry keeps its ID and has nil fields. CLAIM
+            # leaves deleted entries out of the reply.
+            first.insert(0, [encode("500-0"), None])
+            expected.insert(0, "first")
         first_stream, second_stream = encode("first"), encode("second")
         if protocol == 2:
             raw = [[first_stream, first], [second_stream, second]]
@@ -699,7 +703,7 @@ class TestRecordStreamingLag:
         assert [
             call.kwargs["attributes"][REDIS_CLIENT_STREAM_NAME]
             for call in instrument.record.call_args_list
-        ] == ["first", "second"]
+        ] == expected
 
 
 @pytest.mark.fixed_client

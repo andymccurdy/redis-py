@@ -1317,8 +1317,8 @@ _DONT_CACHE_WRITE_KEYED = replace(_WRITE_KEYED, is_dont_cache=True)
 # supported version does not disagree on the fields that decide cacheability. The
 # exceptions are the ``bless`` container, which first ships in 8.11 and was validated against
 # that release's ``COMMAND INFO`` reply, and the set member expiration reads (``sexpiretime``,
-# ``spexpiretime``, ``sttl``, ``spttl``), which first ship in 8.12 and were validated against
-# the ``COMMAND INFO`` reply of an 8.11.240 build.
+# ``spexpiretime``, ``sttl``, ``spttl``) and ``bitrangeintarray``, which first ship in 8.12
+# and were validated against the ``COMMAND INFO`` reply of an 8.11.240 build.
 #
 # The table is not exhaustive: on 8.10.0 the server reports 127 cacheable commands and this
 # covers 80 of them. The count is version-qualified because it moves between releases - a
@@ -1361,6 +1361,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "bitcount": _CACHEABLE_KEYED,
                 "bitfield_ro": _CACHEABLE_KEYED,
                 "bitpos": _CACHEABLE_KEYED,
+                "bitrangeintarray": _CACHEABLE_KEYED,
                 # The BLESS container, keyed by subcommand the way ``execute_command``
                 # receives it. Validated against the 8.11 ``COMMAND INFO`` reply, the first
                 # release that reports it.

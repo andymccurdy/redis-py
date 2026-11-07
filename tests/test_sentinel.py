@@ -11,8 +11,13 @@ import redis.sentinel
 from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig, TrackingMode
-from redis.event import AfterConnectionReleasedEvent, EventListenerInterface
-from redis.maint_notifications import MaintNotificationsConfig
+from redis.event import (
+    AfterConnectionReleasedEvent,
+    EventDispatcher,
+    EventListenerInterface,
+    MaintenanceCompletedEvent,
+)
+from redis.maint_notifications import MaintNotificationsConfig, MaintenanceState
 from redis import exceptions
 from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.sentinel import (
@@ -421,6 +426,7 @@ def test_master_failover_release_decrements_used_count():
 @skip_if_server_version_lt("7.4.0")
 @pytest.mark.parametrize("phase", ["release", "auth"])
 @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.parametrize("recursive_release", [False, True])
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 @pytest.mark.parametrize(
     "parser_class",
@@ -433,7 +439,7 @@ def test_master_failover_release_decrements_used_count():
     ],
 )
 def test_cached_master_change_during_release(
-    r2, stack_url, phase, outcome, tracking_mode, parser_class
+    r2, stack_url, phase, outcome, recursive_release, tracking_mode, parser_class
 ):
     # Two independent Redis endpoints give the same key different values. Only
     # Sentinel's discovery result is controlled; connection and AUTH I/O are real.
@@ -487,6 +493,8 @@ def test_cached_master_change_during_release(
         manager.discover_master.return_value = addresses[1]
         assert pool.get_master_address() == addresses[1]
         assert not pool.owns_connection(owner)
+        if recursive_release:
+            pool.release(owner)
         if outcome == "error":
             raise RuntimeError("release listener failed")
         if outcome == "cancel":
@@ -558,6 +566,87 @@ def test_cached_master_change_during_release(
         pool.disconnect()
         new_master.delete(key)
         new_master.close()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.onlynoncluster
+@skip_if_server_version_lt("7.4.0")
+@pytest.mark.parametrize("tracking_mode", list(TrackingMode))
+@pytest.mark.parametrize(
+    "parser_class",
+    [
+        _RESP3Parser,
+        pytest.param(
+            _HiredisParser,
+            marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
+        ),
+    ],
+)
+def test_rejected_cached_master_completes_maintenance_outside_pool_lock(
+    r2, tracking_mode, parser_class
+):
+    kwargs = dict(r2.connection_pool.connection_kwargs)
+    kwargs.update(protocol=3, parser_class=parser_class, decode_responses=False)
+    address = (kwargs["host"], kwargs.get("port", 6379))
+    manager = mock.Mock()
+    manager.discover_master.return_value = address
+    calls = []
+
+    class Listener(EventListenerInterface):
+        def listen(self, event):
+            unlocked = []
+
+            def probe():
+                acquired = pool._lock.acquire(blocking=False)
+                unlocked.append(acquired)
+                if acquired:
+                    pool._lock.release()
+
+            worker = threading.Thread(target=probe, daemon=True)
+            worker.start()
+            worker.join(2)
+            # A concurrent idle MOVING handler needs this lock before close()
+            # can join it. Detect the inversion without stranding a worker.
+            assert unlocked == [True], "rejected release listener holds pool lock"
+            assert not event.connection.is_connected
+            calls.append(event)
+            pool.close()
+
+    kwargs["maint_notifications_config"] = MaintNotificationsConfig(
+        enabled="auto",
+        event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+    )
+    pool = SentinelConnectionPool(
+        "mymaster",
+        manager,
+        cache_config=CacheConfig(
+            tracking_mode=tracking_mode,
+            cache_predicate=None
+            if tracking_mode is TrackingMode.PLAIN
+            else lambda *_: True,
+        ),
+        max_connections=1,
+        **kwargs,
+    )
+    owner = pool.get_connection()
+    try:
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        manager.discover_master.return_value = ("new-master", address[1])
+        assert pool.get_master_address() == ("new-master", address[1])
+        assert not pool.owns_connection(owner)
+        pool.release(owner)
+        assert len(calls) == 1
+        assert calls[0].connection is owner
+        assert not owner.is_connected
+        assert not pool._in_use_connections
+        assert not pool._available_connections
+        assert pool._created_connections == 0
+        # Discovery can reconnect after discarding the demoted master's slot.
+        manager.discover_master.return_value = address
+        with Redis(connection_pool=pool) as client:
+            assert client.ping()
+    finally:
+        pool.disconnect()
 
 
 @pytest.mark.fixed_client

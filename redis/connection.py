@@ -2708,6 +2708,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         try:
             if self._in_use:
                 return False
+            self._busy_cache_deadline = 0.0
             self._in_use = True
             self._idle_maintenance = True
             return True
@@ -2726,6 +2727,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             # maintenance operation owns it. Wait without holding the pool lock.
             while self._idle_maintenance:
                 self._idle_maintenance_done.wait()
+            # Invalidations may have arrived since the previous checkout.
+            # Only a fresh drain may open a busy owner's cache-hit window.
+            self._busy_cache_deadline = 0.0
             self._in_use = True
 
     def _disconnect_from_pool(self, inuse_connections):
@@ -4461,6 +4465,14 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                     connection.handle_pending_push_notifications()
                 elif self.cache is None:
                     raise ConnectionError("Connection has data")
+                elif isinstance(connection, CacheProxyConnection):
+                    connection._process_pending_invalidations()
+            if isinstance(connection, CacheProxyConnection):
+                # The readiness poll or drain checked invalidations. Renew the
+                # window revoked by checkout without polling the socket again.
+                connection._busy_cache_deadline = (
+                    time.monotonic() + connection._BUSY_CACHE_GRACE_SECONDS
+                )
         except (ConnectionError, TimeoutError, OSError):
             connection.disconnect()
             connection.connect()
@@ -4507,7 +4519,16 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             connection, CacheProxyConnection
         ) and self._release_cache_connection(connection):
             return
-        with self._lock:
+        # Sentinel may already reject a cached connection at entry. Its
+        # disconnect must not invoke completion listeners under the pool lock.
+        with (
+            (
+                _defer_maintenance_events()
+                if isinstance(connection, CacheProxyConnection)
+                else nullcontext()
+            ),
+            self._lock,
+        ):
             try:
                 self._in_use_connections.remove(connection)
             except KeyError:
@@ -4567,13 +4588,13 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
     def _release_cache_connection(self, connection):
         with self._lock:
-            if not self.owns_connection(connection):
-                return False
             if (
                 connection not in self._in_use_connections
                 or connection in self._releasing_connections
             ):
                 return True
+            if not self.owns_connection(connection):
+                return False
             # Keep it active for disconnect and maintenance, but prevent a
             # recursive release and retain any newer token until listeners finish.
             self._releasing_connections[connection] = None

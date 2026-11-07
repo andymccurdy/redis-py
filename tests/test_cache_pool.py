@@ -3246,6 +3246,81 @@ class TestCachePoolOwnership:
         finally:
             pool.release(borrower)
 
+    @pytest.mark.parametrize("reuse", ["checkout", "idle_auth"])
+    @pytest.mark.parametrize("maintenance", [False, "auto"])
+    def test_reused_owner_does_not_keep_previous_busy_cache_grace(
+        self, pool, r2, reuse, maintenance
+    ):
+        owner_pool = (
+            pool
+            if reuse == "checkout" and maintenance is False
+            else (type(pool) if reuse == "checkout" else ConnectionPool)(
+                cache=pool.cache,
+                **{
+                    **pool.connection_kwargs,
+                    "maint_notifications_config": MaintNotificationsConfig(
+                        enabled=maintenance
+                    ),
+                },
+            )
+        )
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner, borrower = owner_pool.get_connection(), pool.get_connection()
+        checked_out = owner
+        try:
+            # Keep both checkouts inside the previous command's grace window.
+            # Socket I/O and invalidation delivery still use the real server.
+            with patch("redis.connection.time.monotonic", return_value=1000):
+                owner.send_command("GET", key, keys=[key])
+                assert owner.read_response() == b"old"
+                owner_pool.release(owner)
+                checked_out = None
+                r2.set(key, "new")
+                assert owner.can_read(timeout=1)
+
+                def read_fresh():
+                    with patch.object(
+                        owner._conn, "read_response", wraps=owner._conn.read_response
+                    ) as read:
+                        borrower.send_command("GET", key, keys=[key])
+                        assert borrower.read_response() == b"new"
+                        read.assert_not_called()
+
+                if reuse == "checkout":
+                    checked_out = owner_pool.get_connection()
+                    assert checked_out is owner
+                    read_fresh()
+                else:
+                    real_read = owner._conn.read_response
+                    auth_replies = []
+
+                    def auth_read(*args, **kwargs):
+                        read_fresh()
+                        reply = real_read(*args, **kwargs)
+                        if not kwargs.get("push_request", False):
+                            auth_replies.append(reply)
+                        return reply
+
+                    token = Mock()
+                    token.try_get.return_value = "default"
+                    token.get_value.return_value = ""
+                    with patch.object(
+                        owner._conn, "read_response", side_effect=auth_read
+                    ):
+                        owner_pool.re_auth_callback(token)
+                    assert auth_replies == [b"OK"]
+                    checked_out = owner_pool.get_connection()
+                    assert checked_out is owner
+                owner.send_command("PING")
+                assert owner.read_response() == b"PONG"
+        finally:
+            if checked_out is not None:
+                owner_pool.release(checked_out)
+            pool.release(borrower)
+            if owner_pool is not pool:
+                owner_pool.disconnect()
+
     @pytest.mark.parametrize("shared_cache", [False, True])
     def test_checkout_waits_for_an_idle_owner_drain(self, pool, r2, shared_cache):
         """Checkout must join the owner's drain lock before touching the socket."""

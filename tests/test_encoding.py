@@ -44,6 +44,22 @@ class TestEncoding:
         assert isinstance(cached_val, str)
         assert unicode_string == cached_val
 
+    def test_bytearray_encoding(self, r_no_decode):
+        unicode_string = chr(3456) + "abcd" + chr(3421)
+        bytearray_val = bytearray(unicode_string.encode("utf-8"))
+        r_no_decode["unicode-string-bytearray"] = bytearray_val
+        cached_val = r_no_decode["unicode-string-bytearray"]
+        assert isinstance(cached_val, bytes)
+        assert unicode_string == cached_val.decode("utf-8")
+
+    def test_bytearray_encoding_and_decoding(self, r):
+        unicode_string = chr(3456) + "abcd" + chr(3421)
+        bytearray_val = bytearray(unicode_string.encode("utf-8"))
+        r["unicode-string-bytearray"] = bytearray_val
+        cached_val = r["unicode-string-bytearray"]
+        assert isinstance(cached_val, str)
+        assert unicode_string == cached_val
+
     def test_list_encoding(self, r):
         unicode_string = chr(3456) + "abcd" + chr(3421)
         result = [unicode_string, unicode_string, unicode_string]
@@ -71,6 +87,44 @@ class TestEncodingErrors:
         )
         r.set("a", b"foo\xff")
         assert r.get("a") == "foo\ufffd"
+
+    def test_ignore_bytearray(self, request):
+        r = _get_client(
+            redis.Redis,
+            request=request,
+            decode_responses=True,
+            encoding_errors="ignore",
+        )
+        r.set("a", bytearray(b"foo\xff"))
+        assert r.get("a") == "foo"
+
+    def test_replace_bytearray(self, request):
+        r = _get_client(
+            redis.Redis,
+            request=request,
+            decode_responses=True,
+            encoding_errors="replace",
+        )
+        r.set("a", bytearray(b"foo\xff"))
+        assert r.get("a") == "foo\ufffd"
+
+
+class TestEncoder:
+    def test_decode_bytearray(self):
+        encoder = redis._parsers.encoders.Encoder("utf-8", "strict", True)
+        assert encoder.decode(bytearray(b"hello")) == "hello"
+
+    def test_decode_bytearray_without_decode_responses(self):
+        encoder = redis._parsers.encoders.Encoder("utf-8", "strict", False)
+        assert encoder.decode(bytearray(b"hello")) == bytearray(b"hello")
+        assert encoder.decode(bytearray(b"hello"), force=True) == "hello"
+
+    def test_decode_bytearray_errors(self):
+        replace_encoder = redis._parsers.encoders.Encoder("utf-8", "replace", True)
+        assert replace_encoder.decode(bytearray(b"foo\xff")) == "foo\ufffd"
+
+        ignore_encoder = redis._parsers.encoders.Encoder("utf-8", "ignore", True)
+        assert ignore_encoder.decode(bytearray(b"foo\xff")) == "foo"
 
 
 class TestCommandsAreNotEncoded:

@@ -49,6 +49,22 @@ class TestEncoding:
         assert isinstance(cached_val, str)
         assert unicode_string == cached_val
 
+    async def test_bytearray_encoding(self, r_no_decode: redis.Redis):
+        unicode_string = chr(3456) + "abcd" + chr(3421)
+        bytearray_val = bytearray(unicode_string.encode("utf-8"))
+        await r_no_decode.set("unicode-string-bytearray", bytearray_val)
+        cached_val = await r_no_decode.get("unicode-string-bytearray")
+        assert isinstance(cached_val, bytes)
+        assert unicode_string == cached_val.decode("utf-8")
+
+    async def test_bytearray_encoding_and_decoding(self, r: redis.Redis):
+        unicode_string = chr(3456) + "abcd" + chr(3421)
+        bytearray_val = bytearray(unicode_string.encode("utf-8"))
+        await r.set("unicode-string-bytearray", bytearray_val)
+        cached_val = await r.get("unicode-string-bytearray")
+        assert isinstance(cached_val, str)
+        assert unicode_string == cached_val
+
     async def test_list_encoding(self, r: redis.Redis):
         unicode_string = chr(3456) + "abcd" + chr(3421)
         result = [unicode_string, unicode_string, unicode_string]
@@ -66,6 +82,16 @@ class TestEncodingErrors:
     async def test_replace(self, create_redis):
         r = await create_redis(decode_responses=True, encoding_errors="replace")
         await r.set("a", b"foo\xff")
+        assert await r.get("a") == "foo\ufffd"
+
+    async def test_ignore_bytearray(self, create_redis):
+        r = await create_redis(decode_responses=True, encoding_errors="ignore")
+        await r.set("a", bytearray(b"foo\xff"))
+        assert await r.get("a") == "foo"
+
+    async def test_replace_bytearray(self, create_redis):
+        r = await create_redis(decode_responses=True, encoding_errors="replace")
+        await r.set("a", bytearray(b"foo\xff"))
         assert await r.get("a") == "foo\ufffd"
 
 

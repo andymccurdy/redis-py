@@ -697,13 +697,17 @@ class _AsyncRESPBase(AsyncBaseParser):
         This only runs on the default read path, where per-read timeouts
         apply (see _read): explicit and blocking reads use readexactly,
         whose cancelled reads leave their bytes on the stream for the
-        next poll. A per-read timeout here instead disconnects the
-        connection (see Connection.read_response), so bytes already
-        pulled off the stream do not have to survive in the resume state.
-        The pieces are therefore kept in a local list, and only the
+        next poll. The pieces are kept in a local list, and only the
         joined buffer is added to self._chunks once the whole payload
         has arrived, so the resume state never holds the pieces plus a
-        second full copy of the payload.
+        second full copy of the payload. If the read unwinds early (a
+        per-read timeout or a cancellation), the joined pieces are added
+        to self._chunks instead: a timeout on the default path usually
+        disconnects, but callers that pass disconnect_on_error=False
+        (PubSub and push reads) keep the connection and resume by
+        re-parsing the saved header, so bytes already pulled off the
+        stream must survive in the resume state or the resumed read
+        consumes bytes from the following reply.
         """
         remaining = length
         pieces = []
@@ -737,6 +741,15 @@ class _AsyncRESPBase(AsyncBaseParser):
                     raise IncompleteReadError(partial, length)
                 pieces.append(chunk)
                 remaining -= len(chunk)
+        except BaseException:
+            # The read unwound with its pieces only in this local list,
+            # but the bytes are already off the stream. Retain them in
+            # the resume state (see the docstring): a caller keeping the
+            # connection resumes by re-parsing the saved header, and
+            # without the pieces it would read into the following reply.
+            if pieces:
+                self._chunks.append(pieces[0] if len(pieces) == 1 else b"".join(pieces))
+            raise
         finally:
             if active_timeout is not None:
                 try:

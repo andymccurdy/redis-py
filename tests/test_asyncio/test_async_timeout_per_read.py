@@ -222,6 +222,41 @@ async def test_explicit_timeout_mid_bulk_read_preserves_bytes(factory):
     assert response == PAYLOAD
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(make_resp2_connection, id="resp2"),
+        pytest.param(make_resp3_connection, id="resp3"),
+    ],
+)
+async def test_socket_timeout_mid_bulk_read_preserves_bytes_when_kept(factory):
+    # Regression test: on the default path a per-read socket_timeout
+    # interrupts _read_exactly after whole pieces were pulled off the
+    # stream. A caller passing disconnect_on_error=False (PubSub and
+    # push reads) keeps the connection and resumes by re-parsing the
+    # saved header, so the pieces must reach the parser's resume state:
+    # without them the resumed read starts mid-payload, consumes bytes
+    # from the following reply, and returns a corrupted value.
+    conn, reader = factory()
+    # Header plus the first two read-size slices of the payload arrive
+    # promptly; the rest stalls past socket_timeout.
+    reader.feed_data(BULK_WIRE[: READ_SIZE * 2])
+
+    with pytest.raises(TimeoutError):
+        await conn.read_response(disconnect_on_error=False)
+    conn.disconnect.assert_not_awaited()
+
+    feeder = asyncio.create_task(
+        feed_in_pieces(reader, BULK_WIRE[READ_SIZE * 2 :] + b"+OK\r\n")
+    )
+    response = await conn.read_response()
+    await feeder
+
+    assert response == PAYLOAD
+    # the following reply is intact, not consumed as payload bytes
+    assert await conn.read_response() == b"OK"
+
+
 async def test_reads_arm_timeout_only_when_they_can_wait():
     parser = _AsyncRESP2Parser(READ_SIZE)
     reader = asyncio.StreamReader()

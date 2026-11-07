@@ -18,6 +18,13 @@ class MockStream:
         self.pos = 0
         self.interrupt_every = interrupt_every
 
+    @property
+    def _buffer(self):
+        # The parsers consult the private StreamReader buffer to decide
+        # whether a read can wait (and whether any data is buffered at
+        # all); mirror it with the bytes this stream has not consumed yet.
+        return bytearray(self.data[self.pos :])
+
     def tick(self):
         self.counter += 1
         if not self.interrupt_every:

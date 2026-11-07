@@ -93,6 +93,14 @@ def make_async_hiredis_parser(
     parser._connected = True
     parser._reader = DummyHiredisReader(response, decoded_response, has_data)
     parser._stream = stream
+    # __new__ bypasses _AsyncHiredisParser.__init__ (and AsyncBaseParser's),
+    # so the per-read timeout state read_response()/read_from_socket()
+    # consult must be initialized here too.
+    parser._read_size = 65536
+    parser._read_timeout = None
+    parser._apply_read_timeout = False
+    parser._active_read_timeout = None
+    parser._response_read_timeout = None
     parser._hiredis_PushNotificationType = None
     return parser
 
@@ -825,6 +833,11 @@ async def test_connection_disconect_race(parser_class, connect_args):
     reader = mock.Mock(spec=asyncio.StreamReader)
     writer = mock.Mock(spec=asyncio.StreamWriter)
     writer.transport.get_extra_info.side_effect = None
+
+    # The parsers consult the stream's private buffer to decide whether a
+    # read can wait; a spec'd Mock has no such attribute unless it is set.
+    # The mocked reads below serve the data, so the buffer stays empty.
+    reader._buffer = bytearray()
 
     # for HiredisParser
     reader.read.side_effect = read

@@ -648,26 +648,38 @@ class _AsyncRESPBase(AsyncBaseParser):
             result = self._buffer[self._pos : end - 2]
         else:
             tail = self._buffer[self._pos :]
+            stream = self._stream
             try:
                 remaining = want - len(tail)
-                if not self._apply_read_timeout:
-                    # No per-read deadline applies here (explicit caller
-                    # timeout or blocking read): a cancelled readexactly
-                    # leaves its bytes on the stream, so the next poll
-                    # resumes from the stream instead of re-joining and
-                    # re-parsing saved pieces on every poll.
-                    data = await self._stream.readexactly(remaining)
-                    self._chunks.append(data)
-                elif len(self._stream._buffer) >= remaining:
-                    data = await self._stream.readexactly(remaining)
-                    self._chunks.append(data)
-                else:
+                if (
+                    self._apply_read_timeout
+                    and self._read_timeout is not None
+                    and len(stream._buffer) < remaining
+                ):
+                    # The stream does not already hold the whole remainder,
+                    # so this read can wait: _read_exactly bounds every
+                    # wait by its own socket_timeout window.
                     data = await self._read_exactly(remaining)
+                else:
+                    # Every other case is served by readexactly. No
+                    # per-read deadline applies (explicit caller timeout
+                    # or blocking read), a None socket_timeout can never
+                    # fire, or the stream already holds the whole
+                    # remainder so the read cannot wait at all; a cancelled
+                    # readexactly leaves its bytes on the stream, so the
+                    # next poll resumes from the stream instead of
+                    # re-joining and re-parsing saved pieces on every poll.
+                    # Gating the length check on the two flag checks above
+                    # also keeps the private buffer access - and its cost
+                    # per element of an aggregate reply - off the paths
+                    # that cannot wait, notably socket_timeout=None.
+                    data = await stream.readexactly(remaining)
+                    self._chunks.append(data)
             except IncompleteReadError as error:
                 raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from error
             result = (tail + data)[:-2]
             # The bytes read from the stream were recorded in the resume
-            # state by either the buffered fast path or _read_exactly.
+            # state by either the readexactly path or _read_exactly.
         self._pos += want
         return result
 
@@ -682,22 +694,19 @@ class _AsyncRESPBase(AsyncBaseParser):
         whose pieces keep arriving does not time out merely because the
         whole payload takes longer than socket_timeout to arrive.
 
-        Every piece is added to self._chunks as soon as it is read, not
-        only once the whole payload has arrived: the pieces are already
-        off the stream at that point, so if an explicit caller timeout
-        cancels the read mid-payload (e.g. PubSub.get_message(timeout=...)
-        returning None and keeping the connection), the next
-        read_response() must replay them from the resume state instead of
-        losing them and parsing the saved header against a stream that
-        starts mid-payload. Once the read completes, this call's pieces
-        in _chunks are replaced by the single joined buffer, so the
-        resume state does not hold the pieces plus a second full copy of
-        the payload until the response is parsed; an interrupted read
-        keeps its pieces, as they are the only copy of those bytes.
+        This only runs on the default read path, where per-read timeouts
+        apply (see _read): explicit and blocking reads use readexactly,
+        whose cancelled reads leave their bytes on the stream for the
+        next poll. A per-read timeout here instead disconnects the
+        connection (see Connection.read_response), so bytes already
+        pulled off the stream do not have to survive in the resume state.
+        The pieces are therefore kept in a local list, and only the
+        joined buffer is added to self._chunks once the whole payload
+        has arrived, so the resume state never holds the pieces plus a
+        second full copy of the payload.
         """
         remaining = length
-        # Index of this call's first piece in the resume state.
-        chunks_start = len(self._chunks)
+        pieces = []
         active_timeout = None
         try:
             while remaining > 0:
@@ -724,9 +733,9 @@ class _AsyncRESPBase(AsyncBaseParser):
                 if not chunk:
                     # EOF before `length` bytes: report like readexactly did,
                     # so callers keep raising ConnectionError.
-                    partial = b"".join(self._chunks[chunks_start:])
+                    partial = b"".join(pieces)
                     raise IncompleteReadError(partial, length)
-                self._chunks.append(chunk)
+                pieces.append(chunk)
                 remaining -= len(chunk)
         finally:
             if active_timeout is not None:
@@ -734,12 +743,11 @@ class _AsyncRESPBase(AsyncBaseParser):
                     await active_timeout.__aexit__(*sys.exc_info())
                 finally:
                     self._active_read_timeout = None
-        pieces = self._chunks[chunks_start:]
         if len(pieces) == 1:
-            return pieces[0]
-        joined = b"".join(pieces)
-        if len(pieces) > 1:
-            self._chunks[chunks_start:] = [joined]
+            joined = pieces[0]
+        else:
+            joined = b"".join(pieces)
+        self._chunks.append(joined)
         return joined
 
     async def _readline(self) -> bytes:
@@ -752,26 +760,31 @@ class _AsyncRESPBase(AsyncBaseParser):
             result = self._buffer[self._pos : found]
         else:
             tail = self._buffer[self._pos :]
+            stream = self._stream
+            read_timeout = self._read_timeout
             # Each line gets a fresh socket_timeout window, like each read
             # in _read_exactly: the deadline must not be shared across all
             # the lines of one response. Check the flags first to avoid
             # private stream access when per-read timeouts do not apply.
             # readline can only wait while the stream's bytearray buffer
-            # holds no line end.
+            # holds no line end, so an aggregate reply whose lines are
+            # already buffered pays only the flag checks and the (short,
+            # first-match) needle scan per line - no timeout context is
+            # built for a read that cannot wait.
             if (
                 self._apply_read_timeout
-                and self._read_timeout is not None
+                and read_timeout is not None
                 # int needle: ~8ns vs ~80ns for a bytes needle on a bytearray
-                and 10 not in self._stream._buffer
+                and 10 not in stream._buffer
             ):
-                async with async_timeout(self._read_timeout) as active_timeout:
+                async with async_timeout(read_timeout) as active_timeout:
                     self._active_read_timeout = active_timeout
                     try:
-                        data = await self._stream.readline()
+                        data = await stream.readline()
                     finally:
                         self._active_read_timeout = None
             else:
-                data = await self._stream.readline()
+                data = await stream.readline()
             if not data.endswith(b"\r\n"):
                 raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
             result = (tail + data)[:-2]

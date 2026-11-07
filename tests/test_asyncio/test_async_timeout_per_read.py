@@ -199,11 +199,11 @@ async def test_blocking_read_ignores_socket_timeout():
 async def test_explicit_timeout_mid_bulk_read_preserves_bytes(factory):
     # Regression test: an explicit timeout interrupting a large bulk read
     # (the PubSub.get_message(timeout=...) path) returns None and keeps
-    # the connection. The pieces _read_exactly already pulled off the
-    # stream must survive in the parser's _chunks resume state, so the
-    # next read_response() replays them and returns the full, correct
-    # reply instead of parsing the saved header against a stream that
-    # starts mid-payload.
+    # the connection. Explicit reads use readexactly (see _read), so the
+    # bytes the cancelled read had not consumed stay on the stream, and
+    # the next read_response() resumes from the stream and returns the
+    # full, correct reply instead of parsing the saved header against a
+    # stream that starts mid-payload.
     conn, reader = factory()
     # Header plus the first two read-size slices of the payload arrive
     # promptly; the rest is withheld, so the explicit timeout fires
@@ -243,10 +243,11 @@ async def test_reads_arm_timeout_only_when_they_can_wait():
     assert parser._active_read_timeout is None
 
 
-async def test_read_exactly_replaces_pieces_with_joined_buffer():
-    # Once a bulk read completes, its pieces in the resume state are
-    # replaced by the single joined buffer, so _chunks does not hold the
-    # pieces plus a second full copy of the payload.
+async def test_read_exactly_adds_only_the_joined_buffer_to_chunks():
+    # The pieces of a bulk read stay in a local list; only the joined
+    # buffer is added to the resume state once the read completes, so
+    # _chunks does not hold the pieces plus a second full copy of the
+    # payload.
     parser = _AsyncRESP2Parser(READ_SIZE)
     reader = asyncio.StreamReader()
     parser._stream = reader
@@ -261,27 +262,6 @@ async def test_read_exactly_replaces_pieces_with_joined_buffer():
 
     assert result == payload
     assert parser._chunks == [payload]
-
-
-async def test_read_exactly_keeps_pieces_when_eof_interrupts():
-    # An interrupted read keeps its pieces separate in the resume state:
-    # they are the only copy of the bytes already pulled off the stream.
-    parser = _AsyncRESP2Parser(READ_SIZE)
-    reader = asyncio.StreamReader()
-    parser._stream = reader
-    reader.feed_data(b"a" * 1000)
-
-    async def feed_rest_then_eof():
-        await asyncio.sleep(0.05)
-        reader.feed_data(b"b" * 1000)
-        reader.feed_eof()
-
-    feeder = asyncio.create_task(feed_rest_then_eof())
-    with pytest.raises(asyncio.IncompleteReadError):
-        await parser._read_exactly(3000)
-    await feeder
-
-    assert parser._chunks == [b"a" * 1000, b"b" * 1000]
 
 
 async def test_read_exactly_constructs_one_timeout_for_multiple_waits(monkeypatch):

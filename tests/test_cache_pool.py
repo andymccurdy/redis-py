@@ -1,9 +1,11 @@
+import gc
 import multiprocessing
 import signal
 import socket
 import threading
 import time
 import uuid
+import weakref
 from unittest.mock import Mock, patch
 
 import pytest
@@ -39,6 +41,138 @@ from redis.multidb.event import (
 from redis.utils import HIREDIS_AVAILABLE
 
 from .conftest import skip_if_server_version_lt
+
+
+def _gc_finalizer_during_idle_drain(
+    url, pool_class, parser_class, tracking_mode, outcome
+):
+    # Run in a bounded child: the regression blocks inside Redis.__del__, where
+    # an ordinary test exception cannot safely release the ownership lock.
+    pool = pool_class.from_url(
+        url,
+        protocol=3,
+        parser_class=parser_class,
+        cache_config=CacheConfig(
+            tracking_mode=tracking_mode,
+            cache_predicate=None
+            if tracking_mode is TrackingMode.PLAIN
+            else lambda *_: True,
+        ),
+        socket_timeout=1,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
+    peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+    writer = Redis.from_url(url)
+    key = str(uuid.uuid4())
+    writer.set(key, "old")
+    victim = Redis.from_pool(pool)
+    assert victim.get(key) == b"old"
+    owner = pool.get_connection()
+    pool.release(owner)
+    borrower = peers.get_connection()
+    owner._conn.disconnect()
+    client, server = socket.socketpair()
+    client.settimeout(1)
+    owner._conn._sock = client
+    owner._conn._parser.on_connect(owner._conn)
+    parser = owner._conn._parser
+    read_response = parser.read_response
+    disconnect = owner._conn.disconnect
+    drain = borrower._drain_invalidations
+    collected, closing, reading = [], [], False
+
+    class Cancelled(BaseException):
+        pass
+
+    interruption = (
+        RuntimeError("drain interrupted") if outcome == "error" else Cancelled()
+    )
+
+    def observe_gc(phase, info):
+        if phase == "start":
+            collected.append(reading)
+
+    def parse(*args, **kwargs):
+        nonlocal reading
+        reading = True
+        try:
+            if not collected:
+                gc.collect()
+                assert abandoned() is None, "pool-owning client was not finalized"
+                assert owner._conn._sock is client, "finalizer closed an active parser"
+            return read_response(*args, **kwargs)
+        finally:
+            reading = False
+
+    def close_socket(*args, **kwargs):
+        closing.append(reading)
+        return disconnect(*args, **kwargs)
+
+    def drain_and_interrupt(conn):
+        drain(conn)
+        if conn is owner._conn and outcome != "success":
+            raise interruption
+
+    was_enabled, thresholds = gc.isenabled(), gc.get_threshold()
+    gc.disable()
+    gc.collect()
+    victim.reference_cycle = victim
+    abandoned = weakref.ref(victim)
+    del victim
+    gc.callbacks.append(observe_gc)
+    try:
+        writer.set(key, "new")
+        encoded = key.encode()
+        server.sendall(
+            b">2\r\n+invalidate\r\n*1\r\n$"
+            + str(len(encoded)).encode()
+            + b"\r\n"
+            + encoded
+            + b"\r\n"
+        )
+        with (
+            patch.object(parser, "read_response", side_effect=parse),
+            patch.object(owner._conn, "disconnect", side_effect=close_socket),
+            patch.object(
+                borrower, "_drain_invalidations", side_effect=drain_and_interrupt
+            ),
+        ):
+            if outcome == "success":
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"new"
+            else:
+                with pytest.raises(type(interruption)) as error:
+                    borrower.send_command("GET", key, keys=[key])
+                assert error.value is interruption
+        assert collected and collected[0], "GC did not run inside the idle parser"
+        assert closing and not any(closing), "socket closed while parser was active"
+        assert owner._conn._sock is None
+        assert not owner._in_use
+        assert owner._in_use_lock.acquire(blocking=False)
+        owner._in_use_lock.release()
+        # A flushed owner cannot leave a stale cached reply on its peer.
+        borrower.send_command("GET", key, keys=[key])
+        assert borrower.read_response() == b"new"
+        borrower.send_command("PING")
+        assert borrower.read_response() == b"PONG"
+        reused = pool.get_connection()
+        assert reused is owner
+        reused.send_command("PING")
+        assert reused.read_response() == b"PONG"
+        pool.release(reused)
+    finally:
+        gc.callbacks.remove(observe_gc)
+        gc.set_threshold(*thresholds)
+        if was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+        server.close()
+        peers.release(borrower)
+        peers.close()
+        pool.close()
+        writer.delete(key)
+        writer.close()
 
 
 @pytest.mark.fixed_client
@@ -334,6 +468,32 @@ def test_blocking_pool_release_during_moving_does_not_invert_owner_lock(
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_gc_finalizer_during_idle_drain(
+        self, request, pool_class, parser_class, tracking_mode, outcome
+    ):
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_gc_finalizer_during_idle_drain,
+            args=(
+                request.config.getoption("--redis-url"),
+                pool_class,
+                parser_class,
+                tracking_mode,
+                outcome,
+            ),
+        )
+        worker.start()
+        try:
+            worker.join(5)
+            assert not worker.is_alive(), "client finalizer deadlocked an idle drain"
+            assert worker.exitcode == 0
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(5)
+            worker.close()
+
     @pytest.mark.parametrize("relaxed_timeout", [0.5, None])
     @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
     def test_idle_poll_stays_nonblocking_during_moving(

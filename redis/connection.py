@@ -2102,6 +2102,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         self._in_use_lock = threading.Lock()
         self._idle_maintenance_done = threading.Condition(self._in_use_lock)
         self._idle_maintenance = False
+        self._idle_drain_thread = None
         self._in_use = True
         self._disconnect_on_checkout = False
         self._busy_cache_deadline = 0.0
@@ -2739,6 +2740,12 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             self._in_use = True
 
     def _disconnect_from_pool(self, inuse_connections):
+        # Cyclic GC can finalize a pool-owning client from a parser allocation.
+        # Its close runs on this drain's thread: joining our own lock deadlocks,
+        # and closing the socket here would invalidate the active parser.
+        if self._idle_drain_thread == threading.get_ident():
+            self.mark_for_reconnect()
+            return
         # Called outside the pool lock: a drain can dispatch MOVING and need it.
         # Reserve completion's position before checkout can start a new window,
         # but invoke listeners only after closing the socket and releasing ownership.
@@ -2949,51 +2956,57 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                     if owner._in_use:
                         # Hits neither touch a busy socket nor extend its grace.
                         return time.monotonic() < owner._busy_cache_deadline
-                    parser = getattr(owner._conn, "_parser", None)
-                    previous_defer = getattr(
-                        parser, "_deferred_oss_cluster_handler", None
-                    )
-                    if parser is not None:
-                        pending = []
-
-                        def defer(handler, notification):
-                            pending.append((handler, notification))
-                            # A removed node's entries must not be reused in
-                            # the gap between releasing ownership and refresh.
-                            with self._cache_lock:
-                                self._cache.flush()
-
-                        parser._deferred_oss_cluster_handler = defer
-                    conn = owner._conn
-                    defer_timeouts = isinstance(
-                        conn, MaintNotificationsAbstractConnection
-                    )
+                    owner._idle_drain_thread = threading.get_ident()
                     try:
-                        if defer_timeouts:
-                            # Reserve the whole poll, not just its temporary
-                            # socket timeout of zero. The owner lock excludes
-                            # other drains; the pool lock coordinates MOVING.
-                            with owner._pool_lock:
-                                conn._socket_timeout_updates_deferred = True
-                        self._drain_invalidations(conn)
-                    finally:
+                        parser = getattr(owner._conn, "_parser", None)
+                        previous_defer = getattr(
+                            parser, "_deferred_oss_cluster_handler", None
+                        )
+                        if parser is not None:
+                            pending = []
+
+                            def defer(handler, notification):
+                                pending.append((handler, notification))
+                                # A removed node's entries must not be reused in
+                                # the gap between releasing ownership and refresh.
+                                with self._cache_lock:
+                                    self._cache.flush()
+
+                            parser._deferred_oss_cluster_handler = defer
+                        conn = owner._conn
+                        defer_timeouts = isinstance(
+                            conn, MaintNotificationsAbstractConnection
+                        )
                         try:
                             if defer_timeouts:
+                                # Reserve the whole poll, not just its temporary
+                                # socket timeout of zero. The owner lock excludes
+                                # other drains; the pool lock coordinates MOVING.
                                 with owner._pool_lock:
-                                    conn._socket_timeout_updates_deferred = False
-                                    timeout = conn._deferred_socket_timeout
-                                    conn._deferred_socket_timeout = SENTINEL
-                                    if timeout is not SENTINEL:
-                                        conn.update_current_socket_timeout(timeout)
+                                    conn._socket_timeout_updates_deferred = True
+                            self._drain_invalidations(conn)
                         finally:
-                            if parser is not None:
-                                parser._deferred_oss_cluster_handler = previous_defer
-                            # A removed node may never be checked out again. Finish
-                            # cleanup that could not close the socket mid-drain,
-                            # including when parsing fails or is interrupted.
-                            if owner.should_reconnect():
-                                owner.disconnect()
-                    return True
+                            try:
+                                if defer_timeouts:
+                                    with owner._pool_lock:
+                                        conn._socket_timeout_updates_deferred = False
+                                        timeout = conn._deferred_socket_timeout
+                                        conn._deferred_socket_timeout = SENTINEL
+                                        if timeout is not SENTINEL:
+                                            conn.update_current_socket_timeout(timeout)
+                            finally:
+                                if parser is not None:
+                                    parser._deferred_oss_cluster_handler = (
+                                        previous_defer
+                                    )
+                                # A removed node may never be checked out again. Finish
+                                # cleanup that could not close the socket mid-drain,
+                                # including when parsing fails or is interrupted.
+                                if owner.should_reconnect():
+                                    owner.disconnect()
+                        return True
+                    finally:
+                        owner._idle_drain_thread = None
             finally:
                 for handler, notification in pending or ():
                     try:

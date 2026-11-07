@@ -439,6 +439,8 @@ class MaintNotificationsAbstractConnection:
         )
         self._processed_start_maint_notifications = set()
         self._skipped_end_maint_notifications = set()
+        self._socket_timeout_updates_deferred = False
+        self._deferred_socket_timeout = SENTINEL
 
     @abstractmethod
     def _get_parser(self) -> BaseParser:
@@ -1003,15 +1005,19 @@ class MaintNotificationsAbstractConnection:
         return None
 
     def update_current_socket_timeout(self, relaxed_timeout: Optional[float] = None):
-        conn_socket = self._get_socket()
-        if conn_socket:
+        with _get_maintenance_state_lock(self):
+            conn_socket = self._get_socket()
+            if conn_socket is None:
+                return
             timeout = relaxed_timeout if relaxed_timeout != -1 else self.socket_timeout
             # if the current timeout is 0 it means we are in the middle of a can_read call
             # in this case we don't want to change the timeout because the operation
             # is non-blocking and should return immediately
             # Changing the state from non-blocking to blocking in the middle of a read operation
             # will lead to a deadlock
-            if conn_socket.gettimeout() != 0:
+            if self._socket_timeout_updates_deferred:
+                self._deferred_socket_timeout = timeout
+            elif conn_socket.gettimeout() != 0:
                 conn_socket.settimeout(timeout)
             # Deliberately outside the guard above. The parser caches this value
             # to restore after a per-call timeout override, so while a can_read
@@ -2958,16 +2964,35 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                                 self._cache.flush()
 
                         parser._deferred_oss_cluster_handler = defer
+                    conn = owner._conn
+                    defer_timeouts = isinstance(
+                        conn, MaintNotificationsAbstractConnection
+                    )
                     try:
-                        self._drain_invalidations(owner._conn)
+                        if defer_timeouts:
+                            # Reserve the whole poll, not just its temporary
+                            # socket timeout of zero. The owner lock excludes
+                            # other drains; the pool lock coordinates MOVING.
+                            with owner._pool_lock:
+                                conn._socket_timeout_updates_deferred = True
+                        self._drain_invalidations(conn)
                     finally:
-                        if parser is not None:
-                            parser._deferred_oss_cluster_handler = previous_defer
-                        # A removed node may never be checked out again. Finish
-                        # cleanup that could not close the socket mid-drain,
-                        # including when parsing fails or is interrupted.
-                        if owner.should_reconnect():
-                            owner.disconnect()
+                        try:
+                            if defer_timeouts:
+                                with owner._pool_lock:
+                                    conn._socket_timeout_updates_deferred = False
+                                    timeout = conn._deferred_socket_timeout
+                                    conn._deferred_socket_timeout = SENTINEL
+                                    if timeout is not SENTINEL:
+                                        conn.update_current_socket_timeout(timeout)
+                        finally:
+                            if parser is not None:
+                                parser._deferred_oss_cluster_handler = previous_defer
+                            # A removed node may never be checked out again. Finish
+                            # cleanup that could not close the socket mid-drain,
+                            # including when parsing fails or is interrupted.
+                            if owner.should_reconnect():
+                                owner.disconnect()
                     return True
             finally:
                 for handler, notification in pending or ():

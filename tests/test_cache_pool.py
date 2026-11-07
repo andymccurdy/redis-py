@@ -334,6 +334,168 @@ def test_blocking_pool_release_during_moving_does_not_invert_owner_lock(
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("relaxed_timeout", [0.5, None])
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_idle_poll_stays_nonblocking_during_moving(
+        self, pool, r2, relaxed_timeout, outcome
+    ):
+        pool.update_maint_notifications_config(
+            MaintNotificationsConfig(
+                enabled="auto",
+                proactive_reconnect=False,
+                relaxed_timeout=relaxed_timeout,
+            )
+        )
+        owner, borrower = pool.get_connection(), pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        pool.release(owner)
+        owner._conn.disconnect()
+        client, server = socket.socketpair()
+        client.settimeout(1)
+        draining, ready, checked, polling, moved, receiving = (
+            threading.Event() for _ in range(6)
+        )
+        errors, read_timeouts = [], []
+        drain = borrower._drain_invalidations
+
+        class Cancelled(BaseException):
+            pass
+
+        interruption = (
+            RuntimeError("poll interrupted") if outcome == "error" else Cancelled()
+        )
+
+        def drain_and_interrupt(conn):
+            drain(conn)
+            if conn is owner._conn and outcome != "success":
+                raise interruption
+
+        class ObservedSocket:
+            def __getattr__(self, name):
+                return getattr(client, name)
+
+            def gettimeout(self):
+                timeout = client.gettimeout()
+                if threading.current_thread() is mover and not checked.is_set():
+                    checked.set()
+                    ready.set()
+                    assert polling.wait(3)
+                return timeout
+
+            def settimeout(self, timeout):
+                client.settimeout(timeout)
+                if (
+                    threading.current_thread() is reader
+                    and timeout == 0
+                    and checked.is_set()
+                    and not polling.is_set()
+                ):
+                    polling.set()
+                    assert moved.wait(3)
+
+            def recv(self, *args):
+                if len(args) == 1 and draining.is_set():
+                    read_timeouts.append(client.gettimeout())
+                    receiving.set()
+                return client.recv(*args)
+
+            def recv_into(self, *args):
+                if draining.is_set():
+                    read_timeouts.append(client.gettimeout())
+                    receiving.set()
+                return client.recv_into(*args)
+
+        owner._conn._sock = ObservedSocket()
+        owner._conn._parser.on_connect(owner._conn)
+        parser = owner._conn._parser
+        socket_reader, method = (
+            (parser._buffer, "_read_from_socket")
+            if isinstance(parser, _RESP3Parser)
+            else (parser, "read_from_socket")
+        )
+        read_socket = getattr(socket_reader, method)
+        reads = 0
+
+        def poll(*args, **kwargs):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                # The first read consumed the partial push and restored the
+                # original timeout. Race the next read, when the socket is empty.
+                draining.set()
+                assert ready.wait(3)
+            return read_socket(*args, **kwargs)
+
+        def read():
+            try:
+                borrower.send_command("GET", key, keys=[key])
+                assert borrower.read_response() == b"old"
+            except BaseException as exc:
+                errors.append(exc)
+
+        def move():
+            try:
+                assert draining.wait(3)
+                pool._maint_notifications_pool_handler.handle_notification(
+                    NodeMovingNotification(104, None, None, 60)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                moved.set()
+                ready.set()
+
+        reader = threading.Thread(target=read, daemon=True)
+        mover = threading.Thread(target=move, daemon=True)
+        try:
+            # A partial push forces the nonblocking drain to poll again for its
+            # missing key list. No extra server data should be needed to return.
+            server.sendall(b">2\r\n+invalidate\r\n")
+            with (
+                patch.object(socket_reader, method, side_effect=poll),
+                patch.object(
+                    borrower, "_drain_invalidations", side_effect=drain_and_interrupt
+                ),
+            ):
+                reader.start()
+                mover.start()
+                assert receiving.wait(3)
+                assert read_timeouts[0] == 0, "maintenance made the poll blocking"
+                reader.join(3)
+                mover.join(3)
+                assert not reader.is_alive() and not mover.is_alive()
+                assert errors == ([] if outcome == "success" else [interruption])
+                assert all(timeout == 0 for timeout in read_timeouts)
+            assert client.gettimeout() == relaxed_timeout
+            parser = owner._conn._parser
+            assert (
+                parser._buffer.socket_timeout
+                if isinstance(parser, _RESP3Parser)
+                else parser._socket_timeout
+            ) == relaxed_timeout
+            r2.set(key, "new")
+            server.sendall(f"*1\r\n${len(key)}\r\n{key}\r\n".encode())
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"new"
+            pool._maint_notifications_pool_handler.cancel_scheduled_tasks()
+            assert owner.maintenance_state is MaintenanceState.NONE
+            assert client.gettimeout() == 1
+            borrower.send_command("PING")
+            assert borrower.read_response() == b"PONG"
+        finally:
+            ready.set()
+            polling.set()
+            server.close()
+            for worker in (reader, mover):
+                if worker.ident is not None:
+                    worker.join(4)
+            pool._maint_notifications_pool_handler.cancel_scheduled_tasks()
+            pool.release(borrower)
+            client.close()
+
     @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
     def test_rejected_owner_is_idle_before_completion(self, pool, r2, outcome, caplog):
         owner_pool = type(pool)(

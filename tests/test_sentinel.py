@@ -609,6 +609,7 @@ def test_rejected_cached_master_completes_maintenance_outside_pool_lock(
             # can join it. Detect the inversion without stranding a worker.
             assert unlocked == [True], "rejected release listener holds pool lock"
             assert not event.connection.is_connected
+            assert not event.connection._in_use
             calls.append(event)
             pool.close()
 
@@ -638,6 +639,7 @@ def test_rejected_cached_master_completes_maintenance_outside_pool_lock(
         assert len(calls) == 1
         assert calls[0].connection is owner
         assert not owner.is_connected
+        assert not owner._in_use
         assert not pool._in_use_connections
         assert not pool._available_connections
         assert pool._created_connections == 0

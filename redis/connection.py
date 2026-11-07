@@ -4569,6 +4569,8 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 # Pool doesn't own this connection, do not add it back
                 # to the pool.
                 connection.disconnect()
+                if isinstance(connection, CacheProxyConnection):
+                    connection._in_use = False
                 # Subclasses such as SentinelConnectionPool can override
                 # owns_connection() with a comparison different from local PID
                 # ownership. When such a subclass rejects a connection, also require
@@ -5157,6 +5159,8 @@ class BlockingConnectionPool(ConnectionPool):
                     deferred_events = _defer_maintenance_events()
                     deferred_events.__enter__()
                 connection.disconnect()
+                if isinstance(connection, CacheProxyConnection):
+                    connection._in_use = False
                 self.pool.put_nowait(None)
                 # Subclasses can override owns_connection() with a comparison
                 # different from local PID ownership. When such a subclass

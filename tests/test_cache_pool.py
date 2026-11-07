@@ -334,6 +334,85 @@ def test_blocking_pool_release_during_moving_does_not_invert_owner_lock(
 )
 @pytest.mark.parametrize("tracking_mode", list(TrackingMode))
 class TestCachePoolOwnership:
+    @pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+    def test_rejected_owner_is_idle_before_completion(self, pool, r2, outcome, caplog):
+        owner_pool = type(pool)(
+            cache=pool.cache, max_connections=1, **pool.connection_kwargs
+        )
+        owner = owner_pool.get_connection()
+        key = str(uuid.uuid4())
+        r2.set(key, "old")
+        owner.send_command("GET", key, keys=[key])
+        assert owner.read_response() == b"old"
+        r2.set(key, "new")
+        calls = []
+
+        class Cancelled(BaseException):
+            pass
+
+        class Listener(EventListenerInterface):
+            def listen(self, event):
+                assert event.connection is owner
+                assert not owner.is_connected
+                # A discarded connection must no longer report an active
+                # borrower to completion listeners or idle-maintenance callers.
+                assert owner._try_acquire_idle()
+                owner._release_idle()
+                calls.append(event)
+                owner_pool.close()
+                if outcome == "error":
+                    raise RuntimeError("completion listener failed")
+                if outcome == "cancel":
+                    raise Cancelled
+
+        owner.maint_notifications_config = MaintNotificationsConfig(
+            enabled=True,
+            event_dispatcher=EventDispatcher({MaintenanceCompletedEvent: [Listener()]}),
+        )
+        owner.maintenance_state = MaintenanceState.MAINTENANCE
+        try:
+            # Model a topology-aware pool rejecting a checked-out connection.
+            # The socket, cache, disconnect and replacement checkout are real.
+            with patch.object(
+                owner_pool,
+                "owns_connection",
+                side_effect=lambda conn: conn is not owner,
+            ):
+                if outcome == "cancel":
+                    with pytest.raises(Cancelled):
+                        owner_pool.release(owner)
+                else:
+                    owner_pool.release(owner)
+            dispatch_errors = [
+                record
+                for record in caplog.records
+                if record.name == "redis.maint_notifications" and record.exc_info
+            ]
+            if outcome == "error":
+                # Maintenance dispatch logs ordinary listener errors, while
+                # cancellation still propagates to the caller.
+                assert len(dispatch_errors) == 1
+                assert isinstance(dispatch_errors[0].exc_info[1], RuntimeError)
+                assert (
+                    str(dispatch_errors[0].exc_info[1]) == "completion listener failed"
+                )
+            else:
+                assert not dispatch_errors
+            assert len(calls) == 1
+            assert not owner._in_use and not owner.is_connected
+            # The sole slot is usable even when completion was interrupted.
+            replacement = owner_pool.get_connection()
+            try:
+                assert replacement is not owner
+                replacement.send_command("GET", key, keys=[key])
+                assert replacement.read_response() == b"new"
+                replacement.send_command("PING")
+                assert replacement.read_response() == b"PONG"
+            finally:
+                owner_pool.release(replacement)
+        finally:
+            owner_pool.disconnect()
+
     @pytest.mark.parametrize("transition", ["start", "complete", "disconnect"])
     def test_idle_maintenance_transition_preserves_concurrent_handoff(
         self, pool, r2, transition

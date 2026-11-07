@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from itertools import chain
 from queue import Empty, Full, LifoQueue
 from typing import (
@@ -2100,6 +2100,7 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # Checkout and peer invalidation drains share this connection's lock.
         # Release keeps _in_use set through the last socket access.
         self._in_use_lock = threading.Lock()
+        self._pool_disconnect_state = threading.local()
         self._idle_maintenance_done = threading.Condition(self._in_use_lock)
         self._idle_maintenance = False
         self._idle_drain_thread = None
@@ -2743,22 +2744,30 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # Cyclic GC can finalize a pool-owning client from a parser allocation.
         # Its close runs on this drain's thread: joining our own lock deadlocks,
         # and closing the socket here would invalidate the active parser.
-        if self._idle_drain_thread == threading.get_ident():
+        if self._idle_drain_thread == threading.get_ident() or getattr(
+            self._pool_disconnect_state, "active", False
+        ):
             self.mark_for_reconnect()
             return
         # Called outside the pool lock: a drain can dispatch MOVING and need it.
         # Reserve completion's position before checkout can start a new window,
         # but invoke listeners only after closing the socket and releasing ownership.
-        with _defer_maintenance_events(), self._in_use_lock:
-            # Idle AUTH is active socket I/O even while listed as available.
-            # Sentinel discovery can reenter free-only disconnect from that
-            # AUTH's reconnect, so exclude active owners before waiting.
-            if not inuse_connections and self._in_use:
-                return
-            while self._idle_maintenance:
-                self._idle_maintenance_done.wait()
-            if inuse_connections or not self._in_use:
-                self.disconnect()
+        # Set this before acquiring ownership: even context-manager entry or
+        # disconnect itself can collect a client whose finalizer closes the pool.
+        self._pool_disconnect_state.active = True
+        try:
+            with _defer_maintenance_events(), self._in_use_lock:
+                # Idle AUTH is active socket I/O even while listed as available.
+                # Sentinel discovery can reenter free-only disconnect from that
+                # AUTH's reconnect, so exclude active owners before waiting.
+                if not inuse_connections and self._in_use:
+                    return
+                while self._idle_maintenance:
+                    self._idle_maintenance_done.wait()
+                if inuse_connections or not self._in_use:
+                    self.disconnect()
+        finally:
+            del self._pool_disconnect_state.active
 
     def re_auth(self):
         self._conn.re_auth()
@@ -4224,6 +4233,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
 
         self._fork_lock = threading.RLock()
         self._lock = threading.RLock()
+        self._cache_disconnects = threading.local()
 
         # Generate unique pool ID for observability (matches go-redis behavior)
         self._pool_id = secrets.token_hex(4)
@@ -4287,6 +4297,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # A parent thread may have held the lock at fork time, and the
             # handler reset below takes it to revert an active MOVING.
             self._lock = threading.RLock()
+            self._cache_disconnects = threading.local()
             # The cached entries were filled on the parent's connections: their
             # invalidations go to the parent, and a hit would read the
             # parent's socket.
@@ -4708,8 +4719,37 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 else:
                     connection.disconnect()
 
-        for connection in cached_connections:
+        self._disconnect_cached_connections(cached_connections, inuse_connections)
+
+    def _disconnect_cached_connections(self, connections, inuse_connections):
+        pending = getattr(self._cache_disconnects, "pending", None)
+        if pending is not None:
+            for connection in connections:
+                connection.mark_for_reconnect()
+                pending.append((connection, inuse_connections))
+            return
+        for connection in connections:
             connection._disconnect_from_pool(inuse_connections)
+
+    @contextmanager
+    def _auth_lock(self):
+        # Sentinel discovery can disconnect free sockets while AUTH still
+        # holds the pool lock. Join idle drains only after that outer lock is
+        # released, since their cleanup also needs the pool lock.
+        state = self._cache_disconnects
+        if getattr(state, "pending", None) is not None:
+            with self._lock:
+                yield
+            return
+        pending = []
+        state.pending = pending
+        try:
+            with self._lock:
+                yield
+        finally:
+            del state.pending
+            for connection, inuse_connections in pending:
+                connection._disconnect_from_pool(inuse_connections)
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
@@ -4742,7 +4782,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         # lock before invoking them, including when AUTH fails.
         with _defer_maintenance_events() if self.cache is not None else nullcontext():
             try:
-                with self._lock:
+                with self._auth_lock() if self.cache is not None else self._lock:
                     for conn in self._available_connections:
                         cached = isinstance(conn, CacheProxyConnection)
                         if cached and not conn._try_acquire_idle():
@@ -4911,6 +4951,7 @@ class BlockingConnectionPool(ConnectionPool):
             # A parent thread may have held the lock at fork time, and the
             # handler reset below takes it to revert an active MOVING.
             self._lock = threading.RLock()
+            self._cache_disconnects = threading.local()
             # The thread applying a MOVING in the parent does not exist here
             # to clear these, and a stale flag makes a checkout nest on the
             # lock and leak it.
@@ -5290,8 +5331,7 @@ class BlockingConnectionPool(ConnectionPool):
                     pass
                 self._locked = False
 
-        for connection in cached_connections:
-            connection._disconnect_from_pool(inuse_connections)
+        self._disconnect_cached_connections(cached_connections, inuse_connections)
 
     def _get_free_connections(self):
         with self._lock:

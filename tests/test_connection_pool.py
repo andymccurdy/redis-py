@@ -393,15 +393,73 @@ class TestBlockingConnectionPool:
             assert pool.get_connection() is connection
 
     @pytest.mark.fixed_client
+    def test_release_during_idle_re_auth(self, master_host):
+        with redis.BlockingConnectionPool(
+            max_connections=2, host=master_host[0], port=master_host[1]
+        ) as pool:
+            idle = pool.get_connection()
+            in_use = pool.get_connection()
+            pool.release(idle)
+            token = mock.Mock()
+            token.try_get.return_value = "default"
+            token.get_value.return_value = "token"
+            auth_started = Event()
+            finish_auth = Event()
+            errors = []
+
+            def read_auth_response():
+                auth_started.set()
+                assert finish_auth.wait(timeout=5)
+                return b"OK"
+
+            def refresh():
+                try:
+                    pool.re_auth_callback(token)
+                except BaseException as error:
+                    errors.append(error)
+
+            with (
+                mock.patch.object(idle, "send_command"),
+                mock.patch.object(
+                    idle, "read_response", side_effect=read_auth_response
+                ),
+                mock.patch.object(in_use, "send_command") as send_command,
+                mock.patch.object(in_use, "read_response") as read_response,
+            ):
+                refresher = Thread(target=refresh)
+                refresher.start()
+                try:
+                    assert auth_started.wait(timeout=5)
+                    # Released before re_auth_callback() sets the token, so
+                    # there is nothing to apply yet.
+                    pool.release(in_use)
+                    send_command.assert_not_called()
+                finally:
+                    finish_auth.set()
+                    refresher.join(timeout=5)
+
+                assert not errors
+                assert pool.get_connection() is idle
+                # in_use is back in the queue with the token pending, so the
+                # checkout has to send AUTH before handing it out.
+                assert pool.get_connection() is in_use
+                send_command.assert_called_once_with("AUTH", "default", "token")
+                read_response.assert_called_once_with()
+
+    @pytest.mark.fixed_client
     def test_release_keeps_the_slot_when_re_auth_fails(self):
         pool = self.get_pool(max_connections=1, timeout=0.05)
         connection = pool.get_connection()
-        connection.re_auth = mock.Mock(side_effect=redis.ConnectionError("broken"))
+        connection.re_auth = mock.Mock(
+            side_effect=[redis.ConnectionError("broken"), None]
+        )
 
         with pytest.raises(redis.ConnectionError, match="broken"):
             pool.release(connection)
 
         assert pool.get_connection() is connection
+        # The token is still pending, so the checkout tries it again.
+        assert connection.re_auth.call_count == 2
 
     @pytest.mark.fixed_client
     def test_set_retry_updates_pooled_connections(self):

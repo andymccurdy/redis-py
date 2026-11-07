@@ -4766,6 +4766,10 @@ class BlockingConnectionPool(ConnectionPool):
 
         try:
             self.ensure_connection(connection)
+            # release() does not take the lock, so a connection released while
+            # re_auth_callback() is running can reach the queue before its
+            # deferred re-auth token is set. Apply it before handing it out.
+            connection.re_auth()
         except BaseException:
             # release the connection back to the pool so that we don't leak it
             self.release(connection)

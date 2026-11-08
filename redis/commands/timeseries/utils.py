@@ -173,6 +173,7 @@ def _m_range_metadata(aggregation_type=None):
 
 
 def _nativestr_metadata(metadata):
+    """Apply ``nativestr`` to RESP3 metadata so it matches the RESP2 shape."""
     return {
         nativestr(k): [nativestr(v) for v in values] for k, values in metadata.items()
     }

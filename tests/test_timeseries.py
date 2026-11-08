@@ -1336,6 +1336,13 @@ def test_info_unified_rules():
 
 
 @pytest.mark.fixed_client
+def test_info_resp3_keeps_null_labels():
+    # Server-free: a decoded RESP3 map keeps a literal "null" label as is.
+    info = TSInfo({"labels": {"null": "null", "currentLabel": "currentData"}})
+    assert info.labels == {"null": "null", "currentLabel": "currentData"}
+
+
+@pytest.mark.fixed_client
 def test_mrange_unified_metadata_bytes_keys():
     # Server-free: without decode_responses the RESP3 metadata map has bytes
     # keys and values and must parse like the metadata built for RESP2.
@@ -1349,13 +1356,6 @@ def test_mrange_unified_metadata_bytes_keys():
         assert res == {
             b"t": [{b"sensor": b"a"}, {"aggregators": ["avg"]}, [[1000, 1.5]]]
         }
-
-
-@pytest.mark.fixed_client
-def test_info_resp3_keeps_null_labels():
-    # Server-free: a decoded RESP3 map keeps a literal "null" label as is.
-    info = TSInfo({"labels": {"null": "null", "currentLabel": "currentData"}})
-    assert info.labels == {"null": "null", "currentLabel": "currentData"}
 
 
 @pytest.mark.redismod

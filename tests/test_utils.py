@@ -712,6 +712,22 @@ class TestExtractExpireFlags:
     def test_pxat_as_int(self):
         assert extract_expire_flags(pxat=1700000000000) == ["PXAT", 1700000000000]
 
+    def test_pxat_as_datetime_is_exact(self):
+        # int(when.timestamp() * 1000) lands 1 ms low when the seconds part of
+        # the instant sits just above a power of two: the double rounding of
+        # timestamp() survives the *1000 and int() truncates across the
+        # integer boundary (2**31 seconds is 2038-01-19T03:14:08Z).
+        when = datetime(2038, 1, 19, 3, 14, 8, 2000, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 2147483648002]
+        when = datetime(2004, 1, 10, 13, 37, 4, 1000, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 1073741824001]
+        # Sub-millisecond parts still truncate toward zero.
+        when = datetime(2038, 1, 19, 3, 14, 8, 500, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 2147483648000]
+        # Pre-epoch instants truncate toward zero, as int() did (-1000.5 ms).
+        when = datetime(1969, 12, 31, 23, 59, 58, 999500, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", -1000]
+
     def test_ex_takes_precedence_over_px(self):
         # The flags are checked in order; ex wins when several are given.
         assert extract_expire_flags(ex=5, px=999) == ["EX", 5]

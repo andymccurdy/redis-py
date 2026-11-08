@@ -92,6 +92,7 @@ from redis.typing import (
     ZSetRangeResponse,
 )
 from redis.utils import (
+    _datetime_to_unix_ms,
     _timedelta_to_ms,
     experimental_args,
     experimental_method,
@@ -4214,7 +4215,7 @@ class BasicKeyCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/pexpireat
         """
         if isinstance(when, datetime.datetime):
-            when = int(when.timestamp() * 1000)
+            when = _datetime_to_unix_ms(when)
         exp_option = list()
         if nx:
             exp_option.append("NX")
@@ -7456,7 +7457,7 @@ class SetCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(unix_time_milliseconds, datetime.datetime):
-            unix_time_milliseconds = int(unix_time_milliseconds.timestamp() * 1000)
+            unix_time_milliseconds = _datetime_to_unix_ms(unix_time_milliseconds)
 
         options = []
         if nx:
@@ -11396,7 +11397,7 @@ class HashCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(unix_time_milliseconds, datetime.datetime):
-            unix_time_milliseconds = int(unix_time_milliseconds.timestamp() * 1000)
+            unix_time_milliseconds = _datetime_to_unix_ms(unix_time_milliseconds)
 
         options = []
         if nx:

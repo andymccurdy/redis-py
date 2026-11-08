@@ -10,6 +10,8 @@ from redis.asyncio.connection import (
     EncodableT,
     SSLConnection,
 )
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.commands import AsyncSentinelCommands
 from redis.exceptions import (
     ConnectionError,
@@ -234,6 +236,18 @@ class Sentinel(AsyncSentinelCommands):
             sentinel_kwargs = {
                 k: v for k, v in connection_kwargs.items() if k.startswith("socket_")
             }
+        else:
+            sentinel_kwargs = dict(sentinel_kwargs)
+        if "retry" not in sentinel_kwargs:
+            # Master discovery already moves on to the next sentinel when one
+            # fails, so the client's default retry policy would only multiply
+            # the timeout of an unreachable sentinel. Keep the connection-level
+            # behaviour instead: no retries, or a single one when
+            # retry_on_timeout or retry_on_error is set.
+            retry_once = sentinel_kwargs.get("retry_on_timeout") or sentinel_kwargs.get(
+                "retry_on_error"
+            )
+            sentinel_kwargs["retry"] = Retry(NoBackoff(), 1 if retry_once else 0)
         self.sentinel_kwargs = sentinel_kwargs
 
         self.sentinels = [

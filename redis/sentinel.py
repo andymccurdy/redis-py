@@ -262,7 +262,11 @@ class Sentinel(SentinelCommands):
     connecting to sentinel instances. Any argument that can be passed to
     a normal Redis connection can be specified here. If ``sentinel_kwargs`` is
     not specified, any socket_timeout and socket_keepalive options specified
-    in ``connection_kwargs`` will be used.
+    in ``connection_kwargs`` will be used. Unless ``sentinel_kwargs`` contains
+    ``retry``, the sentinel clients don't retry a failed command (or retry it
+    once when ``retry_on_timeout`` or ``retry_on_error`` is set), since master
+    discovery already moves on to the next sentinel; pass a ``Retry`` object
+    as ``retry`` to use another policy.
 
     ``connection_kwargs`` are keyword arguments that will be used when
     establishing a connection to a Redis server.

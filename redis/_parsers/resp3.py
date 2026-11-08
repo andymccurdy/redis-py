@@ -136,6 +136,16 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
                     timeout=timeout,
                 )
             response = resp_dict
+        # attribute response: auxiliary data that comes before the reply it
+        # describes. skip it and read the reply
+        elif byte == b"|":
+            for _ in range(_parse_int(response, raw) * 2):
+                self._read_response(disable_decoding=True, timeout=timeout)
+            return self._read_response(
+                disable_decoding=disable_decoding,
+                push_request=push_request,
+                timeout=timeout,
+            )
         # push response
         elif byte == b">":
             response = [
@@ -274,6 +284,14 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
                     disable_decoding=disable_decoding, push_request=push_request
                 )
             response = resp_dict
+        # attribute response: auxiliary data that comes before the reply it
+        # describes. skip it and read the reply
+        elif byte == b"|":
+            for _ in range(_parse_int(response, raw) * 2):
+                await self._read_response(disable_decoding=True)
+            return await self._read_response(
+                disable_decoding=disable_decoding, push_request=push_request
+            )
         # push response
         elif byte == b">":
             response = [

@@ -4548,6 +4548,65 @@ class TestMalformedNumericFrameInvalidatesConnection:
         assert conn.is_connected is True
 
 
+# The MGET example of the attribute type in the RESP3 specification: the
+# attribute map comes first, then the actual reply.
+RESP3_ATTRIBUTE_BEFORE_REPLY = (
+    b"|1\r\n+key-popularity\r\n"
+    b"%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n"
+    b"*2\r\n:2039123\r\n:9543892\r\n"
+)
+
+
+@pytest.mark.fixed_client
+class TestRESP3AttributeReply:
+    """A RESP3 attribute (`|`) is auxiliary data that comes before the part of
+    a reply it describes. The parser skips it and returns that part.
+    """
+
+    def test_attribute_before_reply(self):
+        conn = _connection_with_stream(
+            RESP3_ATTRIBUTE_BEFORE_REPLY + b"+SECOND\r\n", _RESP3Parser
+        )
+
+        assert conn.read_response() == [2039123, 9543892]
+        assert conn.read_response() == b"SECOND"
+        assert conn.is_connected is True
+
+    def test_attribute_before_array_element(self):
+        conn = _connection_with_stream(
+            b"*3\r\n:1\r\n:2\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n+SECOND\r\n",
+            _RESP3Parser,
+        )
+
+        assert conn.read_response() == [1, 2, 3]
+        assert conn.read_response() == b"SECOND"
+
+    def test_attribute_is_not_decoded(self):
+        conn = _connection_with_stream(
+            b"|1\r\n$3\r\nkey\r\n$2\r\n\xff\xfe\r\n$5\r\nvalue\r\n",
+            _RESP3Parser,
+            decode_responses=True,
+        )
+
+        assert conn.read_response() == "value"
+
+
+@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
+@skip_if_server_version_lt("6.0.0")
+@skip_if_redis_enterprise()
+def test_resp3_parser_skips_attribute_from_server(r):
+    args = dict(r.connection_pool.connection_kwargs)
+    args.update(protocol=3, parser_class=_RESP3Parser)
+    conn = Connection(**args)
+
+    conn.send_command("DEBUG", "PROTOCOL", "attrib")
+    assert conn.read_response() == b"Some real reply following the attribute"
+    conn.send_command("PING")
+    assert conn.read_response() == b"PONG"
+    conn.disconnect()
+
+
 @pytest.mark.fixed_client
 @pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="hiredis is not installed")
 class TestPushHandlerValueErrorKeepsConnection:

@@ -50,6 +50,7 @@ from redis.backoff import (
     ExponentialWithJitterBackoff,
     NoBackoff,
 )
+from redis.client import CaseInsensitiveDict, _cached_default_response_callbacks
 from redis.cluster import (
     _REPLICAS_ONLY_STRATEGIES,
     PIPELINE_BLOCKED_COMMANDS,
@@ -58,6 +59,9 @@ from redis.cluster import (
     LoadBalancingStrategy,
     _resolve_localhost,
     get_node_name,
+    parse_cluster_shards,
+    parse_cluster_shards_unified,
+    parse_cluster_shards_with_str_keys,
 )
 from redis.commands.cluster import AsyncClusterMultiKeyCommands
 from redis.commands.core import HotkeysMetricsTypes
@@ -3045,6 +3049,69 @@ class TestRedisClusterObj:
 class TestRedisClusterObjMocked:
     """RedisCluster behaviour checked against mocked nodes; no server needed."""
 
+    async def test_response_callbacks_are_case_insensitive(self) -> None:
+        """
+        The callback table is a case-insensitive per-client copy, shared by
+        reference with every node.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            callbacks = rc.response_callbacks
+            assert isinstance(callbacks, CaseInsensitiveDict)
+            assert callbacks["ping"] is callbacks["PING"]
+            assert callbacks["cluster shards"] is callbacks["CLUSTER SHARDS"]
+            for node in rc.get_nodes():
+                assert node.response_callbacks is callbacks
+
+            def custom_callback(response):
+                return f"custom_{response}"
+
+            rc.set_response_callback("custom_cmd", custom_callback)
+            for node in rc.get_nodes():
+                assert node.response_callbacks["CUSTOM_CMD"] is custom_callback
+        finally:
+            await rc.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "protocol,legacy_responses,expected",
+        [
+            (None, True, parse_cluster_shards_with_str_keys),
+            (2, True, parse_cluster_shards),
+            (3, True, parse_cluster_shards),
+            (None, False, parse_cluster_shards_unified),
+        ],
+    )
+    async def test_cluster_shards_override_does_not_touch_cached_table(
+        self, protocol, legacy_responses, expected
+    ) -> None:
+        canonical = _cached_default_response_callbacks(protocol, legacy_responses)
+        canonical_before = dict(canonical)
+        kwargs = {"legacy_responses": legacy_responses}
+        if protocol is not None:
+            kwargs["protocol"] = protocol
+        rc = await get_mocked_redis_client(
+            host=default_host, port=default_port, **kwargs
+        )
+        try:
+            assert rc.response_callbacks["CLUSTER SHARDS"] is expected
+            assert rc.response_callbacks is not canonical
+            assert dict(canonical) == canonical_before
+        finally:
+            await rc.aclose()
+
+    async def test_lowercase_command_runs_response_callback(self) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            rc.set_response_callback("GET", lambda response: "static")
+            node = rc.get_default_node()
+            connection = mock.AsyncMock()
+            connection.read_response.return_value = b"foo"
+            assert await node.parse_response(connection, "get") == "static"
+            assert await node.parse_response(connection, "GeT") == "static"
+        finally:
+            await rc.aclose()
+
     async def test_aclosing(self) -> None:
         cluster = await get_mocked_redis_client(host=default_host, port=default_port)
         called = 0
@@ -3363,6 +3430,16 @@ class TestClusterRedisCommands:
     """
     Tests for RedisCluster unique commands
     """
+
+    async def test_case_insensitive_command_names(self, r: RedisCluster) -> None:
+        assert r.response_callbacks["ping"] == r.response_callbacks["PING"]
+
+    async def test_lowercase_execute_command_runs_response_callback(
+        self, r: RedisCluster
+    ) -> None:
+        r.set_response_callback("GET", lambda response: "static")
+        await r.set("a", "foo")
+        assert await r.execute_command("get", "a") == "static"
 
     async def _wait_for_bgsave(self, r: RedisCluster, timeout=10) -> None:
         loop = asyncio.get_running_loop()

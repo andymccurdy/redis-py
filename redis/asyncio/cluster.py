@@ -47,7 +47,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers import AsyncCommandsParser, Encoder
-from redis._parsers.helpers import decode_info, get_response_callbacks
+from redis._parsers.helpers import decode_info
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import (
     PubSub,
@@ -70,7 +70,12 @@ from redis.asyncio.observability.recorder import (
 from redis.asyncio.retry import Retry, _to_async_retry
 from redis.auth.token import TokenInterface
 from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
-from redis.client import EMPTY_RESPONSE, NEVER_DECODE, AbstractRedis
+from redis.client import (
+    EMPTY_RESPONSE,
+    NEVER_DECODE,
+    AbstractRedis,
+    default_response_callbacks,
+)
 from redis.cluster import (
     _EVAL_COMMANDS,
     _REPLICAS_ONLY_STRATEGIES,
@@ -696,7 +701,7 @@ class RedisCluster(
         if retry_on_error:
             self.retry.update_supported_errors(retry_on_error)
 
-        kwargs["response_callbacks"] = get_response_callbacks(
+        kwargs["response_callbacks"] = default_response_callbacks(
             user_protocol=kwargs.get("protocol"),
             legacy_responses=kwargs.get("legacy_responses", True),
         )

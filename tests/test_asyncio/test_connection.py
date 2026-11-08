@@ -1745,6 +1745,24 @@ class TestAsyncRESP3AttributeReply:
         assert await conn.read_response() == "value"
         await conn.disconnect()
 
+    async def test_attribute_is_not_read_as_a_reply(self):
+        # an error or a push message in an attribute is data of the attribute,
+        # and an attribute in an attribute describes the value after it
+        conn = Connection(protocol=3, parser_class=_AsyncRESP3Parser)
+        _attach_stream(
+            conn,
+            b"|3\r\n"
+            b"+error\r\n-LOADING Redis is loading the dataset in memory\r\n"
+            b"+push\r\n>2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n"
+            b"+attribute\r\n|1\r\n+unit\r\n+ms\r\n:3600\r\n"
+            b"+OK\r\n+SECOND\r\n",
+        )
+
+        assert await conn.read_response() == b"OK"
+        assert await conn.read_response() == b"SECOND"
+        assert conn.is_connected is True
+        await conn.disconnect()
+
 
 @pytest.mark.onlynoncluster
 @pytest.mark.fixed_client

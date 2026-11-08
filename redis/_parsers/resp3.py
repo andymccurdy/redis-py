@@ -140,7 +140,7 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         # describes. skip it and read the reply
         elif byte == b"|":
             for _ in range(_parse_int(response, raw) * 2):
-                self._read_response(disable_decoding=True, timeout=timeout)
+                self._skip_response(timeout=timeout)
             return self._read_response(
                 disable_decoding=disable_decoding,
                 push_request=push_request,
@@ -179,6 +179,30 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
             response = self.encoder.decode(response)
 
         return response
+
+    def _skip_response(self, timeout: Union[float, object] = SENTINEL) -> None:
+        # read a part of an attribute without handling it as a reply: an error
+        # in it isn't raised, and nothing in it is decoded
+        raw = self._buffer.readline(timeout=timeout)
+        if not raw:
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+
+        byte, response = raw[:1], raw[1:]
+
+        if byte in (b"$", b"=", b"!"):
+            self._buffer.read(_parse_int(response, raw), timeout=timeout)
+        elif byte in (b"*", b"~", b">"):
+            for _ in range(_parse_int(response, raw)):
+                self._skip_response(timeout=timeout)
+        elif byte == b"%":
+            for _ in range(_parse_int(response, raw) * 2):
+                self._skip_response(timeout=timeout)
+        # an attribute, and the value it describes
+        elif byte == b"|":
+            for _ in range(_parse_int(response, raw) * 2 + 1):
+                self._skip_response(timeout=timeout)
+        elif byte not in (b"-", b"+", b"_", b":", b"(", b",", b"#"):
+            raise InvalidResponse(f"Protocol Error: {raw!r}")
 
 
 class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
@@ -288,7 +312,7 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         # describes. skip it and read the reply
         elif byte == b"|":
             for _ in range(_parse_int(response, raw) * 2):
-                await self._read_response(disable_decoding=True)
+                await self._skip_response()
             return await self._read_response(
                 disable_decoding=disable_decoding, push_request=push_request
             )
@@ -315,3 +339,24 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
         if isinstance(response, bytes) and disable_decoding is False:
             response = self.encoder.decode(response)
         return response
+
+    async def _skip_response(self) -> None:
+        # read a part of an attribute without handling it as a reply: an error
+        # in it isn't raised, and nothing in it is decoded
+        raw = await self._readline()
+        byte, response = raw[:1], raw[1:]
+
+        if byte in (b"$", b"=", b"!"):
+            await self._read(_parse_int(response, raw))
+        elif byte in (b"*", b"~", b">"):
+            for _ in range(_parse_int(response, raw)):
+                await self._skip_response()
+        elif byte == b"%":
+            for _ in range(_parse_int(response, raw) * 2):
+                await self._skip_response()
+        # an attribute, and the value it describes
+        elif byte == b"|":
+            for _ in range(_parse_int(response, raw) * 2 + 1):
+                await self._skip_response()
+        elif byte not in (b"-", b"+", b"_", b":", b"(", b",", b"#"):
+            raise InvalidResponse(f"Protocol Error: {raw!r}")

@@ -46,7 +46,7 @@ def _run_bounded(target, args):
         worker.close()
 
 
-def _finalizer_during_shutdown(url, pool_class, parser_class, automatic):
+def _finalizer_during_shutdown(url, pool_class, parser_class, automatic, operation):
     pool = pool_class.from_url(
         url,
         protocol=3,
@@ -56,7 +56,8 @@ def _finalizer_during_shutdown(url, pool_class, parser_class, automatic):
         maint_notifications_config=MaintNotificationsConfig(enabled=False),
     )
     owner = pool.get_connection()
-    pool.release(owner)
+    if operation != "release":
+        pool.release(owner)
     enabled, thresholds = gc.isenabled(), gc.get_threshold()
     gc.disable()
     victim = Redis.from_pool(pool)
@@ -82,9 +83,17 @@ def _finalizer_during_shutdown(url, pool_class, parser_class, automatic):
 
     try:
         with patch.object(owner._conn, "disconnect", disconnect):
-            pool.close()
+            if operation == "release":
+                owner.mark_for_reconnect()
+                pool.release(owner)
+            elif operation == "free_disconnect":
+                pool.disconnect_free_connections()
+            else:
+                pool.close()
         assert collected
         assert not owner.is_connected
+        assert not owner._in_use_lock.locked()
+        assert not owner._idle_maintenance
         reused = pool.get_connection()
         reused.send_command("PING")
         assert reused.read_response() == b"PONG"
@@ -101,10 +110,19 @@ def _finalizer_during_shutdown(url, pool_class, parser_class, automatic):
 @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
 @pytest.mark.parametrize("parser_class", PARSERS)
 @pytest.mark.parametrize("automatic", [False, True])
-def test_finalizer_during_pool_shutdown(request, pool_class, parser_class, automatic):
+@pytest.mark.parametrize("operation", ["close", "release", "free_disconnect"])
+def test_finalizer_during_pool_shutdown(
+    request, pool_class, parser_class, automatic, operation
+):
     _run_bounded(
         _finalizer_during_shutdown,
-        (request.config.getoption("--redis-url"), pool_class, parser_class, automatic),
+        (
+            request.config.getoption("--redis-url"),
+            pool_class,
+            parser_class,
+            automatic,
+            operation,
+        ),
     )
 
 

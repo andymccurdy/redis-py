@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import skip_if_server_version_lt
+
 from redis import Redis
 from redis import maint_notifications
 from redis._defaults import DEFAULT_SOCKET_CONNECT_TIMEOUT, DEFAULT_SOCKET_TIMEOUT
@@ -3238,6 +3240,112 @@ def test_started_listener_closing_pool_preserves_order_for_all_listeners():
         assert not handler._scheduled_timers
     finally:
         pool.close()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize(
+    "cached",
+    [False, pytest.param(True, marks=skip_if_server_version_lt("7.4.0"))],
+)
+@pytest.mark.parametrize("cancel_completion", [False, True])
+def test_cancelled_start_listener_delivers_queued_completion(
+    request, pool_class, cached, cancel_completion
+):
+    events = []
+    cancellation = KeyboardInterrupt("cancel start listener")
+
+    class Listener(EventListenerInterface):
+        def listen(self, event):
+            events.append(type(event))
+            if isinstance(event, MaintenanceStartedEvent):
+                event.connection_pool.close()
+                raise cancellation
+            if cancel_completion:
+                raise SystemExit("cancel completion listener")
+
+    pool = pool_class.from_url(
+        request.config.getoption("--redis-url"),
+        protocol=3,
+        cache_config=CacheConfig() if cached else None,
+        maint_notifications_config=MaintNotificationsConfig(
+            enabled="auto",
+            proactive_reconnect=False,
+            event_dispatcher=EventDispatcher(
+                {
+                    MaintenanceStartedEvent: [Listener()],
+                    MaintenanceCompletedEvent: [Listener()],
+                }
+            ),
+        ),
+    )
+    connection = pool.get_connection()
+    pool.release(connection)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            connection._maint_notifications_connection_handler.handle_notification(
+                NodeMigratingNotification(1, 60)
+            )
+        assert raised.value is cancellation
+        assert events == [MaintenanceStartedEvent, MaintenanceCompletedEvent]
+        assert connection.maintenance_state == MaintenanceState.NONE
+        assert id(pool) not in maint_notifications._maintenance_event_queues
+        assert id(pool) not in maint_notifications._maintenance_event_dispatching
+        reused = pool.get_connection()
+        reused.send_command("PING")
+        assert reused.read_response() == b"PONG"
+        pool.release(reused)
+        pool.close()
+        assert events == [MaintenanceStartedEvent, MaintenanceCompletedEvent]
+    finally:
+        pool.close()
+
+
+@pytest.mark.fixed_client
+def test_cancelled_listener_does_not_strand_other_deferred_sources():
+    events = []
+    cancellation = KeyboardInterrupt("cancel first source")
+
+    class Listener(EventListenerInterface):
+        def listen(self, event):
+            events.append((event.connection, type(event)))
+            if isinstance(event, MaintenanceStartedEvent):
+                event.connection.disconnect()
+                if event.connection is first:
+                    raise cancellation
+
+    config = MaintNotificationsConfig(
+        enabled=True,
+        event_dispatcher=EventDispatcher(
+            {
+                MaintenanceStartedEvent: [Listener()],
+                MaintenanceCompletedEvent: [Listener()],
+            }
+        ),
+    )
+    first, second = (
+        Connection(protocol=3, maint_notifications_config=config) for _ in range(2)
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            with maint_notifications._defer_maintenance_events():
+                for connection in (first, second):
+                    connection._maint_notifications_connection_handler.handle_notification(
+                        NodeMigratingNotification(1, 60)
+                    )
+        assert raised.value is cancellation
+        for connection in (first, second):
+            assert [kind for source, kind in events if source is connection] == [
+                MaintenanceStartedEvent,
+                MaintenanceCompletedEvent,
+            ]
+            assert id(connection) not in maint_notifications._maintenance_event_queues
+            assert (
+                id(connection) not in maint_notifications._maintenance_event_dispatching
+            )
+    finally:
+        first.disconnect()
+        second.disconnect()
 
 
 @pytest.mark.fixed_client

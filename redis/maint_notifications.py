@@ -846,8 +846,15 @@ def _defer_maintenance_events():
         if pending:
             for _, delivery in pending:
                 delivery.ready = True
+            cancellation = None
             for source in dict.fromkeys(source for source, _ in pending):
-                _drain_maintenance_events(source)
+                try:
+                    _drain_maintenance_events(source)
+                except BaseException as error:
+                    if cancellation is None:
+                        cancellation = error
+            if cancellation is not None:
+                raise cancellation
 
 
 def _drain_maintenance_events(source):
@@ -856,6 +863,7 @@ def _drain_maintenance_events(source):
         if source in _maintenance_event_dispatching:
             return
         _maintenance_event_dispatching.add(source)
+    cancellation = None
     try:
         while True:
             with _maintenance_event_lock:
@@ -864,7 +872,7 @@ def _drain_maintenance_events(source):
                     _maintenance_event_dispatching.remove(source)
                     if not queue:
                         _maintenance_event_queues.pop(source, None)
-                    return
+                    break
                 delivery = queue.popleft()
             # No queue, handler or ownership lock is held during callbacks.
             # Reentrant events append to this queue and follow the current
@@ -877,9 +885,15 @@ def _drain_maintenance_events(source):
                     logger.exception(
                         f"Error dispatching maintenance event: {delivery.event}"
                     )
+                except BaseException as error:
+                    # A listener may enqueue completion by closing its pool
+                    # before cancelling. Deliver ready events without retrying
+                    # that listener, then propagate the original cancellation.
+                    if cancellation is None:
+                        cancellation = error
             if os.getpid() != pid:
                 # A listener forked: the child has a fresh dispatch queue.
-                return
+                break
     except BaseException:
         if os.getpid() == pid:
             with _maintenance_event_lock:
@@ -887,6 +901,8 @@ def _drain_maintenance_events(source):
                 if not _maintenance_event_queues.get(source):
                     _maintenance_event_queues.pop(source, None)
         raise
+    if cancellation is not None:
+        raise cancellation
 
 
 def _dispatch_maintenance_event(
@@ -895,9 +911,9 @@ def _dispatch_maintenance_event(
 ) -> None:
     """
     Dispatch a maintenance event to the dispatcher configured on ``config``,
-    if any. A failing listener is logged and never interrupts the notification
-    handling that emitted the event: the push parser swallows exceptions
-    silently, so letting one out would abort the remaining handling instead.
+    if any. Ordinary listener exceptions are logged: the push parser swallows
+    them silently, so letting one out would abort the remaining handling.
+    Cancellation propagates after ready deliveries have drained.
     """
     if config.event_dispatcher is None:
         return

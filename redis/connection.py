@@ -3989,7 +3989,12 @@ class MaintNotificationsAbstractConnectionPool:
         :param moving_address_src: The address of the node that is being moved.
         """
         debug = logger.isEnabledFor(logging.DEBUG)
-        with _defer_maintenance_events() if self.cache is not None else nullcontext():
+        with (
+            _defer_maintenance_events() if self.cache is not None else nullcontext(),
+            self._defer_cached_disconnects()
+            if self.cache is not None
+            else nullcontext(),
+        ):
             with self._get_pool_lock():
                 for conn in self._get_free_connections():
                     if self._should_update_connection(
@@ -4732,24 +4737,27 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             connection._disconnect_from_pool(inuse_connections)
 
     @contextmanager
-    def _auth_lock(self):
-        # Sentinel discovery can disconnect free sockets while AUTH still
-        # holds the pool lock. Join idle drains only after that outer lock is
-        # released, since their cleanup also needs the pool lock.
+    def _defer_cached_disconnects(self):
+        # Finalizers and Sentinel discovery may close this pool inside an
+        # ownership or pool lock. Join drains only after the caller releases
+        # those locks and any idle claim; a drain's cleanup needs them too.
         state = self._cache_disconnects
         if getattr(state, "pending", None) is not None:
-            with self._lock:
-                yield
+            yield
             return
         pending = []
         state.pending = pending
         try:
-            with self._lock:
-                yield
+            yield
         finally:
             del state.pending
             for connection, inuse_connections in pending:
                 connection._disconnect_from_pool(inuse_connections)
+
+    @contextmanager
+    def _auth_lock(self):
+        with self._defer_cached_disconnects(), self._lock:
+            yield
 
     def close(self) -> None:
         """Close the pool, disconnecting all connections"""
@@ -5218,8 +5226,11 @@ class BlockingConnectionPool(ConnectionPool):
         owner_locked = False
         pool_locked = False
         deferred_events = None
+        deferred_disconnects = None
         try:
             if owner_lock is not None:
+                deferred_disconnects = self._defer_cached_disconnects()
+                deferred_disconnects.__enter__()
                 deferred_events = _defer_maintenance_events()
                 deferred_events.__enter__()
                 owner_lock.acquire()
@@ -5293,8 +5304,12 @@ class BlockingConnectionPool(ConnectionPool):
                 self._lock.release()
             if owner_locked:
                 owner_lock.release()
-            if deferred_events is not None:
-                deferred_events.__exit__(*sys.exc_info())
+            try:
+                if deferred_disconnects is not None:
+                    deferred_disconnects.__exit__(*sys.exc_info())
+            finally:
+                if deferred_events is not None:
+                    deferred_events.__exit__(*sys.exc_info())
 
     def disconnect(self, inuse_connections: bool = True):
         """

@@ -551,6 +551,22 @@ async def test_client_setinfo_skipped_with_explicit_none(connection_kwargs):
     conn.read_response.assert_not_awaited()
 
 
+@pytest.mark.fixed_client
+async def test_resp3_handshake_skips_health_check_without_auth():
+    # A health-check PING sent before HELLO is rejected by proxies that gate
+    # every command but HELLO/AUTH/QUIT until the handshake completes.
+    conn = Connection(protocol=3, health_check_interval=15)
+    conn._parser.on_connect = mock.Mock()
+    conn.send_command = mock.AsyncMock()
+    conn.read_response = mock.AsyncMock(return_value={"proto": 3})
+
+    await conn.on_connect_check_health()
+
+    assert conn.send_command.await_args_list[0] == mock.call(
+        "HELLO", conn.protocol, check_health=False
+    )
+
+
 @pytest.mark.onlynoncluster
 async def test_invalid_response(create_redis):
     r = await create_redis(single_connection_client=True)

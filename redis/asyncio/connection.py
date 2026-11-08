@@ -1246,7 +1246,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 # update cluster exception classes
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
-            await self.send_command("HELLO", self.protocol, check_health=check_health)
+            # avoid checking health here -- PING will fail if we try
+            # to check the health prior to HELLO completing the handshake
+            await self.send_command("HELLO", self.protocol, check_health=False)
             response = await self.read_response()
             # if response.get(b"proto") != self.protocol and response.get(
             #     "proto"

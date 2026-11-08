@@ -1442,7 +1442,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # update cluster exception classes
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
-            self.send_command("HELLO", self.protocol, check_health=check_health)
+            # avoid checking health here -- PING will fail if we try
+            # to check the health prior to HELLO completing the handshake
+            self.send_command("HELLO", self.protocol, check_health=False)
             self.handshake_metadata = self.read_response()
             if (
                 self.handshake_metadata.get(b"proto") != self.protocol

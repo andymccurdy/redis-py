@@ -233,8 +233,8 @@ class Sentinel(AsyncSentinelCommands):
         self,
         sentinels: Iterable[Tuple[str, int]],
         min_other_sentinels: int = 0,
-        sentinel_kwargs: Optional[Mapping[str, Any]] = None,
-        force_master_ip: Optional[str] = None,
+        sentinel_kwargs: Mapping[str, Any] | None = None,
+        force_master_ip: str | None = None,
         **connection_kwargs: Any,
     ) -> None:
         # if sentinel_kwargs isn't defined, use the socket_* options from

@@ -1,6 +1,6 @@
 import random
 import weakref
-from typing import Any, Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union
 
 from redis.client import Redis
 from redis.commands import SentinelCommands
@@ -270,8 +270,8 @@ class Sentinel(SentinelCommands):
         self,
         sentinels: Iterable[Tuple[str, int]],
         min_other_sentinels: int = 0,
-        sentinel_kwargs: Optional[Mapping[str, Any]] = None,
-        force_master_ip: Optional[str] = None,
+        sentinel_kwargs: Mapping[str, Any] | None = None,
+        force_master_ip: str | None = None,
         **connection_kwargs: Any,
     ) -> None:
         # if sentinel_kwargs isn't defined, use the socket_* options from
@@ -364,7 +364,7 @@ class Sentinel(SentinelCommands):
             return False
         return True
 
-    def discover_master(self, service_name):
+    def discover_master(self, service_name: str):
         """
         Asks sentinel servers for the Redis master's address corresponding
         to the service labeled ``service_name``.
@@ -438,9 +438,9 @@ class Sentinel(SentinelCommands):
 
     def master_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """
@@ -488,9 +488,9 @@ class Sentinel(SentinelCommands):
 
     def slave_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """

@@ -1992,6 +1992,22 @@ class TestPubSubWorkerThread:
                 if stopper.ident is not None:
                     stopper.join(timeout=2.0)
 
+    def test_run_in_thread_waits_on_socket_by_default(self):
+        p = redis.Redis().pubsub()
+        timeouts = []
+        called = threading.Event()
+
+        def fake_get_message(ignore_subscribe_messages=False, timeout=0.0):
+            timeouts.append(timeout)
+            called.set()
+
+        p.get_message = fake_get_message
+        thread = p.run_in_thread()
+        assert called.wait(timeout=1.0)
+        thread.stop(timeout=2.0)
+        # a zero timeout turns the worker into a busy loop
+        assert timeouts[0] > 0
+
     def test_stop_waits_for_worker_before_returning(self):
         entered = threading.Event()
         release = threading.Event()

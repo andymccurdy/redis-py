@@ -455,8 +455,9 @@ caller can use the thread.stop() method to shut down the event loop and
 thread. Behind the scenes, this is simply a wrapper around get_message()
 that runs in a separate thread, essentially creating a tiny non-blocking
 event loop for you. run_in_thread() takes an optional sleep_time
-argument. If specified, the event loop will call time.sleep() with the
-value in each iteration of the loop.
+argument (default 0.1): how long each iteration of the loop waits on the
+socket for a message. It also bounds how long thread.stop() takes. A value
+of 0 polls without waiting and keeps a CPU core busy.
 
 Note: Since we're running in a separate thread, there's no way to handle
 messages that aren't automatically handled with registered message
@@ -467,7 +468,7 @@ handlers attached.
 .. code:: python
 
    >>> p.subscribe(**{'my-channel': my_handler})
-   >>> thread = p.run_in_thread(sleep_time=0.001)
+   >>> thread = p.run_in_thread()
    # the event loop is now running in the background processing messages
    # when it's time to shut it down...
    >>> thread.stop()

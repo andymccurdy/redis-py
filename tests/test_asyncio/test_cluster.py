@@ -6055,6 +6055,7 @@ class TestMultiShardRequests:
                 assert await pipe.execute() == [0]
         assert keyslot.call_count == len(keys)
 
+    @skip_if_server_version_lt("8.4")
     async def test_keys_that_cannot_be_located_are_not_split(
         self, r: RedisCluster, monkeypatch
     ) -> None:

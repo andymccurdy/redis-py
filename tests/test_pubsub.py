@@ -4605,7 +4605,23 @@ class TestClusterPubSubSlotMigration:
         with mock.patch.object(pubsub, "_poll_node_pubsub", return_value=None) as poll:
             assert pubsub._sharded_message_generator(timeout=0.4) == (None, None)
 
-        assert [c.args[1] for c in poll.call_args_list] == [0.1] * 4
+        # Four split slices, then one non-blocking sweep.
+        assert [c.args[1] for c in poll.call_args_list] == [0.1] * 4 + [0.0] * 4
+
+    def test_sharded_message_generator_sweeps_for_late_message(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"c0", "data": b"late"}
+
+        # The message reaches the first node only after its slice ran out.
+        with mock.patch.object(
+            pubsub, "_poll_node_pubsub", side_effect=[None, None, msg]
+        ):
+            assert pubsub._sharded_message_generator(timeout=0.4) == (idle[0], msg)
 
     def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """

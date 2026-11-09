@@ -456,8 +456,9 @@ thread. Behind the scenes, this is simply a wrapper around get_message()
 that runs in a separate thread, essentially creating a tiny non-blocking
 event loop for you. run_in_thread() takes an optional sleep_time
 argument (default 0.1): how long each iteration of the loop waits on the
-socket for a message. It also bounds how long thread.stop() takes. A value
-of 0 polls without waiting and keeps a CPU core busy.
+socket for a message, so an idle thread notices thread.stop() within that
+time. A handler that is still running delays it; thread.stop(timeout=...)
+bounds the wait. A value of 0 polls without waiting and keeps a CPU core busy.
 
 Note: Since we're running in a separate thread, there's no way to handle
 messages that aren't automatically handled with registered message

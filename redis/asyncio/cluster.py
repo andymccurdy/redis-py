@@ -5515,7 +5515,8 @@ class ClusterPubSub(PubSub):
         nodes = len(self.node_pubsub_mapping)
         # Split the wait across the pass, otherwise every idle node ahead of the
         # one with a message adds a full timeout.
-        node_timeout = timeout / nodes if timeout and nodes > 1 else timeout
+        split = bool(timeout) and nodes > 1
+        node_timeout = timeout / nodes if split else timeout
         for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
@@ -5602,6 +5603,10 @@ class ClusterPubSub(PubSub):
                 return pubsub, message
         if first_error is not None and failed == polled:
             raise first_error
+        if split and polled:
+            # A message can reach a node after its slice ran out; sweep once
+            # without waiting before reporting a timeout.
+            return await self._sharded_message_generator(0.0)
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)
         return None, None

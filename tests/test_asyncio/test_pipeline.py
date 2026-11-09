@@ -1026,6 +1026,7 @@ class TestAsyncPipelineRetryChecker:
         host = "localhost"
         port = 6379
         db = 0
+        _resp2_fallback = False
 
         def __init__(self, retry):
             self.retry = retry

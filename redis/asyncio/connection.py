@@ -51,7 +51,12 @@ else:
 from ..auth.token import TokenInterface
 from ..driver_info import DriverInfo, resolve_driver_info
 from ..event import AsyncAfterConnectionReleasedEvent, EventDispatcher
-from ..utils import deprecated_args, format_error_message, is_os_level_timeout
+from ..utils import (
+    deprecated_args,
+    format_error_message,
+    is_os_level_timeout,
+    warn_deprecated,
+)
 
 # the functionality is available in 3.11.x but has a major issue before
 # 3.11.3. See https://github.com/redis/redis-py/issues/2633
@@ -125,8 +130,14 @@ from .._parsers import (
     _AsyncRESP3Parser,
 )
 
-SYM_STAR = b"*"
-SYM_DOLLAR = b"$"
+# ``SYM_STAR`` and ``SYM_DOLLAR`` are deprecated: nothing in this library uses them any
+# more. They are bound to private names and served through the module ``__getattr__``
+# below, so that reading them warns. The annotations let linters and type checkers see the
+# names without binding them, which would bypass the warning.
+SYM_STAR: bytes
+SYM_DOLLAR: bytes
+_DEPRECATED_SYM_STAR = b"*"
+_DEPRECATED_SYM_DOLLAR = b"$"
 SYM_CRLF = b"\r\n"
 SYM_LF = b"\n"
 SYM_EMPTY = b""
@@ -3613,3 +3624,26 @@ class BlockingConnectionPool(ConnectionPool):
             if not locked:
                 self._release_in_background(connection)
             raise
+
+
+def __getattr__(name: str):
+    """
+    Serve the deprecated ``SYM_STAR`` and ``SYM_DOLLAR`` constants, warning on the way.
+
+    A module attribute cannot be deprecated by decoration, so the constants are bound to
+    private names above and resolved here instead - which is only reached because no module
+    attribute of that name exists.
+    """
+    if name == "SYM_STAR":
+        value = _DEPRECATED_SYM_STAR
+    elif name == "SYM_DOLLAR":
+        value = _DEPRECATED_SYM_DOLLAR
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    warn_deprecated(
+        name,
+        reason="Nothing in this library uses it any more",
+        version="8.2.0",
+        stacklevel=3,
+    )
+    return value

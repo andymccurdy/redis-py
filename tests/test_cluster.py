@@ -34,6 +34,7 @@ from redis.cluster import (
     REPLICA,
     ClusterNode,
     ClusterPipeline,
+    ExecutionStrategy,
     LoadBalancingStrategy,
     NodesManager,
     RedisCluster,
@@ -8125,6 +8126,18 @@ class TestClusterPipeline:
             pipe.touch("a", "b")
             assert len(pipe) == 1
             assert pipe.execute() == [2]
+
+    def test_touch_not_required_from_execution_strategy_subclasses(self):
+        """
+        Test that a strategy that does not define touch can still be
+        instantiated, and that its touch falls back to execute_command
+        """
+        stubs = {
+            name: lambda self, *args, **kwargs: args
+            for name in ExecutionStrategy.__abstractmethods__
+        }
+        strategy = type("StrategyWithoutTouch", (ExecutionStrategy,), stubs)()
+        assert strategy.touch("a", "b") == ("TOUCH", "a", "b")
 
     def test_unlink_single(self, r):
         """

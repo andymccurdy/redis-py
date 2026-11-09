@@ -6004,9 +6004,8 @@ class ExecutionStrategy(ABC):
     def exists(self, *keys):
         pass
 
-    @abstractmethod
     def touch(self, *keys):
-        pass
+        return self.execute_command("TOUCH", *keys)
 
     @abstractmethod
     def eval(self):
@@ -6112,9 +6111,6 @@ class AbstractStrategy(ExecutionStrategy):
 
     def exists(self, *keys):
         return self.execute_command("EXISTS", *keys)
-
-    def touch(self, *keys):
-        return self.execute_command("TOUCH", *keys)
 
     def eval(self):
         """ """

@@ -4850,3 +4850,263 @@ def test_send_packed_command_os_level_timeout_is_a_connection_error():
     with pytest.raises(ConnectionError):
         conn.send_packed_command(b"PING", check_health=False)
     conn.disconnect.assert_called_once()
+
+
+def _wrapped_ssl_context(conn):
+    contexts = []
+
+    def wrap_socket(context, sock, **kwargs):
+        contexts.append(context)
+        return MagicMock()
+
+    with socket.socket() as sock:
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            conn._wrap_socket_with_ssl(sock)
+    return contexts[0]
+
+
+@pytest.mark.fixed_client
+def test_ssl_connections_with_same_settings_share_a_context():
+    contexts = [
+        _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none")) for _ in range(5)
+    ]
+
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"ssl_cert_reqs": "optional", "ssl_check_hostname": False},
+        {"ssl_cert_reqs": "none", "ssl_ciphers": "ECDHE+AESGCM"},
+        {"ssl_cert_reqs": "none", "ssl_min_version": ssl.TLSVersion.TLSv1_3},
+        {
+            "ssl_cert_reqs": "none",
+            "ssl_include_verify_flags": [ssl.VerifyFlags.VERIFY_X509_STRICT],
+        },
+    ],
+)
+def test_ssl_connections_with_different_settings_do_not_share_a_context(settings):
+    context = _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none"))
+
+    assert _wrapped_ssl_context(SSLConnection(**settings)) is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_certificate_rotation(tmp_path):
+    certfile = tmp_path / "client.crt"
+    certfile.write_text("old")
+    settings = {"ssl_cert_reqs": "none", "ssl_certfile": str(certfile)}
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        context = _wrapped_ssl_context(SSLConnection(**settings))
+        assert _wrapped_ssl_context(SSLConnection(**settings)) is context
+
+        certfile.write_text("rotated")
+        assert _wrapped_ssl_context(SSLConnection(**settings)) is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_replacement_with_same_size_and_mtime(tmp_path):
+    certfile = tmp_path / "client.crt"
+    certfile.write_text("old")
+    stat = certfile.stat()
+    settings = {"ssl_cert_reqs": "none", "ssl_certfile": str(certfile)}
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        context = _wrapped_ssl_context(SSLConnection(**settings))
+
+        replacement = tmp_path / "client.crt.new"
+        replacement.write_text("new")
+        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(replacement, certfile)
+
+        assert _wrapped_ssl_context(SSLConnection(**settings)) is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_ca_directory_change(tmp_path):
+    settings = {"ssl_cert_reqs": "none", "ssl_ca_path": str(tmp_path)}
+
+    with patch.object(ssl.SSLContext, "load_verify_locations"):
+        context = _wrapped_ssl_context(SSLConnection(**settings))
+        assert _wrapped_ssl_context(SSLConnection(**settings)) is context
+
+        (tmp_path / "ca.0").write_text("rotated")
+        os.utime(tmp_path, ns=(0, 0))
+        assert _wrapped_ssl_context(SSLConnection(**settings)) is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_follows_sslkeylogfile(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "first.log"))
+    context = _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none"))
+
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "second.log"))
+
+    assert _wrapped_ssl_context(SSLConnection(ssl_cert_reqs="none")) is not context
+
+
+@pytest.mark.fixed_client
+def test_concurrent_connections_share_one_ssl_context():
+    workers = 8
+    barrier = threading.Barrier(workers)
+    contexts = []
+    create_default_context = ssl.create_default_context
+
+    def slow_create_default_context():
+        time.sleep(0.05)
+        return create_default_context()
+
+    def wrap_socket(context, sock, **kwargs):
+        contexts.append(context)
+        return MagicMock()
+
+    def connect(conn):
+        barrier.wait()
+        conn._wrap_socket_with_ssl(MagicMock())
+
+    connections = [
+        SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+        for _ in range(workers)
+    ]
+    with patch("ssl.create_default_context", slow_create_default_context):
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            threads = [
+                threading.Thread(target=connect, args=(conn,)) for conn in connections
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+    assert len(contexts) == workers
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_build_can_open_a_connection():
+    nested = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile="client.crt")
+
+    def load_cert_chain(*args, **kwargs):
+        # As an ssl_password callback fetching the password from Redis would
+        _wrapped_ssl_context(nested)
+
+    def connect():
+        with patch.object(ssl.SSLContext, "load_cert_chain", load_cert_chain):
+            _wrapped_ssl_context(conn)
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="Requires os.fork")
+def test_ssl_context_lock_is_usable_in_a_forked_child():
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with redis.utils._SHARED_SSL_CONTEXTS_LOCK:
+            held.set()
+            release.wait()
+
+    thread = threading.Thread(target=hold_lock, daemon=True)
+    thread.start()
+    assert held.wait(timeout=5)
+    pid = os.fork()
+    if pid == 0:
+        usable = redis.utils._SHARED_SSL_CONTEXTS_LOCK.acquire(timeout=5)
+        os._exit(0 if usable else 1)
+    release.set()
+    thread.join()
+
+    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
+def test_ssl_context_is_released_with_its_last_connection():
+    context = _wrapped_ssl_context(
+        SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+AESGCM")
+    )
+    context_ref = weakref.ref(context)
+
+    del context
+    gc.collect()
+
+    assert context_ref() is None
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_keeps_certificate_file_roles_apart(tmp_path):
+    pem = tmp_path / "combined.pem"
+    pem.write_text("pem")
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "load_verify_locations"):
+            client_cert = _wrapped_ssl_context(
+                SSLConnection(ssl_cert_reqs="none", ssl_certfile=str(pem))
+            )
+            ca_certs = _wrapped_ssl_context(
+                SSLConnection(ssl_cert_reqs="none", ssl_ca_certs=str(pem))
+            )
+
+    assert client_cert is not ca_certs
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
+def test_ssl_context_with_callable_password_does_not_keep_its_owner_alive():
+    class Owner:
+        def __init__(self):
+            self.conn = SSLConnection(
+                ssl_cert_reqs="none",
+                ssl_certfile="client.crt",
+                ssl_password=self.password,
+            )
+
+        def password(self):
+            return "password"
+
+    def wrap_socket(context, sock, **kwargs):
+        return types.SimpleNamespace(context=context, settimeout=lambda timeout: None)
+
+    owner = Owner()
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "wrap_socket", wrap_socket):
+            owner.conn._sock = owner.conn._wrap_socket_with_ssl(MagicMock())
+    owner_ref = weakref.ref(owner)
+
+    del owner
+    gc.collect()
+
+    assert owner_ref() is None
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("ca_data", [bytearray(b"ca"), memoryview(bytearray(b"ca"))])
+def test_ssl_context_with_unhashable_ca_data_is_not_shared(ca_data):
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_ca_data=ca_data)
+
+    with patch.object(ssl.SSLContext, "load_verify_locations"):
+        assert _wrapped_ssl_context(conn) is not _wrapped_ssl_context(conn)
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_with_missing_certificate_file_raises(tmp_path):
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile=str(tmp_path / "missing"))
+
+    with pytest.raises(FileNotFoundError):
+        _wrapped_ssl_context(conn)

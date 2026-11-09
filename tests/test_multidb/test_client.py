@@ -855,6 +855,51 @@ class TestMultiDbClient:
         "mock_multi_db_config,mock_db, mock_db1, mock_db2",
         [
             (
+                {"hc_interval": 100},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    def test_opened_circuit_is_half_opened_after_its_grace_period(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        """
+        Validates that an opened circuit moves to HALF_OPEN after the circuit's
+        own grace period, not the default one, so the recovery health check
+        can close it again. Background health checks are effectively disabled
+        so they cannot close the circuit first.
+        """
+        cb1 = PBCircuitBreakerAdapter(pybreaker.CircuitBreaker(reset_timeout=0.1))
+        cb1.database = mock_db1
+        mock_db1.circuit = cb1
+
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+        mock_multi_db_config.health_checks = [mock_hc]
+
+        with patch.object(mock_multi_db_config, "databases", return_value=databases):
+            mock_db1.client.execute_command.return_value = "OK1"
+
+            client = MultiDBClient(mock_multi_db_config)
+            try:
+                assert client.set("key", "value") == "OK1"
+
+                cb1.state = CBState.OPEN
+
+                wait_for_condition(
+                    lambda: cb1.state == CBState.CLOSED,
+                    timeout=5.0,
+                    error_message="Timeout waiting for cb1 to close after its grace period",
+                )
+            finally:
+                client.close()
+
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
                 {},
                 {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
                 {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},

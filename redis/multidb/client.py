@@ -20,7 +20,6 @@ from redis.multidb.circuit import CircuitBreaker
 from redis.multidb.circuit import State as CBState
 from redis.multidb.command_executor import DefaultCommandExecutor
 from redis.multidb.config import (
-    DEFAULT_GRACE_PERIOD,
     DatabaseConfig,
     InitialHealthCheck,
     MultiDbConfig,
@@ -537,7 +536,7 @@ class MultiDBClient(RedisModuleCommands, CoreCommands):
             )
 
             self._bg_scheduler.run_once(
-                DEFAULT_GRACE_PERIOD, _half_open_circuit, circuit
+                circuit.grace_period, _half_open_circuit, circuit
             )
 
         if old_state != CBState.CLOSED and new_state == CBState.CLOSED:

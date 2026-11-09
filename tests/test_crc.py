@@ -57,3 +57,7 @@ class TestKeySlot:
     def test_custom_bucket_is_honored(self):
         assert key_slot(b"foo", 100) == crc_hqx(b"foo", 0) % 100
         assert 0 <= key_slot(b"123456789", 100) < 100
+
+    def test_memoryview_key_matches_bytes(self):
+        assert key_slot(memoryview(b"foo")) == key_slot(b"foo")
+        assert key_slot(memoryview(b"{user1000}.x")) == key_slot(b"{user1000}")

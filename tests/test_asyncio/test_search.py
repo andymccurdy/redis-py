@@ -4860,6 +4860,7 @@ class TestHybridSearch(AsyncSearchTestsBase):
             b"18",
         ]
 
+    @pytest.mark.redismod
     async def test_hybrid_search_query_with_explain_score_and_cursor(self, decoded_r):
         with pytest.raises(DataError, match="explain_score is not supported"):
             await decoded_r.ft().hybrid_search(

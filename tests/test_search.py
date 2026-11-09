@@ -6784,6 +6784,7 @@ class TestHybridSearch(SearchTestsBase):
             b"18",
         ]
 
+    @pytest.mark.redismod
     def test_hybrid_search_query_with_explain_score_and_cursor(self, client):
         with pytest.raises(DataError, match="explain_score is not supported"):
             client.ft().hybrid_search(

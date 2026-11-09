@@ -735,6 +735,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_pool_handler_for_connection(
         self, maint_notifications_pool_handler: MaintNotificationsPoolHandler
     ):
+        if self._resp2_fallback:
+            return
         # Deep copy the pool handler to avoid sharing the same pool handler
         # between multiple connections, because otherwise each connection will override
         # the connection reference and the pool handler will only hold a reference

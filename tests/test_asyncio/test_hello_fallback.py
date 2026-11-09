@@ -79,6 +79,9 @@ class TestHelloFallback:
         assert conn.get_protocol() == 2
         assert conn._resp2_fallback is True
         assert conn.handshake_metadata == {}
+        conn.set_maint_notifications_pool_handler_for_connection(mock.Mock())
+        assert conn._maint_notifications_pool_handler is None
+        assert conn._maint_notifications_connection_handler is None
         conn.set_maint_notifications_cluster_handler_for_connection(mock.Mock())
         assert conn._oss_cluster_maint_notifications_handler is None
         with pytest.raises(ConnectionError, match="Connection has data"):
@@ -396,6 +399,9 @@ async def test_fallback_client_and_pipeline(
                     == expected
                 )
         assert pool._available_connections[-1].get_protocol() == 2
+        await pool.update_maint_notifications_config(
+            MaintNotificationsConfig(enabled="auto")
+        )
         await pool.disconnect()
         assert await client.hgetall(key) == expected[0]
 

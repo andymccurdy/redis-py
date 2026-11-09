@@ -1654,7 +1654,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         elif b" " in args[0]:
             args = tuple(args[0].split()) + args[1:]
 
-        buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
+        buff = b"*%d\r\n" % len(args)
 
         buffer_cutoff = self._buffer_cutoff
         for arg in map(self.encoder.encode, args):
@@ -1666,23 +1666,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 or arg_length > buffer_cutoff
                 or isinstance(arg, memoryview)
             ):
-                buff = SYM_EMPTY.join(
-                    (buff, SYM_DOLLAR, str(arg_length).encode(), SYM_CRLF)
-                )
-                output.append(buff)
+                output.append(b"%s$%d\r\n" % (buff, arg_length))
                 output.append(arg)
                 buff = SYM_CRLF
             else:
-                buff = SYM_EMPTY.join(
-                    (
-                        buff,
-                        SYM_DOLLAR,
-                        str(arg_length).encode(),
-                        SYM_CRLF,
-                        arg,
-                        SYM_CRLF,
-                    )
-                )
+                buff = b"%s$%d\r\n%s\r\n" % (buff, arg_length, arg)
         output.append(buff)
         return output
 

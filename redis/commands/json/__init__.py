@@ -300,7 +300,7 @@ class AsyncJSON(_JSONBase):
         """
 
         def _read_file(fp: str) -> dict:
-            with open(fp) as f:
+            with open(fp, "rb") as f:
                 return loads(f.read())
 
         file_content = await asyncio.to_thread(_read_file, file_name)
@@ -360,7 +360,7 @@ class AsyncJSON(_JSONBase):
                     fpha=fpha,
                 )
                 set_files_result[file_path] = True
-            except JSONDecodeError:
+            except (JSONDecodeError, UnicodeDecodeError):
                 set_files_result[file_path] = False
 
         return set_files_result

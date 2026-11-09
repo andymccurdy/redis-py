@@ -1179,3 +1179,51 @@ async def test_toggle_dollar(decoded_r: redis.Redis):
     # Test missing key
     with pytest.raises(exceptions.ResponseError):
         await decoded_r.json().toggle("non_existing_doc", "$..a")
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+async def test_set_file_reads_utf8(tmp_path, monkeypatch, encoding):
+    # JSON files are UTF-8, so set_file must not decode them with the locale
+    # encoding (cp1252, cp932, ... on Windows), and a UTF-8 BOM must not break
+    # parsing. set is stubbed so this runs without a server.
+    import json
+
+    obj = {"name": "café", "city": "東京"}
+    jsonfile = tmp_path / "data.json"
+    jsonfile.write_text(json.dumps(obj, ensure_ascii=False), encoding=encoding)
+
+    json_client = redis.Redis().json()
+    captured = []
+
+    async def fake_set(name, path, value, **kwargs):
+        captured.append(value)
+        return True
+
+    monkeypatch.setattr(json_client, "set", fake_set)
+
+    assert await json_client.set_file("test", Path.root_path(), str(jsonfile))
+    assert captured == [obj]
+
+
+@pytest.mark.fixed_client
+async def test_set_path_skips_non_utf8_file(tmp_path, monkeypatch):
+    # set_file reads bytes, so a file that isn't UTF-8/16/32 raises
+    # UnicodeDecodeError. set_path must record it as failed and keep going.
+    # set is stubbed so this runs without a server.
+    import json
+
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"a": 1}), encoding="utf-8")
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b"\x80\x81 not utf-8")
+
+    json_client = redis.Redis().json()
+
+    async def fake_set(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(json_client, "set", fake_set)
+
+    result = await json_client.set_path(Path.root_path(), str(tmp_path))
+    assert result == {str(good): True, str(bad): False}

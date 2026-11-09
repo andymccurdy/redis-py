@@ -654,7 +654,7 @@ class JSONCommands:
 
         """
 
-        with open(file_name) as fp:
+        with open(file_name, "rb") as fp:
             file_content = loads(fp.read())
 
         return self.set(
@@ -725,7 +725,7 @@ class JSONCommands:
                         fpha=fpha,
                     )
                     set_files_result[file_path] = True
-                except JSONDecodeError:
+                except (JSONDecodeError, UnicodeDecodeError):
                     set_files_result[file_path] = False
 
         return set_files_result

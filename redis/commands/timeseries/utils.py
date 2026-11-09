@@ -172,6 +172,13 @@ def _m_range_metadata(aggregation_type=None):
     return {"aggregators": [nativestr(agg).lower() for agg in aggregators]}
 
 
+def _nativestr_metadata(metadata):
+    """Apply ``nativestr`` to RESP3 metadata so it matches the RESP2 shape."""
+    return {
+        nativestr(k): [nativestr(v) for v in values] for k, values in metadata.items()
+    }
+
+
 def parse_m_range_unified(response, **kwargs):
     """Unified parser for TS.MRANGE / TS.MREVRANGE.
 
@@ -183,7 +190,7 @@ def parse_m_range_unified(response, **kwargs):
     if isinstance(response, dict):
         res = {}
         for key, item in response.items():
-            metadata = item[1] if len(item) > 2 else []
+            metadata = _nativestr_metadata(item[1]) if len(item) > 2 else []
             res[key] = [item[0], metadata, parse_range_unified(item[-1])]
         return res
     res = {}

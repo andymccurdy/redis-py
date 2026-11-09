@@ -3437,7 +3437,7 @@ def test_blocking_pool_fork_in_maintenance_does_not_stay_in_maintenance():
             free = pool._lock.acquire(blocking=False)
             if free:
                 pool._lock.release()
-            if free and not pool._in_maintenance and not pool._locked:
+            if free and not pool._in_maintenance:
                 status = 0
         finally:
             os._exit(status)

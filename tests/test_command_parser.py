@@ -99,6 +99,14 @@ class TestCommandsParser:
                 assert commands_parser.get_keys(r, *args) == keys
         server.assert_not_called()
 
+    @skip_if_server_version_lt("8.4.0")
+    def test_get_moveable_keys_from_key_specs_with_keystep(self, r):
+        commands_parser = CommandsParser(r)
+        args = ["MSETEX", 2, "k1", "v1", "k2", "v2", "EX", 10]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            assert commands_parser.get_keys(r, *args) == ["k1", "k2"]
+        server.assert_not_called()
+
     # A bug in redis<7.0 causes this to fail: https://github.com/redis/redis/issues/9493
     @skip_if_server_version_lt("7.0.0")
     def test_get_eval_keys_with_0_keys(self, r):

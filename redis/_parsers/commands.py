@@ -118,7 +118,7 @@ class AbstractCommandsParser:
                 if numkeys < 0:
                     return None
                 first += find_spec["firstkey"]
-                last = first + numkeys - 1
+                last = first + (numkeys - 1) * find_spec["keystep"]
             else:
                 return None
             step = find_spec["keystep"]

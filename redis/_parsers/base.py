@@ -801,6 +801,14 @@ class _AsyncRESPBase(AsyncBaseParser):
                 idx = buffer.find(10)
                 if idx >= 0 and stream._exception is None:
                     if idx > stream._limit:
+                        # StreamReader.readline() discards a complete
+                        # over-limit line before raising ValueError; do
+                        # the same, so a caller that retains the
+                        # connection (disconnect_on_error=False) can
+                        # reach the following frames instead of raising
+                        # on these bytes on every later read.
+                        del buffer[: idx + 1]
+                        stream._maybe_resume_transport()
                         raise ValueError(
                             "Separator is found, but chunk is longer than limit"
                         )

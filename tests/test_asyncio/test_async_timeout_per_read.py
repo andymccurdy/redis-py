@@ -258,6 +258,33 @@ async def test_socket_timeout_mid_bulk_read_preserves_bytes_when_kept(factory):
     assert await conn.read_response() == b"OK"
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(make_resp2_connection, id="resp2"),
+        pytest.param(make_resp3_connection, id="resp3"),
+    ],
+)
+async def test_over_limit_buffered_line_is_consumed_before_raising(factory):
+    # Regression test for the codex P2 on base.py:805: a complete RESP
+    # line longer than StreamReader._limit that is already buffered must
+    # be consumed before _readline raises ValueError, exactly like
+    # StreamReader.readline() does. Otherwise a caller that retains the
+    # connection (disconnect_on_error=False, as PubSub and push reads do)
+    # raises on the same bytes on every later read instead of reaching
+    # the following frames.
+    conn, reader = factory()
+    over_limit = b"-" + b"x" * (reader._limit + 1) + b"\r\n"
+    reader.feed_data(over_limit + b"+OK\r\n")
+
+    with pytest.raises(ValueError, match="longer than limit"):
+        await conn.read_response(disconnect_on_error=False)
+    conn.disconnect.assert_not_awaited()
+
+    # the over-limit line is gone: the next read reaches the following reply
+    assert await conn.read_response() == b"OK"
+
+
 async def test_reads_arm_timeout_only_when_they_can_wait():
     parser = _AsyncRESP2Parser(READ_SIZE)
     reader = asyncio.StreamReader()

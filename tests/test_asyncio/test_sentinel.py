@@ -579,9 +579,25 @@ def test_sentinel_clients_do_not_retry_by_default():
 
 
 @pytest.mark.onlynoncluster
+def test_sentinel_clients_retry_once_on_error_when_asked():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry_on_error": [exceptions.ConnectionError]},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 1
+
+
+@pytest.mark.onlynoncluster
 def test_sentinel_clients_use_the_given_retry():
     sentinel = Sentinel(
         [("localhost", 26379)],
         sentinel_kwargs={"retry": Retry(ExponentialBackoff(), 2)},
     )
     assert sentinel.sentinels[0].get_retry().get_retries() == 2
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_kwargs_are_not_modified():
+    sentinel_kwargs = {"socket_timeout": 1}
+    Sentinel([("localhost", 26379)], sentinel_kwargs=sentinel_kwargs)
+    assert sentinel_kwargs == {"socket_timeout": 1}

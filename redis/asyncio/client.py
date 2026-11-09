@@ -1188,9 +1188,14 @@ class Monitor:
             client_port = client_info[5:]
             client_type = "unix"
         else:
-            # use rsplit as ipv6 addresses contain colons
-            client_address, client_port = client_info.rsplit(":", 1)
-            client_type = "tcp"
+            if client_info == "":
+                client_address = ""
+                client_port = ""
+                client_type = "unknown"
+            else:
+                # use rsplit as ipv6 addresses contain colons
+                client_address, client_port = client_info.rsplit(":", 1)
+                client_type = "tcp"
         return {
             "time": float(command_time),
             "db": int(db_id),
@@ -1319,6 +1324,18 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
+                if self.push_handler_func is not None:
+                    # The handler is set on the parser of a pooled connection:
+                    # put the parser's own back, or the next PubSub that gets
+                    # this connection has its messages handed to ours
+                    parser = self.connection._get_parser()
+                    if (
+                        getattr(parser, "pubsub_push_handler_func", None)
+                        is self.push_handler_func
+                    ):
+                        parser.set_pubsub_push_handler(
+                            parser.handle_pubsub_push_response
+                        )
                 # Detach before awaiting release, as Pipeline.reset() does, so
                 # the pubsub never holds a connection that is back in the pool.
                 connection, self.connection = self.connection, None

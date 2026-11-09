@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import functools
+import inspect
 import warnings
 import pytest
 from redis.exceptions import DataError
@@ -366,20 +368,119 @@ class TestDeprecatedArgs:
             assert len(w) == 0
         assert not filterable_args_calls
 
-        # The outer decorator sees the inner wrapper's (*args, **kwargs)
-        # signature, so it warns only for keyword usage.
+        # Stacking merges into one wrapper over func, so the outer layer sees
+        # func's own signature and warns for positional usage too.
         stacked = deprecated_args(args_to_warn=["new_param"])(never_warns)
+        assert stacked.__wrapped__ is func
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            assert stacked("a", "b") == ("a", "b")
+            assert stacked("a") == ("a", None)
             assert stacked(old_param="a") == ("a", None)
             assert len(w) == 0
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             assert stacked(new_param="b") == (None, "b")
+            assert stacked("a", "b") == ("a", "b")
+            assert len(w) == 2
+            assert all("new_param" in str(x.message) for x in w)
+
+    def test_stacked_layers_merge_into_one_wrapper(self):
+        def func(a=None, b=None, c=None):
+            return (a, b, c)
+
+        inner = deprecated_args(args_to_warn=["c"], reason="inner")(func)
+        outer = deprecated_args(args_to_warn=["b"], reason="outer")(inner)
+        assert outer.__wrapped__ is func
+        assert outer.__name__ == "func"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(1) == (1, None, None)
+            assert outer(a=1) == (1, None, None)
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(1, 2, 3) == (1, 2, 3)
+            assert outer(c=3, b=2) == (None, 2, 3)
+            # Each layer keeps its own message, outermost first.
+            assert [str(x.message) for x in w] == [
+                "Call to 'func' function with deprecated usage of input "
+                f"argument/s '{arg}'. ({reason})"
+                for arg, reason in (("b", "outer"), ("c", "inner")) * 2
+            ]
+
+    def test_deprecated_args_warn_at_call_site(self):
+        def func(a=None, b=None):
+            return (a, b)
+
+        single = deprecated_args(args_to_warn=["b"])(func)
+        merged = deprecated_args(args_to_warn=["a"])(
+            deprecated_args(args_to_warn=["b"])(func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            single_line = inspect.currentframe().f_lineno + 1
+            single(b=2)
+            merged_line = inspect.currentframe().f_lineno + 1
+            merged(a=1, b=2)
+        # Every layer points at the line that called the decorated function.
+        assert [(x.filename, x.lineno) for x in w] == [
+            (__file__, single_line),
+            (__file__, merged_line),
+            (__file__, merged_line),
+        ]
+
+    def test_stacked_wildcard_and_named_layers(self, filterable_args_calls):
+        def func(self=None, a=None, b=None, c=None):
+            return (a, b, c)
+
+        merged = deprecated_args(args_to_warn=["c"])(
+            deprecated_args(args_to_warn=["*"], allowed_args=["a", "c"])(func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert merged(None, 1) == (1, None, None)
+            assert merged(a=1) == (1, None, None)
+            assert len(w) == 0
+        assert not filterable_args_calls
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            merged(c=3)  # allowed by the wildcard layer, warned by the named one
             assert len(w) == 1
-            assert "new_param" in str(w[0].message)
+            assert "'c'" in str(w[0].message)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            merged(None, 1, 2)  # positional b reaches the wildcard layer
+            assert len(w) == 1
+            assert "['b']" in str(w[0].message)
+
+    def test_foreign_decorator_between_layers_is_kept(self):
+        calls = []
+
+        def func(a=None, b=None):
+            return (a, b)
+
+        inner = deprecated_args(args_to_warn=["b"])(func)
+
+        @functools.wraps(inner)
+        def foreign(*args, **kwargs):
+            calls.append(args)
+            return inner(*args, **kwargs)
+
+        outer = deprecated_args(args_to_warn=["a"])(foreign)
+        assert outer.__wrapped__ is foreign
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(b=2) == (None, 2)
+            assert len(w) == 1
+            assert "'b'" in str(w[0].message)
+        assert calls == [()]
 
 
 # Tests for experimental_method decorator
@@ -573,6 +674,18 @@ class TestExtractExpireFlags:
 
     def test_px_as_timedelta_uses_milliseconds(self):
         assert extract_expire_flags(px=timedelta(seconds=2)) == ["PX", 2000]
+
+    def test_px_as_timedelta_is_exact(self):
+        # 1.001 * 1000 is 1000.9999999999999 in floating point
+        assert extract_expire_flags(px=timedelta(milliseconds=1001)) == ["PX", 1001]
+
+    def test_px_as_negative_timedelta_truncates_toward_zero(self):
+        assert extract_expire_flags(px=timedelta(milliseconds=-1001)) == ["PX", -1001]
+        assert extract_expire_flags(px=timedelta(milliseconds=-1500.3)) == [
+            "PX",
+            -1500,
+        ]
+        assert extract_expire_flags(px=timedelta(microseconds=-500)) == ["PX", 0]
 
     def test_px_as_digit_string(self):
         assert extract_expire_flags(px="500") == ["PX", 500]

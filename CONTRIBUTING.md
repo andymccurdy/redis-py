@@ -134,9 +134,14 @@ and then run:
 
 `$ apt update && apt install <package>`
 
-You can see the logging output of a containers like this:
+To follow logs from a development service, run the following from the
+repository root:
 
-`$ docker logs -f <service>`
+`$ docker compose logs -f <service>`
+
+For example, `docker compose logs -f redis` follows the standalone Redis service.
+The service name comes from `docker-compose.yml`; `docker logs` instead expects a
+container name or ID, such as `redis-standalone`.
 
 ### Troubleshooting
 

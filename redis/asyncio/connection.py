@@ -13,6 +13,7 @@ from itertools import chain
 from types import MappingProxyType
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Iterable,
     List,
@@ -929,6 +930,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             self._writer.close()
             self._writer = self._reader = None
 
+    def _force_disconnect(self) -> None:
+        """Disconnect synchronously, without waiting for the close to finish."""
+        # Same session cleanup as disconnect() does first; both are idempotent.
+        self._reset_himport_state()
+        self._complete_maintenance_on_disconnect()
+        self._parser.on_disconnect()
+        self.reset_should_reconnect()
+        self._close()
+
     def __repr__(self):
         repr_args = ",".join((f"{k}={v}" for k, v in self.repr_pieces()))
         return f"<{self.__class__.__module__}.{self.__class__.__name__}({repr_args})>"
@@ -1096,17 +1106,24 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             )
             raise e
         except OSError as e:
-            e = ConnectionError(self._error_message(e))
+            conn_error = ConnectionError(self._error_message(e))
             await record_error_count(
                 server_address=getattr(self, "host", None),
                 server_port=getattr(self, "port", None),
                 network_peer_address=getattr(self, "host", None),
                 network_peer_port=getattr(self, "port", None),
-                error_type=e,
+                error_type=conn_error,
                 retry_attempts=actual_retry_attempts,
                 is_internal=False,
             )
-            raise e
+            # Preserve the original OSError (with its errno) as the cause so
+            # the retry policy can tell unrecoverable failures apart. Clear the
+            # local afterwards so its traceback does not form a reference cycle
+            # with this frame.
+            try:
+                raise conn_error from e
+            finally:
+                conn_error = None
         except Exception as exc:
             raise ConnectionError(exc) from exc
 
@@ -1316,63 +1333,70 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         # Likewise the relaxation a maintenance applied to it: restored and
         # reported here, ahead of a close that may time out or be skipped
         self._complete_maintenance_on_disconnect()
-        # On Python 3.13+, asyncio.timeout() raises RuntimeError when called
-        # outside a running Task (e.g. during GC finalization or event-loop
-        # callbacks).  In that context we fall back to a synchronous close.
-        # See https://github.com/redis/redis-py/issues/3856
-        if asyncio.current_task() is None:
-            self._parser.on_disconnect()
-            self.reset_should_reconnect()
-            self._close()
+        self._parser.on_disconnect()
+        # Reset the reconnect flag
+        self.reset_should_reconnect()
+        if not self.is_connected:
             return
-
         try:
-            async with async_timeout(self.socket_connect_timeout):
-                self._parser.on_disconnect()
-                # Reset the reconnect flag
-                self.reset_should_reconnect()
-                if not self.is_connected:
-                    return
-                try:
-                    self._writer.close()  # type: ignore[union-attr]
-                    # wait for close to finish, except when handling errors and
-                    # forcefully disconnecting.
-                    if not nowait:
-                        await self._writer.wait_closed()  # type: ignore[union-attr]
-                except OSError:
-                    pass
-                finally:
-                    self._reader = None
-                    self._writer = None
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"Timed out closing connection after {self.socket_connect_timeout}"
-            ) from None
+            # On Python 3.13+, asyncio.timeout() raises RuntimeError when called
+            # outside a running Task (e.g. during GC finalization or event-loop
+            # callbacks).  In that context we fall back to a synchronous close.
+            # See https://github.com/redis/redis-py/issues/3856
+            if asyncio.current_task() is None:
+                self._close()
+                return
 
-        if error:
-            if health_check_failed:
-                close_reason = CloseReason.HEALTHCHECK_FAILED
-            else:
-                close_reason = CloseReason.ERROR
+            # Taken before the first await, as sync does, so a concurrent
+            # disconnect() finds no socket to close and records nothing.
+            writer = self._writer
+            self._reader = None
+            self._writer = None
+            try:
+                async with async_timeout(self.socket_connect_timeout):
+                    try:
+                        writer.close()  # type: ignore[union-attr]
+                        # wait for close to finish, except when handling errors
+                        # and forcefully disconnecting.
+                        if not nowait:
+                            await writer.wait_closed()  # type: ignore[union-attr]
+                    except OSError:
+                        pass
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"Timed out closing connection after {self.socket_connect_timeout}"
+                ) from None
+        finally:
+            # Reached on every close, including one that times out or is
+            # cancelled. The recorders never suspend, so awaiting them here is
+            # safe even while a cancellation propagates.
+            if error:
+                if health_check_failed:
+                    close_reason = CloseReason.HEALTHCHECK_FAILED
+                else:
+                    close_reason = CloseReason.ERROR
 
-            if failure_count is not None and failure_count > self.retry.get_retries():
-                await record_error_count(
-                    server_address=getattr(self, "host", None),
-                    server_port=getattr(self, "port", None),
-                    network_peer_address=getattr(self, "host", None),
-                    network_peer_port=getattr(self, "port", None),
+                if (
+                    failure_count is not None
+                    and failure_count > self.retry.get_retries()
+                ):
+                    await record_error_count(
+                        server_address=getattr(self, "host", None),
+                        server_port=getattr(self, "port", None),
+                        network_peer_address=getattr(self, "host", None),
+                        network_peer_port=getattr(self, "port", None),
+                        error_type=error,
+                        retry_attempts=failure_count,
+                    )
+
+                await record_connection_closed(
+                    close_reason=close_reason,
                     error_type=error,
-                    retry_attempts=failure_count,
                 )
-
-            await record_connection_closed(
-                close_reason=close_reason,
-                error_type=error,
-            )
-        else:
-            await record_connection_closed(
-                close_reason=CloseReason.APPLICATION_CLOSE,
-            )
+            else:
+                await record_connection_closed(
+                    close_reason=CloseReason.APPLICATION_CLOSE,
+                )
 
     async def _send_ping(self):
         """Send PING, expect PONG in return"""
@@ -1477,7 +1501,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def can_read(self) -> bool:
         """Check the socket to see if there's data loaded in the buffer."""
@@ -1488,7 +1514,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except OSError as e:
             await self.disconnect(nowait=True)
             host_error = self._host_error()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     async def read_response(
         self,
@@ -1570,7 +1598,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                     await self.disconnect(nowait=True)
                 raise ConnectionError(
                     f"Error while reading from {host_error} : {e.args}"
-                )
+                ) from e
             if timeout is not None:
                 # user requested timeout, return None. Operation can be retried
                 return None
@@ -1583,7 +1611,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # See the sync Connection.read_response and #4291. The async parser
             # re-parses from self._pos = 0 rather than rewinding a socket
@@ -3036,6 +3066,7 @@ class ConnectionPool(
         self._in_use_connections: Set[AbstractConnection] = set()
         self.encoder_class = self.connection_kwargs.get("encoder_class", Encoder)
         self._lock = asyncio.Lock()
+        self._background_releases: Set[asyncio.Task] = set()
         self._event_dispatcher = self.connection_kwargs.get("event_dispatcher", None)
         if self._event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -3275,26 +3306,46 @@ class ConnectionPool(
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool"""
-        # Connections should always be returned to the correct pool,
-        # not doing so is an error that will cause an exception here.
-        async with self._lock:
-            self._in_use_connections.remove(connection)
+        locked = False
+        disconnect_failed = False
+        try:
+            async with self._lock:
+                locked = True
+                # Connections should always be returned to the correct pool,
+                # not doing so is an error that will cause an exception here.
+                self._in_use_connections.remove(connection)
+                try:
+                    if connection.should_reconnect():
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "Disconnecting released connection marked for "
+                                f"reconnect: {connection}, "
+                                f"{connection.extract_connection_details()}"
+                            )
+                        await connection.disconnect()
+                except BaseException:
+                    # Not known to be closed: close it so reuse reconnects.
+                    connection._force_disconnect()
+                    disconnect_failed = True
+                    raise
+                finally:
+                    # Even if disconnect() is cancelled, don't drop it.
+                    self._available_connections.append(connection)
+        except BaseException as e:
+            if disconnect_failed:
+                # It is back in the pool: still notify listeners and metrics.
+                self._run_in_background(self._finish_release(connection))
+            elif not locked and isinstance(e, asyncio.CancelledError):
+                # Cancelled while waiting for a contended lock: don't leak.
+                self._release_in_background(connection)
+            raise
 
-            if connection.should_reconnect():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Disconnecting released connection marked for reconnect: "
-                        f"{connection}, {connection.extract_connection_details()}"
-                    )
-                await connection.disconnect()
+        await self._finish_release(connection)
 
-            self._available_connections.append(connection)
-
-        await self._event_dispatcher.dispatch_async(
-            AsyncAfterConnectionReleasedEvent(connection)
-        )
-
-        # Record state transition: USED -> IDLE
+    async def _finish_release(self, connection: AbstractConnection) -> None:
+        # Record state transition: USED -> IDLE. Done before the listeners,
+        # which may await I/O and be cancelled, so the counts always match
+        # the pool.
         pool_name = get_pool_name(self)
         await record_connection_count(
             pool_name=pool_name,
@@ -3306,6 +3357,28 @@ class ConnectionPool(
             connection_state=ConnectionState.IDLE,
             counter=1,
         )
+
+        await self._event_dispatcher.dispatch_async(
+            AsyncAfterConnectionReleasedEvent(connection)
+        )
+
+    def _release_in_background(self, connection: AbstractConnection) -> None:
+        if asyncio.current_task() in self._background_releases:
+            return  # this is the background release itself, e.g. at shutdown
+        self._run_in_background(self.release(connection))
+
+    def _run_in_background(self, release_step: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(release_step)
+        self._background_releases.add(task)
+        task.add_done_callback(self._on_background_release_done)
+
+    def _on_background_release_done(self, task: asyncio.Task) -> None:
+        self._background_releases.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "A background connection release failed",
+                exc_info=task.exception(),
+            )
 
     async def disconnect(self, inuse_connections: bool = True):
         """
@@ -3557,6 +3630,15 @@ class BlockingConnectionPool(ConnectionPool):
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool."""
-        async with self._condition:
-            await super().release(connection)
-            self._condition.notify()
+        locked = False
+        try:
+            async with self._condition:
+                locked = True
+                try:
+                    await super().release(connection)
+                finally:
+                    self._condition.notify()
+        except asyncio.CancelledError:
+            if not locked:
+                self._release_in_background(connection)
+            raise

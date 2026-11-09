@@ -5,7 +5,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Unio
 from redis._parsers import Encoder
 from redis.asyncio.multidb.command_executor import DefaultCommandExecutor
 from redis.asyncio.multidb.config import (
-    DEFAULT_GRACE_PERIOD,
     DatabaseConfig,
     InitialHealthCheck,
     MultiDbConfig,
@@ -514,7 +513,7 @@ class MultiDBClient(AsyncRedisModuleCommands, AsyncCoreCommands):
             logger.warning(
                 f"Database {circuit.database} is unreachable. Failover has been initiated."
             )
-            loop.call_later(DEFAULT_GRACE_PERIOD, _half_open_circuit, circuit)
+            loop.call_later(circuit.grace_period, _half_open_circuit, circuit)
 
         if old_state != CBState.CLOSED and new_state == CBState.CLOSED:
             logger.info(f"Database {circuit.database} is reachable again.")

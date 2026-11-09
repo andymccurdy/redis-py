@@ -5,6 +5,7 @@ import pytest
 import redis
 from redis.commands.timeseries.commands import TimeSeriesCommands
 from redis.commands.timeseries.info import TSInfo, parse_info_unified
+from redis.commands.timeseries.utils import parse_m_range_unified
 from redis.utils import SENTINEL
 
 from .conftest import (
@@ -736,6 +737,24 @@ def _mrange_returned_keys(client, res):
     if expects_resp2_shape(client):
         return {next(iter(entry)) for entry in res}
     return set(res.keys())
+
+
+def test_mrange_unified_parser_decodes_resp3_metadata():
+    response = {
+        b"temperature": [
+            {b"sensor": b"a"},
+            {b"aggregators": [b"avg"]},
+            [[1000, b"1.5"]],
+        ]
+    }
+
+    assert parse_m_range_unified(response) == {
+        b"temperature": [
+            {b"sensor": b"a"},
+            {"aggregators": ["avg"]},
+            [[1000, 1.5]],
+        ]
+    }
 
 
 @pytest.mark.onlynoncluster

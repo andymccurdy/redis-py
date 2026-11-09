@@ -22,6 +22,16 @@ def _nativestr_dict(d):
     }
 
 
+def _m_range_metadata_resp3_to_unified(metadata):
+    """Normalize RESP3 TS.MRANGE metadata to the unified string form."""
+    return {
+        nativestr(key): [nativestr(value) for value in values]
+        if isinstance(values, list)
+        else nativestr(values)
+        for key, values in metadata.items()
+    }
+
+
 def parse_query_labels(response, **kwargs):
     """Normalize the TS.QUERYLABELS reply to a ``set`` of unique strings.
 
@@ -183,7 +193,11 @@ def parse_m_range_unified(response, **kwargs):
     if isinstance(response, dict):
         res = {}
         for key, item in response.items():
-            metadata = item[1] if len(item) > 2 else []
+            metadata = (
+                _m_range_metadata_resp3_to_unified(item[1])
+                if len(item) > 2 and isinstance(item[1], dict)
+                else []
+            )
             res[key] = [item[0], metadata, parse_range_unified(item[-1])]
         return res
     res = {}

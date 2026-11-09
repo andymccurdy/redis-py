@@ -1881,3 +1881,140 @@ class TestAsyncConnectionPoolMetricsRecording:
             mock_record.assert_called_once()
             call_kwargs = mock_record.call_args[1]
             assert call_kwargs["close_reason"] == CloseReason.APPLICATION_CLOSE
+
+    @staticmethod
+    def _connect_with_blocking_close(conn):
+        """Give conn a mock socket whose wait_closed() never finishes."""
+        started = asyncio.Event()
+
+        async def hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        conn._writer = MagicMock()
+        conn._writer.wait_closed = AsyncMock(side_effect=hang)
+        conn._reader = MagicMock()
+        return started
+
+    async def test_connection_disconnect_records_connection_closed_on_timeout(self):
+        conn = Connection(socket_connect_timeout=0.01)
+        self._connect_with_blocking_close(conn)
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            error = ConnectionError("Connection lost")
+            with pytest.raises(redis.TimeoutError):
+                await conn.disconnect(error=error)
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.ERROR, error_type=error
+            )
+
+    async def test_connection_disconnect_records_connection_closed_on_cancel(self):
+        conn = Connection()
+        started = self._connect_with_blocking_close(conn)
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            task = asyncio.ensure_future(conn.disconnect())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_concurrent_disconnects_record_connection_closed_once(self):
+        conn = Connection()
+        started = self._connect_with_blocking_close(conn)
+        writer = conn._writer
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            first = asyncio.ensure_future(conn.disconnect())
+            await started.wait()
+            # Starts while the first close is still waiting in wait_closed()
+            await conn.disconnect(nowait=True)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            assert not conn.is_connected
+            writer.close.assert_called_once()
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_connection_disconnect_records_connection_closed_without_task(
+        self,
+    ):
+        conn = Connection()
+        conn._writer = MagicMock()
+        conn._reader = MagicMock()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            # Simulate the no-task context (e.g. GC finalization)
+            with patch("asyncio.current_task", return_value=None):
+                await conn.disconnect()
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_connection_disconnect_skips_connection_closed_when_not_connected(
+        self,
+    ):
+        conn = Connection()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            await conn.disconnect()
+            with patch("asyncio.current_task", return_value=None):
+                await conn.disconnect()
+
+            mock_record.assert_not_called()
+
+    async def test_release_records_connection_closed_once_when_disconnect_cancelled(
+        self,
+    ):
+        pool = ConnectionPool()
+        conn = pool.make_connection()
+        started = self._connect_with_blocking_close(conn)
+        pool._in_use_connections.add(conn)
+        conn.mark_for_reconnect()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            task = asyncio.ensure_future(pool.release(conn))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            async with asyncio.timeout(2):
+                while pool._background_releases:
+                    await asyncio.sleep(0.01)
+
+            assert conn in pool._available_connections
+            assert not conn.is_connected
+            # Recorded by disconnect(), not again by the forced close after it
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )

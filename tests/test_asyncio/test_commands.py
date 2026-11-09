@@ -1461,6 +1461,115 @@ class TestRedisCommands:
         with pytest.raises(exceptions.RedisError):
             await r.bitpos(key, 7) == 12
 
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray(self, r: redis.Redis):
+        # The first and the last bit of each of four bytes are set.
+        await r.set("a", b"\x81\x81\x81\x81")
+        assert await r.bitrangeintarray("a", 0, -1) == [0, 7, 8, 15, 16, 23, 24, 31]
+        assert await r.bitrangeintarray("a", 1, 1) == [8, 15]
+        assert await r.bitrangeintarray("a", 1, 2) == [8, 15, 16, 23]
+        assert await r.bitrangeintarray("a", -1, -1) == [24, 31]
+        assert await r.bitrangeintarray("a", -2, -1) == [16, 23, 24, 31]
+        assert await r.bitrangeintarray("a", 2, 99) == [16, 23, 24, 31]
+        assert await r.bitrangeintarray("a", -99, 0) == [0, 7]
+        assert await r.bitrangeintarray("a", 3, 1) == []
+        assert await r.bitrangeintarray("a", 4, 9) == []
+        assert await r.bitrangeintarray("a", -1, -2) == []
+        for start, end in ((0, -1), (1, 2), (-2, -1), (3, 1)):
+            assert len(await r.bitrangeintarray("a", start, end)) == await r.bitcount(
+                "a", start, end
+            )
+        assert await r.bitrangeintarray("missing", 0, -1) == []
+
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_mode(self, r: redis.Redis):
+        await r.set("a", b"\x81\x81\x81\x81")
+        assert await r.bitrangeintarray("a", 0, 0, "bit") == [0]
+        assert await r.bitrangeintarray("a", 7, 8, "BIT") == [7, 8]
+        assert await r.bitrangeintarray("a", 1, 6, "bit") == []
+        assert await r.bitrangeintarray("a", 9, 15, "bit") == [15]
+        assert await r.bitrangeintarray("a", -8, -1, "bit") == [24, 31]
+        assert await r.bitrangeintarray("a", 30, 1000, "bit") == [31]
+        assert await r.bitrangeintarray("a", 32, 40, "bit") == []
+        assert await r.bitrangeintarray("a", 1, 1, "byte") == [8, 15]
+        with pytest.raises(redis.ResponseError):
+            await r.bitrangeintarray("a", 0, -1, "bite")
+
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_limit(self, r: redis.Redis):
+        # Bytes 0, 7 and 8 are full, byte 1 has bits 8 and 15, byte 9 has bit 73.
+        await r.set("a", b"\xff\x81\x00\x00\x00\x00\x00\xff\xff\x40")
+        # A page in byte units completes the byte that holds the last offset.
+        assert await r.bitrangeintarray("a", 0, -1, limit=1) == list(range(8))
+        assert await r.bitrangeintarray("a", 0, -1, limit=9) == [*range(9), 15]
+        assert await r.bitrangeintarray("a", 1, -1, limit=1) == [8, 15]
+        assert await r.bitrangeintarray("a", 0, -1, "bit", limit=9) == list(range(9))
+        assert await r.bitrangeintarray("a", 57, -1, "bit", limit=2) == [57, 58]
+        assert await r.bitrangeintarray("a", 0, -1, limit=0) == []
+        with pytest.raises(redis.ResponseError):
+            await r.bitrangeintarray("a", 0, -1, limit=-1)
+
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_paging(self, r: redis.Redis):
+        await r.set("a", b"\xff\x81\x00\x00\x00\x00\x00\xff\xff\x40")
+        expected = await r.bitrangeintarray("a", 0, -1)
+        assert len(expected) == 27
+        offsets, pages, start = [], [], 0
+        while True:
+            page = await r.bitrangeintarray("a", start, -1, "bit", limit=9)
+            pages.append(page)
+            offsets.extend(page)
+            if len(page) < 9:
+                break
+            start = page[-1] + 1
+        assert [len(page) for page in pages] == [9, 9, 9, 0]
+        assert offsets == expected
+
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_zeros(self, r: redis.Redis):
+        await r.set("a", b"\x81\x81\x81\x81")
+        assert await r.bitrangeintarray("a", 0, 0, "bit", zeros=True) == []
+        assert await r.bitrangeintarray("a", 1, 6, "bit", zeros=True) == list(
+            range(1, 7)
+        )
+        assert await r.bitrangeintarray("a", 0, -1, limit=1, zeros=True) == list(
+            range(1, 7)
+        )
+        await r.set("a", b"\xff\x7e")
+        assert await r.bitrangeintarray("a", 0, -1, zeros=True) == [8, 15]
+        assert await r.bitrangeintarray("a", 0, 99, zeros=True) == [8, 15]
+        # Unlike BITPOS, no clear bits are assumed past the end of the value.
+        await r.set("a", b"\xff\xff")
+        assert await r.bitpos("a", 0) == 16
+        assert await r.bitrangeintarray("a", 0, -1, zeros=True) == []
+
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_wrong_type(self, r: redis.Redis):
+        await r.rpush("a", "a1")
+        with pytest.raises(redis.ResponseError):
+            await r.bitrangeintarray("a", 0, -1)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.240")
+    async def test_bitrangeintarray_native_bitmap(self, r: redis.Redis):
+        old_value = (await r.config_get("bitmap-default-roaring"))[
+            "bitmap-default-roaring"
+        ]
+        await r.config_set("bitmap-default-roaring", "yes")
+        try:
+            for offset in (0, 7, 8, 15, 16, 23, 24, 31):
+                await r.setbit("a", offset, 1)
+        finally:
+            await r.config_set("bitmap-default-roaring", old_value)
+        assert await r.type("a") == b"bitmap"
+        assert await r.bitrangeintarray("a", 0, -1) == [0, 7, 8, 15, 16, 23, 24, 31]
+        assert await r.bitrangeintarray("a", 1, 2) == [8, 15, 16, 23]
+        assert await r.bitrangeintarray("a", 7, 8, "bit") == [7, 8]
+        assert await r.bitrangeintarray("a", 0, -1, "bit", limit=3) == [0, 7, 8]
+        assert await r.bitrangeintarray("a", 1, 6, "bit", zeros=True) == list(
+            range(1, 7)
+        )
+
     async def test_decr(self, r: redis.Redis):
         assert await r.decr("a") == -1
         assert await r.get("a") == b"-1"
@@ -2304,6 +2413,15 @@ class TestRedisCommands:
         assert await r.pttl("a") == -1
 
     @skip_if_server_version_lt("2.6.0")
+    async def test_pexpire_timedelta_is_exact(self, r: redis.Redis):
+        await r.set("a", "foo")
+        with patch.object(r, "execute_command", AsyncMock(return_value=True)) as cmd:
+            await r.pexpire("a", datetime.timedelta(milliseconds=1001))
+        assert cmd.call_args.args == ("PEXPIRE", "a", 1001)
+        assert await r.pexpire("a", datetime.timedelta(milliseconds=1001))
+        assert 0 < await r.pttl("a") <= 1001
+
+    @skip_if_server_version_lt("2.6.0")
     async def test_pexpireat_datetime(self, r: redis.Redis):
         expire_at = await redis_server_time(r) + datetime.timedelta(minutes=1)
         await r.set("a", "foo")
@@ -2335,6 +2453,14 @@ class TestRedisCommands:
         assert await r.psetex("a", expire_at, "value")
         assert await r.get("a") == b"value"
         assert 0 < await r.pttl("a") <= 1000
+
+    @skip_if_server_version_lt("2.6.0")
+    async def test_psetex_timedelta_is_exact(self, r: redis.Redis):
+        with patch.object(r, "execute_command", AsyncMock(return_value=True)) as cmd:
+            await r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert cmd.call_args.args == ("PSETEX", "a", 1001, "value")
+        assert await r.psetex("a", datetime.timedelta(milliseconds=1001), "value")
+        assert 0 < await r.pttl("a") <= 1001
 
     @skip_if_server_version_lt("2.6.0")
     async def test_pttl(self, r: redis.Redis):
@@ -3834,6 +3960,21 @@ class TestRedisCommands:
         ) == [1]
         assert 0 < (await r.spttl("test:set", "member1"))[0] <= 5000
         assert await r.spttl("test:set", "member2") == [-1]
+
+    async def test_spexpire_timedelta_is_exact(self, r: redis.Redis):
+        # argument level only, so it needs no SPEXPIRE support on the server
+        with patch.object(r, "execute_command", AsyncMock(return_value=[1])) as cmd:
+            await r.spexpire(
+                "test:set", datetime.timedelta(milliseconds=1001), "member1"
+            )
+        assert cmd.call_args.args == (
+            "SPEXPIRE",
+            "test:set",
+            1001,
+            "MEMBERS",
+            1,
+            "member1",
+        )
 
     @skip_if_server_version_lt("8.11.240")
     async def test_spexpire_conditions(self, r: redis.Redis):

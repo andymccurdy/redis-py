@@ -45,11 +45,12 @@ from redis.utils import str_if_bytes
 from tests.conftest import skip_if_server_version_lt
 
 # The server the static table was generated from.
-# 8.11 is the first release that reports every command the
-# table carries (FT.ALIASLIST from 8.10, the BLESS container from 8.11); 8.10 is the first
-# that reports the ``script_runner`` flag. The guards that compare the whole table against
-# the live reply cannot run below it.
-STATIC_TABLE_SERVER_VERSION = "8.11.0"
+# 8.12 build, is the first that reports every command the
+# table carries (FT.ALIASLIST from 8.10, the BLESS container from 8.11, the set member
+# expiration reads and BITRANGEINTARRAY from 8.12); 8.10 is the first that reports the
+# ``script_runner`` flag. The guards that compare the whole table against the live reply
+# cannot run below it.
+STATIC_TABLE_SERVER_VERSION = "8.11.240"
 
 # Shape of a plain cacheable keyed read, used to stand in for live metadata in the
 # resolver unit tests below.
@@ -135,6 +136,7 @@ LIVE_CACHEABILITY_DIVERGENCE = {
 # of them is exactly how they drifted apart before.
 NEWLY_ELIGIBLE_VS_LEGACY_ALLOW_LIST = frozenset(
     {
+        "BITRANGEINTARRAY",
         "DIGEST",
         "EXPIRETIME",
         "FT.SUGGET",

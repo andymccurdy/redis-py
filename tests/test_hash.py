@@ -1,6 +1,7 @@
 import math
 import time
 from datetime import datetime, timedelta
+from unittest import mock
 
 import pytest
 from redis import exceptions
@@ -101,6 +102,17 @@ def test_hpexpire_with_timedelta(r):
     assert r.hpexpire("test:hash", timedelta(milliseconds=50), "field1") == [1]
     _wait_for_fields_expired(r, "test:hash", "field1")
     assert r.hexists("test:hash", "field2") is True
+
+
+@skip_if_server_version_lt("7.3.240")
+def test_hpexpire_timedelta_is_exact(r):
+    r.delete("test:hash")
+    r.hset("test:hash", "field1", "value1")
+    with mock.patch.object(r, "execute_command", return_value=[1]) as cmd:
+        r.hpexpire("test:hash", timedelta(milliseconds=1001), "field1")
+    assert cmd.call_args.args == ("HPEXPIRE", "test:hash", 1001, "FIELDS", 1, "field1")
+    assert r.hpexpire("test:hash", timedelta(milliseconds=1001), "field1") == [1]
+    assert 0 < r.hpttl("test:hash", "field1")[0] <= 1001
 
 
 @skip_if_server_version_lt("7.3.240")

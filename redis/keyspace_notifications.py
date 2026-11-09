@@ -282,13 +282,13 @@ class KeyNotification:
     # one need re.DOTALL: without it "." stops at a newline and "$" matches before
     # a trailing one, dropping or truncating the key.
     _KEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__keyspace@(\d+|\*)__:(.+)$", re.DOTALL
+        r"^__keyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _KEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__keyevent@(\d+|\*)__:(.+)$"
     )
     _SUBKEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__subkeyspace@(\d+|\*)__:(.+)$", re.DOTALL
+        r"^__subkeyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _SUBKEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__subkeyevent@(\d+|\*)__:(.+)$"

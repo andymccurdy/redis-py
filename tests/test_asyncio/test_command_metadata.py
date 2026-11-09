@@ -31,10 +31,16 @@ from tests.test_command_metadata import (
     CACHEABLE_KEYED,
     INELIGIBLE_RECORD_COMMANDS,
     KEYED_POLICIES,
+    KILL_COMMANDS,
     LIVE_CACHEABILITY_DIVERGENCE,
+    MULTI_SHARD_SUMMED_POLICIES,
+    MOVABLE_KEYS_READS,
+    ONE_SUCCEEDED_POLICIES,
+    PER_NODE_DIAGNOSTICS,
+    SCRIPT_RUNNER_READS,
     STATIC_TABLE_SERVER_VERSION,
+    TABLE_ROUTED_FLAG_COMMANDS,
     WITHHELD_KEYLESS_READS,
-    WITHHELD_ROUTING_COMMANDS,
     cacheability_fields,
     command_flags,
     command_tips,
@@ -107,34 +113,57 @@ class TestWithheldRoutingPolicies:
     shared by both stacks, so only the sync suite covers them.
     """
 
-    async def test_the_movablekeys_reads_withhold_their_policies(self):
+    async def test_the_movablekeys_reads_record_the_keyed_policies(self):
         static_resolver = AsyncStaticMetadataResolver()
 
-        for name in WITHHELD_ROUTING_COMMANDS:
+        for name in (*MOVABLE_KEYS_READS, *SCRIPT_RUNNER_READS):
             metadata = await static_resolver.resolve(name)
 
             assert metadata is not None, name
-            assert metadata.request_policy is None, name
-            assert metadata.response_policy is None, name
-            # Withholding the routing view leaves the cacheability inputs untouched.
+            assert policy_pair(metadata) == KEYED_POLICIES, name
             assert metadata.is_readonly is True, name
             assert metadata.has_key_argument is True, name
             assert metadata.has_complete_metadata is True, name
 
-    async def test_cacheability_is_unaffected_by_the_withheld_routing(self):
+    async def test_the_kill_commands_ask_every_shard_for_one_success(self):
         static_resolver = AsyncStaticMetadataResolver()
 
-        for name in WITHHELD_ROUTING_COMMANDS:
+        for name in KILL_COMMANDS:
+            metadata = await static_resolver.resolve(name)
+
+            assert metadata is not None, name
+            assert policy_pair(metadata) == ONE_SUCCEEDED_POLICIES, name
+            assert metadata.has_key_argument is False, name
+            assert await static_resolver.is_cacheable(name) is False, name
+
+    async def test_the_diagnostics_commands_record_the_server_tips(self):
+        static_resolver = AsyncStaticMetadataResolver()
+
+        for name, policies in PER_NODE_DIAGNOSTICS.items():
+            metadata = await static_resolver.resolve(name)
+
+            assert metadata is not None, name
+            assert policy_pair(metadata) == policies, name
+            assert metadata.has_nondeterministic_output is True, name
+            assert await static_resolver.is_cacheable(name) is False, name
+
+    async def test_the_movablekeys_reads_keep_their_cacheability(self):
+        static_resolver = AsyncStaticMetadataResolver()
+
+        for name in MOVABLE_KEYS_READS:
             # XREAD is the one exclusion here, and the blocking flag is what excludes it.
             assert await static_resolver.is_cacheable(name) is (name != "xread"), name
 
     async def test_the_ineligible_records_withhold_their_policies(self):
         """
-        The four records that state their own ineligibility must not state a routing policy.
+        The records that state their own ineligibility must not state a routing policy the
+        server does not give them.
 
         The table backs both the metadata resolver and ``AsyncStaticPolicyResolver``, so a
         record added for its cacheability inputs alone would otherwise start routing a command
-        the cluster client resolves for itself today.
+        the cluster client resolves for itself today. The script runners are the exception:
+        they are ``movablekeys`` reads, recorded keyed like the others, and TOUCH carries the
+        ``multi_shard`` tip the server gives it.
         """
         static_resolver = AsyncStaticMetadataResolver()
 
@@ -142,8 +171,13 @@ class TestWithheldRoutingPolicies:
             metadata = await static_resolver.resolve(name)
 
             assert metadata is not None, name
-            assert metadata.request_policy is None, name
-            assert metadata.response_policy is None, name
+            if name in SCRIPT_RUNNER_READS:
+                assert policy_pair(metadata) == KEYED_POLICIES, name
+            elif name == "touch":
+                assert policy_pair(metadata) == MULTI_SHARD_SUMMED_POLICIES, name
+            else:
+                assert metadata.request_policy is None, name
+                assert metadata.response_policy is None, name
             # Ineligible for the reason the record states, not for want of metadata.
             assert metadata.is_readonly is True, name
             assert metadata.has_key_argument is True, name
@@ -228,7 +262,8 @@ class TestWithheldRoutingPolicies:
         """
         Verify that every command appearing in RedisCluster.command_flags that is present
         in _STATIC_COMMAND_METADATA has its routing view withheld (request_policy=None and
-        response_policy=None).
+        response_policy=None), except the ``TABLE_ROUTED_FLAG_COMMANDS``, which record the
+        server's tips.
         """
         static_resolver = AsyncStaticMetadataResolver()
         table_core = _STATIC_COMMAND_METADATA["core"]
@@ -242,6 +277,11 @@ class TestWithheldRoutingPolicies:
                     continue
                 metadata = await static_resolver.resolve(table_cmd)
                 assert metadata is not None
+                if table_cmd in TABLE_ROUTED_FLAG_COMMANDS:
+                    assert (
+                        policy_pair(metadata) == TABLE_ROUTED_FLAG_COMMANDS[table_cmd]
+                    ), table_cmd
+                    continue
                 assert metadata.request_policy is None, (
                     f"Command '{table_cmd}' (from COMMAND_FLAGS '{flag_cmd}') must withhold request_policy in _STATIC_COMMAND_METADATA"
                 )
@@ -303,9 +343,13 @@ class TestWithheldRoutingPolicies:
         for name in ALL_WITHHELD_ROUTING_COMMANDS:
             assert await static_resolver.resolve(name) is None, name
 
-        # A keyed read that is not movablekeys still resolves, so the None above is the withheld
-        # record rather than a table-wide miss.
+        # Keyed reads still resolve - the movablekeys ones included - so the None above is the
+        # withheld record rather than a table-wide miss.
         assert policy_pair(await static_resolver.resolve("get")) == KEYED_POLICIES
+        for name in (*MOVABLE_KEYS_READS, *SCRIPT_RUNNER_READS):
+            assert policy_pair(await static_resolver.resolve(name)) == KEYED_POLICIES, (
+                name
+            )
 
     async def test_a_withheld_record_does_not_re_walk_the_metadata_chain(self):
         """
@@ -313,12 +357,12 @@ class TestWithheldRoutingPolicies:
         answer with the very policies the record withholds.
         """
         resolver = AsyncStaticMetadataResolver().with_fallback(
-            AsyncDynamicMetadataResolver({"core": {"zdiff": CACHEABLE_KEYED}})
+            AsyncDynamicMetadataResolver({"core": {"vrandmember": CACHEABLE_KEYED}})
         )
 
-        zdiff_metadata = await resolver.resolve("zdiff")
-        assert zdiff_metadata.request_policy is None
-        assert await resolver.resolve_policies("zdiff") is None
+        vrandmember_metadata = await resolver.resolve("vrandmember")
+        assert vrandmember_metadata.request_policy is None
+        assert await resolver.resolve_policies("vrandmember") is None
 
     async def test_a_policy_level_fallback_still_gets_its_turn(self):
         """
@@ -327,11 +371,11 @@ class TestWithheldRoutingPolicies:
         """
         resolver = AsyncStaticPolicyResolver(
             fallback=MetadataPolicyResolver(
-                AsyncDynamicMetadataResolver({"core": {"zdiff": CACHEABLE_KEYED}})
+                AsyncDynamicMetadataResolver({"core": {"vrandmember": CACHEABLE_KEYED}})
             )
         )
 
-        assert policy_pair(await resolver.resolve("zdiff")) == KEYED_POLICIES
+        assert policy_pair(await resolver.resolve("vrandmember")) == KEYED_POLICIES
 
 
 @pytest.mark.asyncio
@@ -1113,12 +1157,13 @@ class TestAsyncStaticMetadataAgainstServer:
 
             # The routing invariant, decided from the live reply rather than from the table:
             # a command the server says takes a key name argument must be routed to the node
-            # holding that key, so its entry either says DEFAULT_KEYED or says nothing. This
+            # holding that key, so its entry says DEFAULT_KEYED, MULTI_SHARD or nothing. This
             # catches a server-side metadata change that a table-only assertion cannot - a
             # command that gains a key argument, or one whose key specs start reporting one.
             if live_has_key_argument(details):
                 assert metadata.request_policy in (
                     RequestPolicy.DEFAULT_KEYED,
+                    RequestPolicy.MULTI_SHARD,
                     None,
                 ), name
 
@@ -1196,14 +1241,17 @@ class TestAsyncStaticMetadataAgainstServer:
         The routing policies are compared apart from the cacheability inputs because the
         table diverges from the server on purpose for four reasons:
 
-        - EXISTS and MGET are tipped ``request_policy:multi_shard``, which neither client
-          stack implements; the table records the keyed defaults instead.
+        - MGET is tipped ``request_policy:multi_shard``, but the table records the keyed
+          defaults: ``mget`` documents that keys in different slots raise on a cluster.
         - FT.CURSOR is SPECIAL, a client-side routing decision the server does not tip.
-        - The ``movablekeys`` reads withhold their policies entirely. The derived policies come
-          out keyless because their keys are only in the key specs, so recording them would
-          route the command to an arbitrary node instead of the one holding its keys.
-        - The records that state their own ineligibility withhold theirs for the same reason:
-          adding one must not start routing a command the cluster client resolves itself.
+        - The ``COMMAND_FLAGS`` reads - DBSIZE, KEYS, SCAN - and BLESS SCAN and
+          COMMAND withhold their policies entirely, so the cluster client keeps resolving
+          their targets itself.
+        - VRANDMEMBER, which states its own ineligibility, withholds its policies for the
+          same reason: adding it must not start routing a command the client resolves itself.
+
+        The ``movablekeys`` reads agree with the live reply: the parser derives their keyed
+        defaults from the key specs.
 
         ``LIVE_CACHEABILITY_DIVERGENCE`` is the one place the *cacheability* inputs are allowed
         to disagree, and the disagreement is pinned rather than skipped.
@@ -1249,7 +1297,6 @@ class TestAsyncStaticMetadataAgainstServer:
                 diverged.add(name)
 
         assert diverged == {
-            "exists",
             "mget",
             "ft.cursor",
             *ALL_WITHHELD_ROUTING_COMMANDS,

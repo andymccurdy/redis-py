@@ -122,6 +122,27 @@ def test_parse_client_list_as_iter():
 
 
 @pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "separator",
+    [chr(c) for c in (0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+def test_parse_client_list_only_splits_records_on_newline(separator):
+    # CLIENT LIST separates records with "\n" only. Characters that
+    # str.splitlines() also treats as line boundaries can appear inside a field,
+    # e.g. in an ACL username, and must not split the record.
+    response = (
+        f"id=1 addr=127.0.0.1:1 user=a{separator}b flags=N\nid=2 addr=127.0.0.1:2"
+    )
+    expected = [
+        {"id": "1", "addr": "127.0.0.1:1", "user": f"a{separator}b", "flags": "N"},
+        {"id": "2", "addr": "127.0.0.1:2"},
+    ]
+    assert parse_client_list(response) == expected
+    assert list(parse_client_list(response, as_iter=True)) == expected
+
+
+@pytest.mark.fixed_client
 def test_parse_client_info():
     # A CLIENT INFO value can contain both a space (a unix-socket addr such as
     # "/tmp/redis sock/redis.sock") and an "=" (a client name like

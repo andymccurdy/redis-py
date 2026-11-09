@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 import time
+from functools import cached_property, lru_cache
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -31,6 +32,7 @@ from redis._defaults import (
 )
 from redis._parsers.encoders import Encoder
 from redis._parsers.helpers import bool_ok, decode_info, get_response_callbacks
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.cache import CacheConfig, CacheInterface
 from redis.commands import (
@@ -49,7 +51,7 @@ from redis.connection import (
     SSLConnection,
     UnixDomainSocketConnection,
 )
-from redis.credentials import CredentialProvider
+from redis.credentials import CredentialProvider, StreamingCredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
@@ -161,6 +163,48 @@ class CaseInsensitiveDict(dict):
     def update(self, data):
         data = CaseInsensitiveDict(data)
         super().update(data)
+
+    def copy(self) -> "CaseInsensitiveDict":
+        # Keys are already upper-cased; bypass __init__/__setitem__ so the
+        # copy does not re-run ``str.upper`` on every entry.
+        new = type(self).__new__(type(self))
+        dict.update(new, self)
+        return new
+
+
+@lru_cache(maxsize=None)
+def _cached_default_response_callbacks(
+    user_protocol: int | str | None,
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Build the canonical response-callback table for a given
+    ``(protocol, legacy_responses)`` combination exactly once.
+
+    The returned mapping is shared by every caller and MUST NOT be mutated or
+    handed to a client directly. Clients must use
+    :func:`default_response_callbacks`, which returns a per-client copy.
+    """
+    return CaseInsensitiveDict(
+        get_response_callbacks(
+            user_protocol=user_protocol,
+            legacy_responses=legacy_responses,
+        )
+    )
+
+
+def default_response_callbacks(
+    user_protocol: int | str | None,
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Return the default response-callback table for a given
+    ``(protocol, legacy_responses)`` combination.
+
+    This is the helper clients should use. It returns an independent, mutable
+    per-client table copied from the cached canonical one, so the table is not
+    rebuilt and re-upper-cased on every client construction, and changes such
+    as :meth:`Redis.set_response_callback` stay local to the client.
+    """
+    return _cached_default_response_callbacks(user_protocol, legacy_responses).copy()
 
 
 class AbstractRedis:
@@ -418,9 +462,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             Argument is ignored when connection_pool is provided - configure it on the pool
             instead.
         """
-        if event_dispatcher is None:
-            self._event_dispatcher = EventDispatcher()
-        else:
+        if event_dispatcher is not None:
             self._event_dispatcher = event_dispatcher
         if not connection_pool:
             if not retry_on_error:
@@ -541,14 +583,19 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                     }
                 )
             connection_pool = ConnectionPool(**kwargs)
-            self._event_dispatcher.dispatch(
-                AfterPooledConnectionsInstantiationEvent(
-                    [connection_pool], ClientType.SYNC, credential_provider
-                )
-            )
             self.auto_close_connection_pool = True
         else:
             self.auto_close_connection_pool = False
+
+        # A user-supplied dispatcher always gets the event, for its own
+        # listeners. The default one is private to this client, so its only
+        # listener is the built-in re-auth one, which acts on a
+        # StreamingCredentialProvider alone: skip the no-op dispatch (and
+        # building the dispatcher) for any other provider.
+        if event_dispatcher is not None or (
+            credential_provider is not None
+            and isinstance(credential_provider, StreamingCredentialProvider)
+        ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
                     [connection_pool], ClientType.SYNC, credential_provider
@@ -574,12 +621,16 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             )
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
+        self.response_callbacks = default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
         )
+
+    @cached_property
+    def _event_dispatcher(self) -> EventDispatcher:
+        # Built on first use when the client was given no dispatcher; a
+        # dispatcher passed to __init__ is stored on the instance instead.
+        return EventDispatcher()
 
     def __repr__(self) -> str:
         return (
@@ -983,8 +1034,14 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            return self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            return callback(response, **options)
         return response
 
     def get_cache(self) -> Optional[CacheInterface]:
@@ -1070,12 +1127,26 @@ class Monitor:
         self.connection = self.connection_pool.get_connection()
 
     def __enter__(self):
-        self._start_monitor()
+        if self.connection is None:
+            self.connection = self.connection_pool.get_connection()
+        try:
+            self._start_monitor()
+        except BaseException:
+            try:
+                self.__exit__()
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):
-        self.connection.disconnect()
-        self.connection_pool.release(self.connection)
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            connection.disconnect()
+        finally:
+            self.connection_pool.release(connection)
 
     def next_command(self):
         """Parse the response from a monitor command"""
@@ -2152,8 +2223,14 @@ class Pipeline(Redis):
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
                 command_name = args[0]
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
             data.append(r)
 
         return data

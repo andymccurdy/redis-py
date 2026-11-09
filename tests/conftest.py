@@ -725,6 +725,7 @@ def master(request, sentinel_setup):
 
 def _gen_cluster_mock_resp(r, response):
     connection = Mock(spec=Connection)
+    connection._resp2_fallback = False
     connection.retry = Retry(NoBackoff(), 0)
     connection.read_response.return_value = response
     connection.host = "localhost"

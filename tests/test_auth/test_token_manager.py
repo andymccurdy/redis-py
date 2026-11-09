@@ -379,46 +379,37 @@ class TestTokenManager:
     @pytest.mark.asyncio
     async def test_async_success_token_renewal(self, exp_refresh_ratio):
         tokens = []
+        errors = []
+
+        # Use a function to generate fresh tokens at request time
+        # to avoid timing issues on slow CI runners
+        def generate_token():
+            now = datetime.now(timezone.utc).timestamp() * 1000
+            return SimpleToken("value", now + 10000, now, {"oid": "test"})
+
         mock_provider = Mock(spec=IdentityProviderInterface)
-        mock_provider.request_token.side_effect = [
-            SimpleToken(
-                "value",
-                (datetime.now(timezone.utc).timestamp() * 1000) + 100,
-                (datetime.now(timezone.utc).timestamp() * 1000),
-                {"oid": "test"},
-            ),
-            SimpleToken(
-                "value",
-                (datetime.now(timezone.utc).timestamp() * 1000) + 130,
-                (datetime.now(timezone.utc).timestamp() * 1000) + 30,
-                {"oid": "test"},
-            ),
-            SimpleToken(
-                "value",
-                (datetime.now(timezone.utc).timestamp() * 1000) + 160,
-                (datetime.now(timezone.utc).timestamp() * 1000) + 60,
-                {"oid": "test"},
-            ),
-            SimpleToken(
-                "value",
-                (datetime.now(timezone.utc).timestamp() * 1000) + 190,
-                (datetime.now(timezone.utc).timestamp() * 1000) + 90,
-                {"oid": "test"},
-            ),
-        ]
+        mock_provider.request_token.side_effect = (
+            lambda *args, **kwargs: generate_token()
+        )
 
         async def on_next(token):
             nonlocal tokens
             tokens.append(token)
 
+        async def on_error(err):
+            nonlocal errors
+            errors.append(err)
+
         mock_listener = Mock(spec=CredentialsListener)
         mock_listener.on_next = on_next
+        mock_listener.on_error = on_error
 
         retry_policy = RetryPolicy(1, 10)
         config = TokenManagerConfig(exp_refresh_ratio, 0, 1000, retry_policy)
         mgr = TokenManager(mock_provider, config)
         await mgr.start_async(mock_listener, block_for_initial=True)
 
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
         assert len(tokens) > 0
 
     @pytest.mark.parametrize(

@@ -165,9 +165,10 @@ class CommandMetadata:
             absent. ``last_key_pos`` is never consulted: it is ``-1`` for variadic
             commands and must not disqualify one.
 
-            This is not the inverse of ``_is_keyless_command``, which tests
-            ``first_key_pos`` alone and so reports every ``movablekeys`` command as
-            keyless. It is also recorded independently of ``request_policy``, because a
+            This is not the inverse of ``_is_keyless_command``, which lets
+            ``first_key_pos`` decide whenever it is positive and so reports SPUBLISH, whose
+            only key spec is a ``not_key`` shard channel, as keyed. It is also recorded
+            independently of ``request_policy``, because a
             command tip overwrites the keyed/keyless default, after which the resolved
             policy no longer indicates whether the command takes keys.
         has_nondeterministic_output:
@@ -1136,6 +1137,12 @@ _METADATA_BY_REQUEST_POLICY: Mapping[RequestPolicy, CommandMetadata] = MappingPr
 # Record shared by every command the client-side cache may serve: readonly, takes a key
 # name argument, and reports nothing that forbids caching. Spelled out once because the
 # vast majority of the table below is one of these shapes.
+#
+# This includes the ``movablekeys`` commands. Their ``first_key_pos`` is 0, but they do take
+# keys, so ``has_key_argument`` is True. The cluster client routes them like any other keyed
+# command: ``determine_slot`` asks the server for their keys with ``COMMAND GETKEYS``. The
+# parsers read their key specs and also mark them keyed, so a live resolver agrees with this
+# record.
 _CACHEABLE_KEYED = CommandMetadata(
     request_policy=RequestPolicy.DEFAULT_KEYED,
     response_policy=ResponsePolicy.DEFAULT_KEYED,
@@ -1148,48 +1155,30 @@ _CACHEABLE_KEYED = CommandMetadata(
     has_complete_metadata=True,
 )
 
-# Same, for the ``movablekeys`` commands, with the routing policies withheld. Their keys are
-# only discoverable through key specs, so ``first_key_pos`` is 0 and the derived policies come
-# out keyless even though the command genuinely takes keys. This divergence is exactly why
-# ``has_key_argument`` is recorded separately from ``request_policy``.
-#
-# Recording those derived policies here would route the command to an arbitrary node, so they
-# are withheld: a policy resolver then reports the command as unresolved and the cluster client
-# resolves the target itself through ``determine_slot``, which asks the server for the keys with
-# ``COMMAND GETKEYS``. That is the only path that finds the keys of a ``movablekeys`` command,
-# and it is what the routing fallback did before this table backed the static resolver.
-# TODO(pslavova): record the real request/response policies once routing derives keyed/keyless
-# from the key specs (``has_key_argument``) rather than from ``first_key_pos``.
-_CACHEABLE_MOVABLE_KEYS = CommandMetadata(
-    request_policy=None,
-    response_policy=None,
-    is_readonly=True,
-    is_blocking=False,
-    has_key_argument=True,
-    has_nondeterministic_output=False,
-    is_script_runner=False,
-    is_dont_cache=False,
-    has_complete_metadata=True,
+# Same, for a read the server tips ``request_policy:multi_shard`` and
+# ``response_policy:agg_sum``: the cluster client splits its keys by hash slot and sums the
+# per-slot counts.
+_CACHEABLE_MULTI_SHARD_SUMMED = replace(
+    _CACHEABLE_KEYED,
+    request_policy=RequestPolicy.MULTI_SHARD,
+    response_policy=ResponsePolicy.AGG_SUM,
 )
 
 # Same, for a command that also carries the ``blocking`` flag, which makes it ineligible:
 # its reply is what the caller waited for rather than a snapshot the cache may re-serve.
-# XREAD is the only readonly, keyed command the flag excludes. The withheld routing policies
-# are inherited: XREAD is ``movablekeys`` too, so it must be routed by its resolved keys.
-_BLOCKING_MOVABLE_KEYS = replace(_CACHEABLE_MOVABLE_KEYS, is_blocking=True)
+# XREAD is the only readonly, keyed command the flag excludes.
+_BLOCKING_KEYED = replace(_CACHEABLE_KEYED, is_blocking=True)
 
 # Same, for the read-only script runners - EVAL_RO, EVALSHA_RO, FCALL_RO. The
 # ``script_runner`` flag makes them ineligible: the reply is whatever the script computed,
-# which the client cannot tie to the keys the script happened to touch. They are
-# ``movablekeys`` too - their keys are counted by ``numkeys`` - so the withheld routing
-# policies are inherited for the same reason.
+# which the client cannot tie to the keys the script happened to touch.
 #
 # Recorded rather than left absent because the flag only reaches the client from Redis 8.10
 # on: on 7.4.x-8.8.x all three report readonly and keyed with no flag that excludes them,
 # i.e. cacheable, so a resolver reading a live COMMAND reply from one of those servers would
 # admit them. This record states what the command is, independently of what a given server
 # version reports. Removable once the minimum CSC-supported server reports ``script_runner``.
-_SCRIPT_RUNNER_MOVABLE_KEYS = replace(_CACHEABLE_MOVABLE_KEYS, is_script_runner=True)
+_SCRIPT_RUNNER_KEYED = replace(_CACHEABLE_KEYED, is_script_runner=True)
 
 # Readonly but keyless, so not cacheable: the command observes keyspace state without
 # taking a key name argument. Note that this is what makes a search or aggregation query
@@ -1207,8 +1196,8 @@ _READONLY_KEYLESS = CommandMetadata(
 )
 
 # Readonly and keyless with routing policies withheld, so the cluster client keeps
-# resolving its target node via COMMAND_FLAGS (e.g. DEFAULT_NODE for DBSIZE/KEYS/RANDOMKEY
-# or PRIMARIES for SCAN).
+# resolving its target node via COMMAND_FLAGS (e.g. DEFAULT_NODE for DBSIZE/KEYS or
+# PRIMARIES for SCAN).
 _READONLY_KEYLESS_WITHHELD_ROUTING = CommandMetadata(
     request_policy=None,
     response_policy=None,
@@ -1227,11 +1216,21 @@ _NONDETERMINISTIC_KEYED = replace(_CACHEABLE_KEYED, has_nondeterministic_output=
 
 # Same tip on the keyless reads that withhold their routing. Carries no cacheability
 # consequence of its own - a keyless command is already ineligible for want of a key
-# argument - but the table records what the server reports, and both RANDOMKEY and SCAN are
-# tipped ``nondeterministic_output``: one returns an arbitrary key, the other an arbitrary
-# page of the keyspace.
+# argument - but the table records what the server reports, and SCAN is tipped
+# ``nondeterministic_output``: it returns an arbitrary page of the keyspace.
 _NONDETERMINISTIC_KEYLESS_WITHHELD_ROUTING = replace(
     _READONLY_KEYLESS_WITHHELD_ROUTING, has_nondeterministic_output=True
+)
+
+# RANDOMKEY, with the server's tips: ``nondeterministic_output``, as it returns an arbitrary
+# key, and ``request_policy:all_shards`` / ``response_policy:special``. Every primary is
+# asked, and the cluster client picks a key from the shards that hold one, so the reply is
+# None only when the whole cluster is empty - which one shard's reply cannot tell.
+_NONDETERMINISTIC_KEYLESS_ALL_SHARDS_SPECIAL = replace(
+    _READONLY_KEYLESS,
+    request_policy=RequestPolicy.ALL_SHARDS,
+    response_policy=ResponsePolicy.SPECIAL,
+    has_nondeterministic_output=True,
 )
 
 # Write commands. Rule 1 excludes them, so nothing else about them matters to the cache.
@@ -1257,6 +1256,33 @@ _WRITE_KEYLESS_WITHHELD_ROUTING = CommandMetadata(
     is_script_runner=False,
     is_dont_cache=False,
     has_complete_metadata=True,
+)
+
+# ``_WRITE_KEYLESS``, for the commands that stop a running script or function - SCRIPT KILL
+# and FUNCTION KILL. The server tips them ``request_policy:all_shards`` and
+# ``response_policy:one_succeeded``: only the shard running the script can stop it, so every
+# primary is asked, the NOTBUSY errors of the others are dropped, and the one success is the
+# reply. The server flags them neither ``readonly`` nor ``write``, so ``is_readonly`` is False.
+_KILL_KEYLESS_ONE_SUCCEEDED = replace(
+    _WRITE_KEYLESS,
+    request_policy=RequestPolicy.ALL_SHARDS,
+    response_policy=ResponsePolicy.ONE_SUCCEEDED,
+)
+
+# ``_WRITE_KEYLESS``, for the diagnostics commands each node answers about itself -
+# FUNCTION STATS, MEMORY DOCTOR and the LATENCY reports. The server tips them
+# ``nondeterministic_output`` and ``response_policy:special`` with no merge it could name, so
+# the cluster client keeps their replies keyed by node. FUNCTION STATS and MEMORY DOCTOR are
+# tipped ``request_policy:all_shards``, the LATENCY reports ``all_nodes``, as a replica
+# keeps latency samples of its own. None is flagged ``readonly``.
+_NONDETERMINISTIC_KEYLESS_PER_SHARD = replace(
+    _WRITE_KEYLESS,
+    request_policy=RequestPolicy.ALL_SHARDS,
+    response_policy=ResponsePolicy.SPECIAL,
+    has_nondeterministic_output=True,
+)
+_NONDETERMINISTIC_KEYLESS_PER_NODE = replace(
+    _NONDETERMINISTIC_KEYLESS_PER_SHARD, request_policy=RequestPolicy.ALL_NODES
 )
 
 _WRITE_KEYED = CommandMetadata(
@@ -1291,8 +1317,8 @@ _DONT_CACHE_WRITE_KEYED = replace(_WRITE_KEYED, is_dont_cache=True)
 # supported version does not disagree on the fields that decide cacheability. The
 # exceptions are the ``bless`` container, which first ships in 8.11 and was validated against
 # that release's ``COMMAND INFO`` reply, and the set member expiration reads (``sexpiretime``,
-# ``spexpiretime``, ``sttl``, ``spttl``), which first ship in 8.12 and were validated against
-# the ``COMMAND INFO`` reply of an 8.11.240 build.
+# ``spexpiretime``, ``sttl``, ``spttl``) and ``bitrangeintarray``, which first ship in 8.12
+# and were validated against the ``COMMAND INFO`` reply of an 8.11.240 build.
 #
 # The table is not exhaustive: on 8.10.0 the server reports 127 cacheable commands and this
 # covers 80 of them. The count is version-qualified because it moves between releases - a
@@ -1312,16 +1338,22 @@ _DONT_CACHE_WRITE_KEYED = replace(_WRITE_KEYED, is_dont_cache=True)
 # ``nondeterministic_output``, ``ts.info`` ``dont_cache``, and ``xread`` carries
 # the ``blocking`` command flag.
 #
-# Five entries diverge from the live reply, each for a reason spelled out where it occurs:
-# ``exists`` and ``mget`` stand in the keyed defaults for the unimplemented ``multi_shard``
-# tips, ``ft.cursor`` is SPECIAL, a client-side decision the server does not tip, ``touch`` is
-# recorded ``dont_cache`` where the server reports it cacheable, and ``vrandmember`` is
-# recorded ``nondeterministic_output`` where the server tips it nothing. The ``movablekeys``
-# reads - ``eval_ro``, ``evalsha_ro``, ``fcall_ro``, ``sdiffcard``, ``sintercard``,
-# ``sunioncard``, ``xread``, ``zdiff``, ``zinter``, ``zintercard`` and ``zunion`` - plus
-# ``bless scan``, ``command``, ``dbsize``, ``keys``, ``randomkey``, ``scan``, ``touch`` and
-# ``vrandmember`` withhold their routing policies entirely, so the cluster client keeps
-# resolving their targets itself. Their cacheability inputs are unaffected.
+# Four entries diverge from the live reply, each for a reason spelled out where it occurs:
+# ``mget`` stands in the keyed defaults for its ``multi_shard`` tip, ``ft.cursor`` is SPECIAL,
+# a client-side decision the server does not tip, ``touch`` is recorded ``dont_cache`` where
+# the server reports it cacheable, and ``vrandmember`` is recorded ``nondeterministic_output``
+# where the server tips it nothing. ``bless scan``, ``command``, ``dbsize``, ``keys``,
+# ``scan`` and ``vrandmember`` withhold their routing policies entirely, so the cluster
+# client keeps resolving their targets itself. Their cacheability inputs are unaffected.
+# DBSIZE and KEYS are tipped ``request_policy:all_shards``, but recording that would change
+# what they answer on a cluster - every primary instead of the default node - so the
+# COMMAND_FLAGS routing stands. ``randomkey`` records its tips: the answer it gains is the
+# one the command promises, a key from anywhere in the keyspace.
+#
+# The ``movablekeys`` reads - ``eval_ro``, ``evalsha_ro``, ``fcall_ro``, ``sdiffcard``,
+# ``sintercard``, ``sunioncard``, ``xread``, ``zdiff``, ``zinter``, ``zintercard`` and
+# ``zunion`` - record the keyed defaults the parsers derive from their key specs, so none of
+# them diverges.
 _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
     {
         "core": MappingProxyType(
@@ -1329,6 +1361,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "bitcount": _CACHEABLE_KEYED,
                 "bitfield_ro": _CACHEABLE_KEYED,
                 "bitpos": _CACHEABLE_KEYED,
+                "bitrangeintarray": _CACHEABLE_KEYED,
                 # The BLESS container, keyed by subcommand the way ``execute_command``
                 # receives it. Validated against the 8.11 ``COMMAND INFO`` reply, the first
                 # release that reports it.
@@ -1365,22 +1398,16 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "dump": _NONDETERMINISTIC_KEYED,
                 # Not cacheable: script_runner. See the shape's note for why all three are
                 # recorded rather than left to the server to report.
-                "eval_ro": _SCRIPT_RUNNER_MOVABLE_KEYS,
-                "evalsha_ro": _SCRIPT_RUNNER_MOVABLE_KEYS,
-                # The server tips EXISTS request_policy:multi_shard and
-                # response_policy:agg_sum, but ``RequestPolicy.MULTI_SHARD`` is not
-                # implemented in either client stack: ``_split_multi_shard_command``
-                # returns per-key command descriptors where every caller of
-                # ``_determine_nodes`` expects ``ClusterNode``, and the async client has no
-                # MULTI_SHARD entry in ``_policies_callback_mapping`` at all. Recording the
-                # real tips here therefore breaks the command, so the keyed defaults stand
-                # in - which is what the routing fallback resolved to before this table
-                # backed the static resolver.
-                # TODO(pslavova): record the real tips once MULTI_SHARD is implemented
-                # across both stacks (main path and pipeline).
-                "exists": _CACHEABLE_KEYED,
+                "eval_ro": _SCRIPT_RUNNER_KEYED,
+                "evalsha_ro": _SCRIPT_RUNNER_KEYED,
+                # Tipped request_policy:multi_shard / response_policy:agg_sum: the cluster
+                # client splits the keys by hash slot and sums the counts. Keys that share a
+                # slot are sent as one command, exactly as the keyed defaults sent them.
+                "exists": _CACHEABLE_MULTI_SHARD_SUMMED,
                 "expiretime": _CACHEABLE_KEYED,
-                "fcall_ro": _SCRIPT_RUNNER_MOVABLE_KEYS,
+                "fcall_ro": _SCRIPT_RUNNER_KEYED,
+                "function kill": _KILL_KEYLESS_ONE_SUCCEEDED,
+                "function stats": _NONDETERMINISTIC_KEYLESS_PER_SHARD,
                 "geodist": _CACHEABLE_KEYED,
                 "geohash": _CACHEABLE_KEYED,
                 "geopos": _CACHEABLE_KEYED,
@@ -1409,27 +1436,33 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "httl": _NONDETERMINISTIC_KEYED,
                 "hvals": _CACHEABLE_KEYED,
                 "keys": _READONLY_KEYLESS_WITHHELD_ROUTING,
+                "latency doctor": _NONDETERMINISTIC_KEYLESS_PER_NODE,
+                "latency graph": _NONDETERMINISTIC_KEYLESS_PER_NODE,
+                "latency histogram": _NONDETERMINISTIC_KEYLESS_PER_NODE,
                 "lcs": _CACHEABLE_KEYED,
                 "lindex": _CACHEABLE_KEYED,
                 "llen": _CACHEABLE_KEYED,
                 "lpos": _CACHEABLE_KEYED,
                 "lrange": _CACHEABLE_KEYED,
-                # Tipped request_policy:multi_shard by the server, withheld for the reason
-                # spelled out on ``exists`` above.
-                # TODO: record the real tip once MULTI_SHARD is implemented.
+                "memory doctor": _NONDETERMINISTIC_KEYLESS_PER_SHARD,
+                # Tipped request_policy:multi_shard by the server, but recorded keyed on
+                # purpose: ``mget`` documents that keys in different hash slots raise
+                # ``RedisClusterException`` on a cluster, and splitting them instead would
+                # make the read silently non-atomic. ``mget_nonatomic`` is the opt-in split.
                 "mget": _CACHEABLE_KEYED,
                 "pexpiretime": _CACHEABLE_KEYED,
                 "pttl": _NONDETERMINISTIC_KEYED,
-                "randomkey": _NONDETERMINISTIC_KEYLESS_WITHHELD_ROUTING,
+                "randomkey": _NONDETERMINISTIC_KEYLESS_ALL_SHARDS_SPECIAL,
                 # Readonly and keyless. Routing policies are withheld so the cluster client keeps
                 # routing SCAN to all primary nodes (PRIMARIES) rather than a single random node.
                 "scan": _NONDETERMINISTIC_KEYLESS_WITHHELD_ROUTING,
                 "scard": _CACHEABLE_KEYED,
+                "script kill": _KILL_KEYLESS_ONE_SUCCEEDED,
                 "sdiff": _CACHEABLE_KEYED,
-                "sdiffcard": _CACHEABLE_MOVABLE_KEYS,
+                "sdiffcard": _CACHEABLE_KEYED,
                 "sexpiretime": _CACHEABLE_KEYED,
                 "sinter": _CACHEABLE_KEYED,
-                "sintercard": _CACHEABLE_MOVABLE_KEYS,
+                "sintercard": _CACHEABLE_KEYED,
                 "sismember": _CACHEABLE_KEYED,
                 "smembers": _CACHEABLE_KEYED,
                 "smismember": _CACHEABLE_KEYED,
@@ -1447,7 +1480,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "sttl": _NONDETERMINISTIC_KEYED,
                 "substr": _CACHEABLE_KEYED,
                 "sunion": _CACHEABLE_KEYED,
-                "sunioncard": _CACHEABLE_MOVABLE_KEYS,
+                "sunioncard": _CACHEABLE_KEYED,
                 # Not cacheable, and the one entry in this table that records a client-side
                 # judgement instead of what the server reports: TOUCH has a server-side
                 # effect - it refreshes each key's idle time, which is what LRU/LFU
@@ -1458,14 +1491,12 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 # left to every resolver in a chain. Removable once the server tips it
                 # ``dont_cache``.
                 #
-                # Routing policies are withheld, not defaulted: the server tips TOUCH
-                # request_policy:multi_shard / response_policy:agg_sum, and MULTI_SHARD is
-                # unimplemented for the reason spelled out on ``exists`` above. Withholding
-                # keeps the cluster client resolving the target itself, exactly as it does
-                # today for a command this table does not carry.
+                # Routed like EXISTS: the server tips TOUCH request_policy:multi_shard /
+                # response_policy:agg_sum, so its keys are split by hash slot and the counts
+                # summed.
                 "touch": CommandMetadata(
-                    request_policy=None,
-                    response_policy=None,
+                    request_policy=RequestPolicy.MULTI_SHARD,
+                    response_policy=ResponsePolicy.AGG_SUM,
                     is_readonly=True,
                     is_blocking=False,
                     has_key_argument=True,
@@ -1503,13 +1534,13 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 # which is a defect in that list rather than a reason to keep caching it.
                 "xpending": _NONDETERMINISTIC_KEYED,
                 "xrange": _CACHEABLE_KEYED,
-                "xread": _BLOCKING_MOVABLE_KEYS,
+                "xread": _BLOCKING_KEYED,
                 "xrevrange": _CACHEABLE_KEYED,
                 "zcard": _CACHEABLE_KEYED,
                 "zcount": _CACHEABLE_KEYED,
-                "zdiff": _CACHEABLE_MOVABLE_KEYS,
-                "zinter": _CACHEABLE_MOVABLE_KEYS,
-                "zintercard": _CACHEABLE_MOVABLE_KEYS,
+                "zdiff": _CACHEABLE_KEYED,
+                "zinter": _CACHEABLE_KEYED,
+                "zintercard": _CACHEABLE_KEYED,
                 "zlexcount": _CACHEABLE_KEYED,
                 "zmscore": _CACHEABLE_KEYED,
                 "zrange": _CACHEABLE_KEYED,
@@ -1523,7 +1554,7 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 "zrevrank": _CACHEABLE_KEYED,
                 "zscan": _NONDETERMINISTIC_KEYED,
                 "zscore": _CACHEABLE_KEYED,
-                "zunion": _CACHEABLE_MOVABLE_KEYS,
+                "zunion": _CACHEABLE_KEYED,
             }
         ),
         "json": MappingProxyType(

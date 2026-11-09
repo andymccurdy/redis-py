@@ -258,6 +258,8 @@ class PythonRespSerializer:
 
 
 class ConnectionInterface:
+    _resp2_fallback = False
+
     @abstractmethod
     def repr_pieces(self):
         pass
@@ -504,6 +506,8 @@ class MaintNotificationsAbstractConnection:
         way, as is a drain that does not complete within
         ``PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT``.
         """
+        if self._resp2_fallback:
+            raise ConnectionError("Connection has data")
         parser = self._get_push_notifications_parser()
         deferred: list = []
 
@@ -732,6 +736,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_pool_handler_for_connection(
         self, maint_notifications_pool_handler: MaintNotificationsPoolHandler
     ):
+        if self._resp2_fallback:
+            return
         # Deep copy the pool handler to avoid sharing the same pool handler
         # between multiple connections, because otherwise each connection will override
         # the connection reference and the pool handler will only hold a reference
@@ -766,6 +772,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_cluster_handler_for_connection(
         self, oss_cluster_maint_notifications_handler: OSSMaintNotificationsHandler
     ):
+        if self._resp2_fallback:
+            return
         parser = self._get_push_notifications_parser()
         parser.set_oss_cluster_maint_push_handler(
             oss_cluster_maint_notifications_handler.handle_notification
@@ -1164,6 +1172,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.redis_connect_func = redis_connect_func
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self.handshake_metadata = None
+        self._resp2_fallback = False
+        self._client_side_caching = False
         self._sock = None
         self._socket_read_size = socket_read_size
         self._connect_callbacks = []
@@ -1171,8 +1181,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self._re_auth_token: Optional[TokenInterface] = None
         try:
             p = int(protocol)
+            self._protocol_specified_explicitly = True
         except TypeError:
             p = DEFAULT_RESP_VERSION
+            self._protocol_specified_explicitly = False
         except ValueError:
             raise ConnectionError("protocol must be an integer")
         else:
@@ -1317,16 +1329,23 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             )
             raise e
         except OSError as e:
-            e = ConnectionError(self._error_message(e))
+            conn_error = ConnectionError(self._error_message(e))
             record_error_count(
                 server_address=getattr(self, "host", None),
                 server_port=getattr(self, "port", None),
                 network_peer_address=getattr(self, "host", None),
                 network_peer_port=getattr(self, "port", None),
-                error_type=e,
+                error_type=conn_error,
                 retry_attempts=actual_retry_attempts[0],
             )
-            raise e
+            # Preserve the original OSError (with its errno) as the cause so
+            # the retry policy can tell unrecoverable failures apart. Clear the
+            # local afterwards so its traceback does not form a reference cycle
+            # with this frame.
+            try:
+                raise conn_error from e
+            finally:
+                conn_error = None
 
         self._sock = sock
         try:
@@ -1336,8 +1355,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 # Use the passed function redis_connect_func
                 self.redis_connect_func(self)
-        except RedisError:
-            # clean up after any error in on_connect
+        except BaseException:
+            # clean up after any error in on_connect, which includes whatever a
+            # credential provider raises. A socket left in place reads as
+            # connected, so the next command would run without AUTH and SELECT.
             self.disconnect()
             raise
 
@@ -1373,6 +1394,78 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
     def on_connect(self):
         self.on_connect_check_health(check_health=True)
 
+    def _do_resp2_auth(self, auth_args) -> None:
+        """Authenticate with the original credentials, retrying pre-6.0 AUTH."""
+        # avoid checking health here -- PING will fail if we try
+        # to check the health prior to the AUTH
+        self.send_command("AUTH", *auth_args, check_health=False)
+        try:
+            auth_response = self.read_response()
+        except AuthenticationWrongNumberOfArgsError:
+            # a username and password were specified but the Redis
+            # server seems to be < 6.0.0 which expects a single password
+            # arg. retry auth with just the password.
+            self.send_command("AUTH", auth_args[-1], check_health=False)
+            auth_response = self.read_response()
+
+        if str_if_bytes(auth_response) != "OK":
+            raise AuthenticationError("Invalid Username or Password")
+
+    def _fallback_to_resp2(self, error: ResponseError, parser, auth_args=None) -> None:
+        """Handle HELLO failure by falling back to RESP2.
+
+        Validates the error is a recoverable "unknown command" or "NOPROTO",
+        checks that fallback is allowed (not explicitly configured, no
+        RESP3-dependent features active), downgrades parser and protocol,
+        emits a warning, and optionally re-authenticates via standalone AUTH.
+
+        Args:
+            error: The ResponseError from the failed HELLO command.
+            parser: The original parser (for preserving EXCEPTION_CLASSES).
+            auth_args: Original credentials to authenticate after downgrade.
+
+        Raises:
+            ResponseError: If the error is not recoverable or fallback
+                is not permitted.
+        """
+        err_msg = str(error).lower().removeprefix("err ")
+        if not (
+            err_msg in ("unknown command", "noproto")
+            or err_msg.startswith(("unknown command ", "noproto "))
+        ):
+            raise error
+        if self._protocol_specified_explicitly or (
+            self.maint_notifications_config
+            and self.maint_notifications_config.enabled is True
+        ):
+            raise error
+        if self._client_side_caching:
+            raise ResponseError(
+                "Client-side caching requires RESP3; cannot fall back to RESP2"
+            ) from error
+        logger.warning(
+            "Server/proxy at %s does not support HELLO (RESP%s). "
+            "Falling back to RESP2. To silence this warning, "
+            "set protocol=2 explicitly or upgrade your "
+            "server/proxy. Module commands (JSON, Search, TimeSeries, Bloom, "
+            "vector sets) do not adapt their response parsers after automatic "
+            "fallback; set protocol=2 explicitly before using them.",
+            self._host_error(),
+            self.protocol,
+        )
+        if isinstance(self._parser, _RESP3Parser):
+            self.set_parser(_RESP2Parser)
+            self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
+            self._parser.on_connect(self)
+        self.protocol = 2
+        self._resp2_fallback = True
+        self.handshake_metadata = {}
+        self._oss_cluster_maint_notifications_handler = None
+        self._maint_notifications_pool_handler = None
+        self._maint_notifications_connection_handler = None
+        if auth_args:
+            self._do_resp2_auth(auth_args)
+
     def on_connect_check_health(self, check_health: bool = True):
         "Initialize the connection, authenticate and select a database"
         # A fresh socket is a new server session: no prepared HIMPORT fieldsets.
@@ -1397,35 +1490,25 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # update cluster exception classes
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
+            hello_auth_args = auth_args
             if len(auth_args) == 1:
-                auth_args = ["default", auth_args[0]]
+                hello_auth_args = ("default", auth_args[0])
             # avoid checking health here -- PING will fail if we try
             # to check the health prior to the AUTH
             self.send_command(
-                "HELLO", self.protocol, "AUTH", *auth_args, check_health=False
+                "HELLO", self.protocol, "AUTH", *hello_auth_args, check_health=False
             )
-            self.handshake_metadata = self.read_response()
-            # if response.get(b"proto") != self.protocol and response.get(
-            #     "proto"
-            # ) != self.protocol:
-            #     raise ConnectionError("Invalid RESP version")
-        elif auth_args:
-            # avoid checking health here -- PING will fail if we try
-            # to check the health prior to the AUTH
-            self.send_command("AUTH", *auth_args, check_health=False)
-
             try:
-                auth_response = self.read_response()
-            except AuthenticationWrongNumberOfArgsError:
-                # a username and password were specified but the Redis
-                # server seems to be < 6.0.0 which expects a single password
-                # arg. retry auth with just the password.
-                # https://github.com/andymccurdy/redis-py/issues/1274
-                self.send_command("AUTH", auth_args[-1], check_health=False)
-                auth_response = self.read_response()
-
-            if str_if_bytes(auth_response) != "OK":
-                raise AuthenticationError("Invalid Username or Password")
+                self.handshake_metadata = self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
+            except ResponseError as e:
+                self._fallback_to_resp2(e, parser, auth_args=auth_args)
+        elif auth_args:
+            self._do_resp2_auth(auth_args)
 
         # if resp version is specified, switch to it
         elif check_protocol_version(self.protocol, 3):
@@ -1435,12 +1518,15 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
             self.send_command("HELLO", self.protocol, check_health=check_health)
-            self.handshake_metadata = self.read_response()
-            if (
-                self.handshake_metadata.get(b"proto") != self.protocol
-                and self.handshake_metadata.get("proto") != self.protocol
-            ):
-                raise ConnectionError("Invalid RESP version")
+            try:
+                self.handshake_metadata = self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
+            except ResponseError as e:
+                self._fallback_to_resp2(e, parser)
 
         # The tail of the handshake (optional CLIENT MAINT_NOTIFICATIONS, then
         # CLIENT SETNAME / SETINFO / SELECT) does not affect control flow -- the replies
@@ -1625,7 +1711,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 errno = e.args[0]
                 errmsg = e.args[1]
-            raise ConnectionError(f"Error {errno} while writing to socket. {errmsg}.")
+            raise ConnectionError(
+                f"Error {errno} while writing to socket. {errmsg}."
+            ) from e
         except BaseException as e:
             # BaseExceptions can be raised when a socket send operation is not
             # finished, e.g. due to a timeout.  Ideally, a caller could then re-try
@@ -1657,7 +1745,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
         except OSError as e:
             self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error}: {e.args}"
+            ) from e
 
     def read_response(
         self,
@@ -1700,7 +1790,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             if disconnect_on_error:
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 self.disconnect()
-            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+            raise ConnectionError(
+                f"Error while reading from {host_error} : {e.args}"
+            ) from e
         except UNRECOVERABLE_PARSE_ERRORS as e:
             # The parser failed partway through a reply, after the read cursor
             # had already passed bytes it cannot re-interpret. The rewind and
@@ -2068,6 +2160,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     ):
         self.pid = os.getpid()
         self._conn = conn
+        self._resp2_fallback = False
+        if isinstance(conn, AbstractConnection):
+            conn._client_side_caching = True
         self.retry = self._conn.retry
         self.host = self._conn.host
         # A UnixDomainSocketConnection has no port
@@ -2283,9 +2378,19 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
                 self._conn.send_command(*args, **kwargs)
             return
 
-        # Creates cache key.
+        # Creates cache key. An invalidation names a key by the bytes it was sent as,
+        # which ``DefaultCache.delete_by_redis_keys`` matches to a ``str`` or ``bytes``
+        # key but never to a number, so a numeric key is indexed by its encoded form.
+        redis_keys = keys
+        for key in keys:
+            if isinstance(key, (int, float)):
+                encode = self._conn.encoder.encode
+                redis_keys = tuple(
+                    encode(k) if isinstance(k, (int, float)) else k for k in keys
+                )
+                break
         self._current_command_cache_key = CacheKey(
-            command=command, redis_keys=keys, redis_args=args
+            command=command, redis_keys=redis_keys, redis_args=args
         )
 
         is_hit = False
@@ -4087,6 +4192,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # A parent thread may have held the lock at fork time, and the
             # handler reset below takes it to revert an active MOVING.
             self._lock = threading.RLock()
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Record metrics for connections being removed before clearing
         # (only if attributes exist - they won't during __init__)
@@ -4560,6 +4670,11 @@ class BlockingConnectionPool(ConnectionPool):
             # lock and leak it.
             self._in_maintenance = False
             self._locked = False
+            # The cached entries were filled on the parent's connections: their
+            # invalidations go to the parent, and a hit would read the
+            # parent's socket.
+            if self.cache is not None:
+                self.cache.flush()
 
         # Create and fill up a thread safe queue with ``None`` values.
         try:

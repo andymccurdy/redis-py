@@ -3745,10 +3745,3 @@ def __getattr__(name: str):
         stacklevel=3,
     )
     return value
-
-
-# A wildcard import copies only bound names and never calls the module ``__getattr__``,
-# so the deprecated names are listed here next to every other public name. That keeps
-# them in ``from redis.asyncio.connection import *``, which then warns like any other read.
-__all__ = [name for name in globals() if not name.startswith("_")]
-__all__ += ["SYM_STAR", "SYM_DOLLAR"]

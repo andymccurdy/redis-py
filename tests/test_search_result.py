@@ -10,6 +10,7 @@ import pytest
 
 from redis.commands.search import Search
 from redis.commands.search.aggregation import AggregateRequest
+from redis.commands.search.query import Query
 from redis.commands.search.result import Result
 
 
@@ -166,6 +167,24 @@ class TestResultFieldsNamedLikeDocumentAttributes:
         result = Result.from_resp3(res, with_scores=True)
 
         assert result.docs[0].score == 1.5
+
+    def test_resp3_with_payloads(self):
+        res = {
+            "total_results": 1,
+            "results": [
+                {
+                    "id": "doc1",
+                    "payload": b"server-payload",
+                    "extra_attributes": {"payload": "field-value"},
+                },
+            ],
+        }
+
+        query = Query("*").with_payloads()
+
+        result = _make_search()._parse_search_resp3(res, query=query)
+
+        assert result.docs[0].payload == "server-payload"
 
 
 def _make_search():

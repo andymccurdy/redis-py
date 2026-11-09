@@ -519,6 +519,7 @@ class SearchCommands:
             duration=kwargs.get("duration", 0),
             with_scores=getattr(query, "_with_scores", False),
             field_encodings=getattr(query, "_return_fields_decode_as", None),
+            with_payloads=getattr(query, "_with_payloads", False),
         )
 
     def _parse_search_resp3_native(self, res, **kwargs):
@@ -803,6 +804,7 @@ class SearchCommands:
                 duration=kwargs.get("duration", 0),
                 with_scores=getattr(query, "_with_scores", False),
                 field_encodings=getattr(query, "_return_fields_decode_as", None),
+                with_payloads=getattr(query, "_with_payloads", False),
             )
         profile_data = self._to_string_recursive(profile_data)
         return result, profile_data

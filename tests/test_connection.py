@@ -4872,3 +4872,13 @@ class TestDeprecatedRespSymbols:
 
         with pytest.raises(AttributeError, match="nosuchattribute"):
             connection_module.nosuchattribute
+
+    def test_wildcard_import_keeps_the_names(self):
+        """A wildcard import never calls ``__getattr__``, so ``__all__`` must list them."""
+        namespace = {}
+
+        with pytest.warns(DeprecationWarning, match="SYM_STAR"):
+            exec("from redis.connection import *", namespace)
+
+        assert namespace["SYM_STAR"] == b"*"
+        assert namespace["SYM_DOLLAR"] == b"$"

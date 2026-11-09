@@ -3606,8 +3606,30 @@ class TestClusterPubSubSlotMigration:
                 None,
             )
 
-        # Four split slices, then one non-blocking sweep.
-        assert [c.args[1] for c in poll.call_args_list] == [0.1] * 4 + [0.0] * 4
+        # The mock returns at once, so each node also inherits the unspent
+        # share of the ones before it; then one non-blocking sweep.
+        slices = [0.4 / 4, 0.4 / 3, 0.4 / 2, 0.4] + [0.0] * 4
+        assert [c.args[1] for c in poll.call_args_list] == pytest.approx(
+            slices, abs=0.01
+        )
+
+    async def test_sharded_message_generator_gives_skipped_share_to_others(self):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[cooling] = time.monotonic() + 30
+
+        with patch.object(
+            pubsub, "_poll_node_pubsub", AsyncMock(return_value=None)
+        ) as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert poll.call_args_list[0].args == (healthy, pytest.approx(0.4, abs=0.01))
 
     async def test_sharded_message_generator_sweeps_for_late_message(self):
         pubsub = self._make_cluster_pubsub()

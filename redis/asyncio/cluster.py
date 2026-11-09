@@ -5514,9 +5514,18 @@ class ClusterPubSub(PubSub):
         next_ready: Optional[float] = None
         nodes = len(self.node_pubsub_mapping)
         # Split the wait across the pass, otherwise every idle node ahead of the
-        # one with a message adds a full timeout.
+        # one with a message adds a full timeout. Each poll gets an equal share
+        # of what is left, so a skipped or fast-failing node passes its share on.
         split = bool(timeout) and nodes > 1
-        node_timeout = timeout / nodes if split else timeout
+        node_timeout = timeout
+        if split:
+            pass_deadline = time.monotonic() + timeout
+            now = time.monotonic()
+            left = sum(
+                1
+                for ps in list(self.node_pubsub_mapping.values())
+                if self._poll_cool_off.get(ps, 0.0) <= now
+            )
         for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
@@ -5532,6 +5541,9 @@ class ClusterPubSub(PubSub):
                         next_ready = deadline
                     continue
             polled += 1
+            if split:
+                node_timeout = max(pass_deadline - time.monotonic(), 0.0) / max(left, 1)
+                left -= 1
             try:
                 message = await self._poll_node_pubsub(pubsub, node_timeout)
             except MovedError as e:

@@ -4663,7 +4663,11 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # That drain may process MOVING and need the pool lock.
             self._event_dispatcher.dispatch(AfterConnectionReleasedEvent(connection))
         finally:
-            with _defer_maintenance_events(), self._lock:
+            with (
+                _defer_maintenance_events(),
+                self._defer_cached_disconnects(),
+                self._lock,
+            ):
                 token = self._releasing_connections.pop(connection)
                 if token is not None:
                     connection.set_re_auth_token(token)

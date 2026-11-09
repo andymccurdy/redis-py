@@ -11,6 +11,7 @@ from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig
 from redis.connection import BlockingConnectionPool, ConnectionPool
+from redis.event import AfterConnectionReleasedEvent
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.sentinel import SentinelConnectionPool
 from redis.utils import HIREDIS_AVAILABLE
@@ -123,6 +124,122 @@ def test_finalizer_during_pool_shutdown(
             automatic,
             operation,
         ),
+    )
+
+
+def _finalizer_during_release_listener_reconnect(url, parser_class, automatic):
+    pool = ConnectionPool.from_url(
+        url,
+        protocol=3,
+        parser_class=parser_class,
+        cache_config=CacheConfig(),
+        max_connections=2,
+        socket_timeout=1,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
+    owner, released = (pool.get_connection() for _ in range(2))
+    # The peer shares the cache, but closing the owner's pool must not close
+    # the peer's active socket while it waits for the owner's drain to finish.
+    peers = ConnectionPool(cache=pool.cache, **pool.connection_kwargs)
+    borrower = peers.get_connection()
+    key = str(uuid.uuid4())
+    writer = Redis.from_url(url)
+    writer.set(key, "old")
+    owner.send_command("GET", key, keys=[key])
+    assert owner.read_response() == b"old"
+    pool.release(owner)
+    draining, finalizing = threading.Event(), threading.Event()
+    errors = []
+    original_poll = owner._conn.can_read
+    original_disconnect = released._conn.disconnect
+    collected = False
+    enabled, thresholds = gc.isenabled(), gc.get_threshold()
+    gc.disable()
+    victim = Redis.from_pool(pool)
+    victim.reference_cycle = victim
+    abandoned = weakref.ref(victim)
+    del victim
+
+    def poll(*args, **kwargs):
+        if threading.current_thread() is reader:
+            draining.set()
+            assert finalizing.wait(5), "release did not reach its final disconnect"
+        return original_poll(*args, **kwargs)
+
+    def read():
+        try:
+            borrower.send_command("GET", key, keys=[key])
+            assert borrower.read_response() == b"old"
+        except BaseException as error:
+            errors.append(error)
+
+    def mark_for_reconnect(event):
+        if event.connection is released:
+            assert not released.should_reconnect()
+            released.mark_for_reconnect()
+
+    def disconnect(*args, **kwargs):
+        nonlocal collected
+        if not collected:
+            collected = True
+            finalizing.set()
+            if automatic:
+                gc.set_threshold(1, 1, 1)
+                gc.enable()
+                allocations = [[] for _ in range(100)]
+                assert allocations
+            else:
+                gc.collect()
+            assert abandoned() is None, "pool-owning client was not finalized"
+        return original_disconnect(*args, **kwargs)
+
+    listener = Mock()
+    listener.listen.side_effect = mark_for_reconnect
+    reader = threading.Thread(target=read, daemon=True)
+    pool._event_dispatcher.register_listeners({AfterConnectionReleasedEvent: [listener]})
+    try:
+        with (
+            patch.object(owner._conn, "can_read", poll),
+            patch.object(released._conn, "disconnect", disconnect),
+        ):
+            reader.start()
+            assert draining.wait(3), "peer did not start draining the idle owner"
+            pool.release(released)
+            reader.join(3)
+            assert not reader.is_alive(), "release and idle drain deadlocked"
+            assert not errors, errors
+        assert collected
+        assert not released.is_connected
+        assert not owner._in_use_lock.locked()
+        assert not owner._idle_maintenance
+        pool._event_dispatcher.unregister_listeners(
+            {AfterConnectionReleasedEvent: [listener]}
+        )
+        reused = pool.get_connection()
+        reused.send_command("PING")
+        assert reused.read_response() == b"PONG"
+        pool.release(reused)
+    finally:
+        gc.set_threshold(*thresholds)
+        if enabled:
+            gc.enable()
+        else:
+            gc.disable()
+        peers.release(borrower)
+        peers.close()
+        pool.close()
+        writer.delete(key)
+        writer.close()
+
+
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("automatic", [False, True])
+def test_finalizer_during_release_listener_reconnect(
+    request, parser_class, automatic
+):
+    _run_bounded(
+        _finalizer_during_release_listener_reconnect,
+        (request.config.getoption("--redis-url"), parser_class, automatic),
     )
 
 

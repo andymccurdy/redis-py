@@ -4443,6 +4443,7 @@ class TestMultiShardRequests:
 
         keyslot.assert_not_called()
 
+    @skip_if_server_version_lt("8.3.224")
     def test_keys_that_cannot_be_located_are_not_split(self, r, monkeypatch):
         """MSETEX names its key count first, so its keys are not at fixed positions."""
         _route_by_live_tips(r, monkeypatch)

@@ -186,6 +186,27 @@ class TestResultFieldsNamedLikeDocumentAttributes:
 
         assert result.docs[0].payload == "server-payload"
 
+    def test_resp3_profile_with_payloads(self):
+        res = {
+            "Results": {
+                "total_results": 1,
+                "results": [
+                    {
+                        "id": "doc1",
+                        "payload": b"server-payload",
+                        "extra_attributes": {"payload": "field-value"},
+                    },
+                ],
+            },
+            "Profile": {"Shards": [], "Coordinator": {}},
+        }
+
+        query = Query("*").with_payloads()
+
+        result, _ = _make_search()._parse_profile_resp3(res, query=query)
+
+        assert result.docs[0].payload == "server-payload"
+
 
 def _make_search():
     """Build a ``Search`` instance whose parsers can be exercised without

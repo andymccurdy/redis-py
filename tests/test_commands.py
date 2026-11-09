@@ -1948,6 +1948,107 @@ class TestRedisCommands:
         with pytest.raises(redis.ResponseError):
             r.bitpos("mykey", 1, 7, 15, "bite")
 
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray(self, r):
+        # The first and the last bit of each of four bytes are set.
+        r.set("a", b"\x81\x81\x81\x81")
+        assert r.bitrangeintarray("a", 0, -1) == [0, 7, 8, 15, 16, 23, 24, 31]
+        assert r.bitrangeintarray("a", 1, 1) == [8, 15]
+        assert r.bitrangeintarray("a", 1, 2) == [8, 15, 16, 23]
+        assert r.bitrangeintarray("a", -1, -1) == [24, 31]
+        assert r.bitrangeintarray("a", -2, -1) == [16, 23, 24, 31]
+        assert r.bitrangeintarray("a", 2, 99) == [16, 23, 24, 31]
+        assert r.bitrangeintarray("a", -99, 0) == [0, 7]
+        assert r.bitrangeintarray("a", 3, 1) == []
+        assert r.bitrangeintarray("a", 4, 9) == []
+        assert r.bitrangeintarray("a", -1, -2) == []
+        for start, end in ((0, -1), (1, 2), (-2, -1), (3, 1)):
+            assert len(r.bitrangeintarray("a", start, end)) == r.bitcount(
+                "a", start, end
+            )
+        assert r.bitrangeintarray("missing", 0, -1) == []
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_mode(self, r):
+        r.set("a", b"\x81\x81\x81\x81")
+        assert r.bitrangeintarray("a", 0, 0, "bit") == [0]
+        assert r.bitrangeintarray("a", 7, 8, "BIT") == [7, 8]
+        assert r.bitrangeintarray("a", 1, 6, "bit") == []
+        assert r.bitrangeintarray("a", 9, 15, "bit") == [15]
+        assert r.bitrangeintarray("a", -8, -1, "bit") == [24, 31]
+        assert r.bitrangeintarray("a", 30, 1000, "bit") == [31]
+        assert r.bitrangeintarray("a", 32, 40, "bit") == []
+        assert r.bitrangeintarray("a", 1, 1, "byte") == [8, 15]
+        with pytest.raises(redis.ResponseError):
+            r.bitrangeintarray("a", 0, -1, "bite")
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_limit(self, r):
+        # Bytes 0, 7 and 8 are full, byte 1 has bits 8 and 15, byte 9 has bit 73.
+        r.set("a", b"\xff\x81\x00\x00\x00\x00\x00\xff\xff\x40")
+        # A page in byte units completes the byte that holds the last offset.
+        assert r.bitrangeintarray("a", 0, -1, limit=1) == list(range(8))
+        assert r.bitrangeintarray("a", 0, -1, limit=9) == [*range(9), 15]
+        assert r.bitrangeintarray("a", 1, -1, limit=1) == [8, 15]
+        assert r.bitrangeintarray("a", 0, -1, "bit", limit=9) == list(range(9))
+        assert r.bitrangeintarray("a", 57, -1, "bit", limit=2) == [57, 58]
+        assert r.bitrangeintarray("a", 0, -1, limit=0) == []
+        with pytest.raises(redis.ResponseError):
+            r.bitrangeintarray("a", 0, -1, limit=-1)
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_paging(self, r):
+        r.set("a", b"\xff\x81\x00\x00\x00\x00\x00\xff\xff\x40")
+        expected = r.bitrangeintarray("a", 0, -1)
+        assert len(expected) == 27
+        offsets, pages, start = [], [], 0
+        while True:
+            page = r.bitrangeintarray("a", start, -1, "bit", limit=9)
+            pages.append(page)
+            offsets.extend(page)
+            if len(page) < 9:
+                break
+            start = page[-1] + 1
+        assert [len(page) for page in pages] == [9, 9, 9, 0]
+        assert offsets == expected
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_zeros(self, r):
+        r.set("a", b"\x81\x81\x81\x81")
+        assert r.bitrangeintarray("a", 0, 0, "bit", zeros=True) == []
+        assert r.bitrangeintarray("a", 1, 6, "bit", zeros=True) == list(range(1, 7))
+        assert r.bitrangeintarray("a", 0, -1, limit=1, zeros=True) == list(range(1, 7))
+        r.set("a", b"\xff\x7e")
+        assert r.bitrangeintarray("a", 0, -1, zeros=True) == [8, 15]
+        assert r.bitrangeintarray("a", 0, 99, zeros=True) == [8, 15]
+        # Unlike BITPOS, no clear bits are assumed past the end of the value.
+        r.set("a", b"\xff\xff")
+        assert r.bitpos("a", 0) == 16
+        assert r.bitrangeintarray("a", 0, -1, zeros=True) == []
+
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_wrong_type(self, r):
+        r.rpush("a", "a1")
+        with pytest.raises(redis.ResponseError):
+            r.bitrangeintarray("a", 0, -1)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.240")
+    def test_bitrangeintarray_native_bitmap(self, r):
+        old_value = r.config_get("bitmap-default-roaring")["bitmap-default-roaring"]
+        r.config_set("bitmap-default-roaring", "yes")
+        try:
+            for offset in (0, 7, 8, 15, 16, 23, 24, 31):
+                r.setbit("a", offset, 1)
+        finally:
+            r.config_set("bitmap-default-roaring", old_value)
+        assert r.type("a") == b"bitmap"
+        assert r.bitrangeintarray("a", 0, -1) == [0, 7, 8, 15, 16, 23, 24, 31]
+        assert r.bitrangeintarray("a", 1, 2) == [8, 15, 16, 23]
+        assert r.bitrangeintarray("a", 7, 8, "bit") == [7, 8]
+        assert r.bitrangeintarray("a", 0, -1, "bit", limit=3) == [0, 7, 8]
+        assert r.bitrangeintarray("a", 1, 6, "bit", zeros=True) == list(range(1, 7))
+
     @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("6.2.0")
     def test_copy(self, r):

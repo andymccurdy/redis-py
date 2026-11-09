@@ -651,10 +651,27 @@ class _AsyncRESPBase(AsyncBaseParser):
             stream = self._stream
             try:
                 remaining = want - len(tail)
+                buffer = stream._buffer
                 if (
+                    isinstance(stream, StreamReader)
+                    and len(buffer) >= remaining
+                    and stream._exception is None
+                ):
+                    # The whole remainder is already buffered: take it
+                    # straight out of the stream buffer. These are the
+                    # same bytes readexactly() would return, without a
+                    # readexactly() coroutine - and without the flag
+                    # checks below - for a read that cannot wait at all.
+                    # Only a real StreamReader offers this buffer; other
+                    # stream doubles keep the readexactly() path below.
+                    data = bytes(memoryview(buffer)[:remaining])
+                    del buffer[:remaining]
+                    stream._maybe_resume_transport()
+                    self._chunks.append(data)
+                elif (
                     self._apply_read_timeout
                     and self._read_timeout is not None
-                    and len(stream._buffer) < remaining
+                    and len(buffer) < remaining
                 ):
                     # The stream does not already hold the whole remainder,
                     # so this read can wait: _read_exactly bounds every
@@ -669,10 +686,6 @@ class _AsyncRESPBase(AsyncBaseParser):
                     # readexactly leaves its bytes on the stream, so the
                     # next poll resumes from the stream instead of
                     # re-joining and re-parsing saved pieces on every poll.
-                    # Gating the length check on the two flag checks above
-                    # also keeps the private buffer access - and its cost
-                    # per element of an aggregate reply - off the paths
-                    # that cannot wait, notably socket_timeout=None.
                     data = await stream.readexactly(remaining)
                     self._chunks.append(data)
             except IncompleteReadError as error:
@@ -775,29 +788,47 @@ class _AsyncRESPBase(AsyncBaseParser):
             tail = self._buffer[self._pos :]
             stream = self._stream
             read_timeout = self._read_timeout
-            # Each line gets a fresh socket_timeout window, like each read
-            # in _read_exactly: the deadline must not be shared across all
-            # the lines of one response. Check the flags first to avoid
-            # private stream access when per-read timeouts do not apply.
-            # readline can only wait while the stream's bytearray buffer
-            # holds no line end, so an aggregate reply whose lines are
-            # already buffered pays only the flag checks and the (short,
-            # first-match) needle scan per line - no timeout context is
-            # built for a read that cannot wait.
-            if (
-                self._apply_read_timeout
-                and read_timeout is not None
-                # int needle: ~8ns vs ~80ns for a bytes needle on a bytearray
-                and 10 not in stream._buffer
-            ):
-                async with async_timeout(read_timeout) as active_timeout:
-                    self._active_read_timeout = active_timeout
-                    try:
-                        data = await stream.readline()
-                    finally:
-                        self._active_read_timeout = None
-            else:
-                data = await stream.readline()
+            # If the line is already buffered, take it straight out of
+            # the stream buffer: the same bytes readline() would return,
+            # without a timeout context or a readline() coroutine for a
+            # read that cannot wait. The find doubles as the guard, so a
+            # buffered line pays no flag checks either. Only a real
+            # StreamReader offers this buffer; other stream doubles keep
+            # the readline() path below.
+            data = None
+            if isinstance(stream, StreamReader):
+                buffer = stream._buffer
+                idx = buffer.find(10)
+                if idx >= 0 and stream._exception is None:
+                    if idx > stream._limit:
+                        raise ValueError(
+                            "Separator is found, but chunk is longer than limit"
+                        )
+                    data = bytes(memoryview(buffer)[: idx + 1])
+                    del buffer[: idx + 1]
+                    stream._maybe_resume_transport()
+            if data is None:
+                # Each line gets a fresh socket_timeout window, like each
+                # read in _read_exactly: the deadline must not be shared
+                # across all the lines of one response. Check the flags
+                # first to avoid private stream access when per-read
+                # timeouts do not apply. readline can only wait while the
+                # stream's bytearray buffer holds no line end, so no
+                # timeout context is built for a read that cannot wait.
+                if (
+                    self._apply_read_timeout
+                    and read_timeout is not None
+                    # int needle: ~8ns vs ~80ns for a bytes needle on a bytearray
+                    and 10 not in stream._buffer
+                ):
+                    async with async_timeout(read_timeout) as active_timeout:
+                        self._active_read_timeout = active_timeout
+                        try:
+                            data = await stream.readline()
+                        finally:
+                            self._active_read_timeout = None
+                else:
+                    data = await stream.readline()
             if not data.endswith(b"\r\n"):
                 raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
             result = (tail + data)[:-2]

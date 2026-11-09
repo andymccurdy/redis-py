@@ -16,6 +16,7 @@ from unittest import mock
 import pytest
 
 import redis._parsers.base as parser_base
+from redis._parsers.encoders import Encoder
 from redis._parsers.hiredis import _AsyncHiredisParser
 from redis._parsers.resp2 import _AsyncRESP2Parser
 from redis._parsers.resp3 import _AsyncRESP3Parser
@@ -276,6 +277,81 @@ async def test_reads_arm_timeout_only_when_they_can_wait():
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(parser._readline(), 0.2)
     assert parser._active_read_timeout is None
+
+
+class _NoStreamReadsReader(asyncio.StreamReader):
+    """A StreamReader whose read coroutines fail loudly.
+
+    Any use of them means the parser took a stream read for data that
+    was already buffered.
+    """
+
+    async def read(self, n=-1):
+        raise AssertionError("buffered read used stream.read()")
+
+    async def readline(self):
+        raise AssertionError("buffered read used stream.readline()")
+
+    async def readexactly(self, n):
+        raise AssertionError("buffered read used stream.readexactly()")
+
+
+@pytest.mark.parametrize("parser_class", [_AsyncRESP2Parser, _AsyncRESP3Parser])
+async def test_buffered_reads_skip_stream_read_calls(parser_class):
+    # A reply that is already buffered must be parsed straight out of
+    # the stream buffer: no readline()/readexactly() coroutine - and no
+    # per-read timeout context - for lines and bulks that cannot wait.
+    # The gate scenarios (lrange_10k, hgetall_1k with socket_timeout=5)
+    # are exactly this shape: one aggregate reply, already arrived.
+    parser = parser_class(READ_SIZE)
+    reader = _NoStreamReadsReader()
+    wire = b"*3\r\n$5\r\nhello\r\n$5\r\nworld\r\n$1\r\n!\r\n"
+    reader.feed_data(wire)
+    parser._stream = reader
+    parser._connected = True
+    parser.encoder = Encoder("utf-8", "strict", False)
+    parser._apply_read_timeout = True
+    parser._read_timeout = SOCKET_TIMEOUT
+
+    assert await parser.read_response(disable_decoding=True) == [
+        b"hello",
+        b"world",
+        b"!",
+    ]
+
+
+async def test_buffered_line_over_limit_raises():
+    # A buffered line longer than the stream limit raises exactly as
+    # readline() would (readuntil's LimitOverrunError surfaces as
+    # ValueError), instead of being sliced out of the buffer.
+    parser = _AsyncRESP2Parser(READ_SIZE)
+    reader = asyncio.StreamReader()  # default limit 2**16
+    reader.feed_data(b"x" * (2**16 + 10) + b"\r\n")
+    parser._stream = reader
+    parser._connected = True
+    parser.encoder = Encoder("utf-8", "strict", False)
+    parser._apply_read_timeout = True
+    parser._read_timeout = SOCKET_TIMEOUT
+
+    with pytest.raises(ValueError, match="chunk is longer than limit"):
+        await parser._readline()
+
+
+async def test_buffered_read_falls_back_when_stream_has_exception():
+    # A pending stream exception must surface exactly as readline()
+    # raises it, not be silently skipped by the buffered fast path.
+    parser = _AsyncRESP2Parser(READ_SIZE)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"OK\r\n")
+    reader.set_exception(ConnectionError("boom"))
+    parser._stream = reader
+    parser._connected = True
+    parser.encoder = Encoder("utf-8", "strict", False)
+    parser._apply_read_timeout = True
+    parser._read_timeout = SOCKET_TIMEOUT
+
+    with pytest.raises(ConnectionError, match="boom"):
+        await parser._readline()
 
 
 async def test_read_exactly_adds_only_the_joined_buffer_to_chunks():

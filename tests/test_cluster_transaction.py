@@ -590,6 +590,21 @@ class TestClusterTransaction:
             r.nodes_manager.slots_cache[slot] = original_slots_cache
 
     @pytest.mark.onlycluster
+    def test_touch_in_transaction(self, r):
+        """
+        TOUCH is queued inside MULTI/EXEC, so it sees a key set earlier in
+        the same transaction
+        """
+        r["{foo}a"] = 1
+        r["{foo}b"] = 2
+        with r.pipeline(transaction=True) as tx:
+            tx.set("{foo}c", 3)
+            assert tx.touch("{foo}a", "{foo}b", "{foo}c") is tx
+            result = tx.execute()
+        assert len(result) == 2
+        assert result[1] == 3
+
+    @pytest.mark.onlycluster
     def test_exec_error_raised(self, r):
         hashkey = "{key}"
         r[f"{hashkey}:c"] = "a"

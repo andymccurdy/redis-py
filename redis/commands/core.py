@@ -13178,11 +13178,12 @@ class FunctionCommands:
 
         Args:
 
-            library: specify a pattern for matching library names
+            library: specify a pattern for matching library names, or None for all
+                libraries
             withcode: cause the server to include the libraries source implementation
                 in the reply
         """
-        args = ["LIBRARYNAME", library]
+        args = [] if library is None else ["LIBRARYNAME", library]
         if withcode:
             args.append("WITHCODE")
         return self.execute_command("FUNCTION LIST", *args)

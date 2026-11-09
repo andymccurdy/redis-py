@@ -117,6 +117,17 @@ class TestFunction:
         assert_resp_response(r, r.function_list(withcode=True), res, resp3_res)
 
     @pytest.mark.onlynoncluster
+    @pytest.mark.parametrize("withcode", [False, True])
+    def test_function_list_without_library_filter(self, r, withcode):
+        r.function_load(f"#!{engine} name={lib} \n {function}")
+        r.function_load(f"#!{engine} name={lib2} \n {function2}")
+        libraries = r.function_list(withcode=withcode)
+        assert len(libraries) == 2
+        assert r.function_list(library=None, withcode=withcode) == libraries
+        assert len(r.function_list(library=lib, withcode=withcode)) == 1
+        assert r.function_list(library="", withcode=withcode) == []
+
+    @pytest.mark.onlynoncluster
     def test_function_stats(self, r):
         r.function_load(f"#!{engine} name={lib} \n {function}")
         res = [

@@ -21,7 +21,7 @@ from redis._parsers.hiredis import _AsyncHiredisParser
 from redis._parsers.resp2 import _AsyncRESP2Parser
 from redis._parsers.resp3 import _AsyncRESP3Parser
 from redis.asyncio.connection import Connection
-from redis.exceptions import TimeoutError
+from redis.exceptions import ConnectionError, TimeoutError
 from redis.utils import HIREDIS_AVAILABLE
 
 SOCKET_TIMEOUT = 0.3
@@ -256,6 +256,48 @@ async def test_socket_timeout_mid_bulk_read_preserves_bytes_when_kept(factory):
     assert response == PAYLOAD
     # the following reply is intact, not consumed as payload bytes
     assert await conn.read_response() == b"OK"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(make_resp2_connection, id="resp2"),
+        pytest.param(make_resp3_connection, id="resp3"),
+    ],
+)
+async def test_eof_truncated_bulk_reuses_partial_for_resume_state(factory):
+    # Regression test for the codex P2 on base.py:764: when EOF truncates
+    # a bulk reply after several StreamReader.read() iterations,
+    # _read_exactly used to join the pieces twice -- once for
+    # IncompleteReadError.partial and once for the resume state in
+    # _chunks -- briefly holding two full copies of a near-complete
+    # reply. The resume state must reuse the already-joined partial
+    # instead of copying it again.
+    conn, reader = factory()
+    parser = conn._parser
+    read_task = asyncio.create_task(conn.read_response(disconnect_on_error=False))
+    # Header plus the first slice of the payload, then a second slice,
+    # then EOF: _read_exactly sees two pieces before the stream ends,
+    # so the old code joined them twice. The sleeps make sure each
+    # piece is consumed on its own instead of merging into one read.
+    reader.feed_data(BULK_WIRE[:READ_SIZE])
+    await asyncio.sleep(0.05)
+    reader.feed_data(BULK_WIRE[READ_SIZE : READ_SIZE * 2])
+    await asyncio.sleep(0.05)
+    reader.feed_eof()
+
+    with pytest.raises(ConnectionError, match="Connection closed by server") as excinfo:
+        await read_task
+    conn.disconnect.assert_not_awaited()
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, asyncio.IncompleteReadError)
+    received = BULK_WIRE[len(b"$200000\r\n") : READ_SIZE * 2]
+    assert cause.partial == received
+    # one copy only: _chunks holds the header line plus the payload
+    # pieces, and the payload entry reuses the exception's partial
+    assert parser._chunks == [b"$200000\r\n", received]
+    assert parser._chunks[-1] is cause.partial
 
 
 @pytest.mark.parametrize(

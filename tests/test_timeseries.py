@@ -5,6 +5,7 @@ import pytest
 import redis
 from redis.commands.timeseries.commands import TimeSeriesCommands
 from redis.commands.timeseries.info import TSInfo, parse_info_unified
+from redis.commands.timeseries.utils import parse_m_range_unified
 from redis.utils import SENTINEL
 
 from .conftest import (
@@ -1339,6 +1340,22 @@ def test_info_resp3_keeps_null_labels():
     # Server-free: a decoded RESP3 map keeps a literal "null" label as is.
     info = TSInfo({"labels": {"null": "null", "currentLabel": "currentData"}})
     assert info.labels == {"null": "null", "currentLabel": "currentData"}
+
+
+@pytest.mark.fixed_client
+def test_mrange_unified_metadata_bytes_keys():
+    # Server-free: without decode_responses the RESP3 metadata map has bytes
+    # keys and values and must parse like the metadata built for RESP2.
+    resp2 = parse_m_range_unified(
+        [[b"t", [[b"sensor", b"a"]], [[1000, b"1.5"]]]], aggregation_type="avg"
+    )
+    resp3 = parse_m_range_unified(
+        {b"t": [{b"sensor": b"a"}, {b"aggregators": [b"avg"]}, [[1000, 1.5]]]}
+    )
+    for res in (resp2, resp3):
+        assert res == {
+            b"t": [{b"sensor": b"a"}, {"aggregators": ["avg"]}, [[1000, 1.5]]]
+        }
 
 
 @pytest.mark.redismod

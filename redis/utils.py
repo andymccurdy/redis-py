@@ -1,10 +1,13 @@
 import datetime
 import inspect
 import logging
+import os
 import sys
 import textwrap
+import threading
 import warnings
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from functools import cache, wraps
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, TypeVar, Union
@@ -48,6 +51,77 @@ from importlib import metadata
 # explicit value. Import this object from redis.utils instead of creating local
 # sentinels, and compare it by identity only (`is` / `is not`).
 SENTINEL = object()
+
+# Weak values: a context stays cached only while a live connection holds it.
+_SHARED_SSL_CONTEXTS: "weakref.WeakValueDictionary[Any, ssl.SSLContext]" = (
+    weakref.WeakValueDictionary()
+)
+_SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+def _reset_shared_ssl_contexts_lock() -> None:
+    # A fork while another thread builds a context would leave the child with a lock
+    # that nothing can release.
+    global _SHARED_SSL_CONTEXTS_LOCK
+    _SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_shared_ssl_contexts_lock)
+
+
+def _file_signature(path: Any) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        # Left for the context build to report, as it would without the cache
+        return None
+    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
+
+
+def get_shared_ssl_context(
+    build: Callable[[], "ssl.SSLContext"], settings: Any, files: Iterable[Any]
+) -> "ssl.SSLContext":
+    """
+    Return an SSLContext shared by the connections with the same TLS configuration.
+
+    Building a context loads the CA bundle into a new certificate store, which costs
+    far more memory than the TLS connection using it.
+
+    Args:
+        build: Builds the context when no live one matches.
+        settings: Hashable values that determine the context.
+        files: The certificate files and directories the context is loaded from.
+            They are identified by their timestamps, size and inode, so that a rotated
+            file is picked up by the next context built for it. The default CA
+            locations are always included, as is SSLKEYLOGFILE, which
+            ssl.create_default_context() reads.
+    """
+    defaults = ssl.get_default_verify_paths()
+    paths = (*files, defaults.cafile, defaults.capath)
+    key = (
+        settings,
+        os.environ.get("SSLKEYLOGFILE"),
+        tuple((path, _file_signature(path)) for path in paths),
+    )
+    try:
+        hash(key)
+    except (TypeError, ValueError):
+        # An unhashable setting, such as ssl_ca_data given as a bytearray or a
+        # writable memoryview
+        return build()
+    with _SHARED_SSL_CONTEXTS_LOCK:
+        context = _SHARED_SSL_CONTEXTS.get(key)
+    if context is None:
+        # Built outside the lock, so a slow CA load or ssl_password callback does not
+        # stall other connects. A build that loses the race is dropped before any
+        # socket wraps it.
+        built = build()
+        with _SHARED_SSL_CONTEXTS_LOCK:
+            context = _SHARED_SSL_CONTEXTS.get(key)
+            if context is None:
+                context = _SHARED_SSL_CONTEXTS[key] = built
+    return context
 
 
 def from_url(url: str, **kwargs: Any) -> "Redis":

@@ -6,6 +6,7 @@ import math
 import re
 import time
 import warnings
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -39,6 +40,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers.helpers import bool_ok, decode_info
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -68,7 +70,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.commands.helpers import parse_pubsub_subscriptions, pubsub_subscription_args
-from redis.credentials import CredentialProvider
+from redis.credentials import CredentialProvider, StreamingCredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
@@ -393,9 +395,7 @@ class Redis(
             Argument is ignored when connection_pool is provided.
         """
         kwargs: Dict[str, Any]
-        if event_dispatcher is None:
-            self._event_dispatcher = EventDispatcher()
-        else:
+        if event_dispatcher is not None:
             self._event_dispatcher = event_dispatcher
         # auto_close_connection_pool only has an effect if connection_pool is
         # None. It is assumed that if connection_pool is not None, the user
@@ -507,14 +507,19 @@ class Redis(
             # This arg only used if no pool is passed in
             self.auto_close_connection_pool = auto_close_connection_pool
             connection_pool = ConnectionPool(**kwargs)
-            self._event_dispatcher.dispatch(
-                AfterPooledConnectionsInstantiationEvent(
-                    [connection_pool], ClientType.ASYNC, credential_provider
-                )
-            )
         else:
             # If a pool is passed in, do not close it
             self.auto_close_connection_pool = False
+
+        # A user-supplied dispatcher always gets the event, for its own
+        # listeners. The default one is private to this client, so its only
+        # listener is the built-in re-auth one, which acts on a
+        # StreamingCredentialProvider alone: skip the no-op dispatch (and
+        # building the dispatcher) for any other provider.
+        if event_dispatcher is not None or (
+            credential_provider is not None
+            and isinstance(credential_provider, StreamingCredentialProvider)
+        ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
                     [connection_pool], ClientType.ASYNC, credential_provider
@@ -541,6 +546,12 @@ class Redis(
         # using the client.
         self._usage_counter = 0
         self._usage_lock = asyncio.Lock()
+
+    @cached_property
+    def _event_dispatcher(self) -> EventDispatcher:
+        # Built on first use when the client was given no dispatcher; a
+        # dispatcher passed to __init__ is stored on the instance instead.
+        return EventDispatcher()
 
     def __repr__(self):
         return (
@@ -1044,10 +1055,14 @@ class Redis(
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            # Mypy bug: https://github.com/python/mypy/issues/10977
-            command_name = cast(str, command_name)
-            retval = self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            retval = callback(response, **options)
             return await retval if inspect.isawaitable(retval) else retval
         return response
 
@@ -1173,9 +1188,14 @@ class Monitor:
             client_port = client_info[5:]
             client_type = "unix"
         else:
-            # use rsplit as ipv6 addresses contain colons
-            client_address, client_port = client_info.rsplit(":", 1)
-            client_type = "tcp"
+            if client_info == "":
+                client_address = ""
+                client_port = ""
+                client_type = "unknown"
+            else:
+                # use rsplit as ipv6 addresses contain colons
+                client_address, client_port = client_info.rsplit(":", 1)
+                client_type = "tcp"
         return {
             "time": float(command_time),
             "db": int(db_id),
@@ -1304,6 +1324,18 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
+                if self.push_handler_func is not None:
+                    # The handler is set on the parser of a pooled connection:
+                    # put the parser's own back, or the next PubSub that gets
+                    # this connection has its messages handed to ours
+                    parser = self.connection._get_parser()
+                    if (
+                        getattr(parser, "pubsub_push_handler_func", None)
+                        is self.push_handler_func
+                    ):
+                        parser.set_pubsub_push_handler(
+                            parser.handle_pubsub_push_response
+                        )
                 # Detach before awaiting release, as Pipeline.reset() does, so
                 # the pubsub never holds a connection that is back in the pool.
                 connection, self.connection = self.connection, None
@@ -1906,6 +1938,21 @@ CommandStackT = List[CommandT]
 _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 
 
+async def _pack_pipeline_commands(
+    connection: Connection, commands: Sequence[Iterable[EncodableT]]
+) -> List[bytes]:
+    """Pack commands, off the event loop for large batches.
+
+    Packing is pure CPU work and can block the event loop for seconds on
+    very large pipelines (#3416), but handing a batch to a worker thread
+    also costs a dispatch. Small batches are packed inline; only batches
+    at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
+    """
+    if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
+        return connection.pack_commands(commands)
+    return await asyncio.to_thread(connection.pack_commands, commands)
+
+
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     """
     Pipelines provide a way to transmit multiple commands to the Redis server
@@ -2153,7 +2200,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         pre: CommandT = (("MULTI",), {})
         post: CommandT = (("EXEC",), {})
         cmds = (pre, *commands, post)
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection,
             [args for args, options in cmds if EMPTY_RESPONSE not in options],
         )
@@ -2219,8 +2266,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
 
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)
@@ -2240,7 +2293,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         preflight = _himport_exec.prepare_wire_commands(fieldsets)
         # build up all commands into a single request to increase network perf
-        all_cmds = await self._pack_commands(
+        all_cmds = await _pack_pipeline_commands(
             connection, preflight + [args for args, _ in commands]
         )
         await connection.send_packed_command(all_cmds)
@@ -2276,20 +2329,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         if raise_on_error:
             self.raise_first_error(commands, response)
         return response
-
-    async def _pack_commands(
-        self, connection: Connection, commands: Sequence[Iterable[EncodableT]]
-    ) -> List[bytes]:
-        """Pack commands, off the event loop for large batches.
-
-        Packing is pure CPU work and can block the event loop for seconds on
-        very large pipelines (#3416), but handing a batch to a worker thread
-        also costs a dispatch. Small batches are packed inline; only batches
-        at or above ``_PIPELINE_PACK_OFFLOAD_MIN_COMMANDS`` are offloaded.
-        """
-        if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
-            return connection.pack_commands(commands)
-        return await asyncio.to_thread(connection.pack_commands, commands)
 
     def raise_first_error(self, commands: CommandStackT, response: Iterable[Any]):
         for i, r in enumerate(response):

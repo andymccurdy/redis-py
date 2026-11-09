@@ -196,7 +196,9 @@ def _finalizer_during_release_listener_reconnect(url, parser_class, automatic):
     listener = Mock()
     listener.listen.side_effect = mark_for_reconnect
     reader = threading.Thread(target=read, daemon=True)
-    pool._event_dispatcher.register_listeners({AfterConnectionReleasedEvent: [listener]})
+    pool._event_dispatcher.register_listeners(
+        {AfterConnectionReleasedEvent: [listener]}
+    )
     try:
         with (
             patch.object(owner._conn, "can_read", poll),
@@ -234,9 +236,7 @@ def _finalizer_during_release_listener_reconnect(url, parser_class, automatic):
 
 @pytest.mark.parametrize("parser_class", PARSERS)
 @pytest.mark.parametrize("automatic", [False, True])
-def test_finalizer_during_release_listener_reconnect(
-    request, parser_class, automatic
-):
+def test_finalizer_during_release_listener_reconnect(request, parser_class, automatic):
     _run_bounded(
         _finalizer_during_release_listener_reconnect,
         (request.config.getoption("--redis-url"), parser_class, automatic),

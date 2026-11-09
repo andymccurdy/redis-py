@@ -5,10 +5,13 @@ import os
 import platform
 import socket
 import ssl
+import threading
+import time
 import types
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
-from errno import ECONNREFUSED, ETIMEDOUT
+from errno import ECONNREFUSED, ENOENT, ETIMEDOUT
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +40,7 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+from redis.retry import is_retryable_connect_error
 from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.utils import HIREDIS_AVAILABLE
 from tests.conftest import skip_if_server_version_lt
@@ -735,6 +739,201 @@ async def test_connect_timeout_error_without_retry():
     assert conn._connect.call_count == 1
 
 
+@pytest.mark.fixed_client
+async def test_connect_without_retry_on_unrecoverable_oserror():
+    """A connect error that can never succeed on retry (e.g. a missing Unix
+    socket path, ENOENT) fails fast when the Retry object is configured with
+    the opt-in checker."""
+    conn = Connection(
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error)
+    )
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ENOENT, "No such file or directory")
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.connect()
+    # no retries: _connect is called exactly once
+    assert conn._connect.call_count == 1
+    # the original OSError is preserved as the cause for classification
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert excinfo.value.__cause__.errno == ENOENT
+
+
+@pytest.mark.fixed_client
+async def test_connect_retries_on_unrecoverable_oserror_without_checker():
+    """The ENOENT classification is opt-in: without the checker the default
+    retry behavior is unchanged."""
+    conn = Connection(retry=Retry(NoBackoff(), 3))
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ENOENT, "No such file or directory")
+
+    with pytest.raises(ConnectionError):
+        await conn.connect()
+    # 3 retries --> 4 attempts
+    assert conn._connect.call_count == 4
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Immediate reclamation is a refcounting property",
+)
+async def test_connect_check_health_clears_the_chained_exception_local():
+    """The connect handler must not leave the raised ConnectionError bound in
+    its frame. Its traceback points back at the frame, so the local would form
+    a cycle that only the collector can reclaim."""
+
+    class WeakReferenceableOSError(OSError):
+        """OSError itself cannot be weak-referenced."""
+
+    conn = Connection()
+    raised_ref = []
+
+    async def fail_connect():
+        error = WeakReferenceableOSError("refused")
+        raised_ref.append(weakref.ref(error))
+        try:
+            raise error
+        finally:
+            # Clear this frame's local, or its traceback keeps the exception
+            # alive and the assertion measures the test.
+            error = None
+
+    conn._connect = fail_connect
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with pytest.raises(ConnectionError):
+            await conn.connect_check_health(
+                check_health=False, retry_socket_connect=False
+            )
+
+        (ref,) = raised_ref
+        assert ref() is None
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Unix domain sockets are not available on Windows",
+)
+async def test_connect_missing_unix_socket_fails_fast_with_checker(tmp_path):
+    """Real missing-socket path: the opt-in checker stops after one attempt."""
+    conn = UnixDomainSocketConnection(
+        path=str(tmp_path / "missing.sock"),
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error),
+    )
+    with mock.patch.object(conn, "_connect", wraps=conn._connect) as connect:
+        with pytest.raises(ConnectionError) as excinfo:
+            await conn.connect()
+    assert connect.call_count == 1
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert excinfo.value.__cause__.errno == ENOENT
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Unix domain sockets are not available on Windows",
+)
+async def test_connect_missing_unix_socket_retries_without_checker(tmp_path):
+    """Real missing-socket path: without the checker the default retry policy
+    still spends the full retry budget."""
+    conn = UnixDomainSocketConnection(
+        path=str(tmp_path / "missing.sock"),
+        retry=Retry(NoBackoff(), 3),
+    )
+    with mock.patch.object(conn, "_connect", wraps=conn._connect) as connect:
+        with pytest.raises(ConnectionError):
+            await conn.connect()
+    assert connect.call_count == 4
+
+
+@pytest.mark.fixed_client
+async def test_client_connect_uses_retry_checker():
+    """The checker also applies when the client acquires a connection through
+    the pool, not only to a direct connect() call."""
+    client = Redis(
+        unix_socket_path="/nonexistent/redis.sock",
+        retry=Retry(NoBackoff(), 3, is_retryable=is_retryable_connect_error),
+    )
+    error = OSError(ENOENT, "No such file or directory")
+    with mock.patch.object(
+        UnixDomainSocketConnection,
+        "_connect",
+        autospec=True,
+        side_effect=error,
+    ) as connect:
+        with pytest.raises(ConnectionError) as excinfo:
+            await client.ping()
+
+    assert connect.call_count == 1
+    assert excinfo.value.__cause__ is error
+    await client.aclose()
+
+
+@pytest.mark.fixed_client
+async def test_send_packed_command_preserves_oserror_cause():
+    """The write wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._reader = mock.Mock()
+    conn._writer = mock.Mock()
+    conn._writer.transport.is_closing.return_value = False
+    error = OSError(ENOENT, "No such file or directory")
+    conn._writer.writelines.side_effect = error
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.send_packed_command(b"PING", check_health=False)
+
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.fixed_client
+async def test_read_response_preserves_oserror_cause():
+    """The read wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._parser = mock.Mock()
+    error = OSError(ENOENT, "No such file or directory")
+    conn._parser.read_response = mock.AsyncMock(side_effect=error)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.read_response()
+
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.fixed_client
+async def test_can_read_preserves_oserror_cause():
+    """The can_read wrapper must chain the original OSError as the cause."""
+    conn = Connection()
+    conn._parser = mock.Mock()
+    error = OSError(ENOENT, "No such file or directory")
+    conn._parser.can_read = mock.AsyncMock(side_effect=error)
+
+    with pytest.raises(ConnectionError) as excinfo:
+        await conn.can_read()
+
+    assert excinfo.value.__cause__ is error
+
+
+@pytest.mark.fixed_client
+async def test_connect_retries_on_transient_oserror():
+    """A transient socket error such as ECONNREFUSED (server not up yet)
+    stays retryable, so the whole connect flow is retried as before."""
+    conn = Connection(retry=Retry(NoBackoff(), 2))
+    conn._connect = mock.AsyncMock()
+    conn._connect.side_effect = OSError(ECONNREFUSED, "Connection refused")
+
+    with pytest.raises(ConnectionError):
+        await conn.connect()
+    # 2 retries --> 3 attempts
+    assert conn._connect.call_count == 3
+
+
 @pytest.mark.onlynoncluster
 async def test_connection_parse_response_resume(r: redis.Redis):
     """
@@ -842,7 +1041,9 @@ async def test_connection_disconect_race(parser_class, connect_args):
     with patch.object(asyncio, "open_connection", open_connection):
         # disable the initial version handshake
         with patch.multiple(
-            conn, send_command=dummy_method, read_response=dummy_method
+            conn,
+            send_command=dummy_method,
+            read_response=mock.AsyncMock(return_value={b"proto": 3}),
         ):
             await conn.connect()
 
@@ -1729,3 +1930,219 @@ async def test_send_packed_command_os_level_timeout_is_a_connection_error():
         await conn.send_packed_command(b"PING", check_health=False)
     conn.disconnect.assert_awaited_once()
     conn._reader = conn._writer = None  # disconnect was mocked out
+
+
+@pytest.mark.fixed_client
+def test_ssl_connections_with_same_settings_share_a_context():
+    connections = [SSLConnection(ssl_cert_reqs="none") for _ in range(5)]
+
+    contexts = [conn.ssl_context.get() for conn in connections]
+
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+def test_ssl_pool_connections_share_a_context():
+    pool = ConnectionPool(connection_class=SSLConnection, ssl_cert_reqs="none")
+
+    contexts = [pool.make_connection().ssl_context.get() for _ in range(5)]
+
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"ssl_cert_reqs": "optional", "ssl_check_hostname": False},
+        {"ssl_cert_reqs": "none", "ssl_ciphers": "ECDHE+AESGCM"},
+        {"ssl_cert_reqs": "none", "ssl_min_version": ssl.TLSVersion.TLSv1_3},
+        {
+            "ssl_cert_reqs": "none",
+            "ssl_include_verify_flags": [ssl.VerifyFlags.VERIFY_X509_STRICT],
+        },
+    ],
+)
+def test_ssl_connections_with_different_settings_do_not_share_a_context(settings):
+    context = SSLConnection(ssl_cert_reqs="none").ssl_context.get()
+
+    assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_certificate_rotation(tmp_path):
+    certfile = tmp_path / "client.crt"
+    certfile.write_text("old")
+    settings = {"ssl_cert_reqs": "none", "ssl_certfile": str(certfile)}
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        context = SSLConnection(**settings).ssl_context.get()
+        assert SSLConnection(**settings).ssl_context.get() is context
+
+        certfile.write_text("rotated")
+        assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_replacement_with_same_size_and_mtime(tmp_path):
+    certfile = tmp_path / "client.crt"
+    certfile.write_text("old")
+    stat = certfile.stat()
+    settings = {"ssl_cert_reqs": "none", "ssl_certfile": str(certfile)}
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        context = SSLConnection(**settings).ssl_context.get()
+
+        replacement = tmp_path / "client.crt.new"
+        replacement.write_text("new")
+        os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(replacement, certfile)
+
+        assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_is_rebuilt_after_ca_directory_change(tmp_path):
+    settings = {"ssl_cert_reqs": "none", "ssl_ca_path": str(tmp_path)}
+
+    with patch.object(ssl.SSLContext, "load_verify_locations"):
+        context = SSLConnection(**settings).ssl_context.get()
+        assert SSLConnection(**settings).ssl_context.get() is context
+
+        (tmp_path / "ca.0").write_text("rotated")
+        os.utime(tmp_path, ns=(0, 0))
+        assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_follows_sslkeylogfile(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "first.log"))
+    context = SSLConnection(ssl_cert_reqs="none").ssl_context.get()
+
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "second.log"))
+
+    assert SSLConnection(ssl_cert_reqs="none").ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_concurrent_connections_share_one_ssl_context():
+    workers = 8
+    barrier = threading.Barrier(workers)
+    create_default_context = ssl.create_default_context
+
+    def slow_create_default_context():
+        time.sleep(0.05)
+        return create_default_context()
+
+    def get_context(conn):
+        barrier.wait()
+        return conn.ssl_context.get()
+
+    connections = [
+        SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+        for _ in range(workers)
+    ]
+    with patch("ssl.create_default_context", slow_create_default_context):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            contexts = list(executor.map(get_context, connections))
+
+    assert len(contexts) == workers
+    assert all(context is contexts[0] for context in contexts)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
+def test_ssl_context_is_released_with_its_last_connection():
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+AESGCM")
+    context_ref = weakref.ref(conn.ssl_context.get())
+
+    del conn
+    gc.collect()
+
+    assert context_ref() is None
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_keeps_certificate_file_roles_apart(tmp_path):
+    pem = tmp_path / "combined.pem"
+    pem.write_text("pem")
+
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        with patch.object(ssl.SSLContext, "load_verify_locations"):
+            client_cert = SSLConnection(
+                ssl_cert_reqs="none", ssl_certfile=str(pem)
+            ).ssl_context.get()
+            ca_certs = SSLConnection(
+                ssl_cert_reqs="none", ssl_ca_certs=str(pem)
+            ).ssl_context.get()
+
+    assert client_cert is not ca_certs
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_build_can_open_a_connection():
+    nested = SSLConnection(ssl_cert_reqs="none", ssl_ciphers="ECDHE+CHACHA20")
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile="client.crt")
+
+    def load_cert_chain(*args, **kwargs):
+        # As an ssl_password callback fetching the password from Redis would
+        nested.ssl_context.get()
+
+    def get_context():
+        with patch.object(ssl.SSLContext, "load_cert_chain", load_cert_chain):
+            conn.ssl_context.get()
+
+    thread = threading.Thread(target=get_context, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
+@pytest.mark.fixed_client
+@pytest.mark.skipif(
+    platform.python_implementation() == "PyPy",
+    reason="Relies on CPython reference counting to clear the weakref",
+)
+def test_ssl_context_with_callable_password_does_not_keep_its_owner_alive():
+    class Owner:
+        def __init__(self):
+            self.conn = SSLConnection(
+                ssl_cert_reqs="none",
+                ssl_certfile="client.crt",
+                ssl_password=self.password,
+            )
+
+        def password(self):
+            return "password"
+
+    owner = Owner()
+    with patch.object(ssl.SSLContext, "load_cert_chain"):
+        owner.conn.ssl_context.get()
+    owner_ref = weakref.ref(owner)
+
+    del owner
+    gc.collect()
+
+    assert owner_ref() is None
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("ca_data", [bytearray(b"ca"), memoryview(bytearray(b"ca"))])
+def test_ssl_context_with_unhashable_ca_data_is_not_shared(ca_data):
+    settings = {"ssl_cert_reqs": "none", "ssl_ca_data": ca_data}
+
+    with patch.object(ssl.SSLContext, "load_verify_locations"):
+        context = SSLConnection(**settings).ssl_context.get()
+        assert SSLConnection(**settings).ssl_context.get() is not context
+
+
+@pytest.mark.fixed_client
+def test_ssl_context_with_missing_certificate_file_raises(tmp_path):
+    conn = SSLConnection(ssl_cert_reqs="none", ssl_certfile=str(tmp_path / "missing"))
+
+    with pytest.raises(FileNotFoundError):
+        conn.ssl_context.get()

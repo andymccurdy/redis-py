@@ -3,7 +3,7 @@ import logging
 import re
 import threading
 import time
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -32,6 +32,7 @@ from redis._defaults import (
 )
 from redis._parsers.encoders import Encoder
 from redis._parsers.helpers import bool_ok, decode_info, get_response_callbacks
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.cache import CacheConfig, CacheInterface
 from redis.commands import (
@@ -50,7 +51,7 @@ from redis.connection import (
     SSLConnection,
     UnixDomainSocketConnection,
 )
-from redis.credentials import CredentialProvider
+from redis.credentials import CredentialProvider, StreamingCredentialProvider
 from redis.driver_info import DriverInfo, resolve_driver_info
 from redis.event import (
     AfterPooledConnectionsInstantiationEvent,
@@ -461,9 +462,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             Argument is ignored when connection_pool is provided - configure it on the pool
             instead.
         """
-        if event_dispatcher is None:
-            self._event_dispatcher = EventDispatcher()
-        else:
+        if event_dispatcher is not None:
             self._event_dispatcher = event_dispatcher
         if not connection_pool:
             if not retry_on_error:
@@ -584,14 +583,19 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                     }
                 )
             connection_pool = ConnectionPool(**kwargs)
-            self._event_dispatcher.dispatch(
-                AfterPooledConnectionsInstantiationEvent(
-                    [connection_pool], ClientType.SYNC, credential_provider
-                )
-            )
             self.auto_close_connection_pool = True
         else:
             self.auto_close_connection_pool = False
+
+        # A user-supplied dispatcher always gets the event, for its own
+        # listeners. The default one is private to this client, so its only
+        # listener is the built-in re-auth one, which acts on a
+        # StreamingCredentialProvider alone: skip the no-op dispatch (and
+        # building the dispatcher) for any other provider.
+        if event_dispatcher is not None or (
+            credential_provider is not None
+            and isinstance(credential_provider, StreamingCredentialProvider)
+        ):
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
                     [connection_pool], ClientType.SYNC, credential_provider
@@ -621,6 +625,12 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             connection_kwargs.get("protocol"),
             connection_kwargs.get("legacy_responses", True),
         )
+
+    @cached_property
+    def _event_dispatcher(self) -> EventDispatcher:
+        # Built on first use when the client was given no dispatcher; a
+        # dispatcher passed to __init__ is stored on the instance instead.
+        return EventDispatcher()
 
     def __repr__(self) -> str:
         return (
@@ -1024,8 +1034,14 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            return self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            return callback(response, **options)
         return response
 
     def get_cache(self) -> Optional[CacheInterface]:
@@ -1258,6 +1274,16 @@ class PubSub:
         if self.connection:
             self.connection.disconnect()
             self.connection.deregister_connect_callback(self.on_connect)
+            if self.push_handler_func is not None:
+                # The handler is set on the parser of a pooled connection: put
+                # the parser's own back, or the next PubSub that gets this
+                # connection has its messages handed to ours
+                parser = self.connection._get_parser()
+                if (
+                    getattr(parser, "pubsub_push_handler_func", None)
+                    is self.push_handler_func
+                ):
+                    parser.set_pubsub_push_handler(parser.handle_pubsub_push_response)
             self.connection_pool.release(self.connection)
             self.connection = None
         self.health_check_response_counter = 0
@@ -2207,8 +2233,14 @@ class Pipeline(Redis):
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
                 command_name = args[0]
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
             data.append(r)
 
         return data

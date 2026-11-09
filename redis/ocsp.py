@@ -47,6 +47,17 @@ def _verify_response(issuer_cert, ocsp_response):
         raise ConnectionError("failed to valid ocsp response")
 
 
+def _utc_time(obj, name):
+    """Read the timezone-aware ``<name>_utc`` property, falling back to the naive
+    UTC ``<name>`` on cryptography releases that predate it. The naive properties
+    are deprecated and warn on every access where the aware ones exist."""
+    try:
+        return getattr(obj, f"{name}_utc")
+    except AttributeError:
+        value = getattr(obj, name)
+        return value and value.replace(tzinfo=datetime.timezone.utc)
+
+
 def _check_certificate(issuer_cert, cert, ocsp_bytes, validate=True):
     """A wrapper the return the validity of a known ocsp certificate"""
 
@@ -73,15 +84,16 @@ def _check_certificate(issuer_cert, cert, ocsp_bytes, validate=True):
             "failed to retrieve a successful response from the ocsp responder"
         )
 
-    # this_update / next_update are reported in UTC, so compare against UTC now
-    # rather than datetime.now(), which is local time. Comparing a UTC timestamp
-    # to local time let a stale response (next_update already in the past) pass
-    # the freshness check by the host's offset west of UTC.
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    if ocsp_response.this_update >= now:
+    # this_update / next_update are timezone-aware UTC, so compare against an
+    # aware UTC now rather than datetime.now(), which is local time. Comparing a
+    # UTC timestamp to local time let a stale response (next_update already in
+    # the past) pass the freshness check by the host's offset west of UTC.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if _utc_time(ocsp_response, "this_update") >= now:
         raise ConnectionError("ocsp certificate was issued in the future")
 
-    if ocsp_response.next_update and ocsp_response.next_update < now:
+    next_update = _utc_time(ocsp_response, "next_update")
+    if next_update and next_update < now:
         raise ConnectionError("ocsp certificate has invalid update - in the past")
 
     responder_name = ocsp_response.responder_name
@@ -113,7 +125,9 @@ def _check_certificate(issuer_cert, cert, ocsp_bytes, validate=True):
         # checked for revocation and its validity period is all that bounds
         # how long its key is trusted.
         if not (
-            responder_cert.not_valid_before <= now <= responder_cert.not_valid_after
+            _utc_time(responder_cert, "not_valid_before")
+            <= now
+            <= _utc_time(responder_cert, "not_valid_after")
         ):
             raise ConnectionError("delegate certificate is outside its validity period")
         cert_to_validate = responder_cert

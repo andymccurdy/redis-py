@@ -92,6 +92,7 @@ from redis.typing import (
     ZSetRangeResponse,
 )
 from redis.utils import (
+    _timedelta_to_ms,
     experimental_args,
     experimental_method,
     extract_expire_flags,
@@ -2875,6 +2876,65 @@ class BasicKeyCommands(CommandsProtocol):
         return self.execute_command("BITPOS", *params, keys=[key])
 
     @overload
+    def bitrangeintarray(
+        self: SyncClientProtocol,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def bitrangeintarray(
+        self: AsyncClientProtocol,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def bitrangeintarray(
+        self,
+        key: KeyT,
+        start: int,
+        end: int,
+        mode: str | None = None,
+        limit: int | None = None,
+        zeros: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Return the offsets of the set bits in the value of ``key``, in
+        ascending order, between ``start`` and ``end`` inclusive. The range is
+        interpreted as in BITCOUNT, with negative indexes counted from the end.
+        ``mode`` is ``"BYTE"`` or ``"BIT"`` (case-insensitive) and sets
+        whether ``start`` and ``end`` count bytes or bits. When ``mode`` is
+        not set, the server uses ``"BYTE"``. Any other value is rejected by
+        the server. The returned offsets are bit offsets in both modes.
+
+        ``limit`` returns only the lowest ``limit`` offsets of the range.
+        In byte mode the server completes the byte that holds the last
+        offset, so the reply can hold up to 7 offsets more than ``limit``.
+        ``limit=0`` returns an empty list.
+
+        ``zeros`` returns the offsets of the clear bits instead. Unlike
+        BITPOS, no clear bits are assumed past the end of the value.
+
+        For more information, see https://redis.io/commands/bitrangeintarray
+        """
+        params = [key, start, end]
+        if mode is not None:
+            params.append(mode)
+        if limit is not None:
+            params.extend(["LIMIT", limit])
+        if zeros:
+            params.append("ZEROS")
+        return self.execute_command("BITRANGEINTARRAY", *params, keys=[key])
+
+    @overload
     def copy(
         self: SyncClientProtocol,
         source: str,
@@ -4096,7 +4156,7 @@ class BasicKeyCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/pexpire
         """
         if isinstance(time, datetime.timedelta):
-            time = int(time.total_seconds() * 1000)
+            time = _timedelta_to_ms(time)
 
         exp_option = list()
         if nx:
@@ -4202,7 +4262,7 @@ class BasicKeyCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/psetex
         """
         if isinstance(time_ms, datetime.timedelta):
-            time_ms = int(time_ms.total_seconds() * 1000)
+            time_ms = _timedelta_to_ms(time_ms)
         return self.execute_command("PSETEX", name, time_ms, value)
 
     @overload
@@ -7217,7 +7277,7 @@ class SetCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(milliseconds, datetime.timedelta):
-            milliseconds = int(milliseconds.total_seconds() * 1000)
+            milliseconds = _timedelta_to_ms(milliseconds)
 
         options = []
         if nx:
@@ -11162,7 +11222,7 @@ class HashCommands(CommandsProtocol):
             raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
 
         if isinstance(milliseconds, datetime.timedelta):
-            milliseconds = int(milliseconds.total_seconds() * 1000)
+            milliseconds = _timedelta_to_ms(milliseconds)
 
         options = []
         if nx:

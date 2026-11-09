@@ -34,7 +34,13 @@ from redis.connection import CacheProxyConnection
 from redis.event import (
     EventDispatcher,
 )
-from redis.exceptions import AskError, MovedError, RedisError, ResponseError
+from redis.exceptions import (
+    AskError,
+    ConnectionError,
+    MovedError,
+    RedisError,
+    ResponseError,
+)
 from redis.observability.attributes import CSCReason
 from redis.retry import Retry
 from redis.utils import str_if_bytes
@@ -1473,6 +1479,77 @@ class TestClusterCache:
         assert (
             cache == r.nodes_manager.get_node_from_slot(1).redis_connection.get_cache()
         )
+
+    @pytest.mark.parametrize(
+        "r",
+        [{"cache": DefaultCache(CacheConfig(max_size=128))}],
+        indirect=True,
+    )
+    @pytest.mark.onlycluster
+    def test_a_split_command_caches_each_slot_s_reply(self, r):
+        """
+        A pipeline never reads the cache, so with a cache the slots of a split MULTI_SHARD
+        command are sent on their own, each cached under its own keys.
+        """
+        cache = r.nodes_manager.get_node_from_slot(12000).redis_connection.get_cache()
+        # A connection's first reconnect empties the cache - see
+        # ``test_topology_refresh_keeps_cached_entries`` - so use every node once first.
+        r.ping(target_nodes=r.ALL_NODES)
+        keys = ["{a}foo", "{b}foo"]
+        assert r.keyslot(keys[0]) != r.keyslot(keys[1])
+        r.set(keys[0], 1)
+
+        assert r.execute_command("EXISTS", *keys, keys=keys) == 1
+
+        for key in keys:
+            assert (
+                cache.get(
+                    CacheKey(
+                        command="EXISTS", redis_keys=(key,), redis_args=("EXISTS", key)
+                    )
+                )
+                is not None
+            )
+        with patch.object(redis.cluster.NodeCommands, "write") as write:
+            assert r.execute_command("EXISTS", *keys, keys=keys) == 1
+        write.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "r",
+        [{"cache": DefaultCache(CacheConfig(max_size=128))}],
+        indirect=True,
+    )
+    @pytest.mark.onlycluster
+    def test_a_retry_of_a_split_command_resends_only_the_slot_that_failed(
+        self, r, no_cluster_retry_delay
+    ):
+        """
+        With a cache the slots of a split MULTI_SHARD command are sent on their own, and
+        a slot that fails is retried by the client's retry loop. The reply of a slot that
+        already succeeded is kept across the attempts, so that slot is not sent again.
+        """
+        r.ping(target_nodes=r.ALL_NODES)
+        keys = ["{a}foo", "{b}foo"]
+        assert r.keyslot(keys[0]) != r.keyslot(keys[1])
+        r.set(keys[0], 1)
+        send = redis.cluster.RedisCluster._execute_command
+        sent = []
+
+        def fail_once(self, node, *args, **kwargs):
+            sent.append(args)
+            if args == ("EXISTS", keys[1]) and sent.count(args) == 1:
+                raise ConnectionError("lost")
+            return send(self, node, *args, **kwargs)
+
+        with patch.object(redis.cluster.RedisCluster, "_execute_command", fail_once):
+            assert r.execute_command("EXISTS", *keys, keys=keys) == 1
+
+        # The first slot was sent once, the failed slot once more on the retry
+        assert sent == [
+            ("EXISTS", keys[0]),
+            ("EXISTS", keys[1]),
+            ("EXISTS", keys[1]),
+        ]
 
     @pytest.mark.parametrize(
         "r",

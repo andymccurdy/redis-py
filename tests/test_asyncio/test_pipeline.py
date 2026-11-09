@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from redis.asyncio.client import Pipeline, _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS
 from redis.himport import HImportRegistry
 from redis.asyncio.observability import recorder as async_recorder
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
 
@@ -1014,3 +1016,54 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
             self.operation_duration.record.assert_not_called()
 
         async_recorder.reset_collector()
+
+
+@pytest.mark.fixed_client
+class TestAsyncPipelineRetryChecker:
+    """A retry-level checker rejection must still run the pipeline's fail hook."""
+
+    class FakeConnection:
+        host = "localhost"
+        port = 6379
+        db = 0
+        _resp2_fallback = False
+
+        def __init__(self, retry):
+            self.retry = retry
+            self.disconnected = False
+
+        async def send_command(self, *args, **kwargs):
+            if args[0] == "GET":
+                raise redis.TimeoutError("boom")
+            return None
+
+        async def read_response(self):
+            return True
+
+        async def disconnect(self, *args, **kwargs):
+            self.disconnected = True
+
+    class FakeConnectionPool:
+        def __init__(self, connection):
+            self.connection = connection
+
+        async def get_connection(self):
+            return self.connection
+
+        async def release(self, connection):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_retry_checker_rejection_resets_watching_pipeline(self):
+        retry = Retry(NoBackoff(), 3, is_retryable=lambda error: False)
+        connection = self.FakeConnection(retry)
+        pipeline = Pipeline(self.FakeConnectionPool(connection), {}, True, None)
+
+        await pipeline.watch("foo")
+        assert pipeline.watching
+
+        with pytest.raises(redis.WatchError):
+            await pipeline.get("foo")
+
+        assert not pipeline.watching
+        assert connection.disconnected

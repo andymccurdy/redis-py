@@ -1,4 +1,5 @@
 import binascii
+from contextlib import contextmanager
 import datetime
 import gc
 import platform
@@ -26,12 +27,14 @@ from redis.backoff import (
 )
 from redis.cluster import (
     _REPLICAS_ONLY_STRATEGIES,
+    _RESPONSE_POLICY_CALLBACKS,
     PRIMARY,
     PIPELINE_BLOCKED_COMMANDS,
     REDIS_CLUSTER_HASH_SLOTS,
     REPLICA,
     ClusterNode,
     ClusterPipeline,
+    ExecutionStrategy,
     LoadBalancingStrategy,
     NodesManager,
     RedisCluster,
@@ -51,7 +54,7 @@ from redis.commands.metadata import (
     ResponsePolicy,
     StaticMetadataResolver,
 )
-from redis.commands.policies import StaticPolicyResolver
+from redis.commands.policies import DynamicPolicyResolver, StaticPolicyResolver
 from redis.connection import (
     BlockingConnectionPool,
     Connection,
@@ -91,7 +94,11 @@ from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
 from redis.retry import Retry
 from redis.utils import str_if_bytes
-from tests.test_command_metadata import CACHEABLE_KEYED, slot_routed_static_commands
+from tests.test_command_metadata import (
+    CACHEABLE_KEYED,
+    slot_routed_args,
+    slot_routed_static_commands,
+)
 from tests.test_pubsub import wait_for_message
 
 from .conftest import (
@@ -3230,8 +3237,8 @@ class TestStaticMetadataRouting:
     topology re-discovery every ``reinitialize_steps`` MOVEDs.
 
     The ``movablekeys`` reads are the sharp case, and get their own test. Their keys live only in
-    the ``COMMAND`` key specifications, so ``first_key_pos`` is 0 and the derived policies come
-    out keyless; their records withhold the routing policies so the client keeps resolving them.
+    the ``COMMAND`` key specifications, so ``first_key_pos`` is 0; their records carry the keyed
+    defaults, and the client finds the keys through ``COMMAND GETKEYS``.
 
     Key extraction itself is covered by ``tests/test_command_parser.py``, so it is stubbed here
     and these tests assert only the node the command is dispatched to.
@@ -3411,7 +3418,7 @@ class TestStaticMetadataRouting:
         assert set(nodes) == set(primaries)
 
     @pytest.mark.fixed_client
-    @pytest.mark.parametrize("command", ["dbsize", "keys", "randomkey"])
+    @pytest.mark.parametrize("command", ["dbsize", "keys"])
     def test_default_node_commands_route_to_default_node_by_default(self, command):
         rc = get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
@@ -3468,11 +3475,13 @@ class TestStaticMetadataRouting:
         assert nodes == [default_node]
 
     @pytest.mark.fixed_client
-    def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(self):
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_explicit_target_nodes_do_not_apply_the_commands_aggregation(self, targets):
         """
         A response policy resolved for the whole cluster must not apply when the caller
-        named its targets: ``ONE_SUCCEEDED`` would stop the loop after the first node the
-        caller picked, and an ``AGG_*`` would fold the replies of the rest into it.
+        picked its targets, as named nodes or as a nodes flag: ``ONE_SUCCEEDED`` would
+        stop the loop after the first node the caller picked, and an ``AGG_*`` would fold
+        the replies of the rest into it.
         """
         resolver = DynamicMetadataResolver(
             {
@@ -3489,9 +3498,10 @@ class TestStaticMetadataRouting:
         )
         nodes = rc.get_primaries()
         assert len(nodes) > 1
+        target_nodes = nodes if targets == "nodes" else RedisCluster.PRIMARIES
 
         with patch.object(RedisCluster, "_execute_command", return_value=7) as execute:
-            result = rc.execute_command("DBSIZE", target_nodes=nodes)
+            result = rc.execute_command("DBSIZE", target_nodes=target_nodes)
 
         assert execute.call_count == len(nodes)
         assert result == 7 * len(nodes)
@@ -3849,23 +3859,19 @@ class TestStaticMetadataRouting:
         assert chained._metadata_resolver is resolver
 
     @pytest.mark.fixed_client
-    def test_the_movablekeys_reads_are_reported_unresolved(self):
+    def test_the_movablekeys_reads_resolve_keyed(self):
         """
-        The deterministic half of this: a withheld record makes the resolver answer None, which
-        is what sends the client to ``determine_slot``. The dispatch assertion below can only
-        catch a wrong policy probabilistically, because keyless routing picks a random node.
+        The deterministic half of this: a keyed record is what sends the client to
+        ``determine_slot``. The dispatch assertion below can only catch a wrong policy
+        probabilistically, because keyless routing picks a random node.
         """
         rc = self._mocked_cluster()
 
         for command in self.MOVABLE_KEYS_READS:
-            assert rc._policy_resolver.resolve(command) is None, command
-
-        # A keyed read that is not movablekeys still resolves, so the None above is the
-        # withheld record rather than a resolver that knows nothing.
-        assert (
-            rc._policy_resolver.resolve("get").request_policy
-            == RequestPolicy.DEFAULT_KEYED
-        )
+            assert (
+                rc._policy_resolver.resolve(command).request_policy
+                == RequestPolicy.DEFAULT_KEYED
+            ), command
 
     @pytest.mark.fixed_client
     def test_every_slot_routed_entry_is_dispatched_to_the_node_holding_its_key(self):
@@ -3896,10 +3902,805 @@ class TestStaticMetadataRouting:
                     RedisCluster, "_execute_command", return_value="OK"
                 ) as execute_command,
             ):
-                rc.execute_command(command, "{foo}a")
+                rc.execute_command(command, *slot_routed_args(command))
 
             assert execute_command.call_count == 1, command
             assert execute_command.call_args[0][0] is expected_node, command
+
+
+def _route_by_live_tips(r, monkeypatch):
+    """Route ``r`` by the tips of the connected server instead of the shipped records."""
+    monkeypatch.setattr(r, "_policy_resolver", DynamicPolicyResolver(r.commands_parser))
+
+
+def _keys_on_every_shard(r, prefix):
+    """One key per primary, so a command over them reaches every shard."""
+    keys, shards = [], set()
+    for index in range(10000):
+        key = f"{{{prefix}{index}}}key"
+        shard = r.get_node_from_key(key).name
+        if shard not in shards:
+            shards.add(shard)
+            keys.append(key)
+        if len(keys) == len(r.get_primaries()):
+            return keys
+    raise AssertionError("no key found for every shard")
+
+
+@contextmanager
+def _sent_commands(fail=None):
+    """
+    Record each command the cluster client sends to a node, still sending it to the server.
+
+    ``fail(node, args)`` may return an error to raise instead of sending that command once.
+    """
+    sent = []
+    send = RedisCluster._execute_command
+
+    def execute_command(self, node, *args, **kwargs):
+        sent.append((node, args, kwargs))
+        error = fail(node, args) if fail is not None else None
+        if error is not None:
+            raise error
+        return send(self, node, *args, **kwargs)
+
+    with patch.object(RedisCluster, "_execute_command", execute_command):
+        yield sent
+
+
+@contextmanager
+def _pipelined_commands(fail=None):
+    """
+    Record the commands of each pipelined write the cluster client makes to a node - one
+    round trip - still sending them to the server.
+
+    ``fail(args)`` may return an error for a command to answer with instead of sending it,
+    which leaves that command for the pipeline to retry on its own.
+    """
+    batches = []
+    write = redis.cluster.NodeCommands.write
+
+    def record(self):
+        held = []
+        for c in self.commands:
+            error = fail(c.args) if fail is not None else None
+            if error is not None:
+                c.result = error
+                held.append(c)
+        self.commands = [c for c in self.commands if c not in held]
+        batches.append([(c.args, c.options) for c in self.commands])
+        if self.commands:
+            write(self)
+        self.commands.extend(held)
+
+    with patch.object(redis.cluster.NodeCommands, "write", record):
+        yield batches
+
+
+@contextmanager
+def _busy_node(node, *command):
+    """
+    Keep ``node`` busy running ``command`` - a looping script or function - until a KILL stops
+    it. The busy reply threshold is lowered so the node reports BUSY, and accepts the KILL,
+    right away.
+    """
+    client = Redis(host=node.host, port=node.port)
+    threshold = client.config_get("busy-reply-threshold")["busy-reply-threshold"]
+    client.config_set("busy-reply-threshold", 10)
+
+    def run():
+        try:
+            Redis(host=node.host, port=node.port).execute_command(*command)
+        except ResponseError:
+            pass
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            try:
+                client.ping()
+            except ResponseError as e:
+                if "BUSY" in str(e):
+                    break
+            sleep(0.01)
+        else:
+            raise AssertionError(f"{node.name} never became busy")
+        yield
+    finally:
+        thread.join(timeout=10)
+        client.config_set("busy-reply-threshold", threshold)
+        client.close()
+
+
+_SPIN_LIBRARY = (
+    "#!lua name=spinlib\n"
+    "redis.register_function{function_name='spin', "
+    "callback=function() while true do end end, flags={'no-writes'}}"
+)
+
+
+@pytest.mark.onlycluster
+@skip_if_server_version_lt("8.0.0")
+@skip_if_redis_enterprise()
+class TestResponsePolicies:
+    """
+    How the replies of a command sent to several nodes fold into the one reply the caller
+    gets, through real commands that carry each policy on the server.
+    """
+
+    def test_every_response_policy_has_a_callback(self):
+        assert set(_RESPONSE_POLICY_CALLBACKS) == set(ResponsePolicy)
+
+    def test_the_policies_no_command_is_tipped_with_fold_on_their_own(self):
+        """
+        No server command is tipped ``agg_max`` or ``agg_logical_or``, and SCRIPT EXISTS, the
+        one ``agg_logical_and`` command, is merged by its result callback, so these folds are
+        exercised directly.
+        """
+
+        def fold(policy, *replies):
+            return _RESPONSE_POLICY_CALLBACKS[policy](
+                {f"node{index}": reply for index, reply in enumerate(replies)}
+            )
+
+        assert fold(ResponsePolicy.AGG_MAX, 4, 2, 3) == 4
+        assert fold(ResponsePolicy.AGG_MAX, [1, 2], [0, 3]) == [1, 3]
+        assert fold(ResponsePolicy.AGG_LOGICAL_OR, False, True) is True
+        assert fold(ResponsePolicy.AGG_LOGICAL_OR, [1, 0, 0], [0, 0, 1]) == [1, 0, 1]
+        folded = fold(ResponsePolicy.AGG_LOGICAL_AND, 1, 1)
+        assert folded == 1 and type(folded) is int
+        assert fold(ResponsePolicy.AGG_LOGICAL_AND, [1, 0, 1], [1, 1, 0]) == [1, 0, 0]
+
+    def test_agg_sum_adds_up_every_node_s_count(self, r, monkeypatch):
+        """SLOWLOG LEN: all_nodes / agg_sum."""
+        _route_by_live_tips(r, monkeypatch)
+        expected = sum(
+            node.redis_connection.execute_command("SLOWLOG LEN")
+            for node in r.get_nodes()
+        )
+
+        with _sent_commands() as sent:
+            assert r.execute_command("SLOWLOG LEN") == expected
+
+        assert {node.name for node, _, _ in sent} == {n.name for n in r.get_nodes()}
+
+    def test_agg_min_folds_array_replies_element_wise(self, r, monkeypatch):
+        """WAITAOF: all_shards / agg_min, one [numlocal, numreplicas] pair per shard."""
+        _route_by_live_tips(r, monkeypatch)
+        replies = [
+            node.redis_connection.execute_command("WAITAOF", 0, 0, 0)
+            for node in r.get_primaries()
+        ]
+
+        assert r.execute_command("WAITAOF", 0, 0, 0) == [
+            min(column) for column in zip(*replies)
+        ]
+
+    def test_all_succeeded_answers_with_one_reply(self, r, monkeypatch):
+        """FUNCTION LOAD: all_shards / all_succeeded, so every shard gets the library."""
+        _route_by_live_tips(r, monkeypatch)
+        library = "#!lua name=policylib\nredis.register_function('one', function() return 1 end)"
+
+        try:
+            loaded = r.execute_command("FUNCTION LOAD", "REPLACE", library)
+
+            assert str_if_bytes(loaded) == "policylib"
+            for node in r.get_primaries():
+                assert node.redis_connection.fcall("one", 0) == 1
+        finally:
+            r.execute_command("FUNCTION DELETE", "policylib")
+
+    def test_all_succeeded_fails_on_an_error(self, r, monkeypatch):
+        _route_by_live_tips(r, monkeypatch)
+
+        with pytest.raises(ResponseError, match="Library not found"):
+            r.execute_command("FUNCTION DELETE", "no-such-library")
+
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    def test_one_succeeded_raises_when_no_shard_succeeds(self, r, method):
+        """No shard runs a script, so every one answers NOTBUSY."""
+        with _sent_commands() as sent:
+            with pytest.raises(ResponseError, match="NOTBUSY"):
+                getattr(r, method)()
+
+        assert len(sent) == len(r.get_primaries())
+
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    def test_one_succeeded_reports_the_error_of_the_shard_running_the_script(
+        self, r, method
+    ):
+        """
+        The shard running a script that already wrote answers UNKILLABLE, and that is the
+        error reported, not the NOTBUSY of every other shard. The UNKILLABLE is injected:
+        a real one leaves the shard busy until it is shut down.
+        """
+        busy = r.get_primaries()[-1]
+
+        def fail(node, args):
+            if node.name == busy.name:
+                return ResponseError("UNKILLABLE Sorry the script already executed")
+            return None
+
+        with _sent_commands(fail):
+            with pytest.raises(ResponseError, match="UNKILLABLE"):
+                getattr(r, method)()
+
+    def test_script_kill_stops_the_script_on_whichever_shard_runs_it(self, r):
+        """The shipped table tips SCRIPT KILL all_shards / one_succeeded."""
+        busy = r.get_primaries()[-1]
+
+        with _busy_node(busy, "EVAL", "while true do end", 0):
+            with _sent_commands() as sent:
+                assert r.script_kill() is True
+
+        assert len(sent) == len(r.get_primaries())
+
+    def test_function_kill_stops_the_function_on_whichever_shard_runs_it(self, r):
+        busy = r.get_primaries()[-1]
+        busy.redis_connection.function_load(_SPIN_LIBRARY, replace=True)
+
+        try:
+            with _busy_node(busy, "FCALL", "spin", 0):
+                assert str_if_bytes(r.function_kill()) == "OK"
+        finally:
+            busy.redis_connection.function_delete("spinlib")
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TryAgainError("TRYAGAIN"),
+            AskError("1 127.0.0.1:7001"),
+            ConnectionError("lost"),
+        ],
+    )
+    def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
+        self, r, error
+    ):
+        """
+        As the ``one_succeeded`` tip asks, the busy shard's success is the reply even when
+        another shard leaves the command in doubt - and that shard is asked first, so every
+        shard after it is still asked.
+        """
+        busy, doubtful = r.get_primaries()[-1], r.get_primaries()[0]
+
+        def fail(node, args):
+            return error if node.name == doubtful.name else None
+
+        with _busy_node(busy, "EVAL", "while true do end", 0):
+            with _sent_commands(fail) as sent:
+                assert r.script_kill() is True
+
+        assert len(sent) == len(r.get_primaries())
+
+    @pytest.mark.parametrize(
+        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
+    )
+    def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
+        self, r, error
+    ):
+        """
+        With no success, the error that leaves a shard in doubt is reported over the NOTBUSY
+        of the others: that shard may have been running the script.
+        """
+        doubtful = r.get_primaries()[-1]
+
+        def fail(node, args):
+            return error if node.name == doubtful.name else None
+
+        with _sent_commands(fail):
+            with pytest.raises(type(error)):
+                r.script_kill()
+
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_the_caller_s_targets_disable_the_aggregation(
+        self, r, monkeypatch, targets
+    ):
+        """
+        WAITAOF is tipped agg_min, but the caller picked the targets - named nodes and a
+        nodes flag alike - so each node's reply is kept, on the main path and in a
+        pipeline.
+        """
+        _route_by_live_tips(r, monkeypatch)
+        primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
+        expected = {
+            node.name: node.redis_connection.execute_command("WAITAOF", 0, 0, 0)
+            for node in primaries
+        }
+
+        assert (
+            r.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes) == expected
+        )
+        with r.pipeline() as pipe:
+            pipe.execute_command("WAITAOF", 0, 0, 0, target_nodes=target_nodes)
+            assert pipe.execute() == [expected]
+
+    def test_a_retry_asks_only_the_nodes_that_have_not_answered(
+        self, r, no_cluster_retry_delay
+    ):
+        """
+        A node that answered is not asked again when another node fails: asking it again
+        would run a write twice.
+        """
+        primaries = r.get_primaries()
+        failed = primaries[-1]
+        failures = []
+
+        def fail(node, args):
+            if node.name == failed.name and not failures:
+                failures.append(node.name)
+                return ConnectionError("lost")
+            return None
+
+        with _sent_commands(fail) as sent:
+            assert r.execute_command("PING", target_nodes=r.PRIMARIES) is True
+
+        assert failures
+        assert sorted(node.name for node, _, _ in sent) == sorted(
+            [*(node.name for node in primaries), failed.name]
+        )
+
+    def test_info_keeps_each_shard_s_reply(self, r, monkeypatch):
+        """INFO: all_shards / special with no handler, so nothing is merged."""
+        _route_by_live_tips(r, monkeypatch)
+
+        info = r.info()
+
+        assert set(info) == {node.name for node in r.get_primaries()}
+
+    @pytest.mark.parametrize(
+        "command,nodes",
+        [
+            (("MEMORY DOCTOR",), "get_primaries"),
+            (("LATENCY DOCTOR",), "get_nodes"),
+            (("LATENCY HISTOGRAM",), "get_nodes"),
+        ],
+    )
+    def test_the_shipped_table_keeps_each_node_s_diagnostics(self, r, command, nodes):
+        """The server tips them ``special``, with no merge: each node describes itself."""
+        result = r.execute_command(*command)
+
+        assert set(result) == {node.name for node in getattr(r, nodes)()}
+
+    def test_function_stats_reports_every_primary(self, r):
+        assert set(r.function_stats()) == {node.name for node in r.get_primaries()}
+
+    def test_a_result_callback_still_merges_a_fanned_out_command(self, r):
+        """DBSIZE's own callback sums the replies; the response policy does not run twice."""
+        r.mset_nonatomic({key: 1 for key in _keys_on_every_shard(r, "dbsize")})
+        expected = sum(node.redis_connection.dbsize() for node in r.get_primaries())
+
+        assert (
+            r.execute_command("DBSIZE", target_nodes=RedisCluster.PRIMARIES) == expected
+        )
+
+    def test_a_pipeline_folds_each_fanned_out_command_into_one_result(
+        self, r, monkeypatch
+    ):
+        _route_by_live_tips(r, monkeypatch)
+        r.mset_nonatomic({key: 1 for key in _keys_on_every_shard(r, "pipe")})
+        waitaof = [
+            node.redis_connection.execute_command("WAITAOF", 0, 0, 0)
+            for node in r.get_primaries()
+        ]
+        dbsize = sum(node.redis_connection.dbsize() for node in r.get_primaries())
+
+        with r.pipeline() as pipe:
+            pipe.execute_command("WAITAOF", 0, 0, 0)
+            pipe.execute_command("DBSIZE")
+            pipe.execute_command("FUNCTION DELETE", "no-such-library")
+            pipe.execute_command("SCRIPT KILL")
+            results = pipe.execute(raise_on_error=False)
+
+        assert results[0] == [min(column) for column in zip(*waitaof)]
+        assert results[1] == dbsize
+        assert isinstance(results[2], ResponseError)
+        assert isinstance(results[3], ResponseError) and "NOTBUSY" in str(results[3])
+
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
+    @pytest.mark.parametrize("targets", ["flag", "nodes"])
+    def test_a_pipeline_retry_asks_only_the_node_that_failed(self, r, error, targets):
+        """
+        A fanned-out command that fails on one node is retried on that node alone, with
+        the replies of the others kept: asking them again would run a write twice. The
+        node is picked among the targets the caller passed, not by the command's own
+        policy - DBSIZE's is the default node alone.
+        """
+        r.mset_nonatomic({key: 1 for key in _keys_on_every_shard(r, "pipetargets")})
+        primaries = r.get_primaries()
+        dbsize = sum(node.redis_connection.dbsize() for node in primaries)
+        target_nodes = r.PRIMARIES if targets == "flag" else primaries
+        failed = primaries[-1]
+        write = redis.cluster.NodeCommands.write
+        sends = {node.name: 0 for node in primaries}
+
+        def fail_once(self):
+            # The failed node's DBSIZE is not sent once, and answers with ``error`` instead
+            node = r.nodes_manager.find_connection_owner(self.connection)
+            held = [c for c in self.commands if c.args == ("DBSIZE",)]
+            sends[node.name] += len(held)
+            held = held if node.name == failed.name and sends[node.name] == 1 else []
+            self.commands = [c for c in self.commands if c not in held]
+            if self.commands:
+                write(self)
+            for c in held:
+                c.result = error
+                self.commands.append(c)
+
+        with patch.object(redis.cluster.NodeCommands, "write", fail_once):
+            with _sent_commands() as sent:
+                with r.pipeline() as pipe:
+                    pipe.execute_command("DBSIZE", target_nodes=target_nodes)
+                    assert pipe.execute() == [dbsize]
+
+        for node, _, _ in sent:
+            sends[node.name] += 1
+        assert sends == {**{node.name: 1 for node in primaries}, failed.name: 2}
+
+
+@pytest.mark.onlycluster
+@skip_if_server_version_lt("8.0.0")
+class TestMultiShardRequests:
+    """
+    A ``MULTI_SHARD`` command is split into one command per hash slot of its keys, and the
+    per-slot replies are merged into the reply of the command the caller sent.
+    """
+
+    def test_the_counts_of_a_summed_command_are_added_up(self, r):
+        """The shipped table tips EXISTS and TOUCH multi_shard / agg_sum."""
+        keys = _keys_on_every_shard(r, "sum")
+        r.mset_nonatomic({key: 1 for key in keys})
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys, keys[0] + "missing") == len(keys)
+            assert r.execute_command("TOUCH", *keys) == len(keys)
+
+        assert sum(len(batch) for batch in batches) == 2 * len(keys)
+        assert not sent
+
+    def test_a_nodes_flag_keeps_each_primary_s_count(self, r):
+        """
+        EXISTS is tipped agg_sum, but ``target_nodes=PRIMARIES`` picks the targets, so
+        each primary's count is kept rather than summed - the answer a list of the same
+        nodes gets, and the one 8.1.0 gave. A primary that does not hold the key
+        redirects to the one that does, so every primary answers 1.
+        """
+        r.set("{flag}foo", 1)
+        expected = {node.name: 1 for node in r.get_primaries()}
+
+        assert r.execute_command("EXISTS", "{flag}foo", target_nodes=r.PRIMARIES) == (
+            expected
+        )
+        assert (
+            r.execute_command("EXISTS", "{flag}foo", target_nodes=r.get_primaries())
+            == expected
+        )
+
+    def test_the_shipped_records_keep_mget_unsplit(self, r):
+        """MGET documents that keys in different slots raise on a cluster."""
+        with pytest.raises(RedisClusterException, match="same key slot"):
+            r.mget(_keys_on_every_shard(r, "mget"))
+
+    def test_the_values_of_a_per_key_command_come_back_in_key_order(
+        self, r, monkeypatch
+    ):
+        """MGET with the live multi_shard tip, each slot's command carrying its own keys."""
+        _route_by_live_tips(r, monkeypatch)
+        first, second, third = _keys_on_every_shard(r, "order")[:3]
+        keys = [first, second, first + "x", third]
+        assert r.keyslot(first) == r.keyslot(first + "x")
+        r.mset_nonatomic({key: key for key in keys})
+
+        with _pipelined_commands() as batches:
+            values = r.execute_command("MGET", *keys, keys=keys)
+
+        assert [str_if_bytes(value) for value in values] == keys
+        assert [command for batch in batches for command in batch] == [
+            (("MGET", first, first + "x"), {"keys": [first, first + "x"]}),
+            (("MGET", second), {"keys": [second]}),
+            (("MGET", third), {"keys": [third]}),
+        ]
+
+    def test_a_key_travels_with_the_arguments_of_its_step(self, r, monkeypatch):
+        """MSET with the live multi_shard / all_succeeded tips: two arguments per key."""
+        _route_by_live_tips(r, monkeypatch)
+        keys = _keys_on_every_shard(r, "step")
+
+        assert r.execute_command("MSET", *(arg for key in keys for arg in (key, key)))
+
+        assert [str_if_bytes(r.get(key)) for key in keys] == keys
+
+    def test_keys_that_share_a_slot_are_sent_as_they_are(self, r):
+        keys = ["{same}1", "{same}2"]
+        r.mset({key: 1 for key in keys})
+
+        with _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys) == 2
+
+        assert [args for _, args, _ in sent] == [("EXISTS", *keys)]
+
+    def test_keys_that_share_a_slot_are_hashed_once(self, r):
+        """The split routes the command by the slot it computed, not by its keys again."""
+        keys = ["{same}1", "{same}2", "{same}3"]
+
+        with patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert r.execute_command("EXISTS", *keys) == 0
+        assert keyslot.call_count == len(keys)
+
+        with r.pipeline() as pipe:
+            with patch.object(pipe, "keyslot", wraps=pipe.keyslot) as keyslot:
+                pipe.execute_command("EXISTS", *keys)
+                assert pipe.execute() == [0]
+        assert keyslot.call_count == len(keys)
+
+    def test_a_single_key_is_not_split(self, r):
+        """It has nothing to split, so its slot is left to the keyed routing to compute."""
+        with patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert r._split_multi_shard_command("EXISTS", "single") is None
+
+        keyslot.assert_not_called()
+
+    @skip_if_server_version_lt("8.4")
+    def test_keys_that_cannot_be_located_are_not_split(self, r, monkeypatch):
+        """MSETEX names its key count first, so its keys are not at fixed positions."""
+        _route_by_live_tips(r, monkeypatch)
+        first, second = _keys_on_every_shard(r, "movable")[:2]
+
+        with pytest.raises(RedisClusterException, match="same key slot"):
+            r.execute_command("MSETEX", 2, first, "a", second, "b")
+
+    def test_a_split_command_costs_one_round_trip_per_node(self, r):
+        """Each node is sent the commands of all its slots in one pipelined write."""
+        keys = [f"{{trip{index}}}key" for index in range(60)]
+        r.mset_nonatomic({key: 1 for key in keys})
+        nodes = {r.get_node_from_key(key).name for key in keys}
+        assert len({r.keyslot(key) for key in keys}) > len(nodes)
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert len(batches) == len(nodes)
+        assert sum(len(batch) for batch in batches) == len(
+            {r.keyslot(key) for key in keys}
+        )
+        assert not sent
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ConnectionError("lost"),
+            TryAgainError("TRYAGAIN"),
+            ClusterDownError("CLUSTERDOWN The cluster is down"),
+        ],
+    )
+    def test_a_retry_resends_only_the_slots_that_failed(self, r, monkeypatch, error):
+        """
+        A slot that already succeeded is not sent again: the resent DEL would find its keys
+        gone and the summed count would be wrong.
+        """
+        _route_by_live_tips(r, monkeypatch)
+        keys = _keys_on_every_shard(r, "retry")
+        r.mset_nonatomic({key: 1 for key in keys})
+        failed = []
+
+        def fail(args):
+            if args == ("DEL", keys[-1]) and not failed:
+                failed.append(args)
+                return error
+            return None
+
+        with _pipelined_commands(fail) as batches, _sent_commands() as sent:
+            assert r.execute_command("DEL", *keys) == len(keys)
+
+        assert failed
+        # The failed slot reached the server only on the retry, and no other slot twice
+        assert sorted(
+            [
+                *(args for batch in batches for args, _ in batch),
+                *(args for _, args, _ in sent),
+            ]
+        ) == sorted(("DEL", key) for key in keys)
+        assert r.exists(*keys) == 0
+
+    def test_a_slot_without_a_known_node_is_retried(self, r, monkeypatch):
+        """
+        A slot the client knows no node for is resent on its own, with the retries a
+        command sent on its own gets, while the other slots are sent once.
+        """
+        keys = _keys_on_every_shard(r, "uncovered")
+        r.mset_nonatomic({key: 1 for key in keys})
+        get_node_from_slot = r.nodes_manager.get_node_from_slot
+        uncovered = r.keyslot(keys[-1])
+        failed = []
+
+        def lose_the_slot_once(slot, *args, **kwargs):
+            if slot == uncovered and not failed:
+                failed.append(slot)
+                raise SlotNotCoveredError(f"Slot {slot} is not covered")
+            return get_node_from_slot(slot, *args, **kwargs)
+
+        monkeypatch.setattr(r.nodes_manager, "get_node_from_slot", lose_the_slot_once)
+
+        with _pipelined_commands() as batches, _sent_commands() as sent:
+            assert r.execute_command("EXISTS", *keys) == len(keys)
+
+        assert failed
+        assert sorted(args for batch in batches for args, _ in batch) == sorted(
+            ("EXISTS", key) for key in keys[:-1]
+        )
+        assert [args for _, args, _ in sent] == [("EXISTS", keys[-1])]
+
+    def test_an_error_read_from_the_pipeline_is_counted(self, r):
+        """
+        The pipeline counts no command's error, so the split counts the one it raises,
+        on the node its slot was sent to, as a command sent on its own would.
+        """
+        keys = _keys_on_every_shard(r, "counted")
+        error = ResponseError("OOM command not allowed")
+
+        def fail(args):
+            return error if args == ("EXISTS", keys[-1]) else None
+
+        with _pipelined_commands(fail):
+            with patch.object(r, "_record_error_metric") as record:
+                with pytest.raises(ResponseError, match="OOM"):
+                    r.execute_command("EXISTS", *keys)
+
+        record.assert_called_once_with(
+            error=error,
+            connection=r.get_node_from_key(keys[-1]),
+            is_internal=False,
+        )
+
+    def test_a_requested_refresh_runs_before_the_slots_are_routed(self, r):
+        """As a command sent on its own: the slots are routed by the refreshed topology."""
+        keys = _keys_on_every_shard(r, "refresh")
+        events = []
+        run = r.nodes_manager._run_requested_refresh
+        get_node_from_slot = r.nodes_manager.get_node_from_slot
+
+        def run_requested_refresh(*args, **kwargs):
+            events.append("refresh")
+            return run(*args, **kwargs)
+
+        def route(*args, **kwargs):
+            events.append("route")
+            return get_node_from_slot(*args, **kwargs)
+
+        r.nodes_manager._request_refresh()
+        with (
+            patch.object(
+                r.nodes_manager, "_run_requested_refresh", run_requested_refresh
+            ),
+            patch.object(r.nodes_manager, "get_node_from_slot", route),
+        ):
+            assert r.execute_command("EXISTS", *keys) == 0
+
+        assert events[0] == "refresh"
+        assert "route" in events
+
+    def test_a_pipeline_merges_a_split_command_per_slot(self, r, monkeypatch):
+        _route_by_live_tips(r, monkeypatch)
+        keys = _keys_on_every_shard(r, "pipesplit")
+        r.mset_nonatomic({key: key for key in keys})
+
+        with r.pipeline() as pipe:
+            pipe.execute_command("MGET", *reversed(keys))
+            pipe.execute_command("EXISTS", *keys)
+            results = pipe.execute()
+
+        assert [str_if_bytes(value) for value in results[0]] == keys[::-1]
+        assert results[1] == len(keys)
+
+    @pytest.mark.parametrize(
+        "error", [ConnectionError("lost"), TryAgainError("TRYAGAIN")]
+    )
+    def test_a_pipeline_retry_resends_only_the_slots_that_failed(
+        self, r, monkeypatch, error
+    ):
+        """
+        As on the main path: the resent DEL of a slot that already succeeded would find
+        its keys gone, and the summed count would be wrong.
+        """
+        _route_by_live_tips(r, monkeypatch)
+        keys = _keys_on_every_shard(r, "piperetry")
+        r.mset_nonatomic({key: 1 for key in keys})
+        write = redis.cluster.NodeCommands.write
+        written = []
+        failed = []
+
+        def fail_once(self):
+            # The last key's slot is not sent once, and answers with ``error`` instead
+            held = [c for c in self.commands if c.args == ("DEL", keys[-1])]
+            held = held if not failed else []
+            failed.extend(held)
+            self.commands = [c for c in self.commands if c not in held]
+            written.extend(c.args for c in self.commands)
+            if self.commands:
+                write(self)
+            for c in held:
+                c.result = error
+                self.commands.append(c)
+
+        with patch.object(redis.cluster.NodeCommands, "write", fail_once):
+            with _sent_commands() as sent:
+                with r.pipeline() as pipe:
+                    pipe.execute_command("DEL", *keys)
+                    assert pipe.execute() == [len(keys)]
+
+        assert failed
+        # The held slot reached the server only on the retry, and no other slot twice
+        assert sorted([*written, *(args for _, args, _ in sent)]) == sorted(
+            ("DEL", key) for key in keys
+        )
+        assert r.exists(*keys) == 0
+
+
+@pytest.mark.onlycluster
+@skip_if_server_version_lt("8.0.0")
+class TestSpecialResponses:
+    """
+    A ``response_policy:special`` command is merged by a handler of its own, which applies
+    only when the command was resolved for the whole cluster - never to targets the caller
+    picked, as named nodes or as a nodes flag.
+    """
+
+    def test_randomkey_answers_with_a_key_from_any_shard(self, r):
+        assert r.randomkey() is None
+        key = next(
+            f"{{only}}{index}"
+            for index in range(10000)
+            if r.get_node_from_key(f"{{only}}{index}") != r.get_default_node()
+        )
+        r.set(key, 1)
+
+        with _sent_commands() as sent:
+            assert str_if_bytes(r.randomkey()) == key
+
+        assert {node.name for node, _, _ in sent} == {
+            node.name for node in r.get_primaries()
+        }
+
+    @pytest.mark.parametrize("targets", ["nodes", "flag"])
+    def test_the_caller_s_targets_keep_each_node_s_reply(self, r, targets):
+        primaries = r.get_primaries()
+        target_nodes = primaries if targets == "nodes" else r.PRIMARIES
+
+        result = r.randomkey(target_nodes=target_nodes)
+
+        assert result == {node.name: None for node in primaries}
+
+
+@pytest.mark.onlycluster
+class TestReadOnlyEvalSlotResolution:
+    """
+    EVAL_RO and EVALSHA_RO take their keys after ``numkeys`` exactly like EVAL, so their slot
+    is read from the arguments rather than asked of the server - and a script with no keys runs
+    on any node instead of failing to dispatch.
+    """
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_the_keys_are_read_from_the_arguments(self, r):
+        script = "return redis.call('GET', KEYS[1])"
+        r.set("{foo}a", "value")
+        sha = r.script_load(script)
+
+        with patch.object(r, "_get_command_keys", wraps=r._get_command_keys) as keys:
+            assert str_if_bytes(r.eval_ro(script, 1, "{foo}a")) == "value"
+            assert str_if_bytes(r.evalsha_ro(sha, 1, "{foo}a")) == "value"
+
+        keys.assert_not_called()
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_a_script_without_keys_runs_on_any_node(self, r):
+        sha = r.script_load("return 1")
+
+        assert r.eval_ro("return 1", 0) == 1
+        assert r.evalsha_ro(sha, 0) == 1
 
 
 class TestSlotResolutionWithoutADefaultNode:
@@ -7167,6 +7968,39 @@ class TestClusterPipeline:
             str(ex.value).startswith("shard_hint is deprecated in cluster mode") is True
         )
 
+    @skip_if_server_version_lt("7.0.0")
+    def test_a_retry_of_the_pipeline_resends_only_the_unanswered_commands(
+        self, r, no_cluster_retry_delay
+    ):
+        """
+        An error the pipeline does not retry per command, such as CLUSTERDOWN, retries the
+        whole pipeline. That retry resends only the commands no node answered: a write
+        that already succeeded would otherwise run twice. The reply of an answered command
+        is kept as it was parsed, so its response callback is not applied a second time.
+        """
+        first, second = _keys_on_every_shard(r, "stack")[:2]
+        slots = r.execute_command("CLUSTER SLOTS")
+        failed = []
+
+        def fail(args):
+            if args == ("INCR", second) and not failed:
+                failed.append(args)
+                return ClusterDownError("CLUSTERDOWN The cluster is down")
+            return None
+
+        with _pipelined_commands(fail) as batches:
+            with r.pipeline() as pipe:
+                pipe.execute_command("INCR", first)
+                pipe.execute_command("CLUSTER SLOTS")
+                pipe.execute_command("INCR", second)
+                assert pipe.execute() == [1, slots, 1]
+
+        assert failed
+        # Each command reached the server once: the failed one only on the retry
+        assert sorted(args for batch in batches for args, _ in batch) == sorted(
+            [("INCR", first), ("CLUSTER SLOTS",), ("INCR", second)]
+        )
+
     def test_evalsha_in_pipeline(self, r):
         """
         EVALSHA is allowed in ClusterPipeline when keys map to one slot
@@ -7270,6 +8104,41 @@ class TestClusterPipeline:
             r["{key}:b"] = 2
             pipe.delete("{key}:a", "{key}:b")
             assert pipe.execute()
+
+    def test_touch_single(self, r):
+        """
+        Test that touch is queued and executed with the pipeline
+        """
+        r["a"] = 1
+        with r.pipeline(transaction=False) as pipe:
+            assert pipe.touch("a") is pipe
+            assert len(pipe) == 1
+            assert pipe.execute() == [1]
+
+    def test_touch_cross_slot(self, r):
+        """
+        Test that touch over keys in different slots is queued as one command
+        and returns the summed count
+        """
+        r["a"] = 1
+        r["b"] = 2
+        assert r.keyslot("a") != r.keyslot("b")
+        with r.pipeline(transaction=False) as pipe:
+            pipe.touch("a", "b")
+            assert len(pipe) == 1
+            assert pipe.execute() == [2]
+
+    def test_touch_not_required_from_execution_strategy_subclasses(self):
+        """
+        Test that a strategy that does not define touch can still be
+        instantiated, and that its touch falls back to execute_command
+        """
+        stubs = {
+            name: lambda self, *args, **kwargs: args
+            for name in ExecutionStrategy.__abstractmethods__
+        }
+        strategy = type("StrategyWithoutTouch", (ExecutionStrategy,), stubs)()
+        assert strategy.touch("a", "b") == ("TOUCH", "a", "b")
 
     def test_unlink_single(self, r):
         """

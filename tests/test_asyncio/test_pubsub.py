@@ -3631,6 +3631,27 @@ class TestClusterPubSubSlotMigration:
 
         assert poll.call_args_list[0].args == (healthy, pytest.approx(0.4, abs=0.01))
 
+    async def test_sharded_message_generator_ends_pass_after_dispatch(self):
+        from redis.asyncio.cluster import _DISPATCHED
+
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # A handler took the first node's message: the idle node must not get
+        # the rest of the wait.
+        poll = AsyncMock(side_effect=[_DISPATCHED, None])
+        with patch.object(pubsub, "_poll_node_pubsub", poll):
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert poll.call_count == 1
+
     async def test_sharded_message_generator_sweeps_for_late_message(self):
         pubsub = self._make_cluster_pubsub()
         idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]

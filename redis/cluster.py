@@ -4240,6 +4240,9 @@ class ClusterPubSubSlotsCacheListener(EventListenerInterface):
 # siblings hold undelivered messages.
 SHARD_POLL_COOL_OFF_SECONDS = 1.0
 
+# Returned by _poll_node_pubsub when a handler consumed the message it read.
+_DISPATCHED = object()
+
 # How long an unbounded sharded-pubsub poll waits for a not-yet-subscribed
 # per-node pubsub before re-checking that the pubsub is still in
 # node_pubsub_mapping. A retired one is never resubscribed and its
@@ -4727,6 +4730,9 @@ class ClusterPubSub(PubSub):
                 node_name = self._find_node_name_for_pubsub(pubsub)
                 if node_name is not None:
                     self._unreachable_nodes.discard(node_name)
+            if message is _DISPATCHED:
+                # End the pass so a busy shard is not held back by idle ones.
+                return None, None
             if message is not None:
                 return pubsub, message
         if first_error is not None and failed == polled:
@@ -4861,7 +4867,9 @@ class ClusterPubSub(PubSub):
                 # get_sharded_message handle the filtering after processing
                 # subscription state changes
                 return pubsub.handle_message(response, ignore_subscribe_messages=False)
-        return pubsub.handle_message(response, ignore_subscribe_messages=False)
+        message = pubsub.handle_message(response, ignore_subscribe_messages=False)
+        # None here means a handler took it, which is not an empty poll.
+        return _DISPATCHED if message is None else message
 
     @staticmethod
     def _is_publish_response(response) -> bool:
@@ -5049,7 +5057,7 @@ class ClusterPubSub(PubSub):
                 message = None
         else:
             pubsub, message = self._sharded_message_generator(timeout=timeout)
-        if message is None:
+        if message is None or message is _DISPATCHED:
             return None
         # Only sunsubscribe mutates cluster-level shard state; bypassing the
         # lock on the data-message hot path keeps smessage delivery from

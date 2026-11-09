@@ -5208,6 +5208,9 @@ class ClusterPubSubSlotsCacheListener(AsyncEventListenerInterface):
 # siblings hold undelivered messages.
 SHARD_POLL_COOL_OFF_SECONDS = 1.0
 
+# Returned by _poll_node_pubsub when a handler consumed the message it read.
+_DISPATCHED = object()
+
 # How often a failed sharded-pubsub poll may trigger a slots-cache refresh.
 # Reconciliation is otherwise purely event-driven, and a node that has left the
 # deployment answers ECONNREFUSED rather than MOVED - so without this the reader
@@ -5611,6 +5614,9 @@ class ClusterPubSub(PubSub):
                 node_name = self._find_node_name_for_pubsub(pubsub)
                 if node_name is not None:
                     self._unreachable_nodes.discard(node_name)
+            if message is _DISPATCHED:
+                # End the pass so a busy shard is not held back by idle ones.
+                return None, None
             if message is not None:
                 return pubsub, message
         if first_error is not None and failed == polled:
@@ -5716,7 +5722,9 @@ class ClusterPubSub(PubSub):
                 return await pubsub.handle_message(
                     response, ignore_subscribe_messages=False
                 )
-        return await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        message = await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        # None here means a handler took it, which is not an empty poll.
+        return _DISPATCHED if message is None else message
 
     @staticmethod
     def _is_publish_response(response: Any) -> bool:
@@ -5907,7 +5915,7 @@ class ClusterPubSub(PubSub):
         else:
             pubsub, message = await self._sharded_message_generator(timeout=timeout)
 
-        if message is None:
+        if message is None or message is _DISPATCHED:
             return None
         # Only sunsubscribe mutates cluster-level shard state; bypassing the
         # lock on the data-message hot path keeps smessage delivery from

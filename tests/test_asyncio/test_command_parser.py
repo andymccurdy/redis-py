@@ -1,3 +1,5 @@
+from unittest import mock
+
 import pytest
 
 from redis._parsers import AsyncCommandsParser
@@ -26,6 +28,32 @@ class TestAsyncCommandParser:
             assert policies == keyed, name
         assert metadata["spublish"].request_policy is RequestPolicy.DEFAULT_KEYED
         assert metadata["lastsave"].request_policy is RequestPolicy.DEFAULT_KEYLESS
+
+    @pytest.mark.asyncio
+    async def test_get_moveable_keys_from_key_specs(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        cases = [
+            (["ZUNIONSTORE", "out", 2, "a", "b", "WEIGHTS", 2, 3], ["out", "a", "b"]),
+            (["LMPOP", 2, "a", "b", "LEFT"], ["a", "b"]),
+            (["BZMPOP", 0, 1, "a", "MIN"], ["a"]),
+            (["SINTERCARD", 2, "a", "b", "LIMIT", 1], ["a", "b"]),
+            (["FCALL", "f", 0, "arg"], []),
+        ]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            for args, keys in cases:
+                assert await commands_parser.get_keys(*args) == keys
+        server.assert_not_called()
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("8.4.0")
+    async def test_get_moveable_keys_from_key_specs_with_keystep(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        args = ["MSETEX", 2, "k1", "v1", "k2", "v2", "EX", 10]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            assert await commands_parser.get_keys(*args) == ["k1", "k2"]
+        server.assert_not_called()
 
     @pytest.mark.asyncio
     @skip_if_server_version_gte("8.5.240")

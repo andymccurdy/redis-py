@@ -2,6 +2,7 @@ from unittest import mock
 
 import pytest
 from redis._parsers import CommandsParser
+from redis._parsers.commands import _compile_key_specs
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
 from tests.helpers import get_expected_command_policies
 
@@ -106,6 +107,23 @@ class TestCommandsParser:
         with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
             assert commands_parser.get_keys(r, *args) == ["k1", "k2"]
         server.assert_not_called()
+
+    def test_compile_key_specs_follows_the_server_flags(self):
+        def spec(*flags):
+            return {
+                "flags": list(flags),
+                "begin_search": {"type": "index", "spec": {"index": 1}},
+                "find_keys": {
+                    "type": "range",
+                    "spec": {"lastkey": 0, "keystep": 1, "limit": 0},
+                },
+            }
+
+        assert _compile_key_specs([spec("RW"), spec("not_key")]) == (
+            ("range", 1, 0, 0, 1),
+        )
+        assert _compile_key_specs([spec("RW"), spec("variable_flags")]) is None
+        assert _compile_key_specs([spec("incomplete")]) is None
 
     # A bug in redis<7.0 causes this to fail: https://github.com/redis/redis/issues/9493
     @skip_if_server_version_lt("7.0.0")

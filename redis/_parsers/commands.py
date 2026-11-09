@@ -77,55 +77,94 @@ class AbstractCommandsParser:
     def parse_subcommand(self, command, **options):
         return _parse_subcommand(command)
 
-    def _get_keys_from_specs(self, command, args):
+    def _get_keys_from_specs(self, cmd_name, args):
         """
-        Find the keys of a movablekeys command from its key specs, the way the
-        server does, which saves the COMMAND GETKEYS round trip. Returns None
-        when the specs are not enough and the server has to be asked.
+        Find the keys of a movablekeys command from the key specs compiled in
+        initialize(), the way the server does, which saves the COMMAND GETKEYS
+        round trip. Returns None when the server has to be asked.
         """
-        specs = command.get("key_specifications")
-        if not specs:
+        specs = self._movablekeys_specs.get(cmd_name)
+        if specs is None:
             return None
-        args = args[0].split() + list(args[1:])
         argc = len(args)
         keys = []
-        for spec in specs:
-            spec = _spec_dict(spec)
-            begin = _spec_dict(spec.get("begin_search", ()))
-            find = _spec_dict(spec.get("find_keys", ()))
-            if (
-                "incomplete" in {str_if_bytes(f) for f in spec.get("flags", ())}
-                or str_if_bytes(begin.get("type")) != "index"
-            ):
-                return None
-            first = _spec_dict(begin["spec"])["index"]
-            find_type = str_if_bytes(find.get("type"))
-            find_spec = _spec_dict(find.get("spec", ()))
+        for find_type, first, a, b, step in specs:
             if find_type == "range":
-                lastkey = find_spec["lastkey"]
-                limit = find_spec["limit"]
+                lastkey, limit = a, b
                 if lastkey >= 0:
                     last = first + lastkey
                 elif not limit:
                     last = argc + lastkey
                 else:
                     last = first + (argc - first) // limit + lastkey
-            elif find_type == "keynum":
+            else:
+                keynumidx, firstkey = a, b
                 try:
-                    numkeys = int(args[first + find_spec["keynumidx"]])
+                    numkeys = int(args[first + keynumidx])
                 except (IndexError, TypeError, ValueError):
                     return None
                 if numkeys < 0:
                     return None
-                first += find_spec["firstkey"]
-                last = first + (numkeys - 1) * find_spec["keystep"]
-            else:
-                return None
-            step = find_spec["keystep"]
-            if step < 1 or first < 1 or last >= argc:
+                first += firstkey
+                last = first + (numkeys - 1) * step
+            if last >= argc:
                 return None
             keys.extend(args[first : last + 1 : step])
         return keys
+
+
+def _compile_movablekeys_specs(commands):
+    """
+    Compile the key specs of every movablekeys command into tuples that
+    _get_keys_from_specs evaluates, or None where COMMAND GETKEYS has to be
+    asked: no specs, a spec flagged incomplete or variable_flags (the server
+    then ignores the specs too), or a search the client does not implement.
+    """
+    compiled = {}
+    for name, command in commands.items():
+        if "movablekeys" in command["flags"]:
+            compiled[name] = _compile_key_specs(command.get("key_specifications"))
+    return compiled
+
+
+def _compile_key_specs(specs):
+    if not specs:
+        return None
+    compiled = []
+    for spec in specs:
+        flags = _key_spec_flags(spec)
+        if "incomplete" in flags or "variable_flags" in flags:
+            return None
+        if "not_key" in flags:
+            continue
+        spec = _spec_dict(spec)
+        begin = _spec_dict(spec.get("begin_search", ()))
+        find = _spec_dict(spec.get("find_keys", ()))
+        if str_if_bytes(begin.get("type")) != "index":
+            return None
+        first = _spec_dict(begin["spec"])["index"]
+        find_type = str_if_bytes(find.get("type"))
+        find_spec = _spec_dict(find.get("spec", ()))
+        step = find_spec.get("keystep", 0)
+        if first < 1 or step < 1:
+            return None
+        if find_type == "range":
+            compiled.append(
+                (find_type, first, find_spec["lastkey"], find_spec["limit"], step)
+            )
+        elif find_type == "keynum":
+            compiled.append(
+                (
+                    find_type,
+                    first,
+                    find_spec["keynumidx"],
+                    find_spec["firstkey"],
+                    step,
+                )
+            )
+        else:
+            return None
+    return tuple(compiled)
 
 
 def _spec_dict(spec):
@@ -140,12 +179,13 @@ class CommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with
-    'movablekeys', and these commands' keys are determined by the command
-    'COMMAND GETKEYS'.
+    'movablekeys'. Their keys are read from the command's key specs, and
+    'COMMAND GETKEYS' is asked only when the specs are not enough.
     """
 
     def __init__(self, redis_connection):
         self.commands = {}
+        self._movablekeys_specs = {}
         self.redis_connection = redis_connection
         self.initialize(self.redis_connection)
 
@@ -158,6 +198,7 @@ class CommandsParser(AbstractCommandsParser):
         for cmd in uppercase_commands:
             commands[cmd.lower()] = commands.pop(cmd)
         self.commands = commands
+        self._movablekeys_specs = _compile_movablekeys_specs(commands)
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -197,7 +238,7 @@ class CommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = self._get_keys_from_specs(command, args)
+            keys = self._get_keys_from_specs(cmd_name, args)
             if keys is None:
                 keys = self._get_moveable_keys(redis_conn, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
@@ -314,8 +355,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
 
     COMMAND output is used to determine key locations.
-    Commands that do not have a predefined key location are flagged with 'movablekeys',
-    and these commands' keys are determined by the command 'COMMAND GETKEYS'.
+    Commands that do not have a predefined key location are flagged with 'movablekeys'.
+    Their keys are read from the command's key specs, and 'COMMAND GETKEYS' is asked
+    only when the specs are not enough.
 
     NOTE: Due to a bug in redis<7.0, this does not work properly
     for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -325,10 +367,11 @@ class AsyncCommandsParser(AbstractCommandsParser):
     So, don't use this with EVAL or EVALSHA.
     """
 
-    __slots__ = ("commands", "node")
+    __slots__ = ("commands", "node", "_movablekeys_specs")
 
     def __init__(self) -> None:
         self.commands: Dict[str, Union[int, Dict[str, Any]]] = {}
+        self._movablekeys_specs: Dict[str, Optional[Tuple]] = {}
 
     async def initialize(self, node: Optional["ClusterNode"] = None) -> None:
         if node:
@@ -336,6 +379,7 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         commands = await self.node.execute_command("COMMAND")
         self.commands = {cmd.lower(): command for cmd, command in commands.items()}
+        self._movablekeys_specs = _compile_movablekeys_specs(self.commands)
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -375,7 +419,7 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = self._get_keys_from_specs(command, args)
+            keys = self._get_keys_from_specs(cmd_name, args)
             if keys is None:
                 keys = await self._get_moveable_keys(*args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":

@@ -5512,7 +5512,11 @@ class ClusterPubSub(PubSub):
         polled = 0
         failed = 0
         next_ready: Optional[float] = None
-        for _ in range(len(self.node_pubsub_mapping)):
+        nodes = len(self.node_pubsub_mapping)
+        # Split the wait across the pass, otherwise every idle node ahead of the
+        # one with a message adds a full timeout.
+        node_timeout = timeout / nodes if timeout and nodes > 1 else timeout
+        for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
                 # node_pubsub_mapping was emptied between the len() above and
@@ -5528,7 +5532,7 @@ class ClusterPubSub(PubSub):
                     continue
             polled += 1
             try:
-                message = await self._poll_node_pubsub(pubsub, timeout)
+                message = await self._poll_node_pubsub(pubsub, node_timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next

@@ -3590,6 +3590,24 @@ class TestClusterPubSubSlotMigration:
         assert source is good
         assert delivered is message
 
+    async def test_sharded_message_generator_splits_timeout_across_nodes(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(4)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+
+        with patch.object(
+            pubsub, "_poll_node_pubsub", AsyncMock(return_value=None)
+        ) as poll:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert [c.args[1] for c in poll.call_args_list] == [0.1] * 4
+
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """
         Isolation must not swallow a total outage: with nothing left to poll

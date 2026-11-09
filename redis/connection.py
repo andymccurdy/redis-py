@@ -119,6 +119,7 @@ from .utils import (
     deprecated_args,
     ensure_string,
     format_error_message,
+    get_shared_ssl_context,
     is_os_level_timeout,
     str_if_bytes,
     warn_deprecated,
@@ -252,6 +253,8 @@ class PythonRespSerializer:
 
 
 class ConnectionInterface:
+    _resp2_fallback = False
+
     @abstractmethod
     def repr_pieces(self):
         pass
@@ -498,6 +501,8 @@ class MaintNotificationsAbstractConnection:
         way, as is a drain that does not complete within
         ``PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT``.
         """
+        if self._resp2_fallback:
+            raise ConnectionError("Connection has data")
         parser = self._get_push_notifications_parser()
         deferred: list = []
 
@@ -726,6 +731,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_pool_handler_for_connection(
         self, maint_notifications_pool_handler: MaintNotificationsPoolHandler
     ):
+        if self._resp2_fallback:
+            return
         # Deep copy the pool handler to avoid sharing the same pool handler
         # between multiple connections, because otherwise each connection will override
         # the connection reference and the pool handler will only hold a reference
@@ -760,6 +767,8 @@ class MaintNotificationsAbstractConnection:
     def set_maint_notifications_cluster_handler_for_connection(
         self, oss_cluster_maint_notifications_handler: OSSMaintNotificationsHandler
     ):
+        if self._resp2_fallback:
+            return
         parser = self._get_push_notifications_parser()
         parser.set_oss_cluster_maint_push_handler(
             oss_cluster_maint_notifications_handler.handle_notification
@@ -1158,6 +1167,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.redis_connect_func = redis_connect_func
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self.handshake_metadata = None
+        self._resp2_fallback = False
+        self._client_side_caching = False
         self._sock = None
         self._socket_read_size = socket_read_size
         self._connect_callbacks = []
@@ -1165,8 +1176,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self._re_auth_token: Optional[TokenInterface] = None
         try:
             p = int(protocol)
+            self._protocol_specified_explicitly = True
         except TypeError:
             p = DEFAULT_RESP_VERSION
+            self._protocol_specified_explicitly = False
         except ValueError:
             raise ConnectionError("protocol must be an integer")
         else:
@@ -1376,6 +1389,78 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
     def on_connect(self):
         self.on_connect_check_health(check_health=True)
 
+    def _do_resp2_auth(self, auth_args) -> None:
+        """Authenticate with the original credentials, retrying pre-6.0 AUTH."""
+        # avoid checking health here -- PING will fail if we try
+        # to check the health prior to the AUTH
+        self.send_command("AUTH", *auth_args, check_health=False)
+        try:
+            auth_response = self.read_response()
+        except AuthenticationWrongNumberOfArgsError:
+            # a username and password were specified but the Redis
+            # server seems to be < 6.0.0 which expects a single password
+            # arg. retry auth with just the password.
+            self.send_command("AUTH", auth_args[-1], check_health=False)
+            auth_response = self.read_response()
+
+        if str_if_bytes(auth_response) != "OK":
+            raise AuthenticationError("Invalid Username or Password")
+
+    def _fallback_to_resp2(self, error: ResponseError, parser, auth_args=None) -> None:
+        """Handle HELLO failure by falling back to RESP2.
+
+        Validates the error is a recoverable "unknown command" or "NOPROTO",
+        checks that fallback is allowed (not explicitly configured, no
+        RESP3-dependent features active), downgrades parser and protocol,
+        emits a warning, and optionally re-authenticates via standalone AUTH.
+
+        Args:
+            error: The ResponseError from the failed HELLO command.
+            parser: The original parser (for preserving EXCEPTION_CLASSES).
+            auth_args: Original credentials to authenticate after downgrade.
+
+        Raises:
+            ResponseError: If the error is not recoverable or fallback
+                is not permitted.
+        """
+        err_msg = str(error).lower().removeprefix("err ")
+        if not (
+            err_msg in ("unknown command", "noproto")
+            or err_msg.startswith(("unknown command ", "noproto "))
+        ):
+            raise error
+        if self._protocol_specified_explicitly or (
+            self.maint_notifications_config
+            and self.maint_notifications_config.enabled is True
+        ):
+            raise error
+        if self._client_side_caching:
+            raise ResponseError(
+                "Client-side caching requires RESP3; cannot fall back to RESP2"
+            ) from error
+        logger.warning(
+            "Server/proxy at %s does not support HELLO (RESP%s). "
+            "Falling back to RESP2. To silence this warning, "
+            "set protocol=2 explicitly or upgrade your "
+            "server/proxy. Module commands (JSON, Search, TimeSeries, Bloom, "
+            "vector sets) do not adapt their response parsers after automatic "
+            "fallback; set protocol=2 explicitly before using them.",
+            self._host_error(),
+            self.protocol,
+        )
+        if isinstance(self._parser, _RESP3Parser):
+            self.set_parser(_RESP2Parser)
+            self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
+            self._parser.on_connect(self)
+        self.protocol = 2
+        self._resp2_fallback = True
+        self.handshake_metadata = {}
+        self._oss_cluster_maint_notifications_handler = None
+        self._maint_notifications_pool_handler = None
+        self._maint_notifications_connection_handler = None
+        if auth_args:
+            self._do_resp2_auth(auth_args)
+
     def on_connect_check_health(self, check_health: bool = True):
         "Initialize the connection, authenticate and select a database"
         # A fresh socket is a new server session: no prepared HIMPORT fieldsets.
@@ -1400,35 +1485,25 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # update cluster exception classes
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
+            hello_auth_args = auth_args
             if len(auth_args) == 1:
-                auth_args = ["default", auth_args[0]]
+                hello_auth_args = ("default", auth_args[0])
             # avoid checking health here -- PING will fail if we try
             # to check the health prior to the AUTH
             self.send_command(
-                "HELLO", self.protocol, "AUTH", *auth_args, check_health=False
+                "HELLO", self.protocol, "AUTH", *hello_auth_args, check_health=False
             )
-            self.handshake_metadata = self.read_response()
-            # if response.get(b"proto") != self.protocol and response.get(
-            #     "proto"
-            # ) != self.protocol:
-            #     raise ConnectionError("Invalid RESP version")
-        elif auth_args:
-            # avoid checking health here -- PING will fail if we try
-            # to check the health prior to the AUTH
-            self.send_command("AUTH", *auth_args, check_health=False)
-
             try:
-                auth_response = self.read_response()
-            except AuthenticationWrongNumberOfArgsError:
-                # a username and password were specified but the Redis
-                # server seems to be < 6.0.0 which expects a single password
-                # arg. retry auth with just the password.
-                # https://github.com/andymccurdy/redis-py/issues/1274
-                self.send_command("AUTH", auth_args[-1], check_health=False)
-                auth_response = self.read_response()
-
-            if str_if_bytes(auth_response) != "OK":
-                raise AuthenticationError("Invalid Username or Password")
+                self.handshake_metadata = self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
+            except ResponseError as e:
+                self._fallback_to_resp2(e, parser, auth_args=auth_args)
+        elif auth_args:
+            self._do_resp2_auth(auth_args)
 
         # if resp version is specified, switch to it
         elif check_protocol_version(self.protocol, 3):
@@ -1438,12 +1513,15 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 self._parser.EXCEPTION_CLASSES = parser.EXCEPTION_CLASSES
                 self._parser.on_connect(self)
             self.send_command("HELLO", self.protocol, check_health=check_health)
-            self.handshake_metadata = self.read_response()
-            if (
-                self.handshake_metadata.get(b"proto") != self.protocol
-                and self.handshake_metadata.get("proto") != self.protocol
-            ):
-                raise ConnectionError("Invalid RESP version")
+            try:
+                self.handshake_metadata = self.read_response()
+                if (
+                    self.handshake_metadata.get(b"proto") != self.protocol
+                    and self.handshake_metadata.get("proto") != self.protocol
+                ):
+                    raise ConnectionError("Invalid RESP version")
+            except ResponseError as e:
+                self._fallback_to_resp2(e, parser)
 
         # The tail of the handshake (optional CLIENT MAINT_NOTIFICATIONS, then
         # CLIENT SETNAME / SETINFO / SELECT) does not affect control flow -- the replies
@@ -2077,6 +2155,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
     ):
         self.pid = os.getpid()
         self._conn = conn
+        self._resp2_fallback = False
+        if isinstance(conn, AbstractConnection):
+            conn._client_side_caching = True
         self.retry = self._conn.retry
         self.host = self._conn.host
         # A UnixDomainSocketConnection has no port
@@ -2967,15 +3048,12 @@ class SSLConnection(Connection):
             sock.close()
             raise
 
-    def _wrap_socket_with_ssl(self, sock):
+    def _build_ssl_context(self):
         """
-        Wraps the socket with SSL support.
-
-        Args:
-            sock: The plain socket to wrap with SSL.
+        Builds an SSL context from the connection's TLS settings.
 
         Returns:
-            An SSL wrapped socket.
+            A new ssl.SSLContext.
         """
         context = ssl.create_default_context()
         context.check_hostname = self.check_hostname
@@ -3004,6 +3082,38 @@ class SSLConnection(Connection):
             context.minimum_version = self.ssl_min_version
         if self.ssl_ciphers:
             context.set_ciphers(self.ssl_ciphers)
+        return context
+
+    def _wrap_socket_with_ssl(self, sock):
+        """
+        Wraps the socket with SSL support.
+
+        Args:
+            sock: The plain socket to wrap with SSL.
+
+        Returns:
+            An SSL wrapped socket.
+        """
+        if not isinstance(self.certificate_password, (str, bytes, type(None))):
+            # Only the documented password types are shared. Anything else gets a
+            # private context, so the cache key never holds a reference to it.
+            context = self._build_ssl_context()
+        else:
+            context = get_shared_ssl_context(
+                self._build_ssl_context,
+                (
+                    type(self),
+                    self.cert_reqs,
+                    self.check_hostname,
+                    tuple(self.ssl_include_verify_flags or ()),
+                    tuple(self.ssl_exclude_verify_flags or ()),
+                    self.certificate_password,
+                    self.ca_data,
+                    self.ssl_min_version,
+                    self.ssl_ciphers,
+                ),
+                (self.certfile, self.keyfile, self.ca_certs, self.ca_path),
+            )
         if self.ssl_validate_ocsp is True and CRYPTOGRAPHY_AVAILABLE is False:
             raise RedisError("cryptography is not installed.")
 

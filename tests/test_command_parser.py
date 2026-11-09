@@ -1,3 +1,5 @@
+from unittest import mock
+
 import pytest
 from redis._parsers import CommandsParser
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
@@ -57,24 +59,14 @@ class TestCommandsParser:
         ]
         args7 = ["MIGRATE", "192.168.1.34", 6379, "key1", 0, 5000]
 
-        assert_resp_response(
-            r,
-            sorted(commands_parser.get_keys(r, *args1)),
-            ["key1", "key2"],
-            [b"key1", b"key2"],
-        )
+        assert commands_parser.get_keys(r, *args1) == ["key1", "key2"]
         assert_resp_response(
             r,
             sorted(commands_parser.get_keys(r, *args2)),
             ["mystream", "writers"],
             [b"mystream", b"writers"],
         )
-        assert_resp_response(
-            r,
-            sorted(commands_parser.get_keys(r, *args3)),
-            ["out", "zset1", "zset2"],
-            [b"out", b"zset1", b"zset2"],
-        )
+        assert commands_parser.get_keys(r, *args3) == ["out", "zset1", "zset2"]
         assert_resp_response(
             r,
             sorted(commands_parser.get_keys(r, *args4)),
@@ -91,6 +83,21 @@ class TestCommandsParser:
         assert_resp_response(
             r, sorted(commands_parser.get_keys(r, *args7)), ["key1"], [b"key1"]
         )
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_get_moveable_keys_from_key_specs(self, r):
+        commands_parser = CommandsParser(r)
+        cases = [
+            (["ZUNIONSTORE", "out", 2, "a", "b", "WEIGHTS", 2, 3], ["out", "a", "b"]),
+            (["LMPOP", 2, "a", "b", "LEFT"], ["a", "b"]),
+            (["BZMPOP", 0, 1, "a", "MIN"], ["a"]),
+            (["SINTERCARD", 2, "a", "b", "LIMIT", 1], ["a", "b"]),
+            (["FCALL", "f", 0, "arg"], []),
+        ]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            for args, keys in cases:
+                assert commands_parser.get_keys(r, *args) == keys
+        server.assert_not_called()
 
     # A bug in redis<7.0 causes this to fail: https://github.com/redis/redis/issues/9493
     @skip_if_server_version_lt("7.0.0")

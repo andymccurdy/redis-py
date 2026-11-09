@@ -40,6 +40,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers.helpers import bool_ok, decode_info
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -1054,10 +1055,14 @@ class Redis(
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            # Mypy bug: https://github.com/python/mypy/issues/10977
-            command_name = cast(str, command_name)
-            retval = self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            retval = callback(response, **options)
             return await retval if inspect.isawaitable(retval) else retval
         return response
 
@@ -2244,8 +2249,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
 
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)

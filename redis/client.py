@@ -32,6 +32,7 @@ from redis._defaults import (
 )
 from redis._parsers.encoders import Encoder
 from redis._parsers.helpers import bool_ok, decode_info, get_response_callbacks
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.cache import CacheConfig, CacheInterface
 from redis.commands import (
@@ -1033,8 +1034,14 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            return self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            return callback(response, **options)
         return response
 
     def get_cache(self) -> Optional[CacheInterface]:
@@ -2216,8 +2223,14 @@ class Pipeline(Redis):
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
                 command_name = args[0]
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
             data.append(r)
 
         return data

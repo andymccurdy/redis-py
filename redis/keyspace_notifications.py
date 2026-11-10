@@ -1178,7 +1178,7 @@ class KeyspaceNotificationsInterface(ABC):
     @abstractmethod
     def run_in_thread(
         self,
-        poll_timeout: float = 0.0,
+        poll_timeout: float = 0.1,
         daemon: bool = False,
         exception_handler: Callable[
             [
@@ -1489,7 +1489,7 @@ class AbstractKeyspaceNotifications(KeyspaceNotificationsInterface):
 
     def run_in_thread(
         self,
-        poll_timeout: float = 0.0,
+        poll_timeout: float = 0.1,
         daemon: bool = False,
         exception_handler: Callable[
             [
@@ -1513,9 +1513,8 @@ class AbstractKeyspaceNotifications(KeyspaceNotificationsInterface):
         Args:
             poll_timeout: Timeout in seconds for get_message() calls. When no message
                          is available, the thread waits up to this long before checking
-                         again. Default 0.0 (non-blocking). WARNING: the default
-                         causes a CPU spin-loop. It is preferred to pass a positive
-                         value (e.g. 0.1 or 1.0).
+                         again. Default 0.1. A value of 0 polls without waiting
+                         and keeps a CPU core busy.
             daemon: If True, the thread will be a daemon thread and will be
                    terminated when the main program exits. Default False.
             exception_handler: Optional callback invoked when an exception occurs

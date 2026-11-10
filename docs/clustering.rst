@@ -122,8 +122,9 @@ first command attempt that starts once it is due, whichever command that is.
 In a transaction (``MULTI``/``EXEC``, or ``WATCH``), a connection error asks
 for one every ``reinitialize_steps`` errors, as a ``MOVED`` error does.
 Refreshes asked for by errors, including the one every ``reinitialize_steps``
-MOVED errors, run at most once per second per client; requests in between are
-collapsed into one refresh, run by the next command once the second has passed.
+MOVED errors, run at most once per ``topology_refresh_min_interval`` seconds
+per client (one second by default); requests in between are collapsed into one
+refresh, run by the next command once the interval has passed.
 A refresh asked for this way that fails (no node reachable, or no usable
 topology) is logged and asked for again, and the command that ran it goes on
 with the slot map the client already has: the nodes it routes to may still
@@ -134,11 +135,12 @@ node, because the slot map it would retry on is the one it failed on, and
 raises ``RedisClusterUnreachableError`` with its own error as the cause; so
 does a command that runs out of retries while the last refresh reached no
 node. After refreshes that failed in a row, the next one waits as long as the
-``retry`` backoff gives for that many failures, but at least one second. A
-refresh that was interrupted, for example by a timeout around the command that
-ran it, is not counted as failed, but the next one still waits at least one
-second. Refreshes pushed by the server during maintenance (``SMIGRATED``) and
-the first connect are not limited.
+``retry`` backoff gives for that many failures, but at least
+``topology_refresh_min_interval``. A refresh that was interrupted, for example
+by a timeout around the command that ran it, is not counted as failed, but the
+next one still waits at least ``topology_refresh_min_interval``. Refreshes
+pushed by the server during maintenance (``SMIGRATED``), the first connect and
+the refresh a ``CLUSTERDOWN`` error or an uncovered slot runs are not limited.
 
 A refresh keeps the connections of every node that stays in the cluster,
 whatever its role; only the connections of nodes that left are closed.

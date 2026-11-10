@@ -1301,6 +1301,29 @@ class TestAbstractHealthCheckPolicy:
             await policy.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("interval", [None, 0, 2.5])
+    async def test_get_client_keeps_the_cluster_topology_refresh_interval(
+        self, interval
+    ):
+        """
+        The health-check cluster client refreshes its topology no more often
+        than the database's own cluster client does.
+        """
+        underlying = AsyncRedisCluster(
+            startup_nodes=[AsyncClusterNode("node1.example.com", 7000)],
+            topology_refresh_min_interval=interval,
+        )
+        mock_db = Mock(spec=Database)
+        mock_db.client = underlying
+
+        policy = HealthyAllPolicy()
+        try:
+            client = await policy.get_client(mock_db)
+            assert client.nodes_manager._topology_refresh_min_interval == interval
+        finally:
+            await policy.close()
+
+    @pytest.mark.asyncio
     async def test_get_client_preserves_tls_for_standalone(self):
         """
         Verify the health-check client keeps the underlying client's TLS

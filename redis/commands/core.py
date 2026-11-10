@@ -2513,6 +2513,111 @@ class ManagementCommands(CommandsProtocol):
         """
         return self.execute_command("HOTKEYS GET", **kwargs)
 
+    @overload
+    def backup_start(self: SyncClientProtocol, **kwargs) -> bytes | str: ...
+
+    @overload
+    def backup_start(self: AsyncClientProtocol, **kwargs) -> Awaitable[bytes | str]: ...
+
+    def backup_start(self, **kwargs) -> (bytes | str) | Awaitable[bytes | str]:
+        """
+        Start a new backup into the directory set by the ``backupdirname``
+        configuration (a subdirectory of the Redis working directory).
+        The backup directory must be empty, and only one backup can be in
+        progress at a time.
+
+        Poll :meth:`backup_status` until the state is ``incrementing``,
+        then call :meth:`backup_seal` to freeze the backup files.
+
+        For more information, see https://redis.io/commands/backup-start
+        """
+        return self.execute_command("BACKUP START", **kwargs)
+
+    @overload
+    def backup_status(self: SyncClientProtocol, **kwargs) -> dict[str | bytes, Any]: ...
+
+    @overload
+    def backup_status(
+        self: AsyncClientProtocol, **kwargs
+    ) -> Awaitable[dict[str | bytes, Any]]: ...
+
+    def backup_status(
+        self, **kwargs
+    ) -> dict[str | bytes, Any] | Awaitable[dict[str | bytes, Any]]:
+        """
+        Return the state of the current backup as a dict with the keys
+        ``state`` (one of ``idle``, ``pending``, ``snapshotting``,
+        ``incrementing``, ``sealed`` or ``failed``), ``error``,
+        ``start_time`` and ``end_time``.
+
+        For more information, see https://redis.io/commands/backup-status
+        """
+        return self.execute_command("BACKUP STATUS", **kwargs)
+
+    @overload
+    def backup_list(self: SyncClientProtocol, **kwargs) -> list[bytes | str]: ...
+
+    @overload
+    def backup_list(
+        self: AsyncClientProtocol, **kwargs
+    ) -> Awaitable[list[bytes | str]]: ...
+
+    def backup_list(self, **kwargs) -> list[bytes | str] | Awaitable[list[bytes | str]]:
+        """
+        Return the absolute paths of the backup files pinned so far: the base
+        file while the backup is in progress, and the base, incremental and
+        manifest files once it is sealed.
+
+        For more information, see https://redis.io/commands/backup-list
+        """
+        return self.execute_command("BACKUP LIST", **kwargs)
+
+    @overload
+    def backup_seal(self: SyncClientProtocol, **kwargs) -> bytes | str: ...
+
+    @overload
+    def backup_seal(self: AsyncClientProtocol, **kwargs) -> Awaitable[bytes | str]: ...
+
+    def backup_seal(self, **kwargs) -> (bytes | str) | Awaitable[bytes | str]:
+        """
+        Freeze the current backup. After this, the files returned by
+        :meth:`backup_list` are complete and will not change, so they can be
+        copied elsewhere.
+
+        For more information, see https://redis.io/commands/backup-seal
+        """
+        return self.execute_command("BACKUP SEAL", **kwargs)
+
+    @overload
+    def backup_abort(self: SyncClientProtocol, **kwargs) -> bytes | str: ...
+
+    @overload
+    def backup_abort(self: AsyncClientProtocol, **kwargs) -> Awaitable[bytes | str]: ...
+
+    def backup_abort(self, **kwargs) -> (bytes | str) | Awaitable[bytes | str]:
+        """
+        Cancel a backup that has not been sealed yet.
+
+        For more information, see https://redis.io/commands/backup-abort
+        """
+        return self.execute_command("BACKUP ABORT", **kwargs)
+
+    @overload
+    def backup_cleanup(self: SyncClientProtocol, **kwargs) -> bytes | str: ...
+
+    @overload
+    def backup_cleanup(
+        self: AsyncClientProtocol, **kwargs
+    ) -> Awaitable[bytes | str]: ...
+
+    def backup_cleanup(self, **kwargs) -> (bytes | str) | Awaitable[bytes | str]:
+        """
+        Remove the files of a sealed backup and return to the ``idle`` state.
+
+        For more information, see https://redis.io/commands/backup-cleanup
+        """
+        return self.execute_command("BACKUP CLEANUP", **kwargs)
+
 
 class AsyncManagementCommands(ManagementCommands):
     async def command_info(self, **kwargs) -> None:

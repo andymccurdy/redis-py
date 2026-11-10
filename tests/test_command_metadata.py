@@ -166,11 +166,18 @@ TABLE_ROUTED_FLAG_COMMANDS = {
     "randomkey": (RequestPolicy.ALL_SHARDS, ResponsePolicy.SPECIAL),
 }
 
-# Every entry of the static table whose routing view is None. BLESS SCAN and COMMAND are
-# keyless and withhold their routing like the reads above, but neither is flagged readonly.
+# Every entry of the static table whose routing view is None. The BACKUP subcommands, BLESS
+# SCAN and COMMAND are keyless and withhold their routing like the reads above, but none is
+# flagged readonly.
 ALL_WITHHELD_ROUTING_COMMANDS = (
     *WITHHELD_INELIGIBLE_RECORD_COMMANDS,
     *WITHHELD_KEYLESS_READS,
+    "backup abort",
+    "backup cleanup",
+    "backup list",
+    "backup seal",
+    "backup start",
+    "backup status",
     "bless scan",
     "command",
 )

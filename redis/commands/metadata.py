@@ -1358,6 +1358,17 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
     {
         "core": MappingProxyType(
             {
+                # The BACKUP container, keyed by subcommand. Keyless admin commands that the
+                # server flags neither ``readonly`` nor ``write`` and tips nothing. Routing
+                # policies are withheld because the cluster client sends them to the default
+                # node through their COMMAND_FLAGS entry, as it does SAVE and LASTSAVE: a
+                # backup belongs to one node, so a caller picks others with ``target_nodes``.
+                "backup abort": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup cleanup": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup list": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup seal": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup start": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup status": _WRITE_KEYLESS_WITHHELD_ROUTING,
                 "bitcount": _CACHEABLE_KEYED,
                 "bitfield_ro": _CACHEABLE_KEYED,
                 "bitpos": _CACHEABLE_KEYED,

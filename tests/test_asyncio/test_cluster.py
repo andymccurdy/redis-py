@@ -3872,6 +3872,20 @@ class TestClusterRedisCommands:
         with pytest.raises(NotImplementedError):
             await r.memory_doctor()
 
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    async def test_backup_status(self, r: RedisCluster) -> None:
+        node = r.get_primaries()[0]
+        status = await r.backup_status(target_nodes=node)
+        assert status[b"state"] in (
+            b"idle",
+            b"pending",
+            b"snapshotting",
+            b"incrementing",
+            b"sealed",
+            b"failed",
+        )
+
     @skip_if_redis_enterprise()
     async def test_lastsave(self, r: RedisCluster) -> None:
         node = r.get_primaries()[0]

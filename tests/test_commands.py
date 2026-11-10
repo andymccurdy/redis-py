@@ -1717,6 +1717,88 @@ class TestRedisCommands:
                     f"Field '{field}' is missing from HOTKEYS GET response"
                 )
 
+    def _wait_for_backup_state(self, r, state, timeout=10):
+        deadline = time.monotonic() + timeout
+        while r.backup_status()[b"state"] != state:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"backup did not reach the {state!r} state")
+            time.sleep(0.05)
+
+    def _reset_backup(self, r):
+        try:
+            r.backup_abort()
+        except ResponseError:
+            pass
+        r.backup_cleanup()
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_lifecycle(self, r):
+        self._reset_backup(r)
+        status = r.backup_status()
+        assert status[b"state"] == b"idle"
+        assert status[b"start_time"] == 0
+        r.set("a", "1")
+        try:
+            assert r.backup_start() == b"OK"
+            self._wait_for_backup_state(r, b"incrementing")
+            files = r.backup_list()
+            assert len(files) == 1
+            assert files[0].endswith(b".base.rdb")
+
+            assert r.backup_seal() == b"OK"
+            status = r.backup_status()
+            assert status[b"state"] == b"sealed"
+            assert status[b"error"] == b""
+            assert 0 < status[b"start_time"] <= status[b"end_time"]
+            files = r.backup_list()
+            assert len(files) == 3
+            assert files[2].endswith(b"appendonly.aof.manifest")
+
+            assert r.backup_cleanup() == b"OK"
+            assert r.backup_status()[b"state"] == b"idle"
+        finally:
+            self._reset_backup(r)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_abort(self, r):
+        self._reset_backup(r)
+        try:
+            assert r.backup_start() == b"OK"
+            self._wait_for_backup_state(r, b"incrementing")
+            assert r.backup_abort() == b"OK"
+            status = r.backup_status()
+            assert status[b"state"] == b"failed"
+            assert status[b"error"] == b"aborted by user"
+        finally:
+            self._reset_backup(r)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_invalid_state_transitions(self, r):
+        self._reset_backup(r)
+        with pytest.raises(ResponseError, match="No backup in progress"):
+            r.backup_abort()
+        with pytest.raises(ResponseError, match="No backup ready to seal"):
+            r.backup_seal()
+        assert r.backup_list() == []
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_status_decoded(self, decoded_r: redis.Redis):
+        self._reset_backup(decoded_r)
+        assert decoded_r.backup_status() == {
+            "state": "idle",
+            "error": "",
+            "start_time": 0,
+            "end_time": 0,
+        }
+
     @skip_if_redis_enterprise()
     def test_bgsave(self, r):
         self._wait_for_bgsave(r)

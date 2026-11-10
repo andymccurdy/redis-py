@@ -2106,6 +2106,20 @@ class TestClusterRedisCommands:
             if key.startswith("db."):
                 assert not isinstance(value, list)
 
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_status(self, r):
+        node = r.get_primaries()[0]
+        status = r.backup_status(target_nodes=node)
+        assert status[b"state"] in (
+            b"idle",
+            b"pending",
+            b"snapshotting",
+            b"incrementing",
+            b"sealed",
+            b"failed",
+        )
+
     @skip_if_redis_enterprise()
     def test_lastsave(self, r):
         node = r.get_primaries()[0]

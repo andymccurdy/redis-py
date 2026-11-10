@@ -15,6 +15,9 @@ def key_slot(key: EncodedT, bucket: int = REDIS_CLUSTER_HASH_SLOTS) -> int:
     :param key - bytes
     :param bucket - int
     """
+    if isinstance(key, memoryview):
+        # The encoder passes memoryviews through, and they have no find().
+        key = key.tobytes()
     start = key.find(b"{")
     if start > -1:
         end = key.find(b"}", start + 1)

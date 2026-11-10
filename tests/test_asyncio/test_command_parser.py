@@ -1,6 +1,8 @@
+from unittest import mock
+
 import pytest
 
-from redis._parsers import AsyncCommandsParser
+from redis._parsers import AsyncCommandsParser, Encoder
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
 from tests.conftest import skip_if_server_version_gte, skip_if_server_version_lt
 from tests.helpers import get_expected_command_policies
@@ -26,6 +28,72 @@ class TestAsyncCommandParser:
             assert policies == keyed, name
         assert metadata["spublish"].request_policy is RequestPolicy.DEFAULT_KEYED
         assert metadata["lastsave"].request_policy is RequestPolicy.DEFAULT_KEYLESS
+
+    @pytest.mark.asyncio
+    async def test_get_moveable_keys_from_key_specs(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        cases = [
+            (["ZUNIONSTORE", "out", 2, "a", "b", "WEIGHTS", 2, 3], ["out", "a", "b"]),
+            (["LMPOP", 2, "a", "b", "LEFT"], ["a", "b"]),
+            (["BZMPOP", 0, 1, "a", "MIN"], ["a"]),
+            (["SINTERCARD", 2, "a", "b", "LIMIT", 1], ["a", "b"]),
+            (["FCALL", "f", 0, "arg"], []),
+        ]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            for args, keys in cases:
+                assert await commands_parser.get_keys(*args) == keys
+        server.assert_not_called()
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("8.4.0")
+    async def test_get_moveable_keys_from_key_specs_with_keystep(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        args = ["MSETEX", 2, "k1", "v1", "k2", "v2", "EX", 10]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            assert await commands_parser.get_keys(*args) == ["k1", "k2"]
+        server.assert_not_called()
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_key_count_the_server_rejects_is_left_to_the_server(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        cases = ["+2", " 2", "02", "2_0", "2.5", 2.5, b"+2"]
+        with mock.patch.object(
+            commands_parser, "_get_moveable_keys", return_value=None
+        ) as server:
+            for numkeys in cases:
+                await commands_parser.get_keys("LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
+        assert server.call_count == len(cases)
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_key_count_is_read_from_the_encoded_bytes(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        args = ["lmpop", "2", "{a}x", "{b}y", "LEFT"]
+        assert commands_parser._get_keys_from_specs("lmpop", args) == ["{a}x", "{b}y"]
+        # The server would get b"2\x00" and reject it.
+        commands_parser._encoder = Encoder("utf-16-le", "strict", False)
+        assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_malformed_calls_are_left_to_the_server(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        for args in (["lmpop", 1, "k"], ["lmpop", b"9" * 5000, "k", "LEFT"]):
+            assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    @pytest.mark.asyncio
+    async def test_empty_key_range_yields_no_keys(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        commands_parser._movablekeys_specs = {"modcmd": (-2, (("keynum", 1, 0, 1, 4),))}
+        args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
+        assert commands_parser._get_keys_from_specs("modcmd", args) == []
 
     @pytest.mark.asyncio
     @skip_if_server_version_gte("8.5.240")

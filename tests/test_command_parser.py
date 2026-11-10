@@ -1,5 +1,8 @@
+from unittest import mock
+
 import pytest
-from redis._parsers import CommandsParser
+from redis._parsers import CommandsParser, Encoder
+from redis._parsers.commands import _compile_key_specs
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
 from tests.helpers import get_expected_command_policies
 
@@ -57,24 +60,14 @@ class TestCommandsParser:
         ]
         args7 = ["MIGRATE", "192.168.1.34", 6379, "key1", 0, 5000]
 
-        assert_resp_response(
-            r,
-            sorted(commands_parser.get_keys(r, *args1)),
-            ["key1", "key2"],
-            [b"key1", b"key2"],
-        )
+        assert commands_parser.get_keys(r, *args1) == ["key1", "key2"]
         assert_resp_response(
             r,
             sorted(commands_parser.get_keys(r, *args2)),
             ["mystream", "writers"],
             [b"mystream", b"writers"],
         )
-        assert_resp_response(
-            r,
-            sorted(commands_parser.get_keys(r, *args3)),
-            ["out", "zset1", "zset2"],
-            [b"out", b"zset1", b"zset2"],
-        )
+        assert commands_parser.get_keys(r, *args3) == ["out", "zset1", "zset2"]
         assert_resp_response(
             r,
             sorted(commands_parser.get_keys(r, *args4)),
@@ -91,6 +84,78 @@ class TestCommandsParser:
         assert_resp_response(
             r, sorted(commands_parser.get_keys(r, *args7)), ["key1"], [b"key1"]
         )
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_get_moveable_keys_from_key_specs(self, r):
+        commands_parser = CommandsParser(r)
+        cases = [
+            (["ZUNIONSTORE", "out", 2, "a", "b", "WEIGHTS", 2, 3], ["out", "a", "b"]),
+            (["LMPOP", 2, "a", "b", "LEFT"], ["a", "b"]),
+            (["BZMPOP", 0, 1, "a", "MIN"], ["a"]),
+            (["SINTERCARD", 2, "a", "b", "LIMIT", 1], ["a", "b"]),
+            (["FCALL", "f", 0, "arg"], []),
+        ]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            for args, keys in cases:
+                assert commands_parser.get_keys(r, *args) == keys
+        server.assert_not_called()
+
+    @skip_if_server_version_lt("8.4.0")
+    def test_get_moveable_keys_from_key_specs_with_keystep(self, r):
+        commands_parser = CommandsParser(r)
+        args = ["MSETEX", 2, "k1", "v1", "k2", "v2", "EX", 10]
+        with mock.patch.object(commands_parser, "_get_moveable_keys") as server:
+            assert commands_parser.get_keys(r, *args) == ["k1", "k2"]
+        server.assert_not_called()
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_key_count_the_server_rejects_is_left_to_the_server(self, r):
+        commands_parser = CommandsParser(r)
+        cases = ["+2", " 2", "02", "2_0", "2.5", 2.5, b"+2"]
+        with mock.patch.object(
+            commands_parser, "_get_moveable_keys", return_value=None
+        ) as server:
+            for numkeys in cases:
+                commands_parser.get_keys(r, "LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
+        assert server.call_count == len(cases)
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_key_count_is_read_from_the_encoded_bytes(self, r):
+        commands_parser = CommandsParser(r)
+        args = ["lmpop", "2", "{a}x", "{b}y", "LEFT"]
+        assert commands_parser._get_keys_from_specs("lmpop", args) == ["{a}x", "{b}y"]
+        # The server would get b"2\x00" and reject it.
+        commands_parser._encoder = Encoder("utf-16-le", "strict", False)
+        assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_malformed_calls_are_left_to_the_server(self, r):
+        commands_parser = CommandsParser(r)
+        for args in (["lmpop", 1, "k"], ["lmpop", b"9" * 5000, "k", "LEFT"]):
+            assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    def test_empty_key_range_yields_no_keys(self, r):
+        commands_parser = CommandsParser(r)
+        commands_parser._movablekeys_specs = {"modcmd": (-2, (("keynum", 1, 0, 1, 4),))}
+        args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
+        assert commands_parser._get_keys_from_specs("modcmd", args) == []
+
+    def test_compile_key_specs_follows_the_server_flags(self):
+        def spec(*flags):
+            return {
+                "flags": list(flags),
+                "begin_search": {"type": "index", "spec": {"index": 1}},
+                "find_keys": {
+                    "type": "range",
+                    "spec": {"lastkey": 0, "keystep": 1, "limit": 0},
+                },
+            }
+
+        assert _compile_key_specs([spec("RW"), spec("not_key")]) == (
+            ("range", 1, 0, 0, 1),
+        )
+        assert _compile_key_specs([spec("RW"), spec("variable_flags")]) is None
+        assert _compile_key_specs([spec("incomplete")]) is None
 
     # A bug in redis<7.0 causes this to fail: https://github.com/redis/redis/issues/9493
     @skip_if_server_version_lt("7.0.0")

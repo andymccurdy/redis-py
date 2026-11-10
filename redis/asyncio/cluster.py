@@ -5570,6 +5570,10 @@ class ClusterPubSub(PubSub):
                     if next_ready is None or deadline < next_ready:
                         next_ready = deadline
                     continue
+            if pubsub.connection is None:
+                # Nothing to read and no wait: not a poll, so a pass whose
+                # other nodes are cooling off still sleeps below.
+                continue
             polled += 1
             if split:
                 node_timeout = max(pass_deadline - time.monotonic(), 0.0) / max(left, 1)

@@ -3784,6 +3784,35 @@ class TestClusterPubSubSlotMigration:
 
         assert passes.call_count == 3
 
+    async def test_sharded_message_generator_sleeps_past_unconnected_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        clock = [time.monotonic()]
+        pubsub._poll_cool_off[cooling] = clock[0] + 30
+
+        async def sleep(next_ready, timeout):
+            clock[0] += timeout
+
+        with (
+            patch("redis.asyncio.cluster.time") as fake_time,
+            patch.object(pubsub, "_wait_out_cool_off", AsyncMock(side_effect=sleep)),
+            patch.object(pubsub, "_sharded_pass", wraps=pubsub._sharded_pass) as passes,
+        ):
+            # Ticks on each read, so a pass that never sleeps still ends.
+            fake_time.monotonic.side_effect = (
+                lambda: clock.__setitem__(0, clock[0] + 0.001) or clock[0]
+            )
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert passes.call_count == 3
+
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """
         Isolation must not swallow a total outage: with nothing left to poll

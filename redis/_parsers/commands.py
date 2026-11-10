@@ -99,11 +99,10 @@ class AbstractCommandsParser:
                     last = first + (argc - first) // limit + lastkey
             else:
                 keynumidx, firstkey = a, b
-                try:
-                    numkeys = int(args[first + keynumidx])
-                except (IndexError, TypeError, ValueError):
+                if first + keynumidx >= argc:
                     return None
-                if numkeys < 0:
+                numkeys = _parse_numkeys(args[first + keynumidx])
+                if numkeys is None or numkeys < 0:
                     return None
                 first += firstkey
                 last = first + (numkeys - 1) * step
@@ -111,6 +110,26 @@ class AbstractCommandsParser:
                 return None
             keys.extend(args[first : last + 1 : step])
         return keys
+
+
+def _parse_numkeys(value):
+    """
+    The key count as the server reads it, or None for a value it rejects.
+    int() also accepts "+2", " 2", "02", "2_0" and the float 2.5.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = repr(value)
+    elif isinstance(value, (bytes, bytearray)):
+        value = value.decode("ascii", "replace")
+    elif not isinstance(value, str):
+        return None
+    try:
+        numkeys = int(value)
+    except ValueError:
+        return None
+    return numkeys if str(numkeys) == value else None
 
 
 def _compile_movablekeys_specs(commands):

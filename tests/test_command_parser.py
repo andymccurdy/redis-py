@@ -108,6 +108,17 @@ class TestCommandsParser:
             assert commands_parser.get_keys(r, *args) == ["k1", "k2"]
         server.assert_not_called()
 
+    @skip_if_server_version_lt("7.0.0")
+    def test_key_count_the_server_rejects_is_left_to_the_server(self, r):
+        commands_parser = CommandsParser(r)
+        cases = ["+2", " 2", "02", "2_0", "2.5", 2.5, b"+2"]
+        with mock.patch.object(
+            commands_parser, "_get_moveable_keys", return_value=None
+        ) as server:
+            for numkeys in cases:
+                commands_parser.get_keys(r, "LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
+        assert server.call_count == len(cases)
+
     def test_compile_key_specs_follows_the_server_flags(self):
         def spec(*flags):
             return {

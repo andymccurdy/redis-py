@@ -56,6 +56,19 @@ class TestAsyncCommandParser:
         server.assert_not_called()
 
     @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_key_count_the_server_rejects_is_left_to_the_server(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        cases = ["+2", " 2", "02", "2_0", "2.5", 2.5, b"+2"]
+        with mock.patch.object(
+            commands_parser, "_get_moveable_keys", return_value=None
+        ) as server:
+            for numkeys in cases:
+                await commands_parser.get_keys("LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
+        assert server.call_count == len(cases)
+
+    @pytest.mark.asyncio
     @skip_if_server_version_gte("8.5.240")
     async def test_get_command_policies(self, r):
         commands_parser = AsyncCommandsParser()

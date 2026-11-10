@@ -122,6 +122,7 @@ from .utils import (
     get_shared_ssl_context,
     is_os_level_timeout,
     str_if_bytes,
+    warn_deprecated,
 )
 
 if SSL_AVAILABLE:
@@ -134,8 +135,14 @@ else:
 if HIREDIS_AVAILABLE:
     import hiredis
 
-SYM_STAR = b"*"
-SYM_DOLLAR = b"$"
+# ``SYM_STAR`` and ``SYM_DOLLAR`` are deprecated: nothing in this library uses them any
+# more. They are bound to private names and served through the module ``__getattr__``
+# below, so that reading them warns. The annotations let linters and type checkers see the
+# names without binding them, which would bypass the warning.
+SYM_STAR: bytes
+SYM_DOLLAR: bytes
+_DEPRECATED_SYM_STAR = b"*"
+_DEPRECATED_SYM_DOLLAR = b"$"
 SYM_CRLF = b"\r\n"
 SYM_EMPTY = b""
 
@@ -224,7 +231,7 @@ class PythonRespSerializer:
         elif b" " in args[0]:
             args = tuple(args[0].split()) + args[1:]
 
-        buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
+        buff = b"*%d\r\n" % len(args)
 
         buffer_cutoff = self._buffer_cutoff
         for arg in map(self.encode, args):
@@ -236,23 +243,11 @@ class PythonRespSerializer:
                 or arg_length > buffer_cutoff
                 or isinstance(arg, memoryview)
             ):
-                buff = SYM_EMPTY.join(
-                    (buff, SYM_DOLLAR, str(arg_length).encode(), SYM_CRLF)
-                )
-                output.append(buff)
+                output.append(b"%s$%d\r\n" % (buff, arg_length))
                 output.append(arg)
                 buff = SYM_CRLF
             else:
-                buff = SYM_EMPTY.join(
-                    (
-                        buff,
-                        SYM_DOLLAR,
-                        str(arg_length).encode(),
-                        SYM_CRLF,
-                        arg,
-                        SYM_CRLF,
-                    )
-                )
+                buff = b"%s$%d\r\n%s\r\n" % (buff, arg_length, arg)
         output.append(buff)
         return output
 
@@ -4650,7 +4645,6 @@ class BlockingConnectionPool(ConnectionPool):
         self.queue_class = queue_class
         self.timeout = timeout
         self._in_maintenance = False
-        self._locked = False
         super().__init__(
             connection_class=connection_class,
             max_connections=max_connections,
@@ -4669,7 +4663,6 @@ class BlockingConnectionPool(ConnectionPool):
             # to clear these, and a stale flag makes a checkout nest on the
             # lock and leak it.
             self._in_maintenance = False
-            self._locked = False
             # The cached entries were filled on the parent's connections: their
             # invalidations go to the parent, and a hit would read the
             # parent's socket.
@@ -4677,10 +4670,11 @@ class BlockingConnectionPool(ConnectionPool):
                 self.cache.flush()
 
         # Create and fill up a thread safe queue with ``None`` values.
+        locked = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                locked = True
 
             # Record metrics for connections being removed before clearing
             # Note: Access pool.queue directly to avoid deadlock since we may
@@ -4721,12 +4715,8 @@ class BlockingConnectionPool(ConnectionPool):
             # disconnect them later.
             self._connections = []
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if locked:
+                self._lock.release()
 
         self._on_reset_after_fork()
 
@@ -4775,10 +4765,11 @@ class BlockingConnectionPool(ConnectionPool):
 
     def make_connection(self):
         "Make a fresh connection."
+        locked = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                locked = True
 
             if self.cache is not None:
                 connection = CacheProxyConnection(
@@ -4792,12 +4783,8 @@ class BlockingConnectionPool(ConnectionPool):
 
             return connection
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if locked:
+                self._lock.release()
 
     @deprecated_args(
         args_to_warn=["*"],
@@ -4824,10 +4811,11 @@ class BlockingConnectionPool(ConnectionPool):
         # Try and get a connection from the pool. If one isn't available within
         # self.timeout then raise a ``ConnectionError``.
         connection = None
+        locked = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                locked = True
             try:
                 connection = self.pool.get(block=True, timeout=self.timeout)
             except Empty:
@@ -4852,12 +4840,8 @@ class BlockingConnectionPool(ConnectionPool):
                     raise
                 is_created = True
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if locked:
+                self._lock.release()
 
         # Record state transition for observability
         pool_name = get_pool_name(self)
@@ -4907,10 +4891,11 @@ class BlockingConnectionPool(ConnectionPool):
         # Make sure we haven't changed process.
         self._checkpid()
 
+        locked = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                locked = True
             if not self.owns_connection(connection):
                 # pool doesn't own this connection. do not add it back
                 # to the pool. instead add a None value which is a placeholder
@@ -4961,22 +4946,19 @@ class BlockingConnectionPool(ConnectionPool):
             except Full:
                 pass
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if locked:
+                self._lock.release()
 
     def disconnect(self, inuse_connections: bool = True):
         """
         Disconnects either all connections in the pool or just the free connections.
         """
         self._checkpid()
+        locked = False
         try:
             if self._in_maintenance:
                 self._lock.acquire()
-                self._locked = True
+                locked = True
 
             if inuse_connections:
                 connections = self._connections
@@ -4986,12 +4968,8 @@ class BlockingConnectionPool(ConnectionPool):
             for connection in connections:
                 connection.disconnect()
         finally:
-            if self._locked:
-                try:
-                    self._lock.release()
-                except Exception:
-                    pass
-                self._locked = False
+            if locked:
+                self._lock.release()
 
     def _get_free_connections(self):
         with self._lock:
@@ -5015,3 +4993,26 @@ class BlockingConnectionPool(ConnectionPool):
         The pool will be in maintenance mode only when we are processing a MOVING notification.
         """
         self._in_maintenance = in_maintenance
+
+
+def __getattr__(name: str):
+    """
+    Serve the deprecated ``SYM_STAR`` and ``SYM_DOLLAR`` constants, warning on the way.
+
+    A module attribute cannot be deprecated by decoration, so the constants are bound to
+    private names above and resolved here instead - which is only reached because no module
+    attribute of that name exists.
+    """
+    if name == "SYM_STAR":
+        value = _DEPRECATED_SYM_STAR
+    elif name == "SYM_DOLLAR":
+        value = _DEPRECATED_SYM_DOLLAR
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    warn_deprecated(
+        name,
+        reason="Nothing in this library uses it any more",
+        version="8.2.0",
+        stacklevel=3,
+    )
+    return value

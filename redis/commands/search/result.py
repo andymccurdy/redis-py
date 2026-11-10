@@ -104,6 +104,7 @@ class Result:
         duration: float = 0,
         with_scores: bool = False,
         field_encodings: Optional[dict] = None,
+        with_payloads: bool = False,
     ) -> "Result":
         """Construct a Result from a RESP3 dict response.
 
@@ -135,6 +136,9 @@ class Result:
             score = None
             if with_scores and "score" in result_item:
                 score = float(result_item["score"])
+            payload = None
+            if with_payloads:
+                payload = to_string(result_item.get("payload"))
 
             fields = {}
             extra_attrs = result_item.get("extra_attributes") or {}
@@ -154,7 +158,9 @@ class Result:
                 pass
 
             instance.docs.append(
-                _make_document(doc_id, fields, score, with_scores, None, False)
+                _make_document(
+                    doc_id, fields, score, with_scores, payload, with_payloads
+                )
             )
 
         return instance

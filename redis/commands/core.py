@@ -13178,11 +13178,12 @@ class FunctionCommands:
 
         Args:
 
-            library: specify a pattern for matching library names
+            library: specify a pattern for matching library names, or None for all
+                libraries
             withcode: cause the server to include the libraries source implementation
                 in the reply
         """
-        args = ["LIBRARYNAME", library]
+        args = [] if library is None else ["LIBRARYNAME", library]
         if withcode:
             args.append("WITHCODE")
         return self.execute_command("FUNCTION LIST", *args)
@@ -13266,11 +13267,15 @@ class FunctionCommands:
         """
         Restore libraries from the serialized ``payload``.
         You can use the optional policy argument to provide a policy
-        for handling existing libraries.
+        for handling existing libraries. ``None`` omits it, which the server
+        treats as ``APPEND``.
 
         For more information, see https://redis.io/commands/function-restore
         """
-        return self.execute_command("FUNCTION RESTORE", payload, policy)
+        pieces = [payload]
+        if policy is not None:
+            pieces.append(policy)
+        return self.execute_command("FUNCTION RESTORE", *pieces)
 
     @overload
     def function_kill(self: SyncClientProtocol) -> bytes | str: ...

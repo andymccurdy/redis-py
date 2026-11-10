@@ -4687,6 +4687,31 @@ class TestClusterPubSubSlotMigration:
 
         assert [c.args[1] for c in p.call_args_list] == [0.0, 0.0, 0.0]
 
+    def test_sharded_message_generator_reuses_time_a_fast_shard_left(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = self._make_node_pubsub({b"idle": None})
+        fast = self._make_node_pubsub({b"fast": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": idle, "127.0.0.1:7001": fast}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"idle", "data": b"x"}
+        idle_polls = []
+
+        def poll(ps, timeout):
+            if ps is fast:
+                return None
+            idle_polls.append(timeout)
+            # Arrives after the idle node's first slice, within the timeout.
+            if len(idle_polls) == 3:
+                return msg
+            time.sleep(timeout)
+            return None
+
+        with mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll):
+            assert pubsub._sharded_message_generator(timeout=0.2) == (idle, msg)
+
+        # The sweep, the first timed slice, then a second pass over the rest.
+        assert idle_polls[2] > 0
+
     def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """
         Isolation must not swallow a total outage: with nothing left to poll

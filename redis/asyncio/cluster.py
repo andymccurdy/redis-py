@@ -5211,6 +5211,9 @@ SHARD_POLL_COOL_OFF_SECONDS = 1.0
 # Returned by _poll_node_pubsub when a handler consumed the message it read.
 _DISPATCHED = object()
 
+# A timed sharded pass shorter than this blocked on no node.
+_SHARD_PASS_MIN_BLOCK_SECONDS = 0.001
+
 # How often a failed sharded-pubsub poll may trigger a slots-cache refresh.
 # Reconciliation is otherwise purely event-driven, and a node that has left the
 # deployment answers ECONNREFUSED rather than MOVED - so without this the reader
@@ -5514,9 +5517,21 @@ class ClusterPubSub(PubSub):
         if timeout and len(self.node_pubsub_mapping) > 1:
             # Block only when no node has data, so a busy shard does not wait
             # out the slices of its idle siblings.
+            deadline = time.monotonic() + timeout
             pubsub, message = await self._sharded_pass(0.0)
+            while message is None:
+                # A node that returns early leaves time the nodes before it
+                # did not get; pass again until the deadline.
+                start = time.monotonic()
+                if start >= deadline:
+                    break
+                pubsub, message = await self._sharded_pass(deadline - start)
+                if time.monotonic() - start < _SHARD_PASS_MIN_BLOCK_SECONDS:
+                    # No node could block; looping would spin to the deadline.
+                    break
             if message is None:
-                pubsub, message = await self._sharded_pass(timeout)
+                # A message can reach a node after its slice ran out.
+                pubsub, message = await self._sharded_pass(0.0)
         else:
             pubsub, message = await self._sharded_pass(timeout)
         if message is _DISPATCHED:
@@ -5632,10 +5647,6 @@ class ClusterPubSub(PubSub):
                 return pubsub, message
         if first_error is not None and failed == polled:
             raise first_error
-        if split and polled:
-            # A message can reach a node after its slice ran out; sweep once
-            # without waiting before reporting a timeout.
-            return await self._sharded_pass(0.0)
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)
         return None, None

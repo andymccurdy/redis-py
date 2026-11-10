@@ -7,6 +7,8 @@ from redis.client import StrictRedis
 
 import redis.sentinel
 from redis import exceptions
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.sentinel import (
     MasterNotFoundError,
@@ -633,3 +635,36 @@ def test_himport_prepare_set_survives_reconnect(deployed_sentinel):
     master.delete("himport:sentinel:2")
     master.himport_set("himport:sentinel:2", "users", ["bob", "b@x.com"])
     assert master.hget("himport:sentinel:2", "email") == "b@x.com"
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_do_not_retry_by_default():
+    # Master discovery moves on to the next sentinel by itself; retrying an
+    # unreachable sentinel with the client default policy multiplies its timeout.
+    sentinel = Sentinel([("localhost", 26379), ("localhost", 26380)])
+    assert [s.get_retry().get_retries() for s in sentinel.sentinels] == [0, 0]
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_retry_once_on_error_when_asked():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry_on_error": [exceptions.ConnectionError]},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 1
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_use_the_given_retry():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry": Retry(ExponentialBackoff(), 2)},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 2
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_kwargs_are_not_modified():
+    sentinel_kwargs = {"socket_timeout": 1}
+    Sentinel([("localhost", 26379)], sentinel_kwargs=sentinel_kwargs)
+    assert sentinel_kwargs == {"socket_timeout": 1}

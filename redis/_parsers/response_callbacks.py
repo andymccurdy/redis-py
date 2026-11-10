@@ -24,7 +24,7 @@ protocol-specific overlay. Callers wrap the returned dict in
 ``CaseInsensitiveDict``.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from redis.himport import (
     HIMPORT_DISCARD,
@@ -520,3 +520,36 @@ def get_response_callbacks(
         else:
             callbacks.update(_RedisCallbacksRESP2Unified)
     return callbacks
+
+
+def _get_response_callback(
+    callbacks: Mapping, command: str | bytes, connection: Any
+) -> Callable | None:
+    """Select a default callback for the negotiated wire protocol.
+
+    A default-RESP3 connection may fall back independently of the other
+    connections using this mapping. Select its RESP2 callback without mutating
+    the shared mapping or replacing callbacks installed by the caller.
+    """
+    if not getattr(connection, "_resp2_fallback", False):
+        return callbacks.get(command)
+
+    normalized_command = str_if_bytes(command).upper()
+    callback = callbacks.get(normalized_command)
+    if command != normalized_command:
+        # Preserve callbacks registered under the caller's original spelling.
+        callback = callbacks.get(command, callback)
+    if connection.legacy_responses:
+        resp3_callbacks = _RedisCallbacksRESP3toRESP2Legacy
+        resp2_callbacks = _RedisCallbacksRESP2
+    else:
+        resp3_callbacks = _RedisCallbacksRESP3Unified
+        resp2_callbacks = _RedisCallbacksRESP2Unified
+    default_callback = resp3_callbacks.get(
+        normalized_command, _RedisCallbacks.get(normalized_command)
+    )
+    if callback is default_callback:
+        return resp2_callbacks.get(
+            normalized_command, _RedisCallbacks.get(normalized_command)
+        )
+    return callback

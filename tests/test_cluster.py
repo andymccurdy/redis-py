@@ -34,6 +34,7 @@ from redis.cluster import (
     REPLICA,
     ClusterNode,
     ClusterPipeline,
+    ExecutionStrategy,
     LoadBalancingStrategy,
     NodesManager,
     RedisCluster,
@@ -4443,6 +4444,7 @@ class TestMultiShardRequests:
 
         keyslot.assert_not_called()
 
+    @skip_if_server_version_lt("8.4")
     def test_keys_that_cannot_be_located_are_not_split(self, r, monkeypatch):
         """MSETEX names its key count first, so its keys are not at fixed positions."""
         _route_by_live_tips(r, monkeypatch)
@@ -8102,6 +8104,41 @@ class TestClusterPipeline:
             r["{key}:b"] = 2
             pipe.delete("{key}:a", "{key}:b")
             assert pipe.execute()
+
+    def test_touch_single(self, r):
+        """
+        Test that touch is queued and executed with the pipeline
+        """
+        r["a"] = 1
+        with r.pipeline(transaction=False) as pipe:
+            assert pipe.touch("a") is pipe
+            assert len(pipe) == 1
+            assert pipe.execute() == [1]
+
+    def test_touch_cross_slot(self, r):
+        """
+        Test that touch over keys in different slots is queued as one command
+        and returns the summed count
+        """
+        r["a"] = 1
+        r["b"] = 2
+        assert r.keyslot("a") != r.keyslot("b")
+        with r.pipeline(transaction=False) as pipe:
+            pipe.touch("a", "b")
+            assert len(pipe) == 1
+            assert pipe.execute() == [2]
+
+    def test_touch_not_required_from_execution_strategy_subclasses(self):
+        """
+        Test that a strategy that does not define touch can still be
+        instantiated, and that its touch falls back to execute_command
+        """
+        stubs = {
+            name: lambda self, *args, **kwargs: args
+            for name in ExecutionStrategy.__abstractmethods__
+        }
+        strategy = type("StrategyWithoutTouch", (ExecutionStrategy,), stubs)()
+        assert strategy.touch("a", "b") == ("TOUCH", "a", "b")
 
     def test_unlink_single(self, r):
         """

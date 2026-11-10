@@ -80,9 +80,18 @@ class TestAsyncCommandParser:
         assert commands_parser._get_keys_from_specs("lmpop", args) is None
 
     @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_malformed_calls_are_left_to_the_server(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        for args in (["lmpop", 1, "k"], ["lmpop", b"9" * 5000, "k", "LEFT"]):
+            assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    @pytest.mark.asyncio
     async def test_empty_key_range_yields_no_keys(self, r):
         commands_parser = AsyncCommandsParser()
         await commands_parser.initialize(node=r.get_default_node())
+        commands_parser.commands["modcmd"] = {"arity": -2}
         commands_parser._movablekeys_specs = {"modcmd": (("keynum", 1, 0, 1, 4),)}
         args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
         assert commands_parser._get_keys_from_specs("modcmd", args) == []

@@ -93,6 +93,10 @@ class AbstractCommandsParser:
         if specs is None:
             return None
         argc = len(args)
+        # COMMAND GETKEYS rejects a wrong argument count before reading specs.
+        arity = int(self.commands[cmd_name]["arity"])
+        if argc < abs(arity) or (arity > 0 and argc != arity):
+            return None
         keys = []
         for find_type, first, a, b, step in specs:
             if find_type == "range":
@@ -134,6 +138,9 @@ def _parse_numkeys(value, encoder):
     if not isinstance(raw, (bytes, bytearray)) or not raw.isdigit():
         return None
     if len(raw) > 1 and raw.startswith(b"0"):
+        return None
+    # More digits than a signed 64-bit count; int() would also refuse 4300+.
+    if len(raw) > 19:
         return None
     return int(raw)
 

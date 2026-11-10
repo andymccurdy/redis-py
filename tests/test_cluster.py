@@ -4866,10 +4866,13 @@ class TestTopologyRefreshPacing:
         )
 
     @pytest.mark.fixed_client
-    def test_negative_interval_is_rejected(self):
-        with pytest.raises(RedisClusterException, match="must not be negative"):
+    @pytest.mark.parametrize("interval", [-1, float("nan"), float("inf")])
+    def test_invalid_interval_is_rejected(self, interval):
+        with pytest.raises(RedisClusterException, match="must be a finite"):
             RedisCluster(
-                host=default_host, port=default_port, topology_refresh_min_interval=-1
+                host=default_host,
+                port=default_port,
+                topology_refresh_min_interval=interval,
             )
 
     @pytest.mark.fixed_client

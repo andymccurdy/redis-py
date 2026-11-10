@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import logging
+import math
 import random
 import threading
 import time
@@ -481,10 +482,10 @@ class RedisCluster(
           are collapsed into one refresh, run by the next command attempt once
           the interval has passed. After refreshes that failed in a row, the
           ``retry`` backoff can make the wait longer, never shorter. 0 lets every
-          requested refresh run at once. Must not be negative. Server-pushed
-          refreshes (SMIGRATED), the first initialization and the refresh a
-          ``CLUSTERDOWN`` or an uncovered slot runs are not limited. Defaults to
-          one second when not set.
+          requested refresh run at once. Must be finite and not negative.
+          Server-pushed refreshes (SMIGRATED), the first initialization and the
+          refresh a ``CLUSTERDOWN`` or an uncovered slot runs are not limited.
+          Defaults to one second when not set.
 
     | Rest of the arguments will be passed to the
       :class:`~redis.asyncio.connection.Connection` instances when created
@@ -640,12 +641,13 @@ class RedisCluster(
                 "Unix domain socket is not supported in cluster mode"
             )
 
-        if (
-            topology_refresh_min_interval is not None
-            and topology_refresh_min_interval < 0
+        if topology_refresh_min_interval is not None and (
+            not math.isfinite(topology_refresh_min_interval)
+            or topology_refresh_min_interval < 0
         ):
             raise RedisClusterException(
-                "Argument 'topology_refresh_min_interval' must not be negative"
+                "Argument 'topology_refresh_min_interval' must be a finite,"
+                " non-negative number"
             )
 
         port_is_provided = bool(port) or type(port) is int

@@ -20,10 +20,16 @@ from redis.commands.metadata import (
     RequestPolicy,
     ResponsePolicy,
 )
-from redis.exceptions import IncorrectPolicyType, RedisError, ResponseError
+from redis.exceptions import (
+    DataError,
+    IncorrectPolicyType,
+    RedisError,
+    ResponseError,
+)
 from redis.utils import deprecated_function, str_if_bytes
 
 if TYPE_CHECKING:
+    from redis._parsers.encoders import Encoder
     from redis.asyncio.cluster import ClusterNode
 
 # The record type ``_build_command_records`` builds per command: policies or full metadata.
@@ -101,35 +107,35 @@ class AbstractCommandsParser:
                 keynumidx, firstkey = a, b
                 if first + keynumidx >= argc:
                     return None
-                numkeys = _parse_numkeys(args[first + keynumidx])
+                numkeys = _parse_numkeys(args[first + keynumidx], self._encoder)
                 if numkeys is None or numkeys < 0:
                     return None
                 first += firstkey
                 last = first + (numkeys - 1) * step
+            if last < first:
+                # No keys, as for the server; a negative slice end would wrap.
+                continue
             if last >= argc:
                 return None
             keys.extend(args[first : last + 1 : step])
         return keys
 
 
-def _parse_numkeys(value):
+def _parse_numkeys(value, encoder):
     """
     The key count as the server reads it, or None for a value it rejects.
-    int() also accepts "+2", " 2", "02", "2_0" and the float 2.5.
+    Checks the bytes the client sends: int() also accepts "+2", " 2", "02",
+    "2_0" and 2.5, and a str is sent in the client's encoding.
     """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        value = repr(value)
-    elif isinstance(value, (bytes, bytearray)):
-        value = value.decode("ascii", "replace")
-    elif not isinstance(value, str):
-        return None
     try:
-        numkeys = int(value)
-    except ValueError:
+        raw = encoder.encode(value)
+    except DataError:
         return None
-    return numkeys if str(numkeys) == value else None
+    if not isinstance(raw, (bytes, bytearray)) or not raw.isdigit():
+        return None
+    if len(raw) > 1 and raw.startswith(b"0"):
+        return None
+    return int(raw)
 
 
 def _compile_movablekeys_specs(commands):
@@ -205,6 +211,7 @@ class CommandsParser(AbstractCommandsParser):
     def __init__(self, redis_connection):
         self.commands = {}
         self._movablekeys_specs = {}
+        self._encoder = None
         self.redis_connection = redis_connection
         self.initialize(self.redis_connection)
 
@@ -218,6 +225,7 @@ class CommandsParser(AbstractCommandsParser):
             commands[cmd.lower()] = commands.pop(cmd)
         self.commands = commands
         self._movablekeys_specs = _compile_movablekeys_specs(commands)
+        self._encoder = r.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -391,6 +399,7 @@ class AsyncCommandsParser(AbstractCommandsParser):
     def __init__(self) -> None:
         self.commands: Dict[str, Union[int, Dict[str, Any]]] = {}
         self._movablekeys_specs: Dict[str, Optional[Tuple]] = {}
+        self._encoder: Optional["Encoder"] = None
 
     async def initialize(self, node: Optional["ClusterNode"] = None) -> None:
         if node:
@@ -399,6 +408,7 @@ class AsyncCommandsParser(AbstractCommandsParser):
         commands = await self.node.execute_command("COMMAND")
         self.commands = {cmd.lower(): command for cmd, command in commands.items()}
         self._movablekeys_specs = _compile_movablekeys_specs(self.commands)
+        self._encoder = self.node.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions

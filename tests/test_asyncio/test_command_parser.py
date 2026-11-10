@@ -2,7 +2,7 @@ from unittest import mock
 
 import pytest
 
-from redis._parsers import AsyncCommandsParser
+from redis._parsers import AsyncCommandsParser, Encoder
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
 from tests.conftest import skip_if_server_version_gte, skip_if_server_version_lt
 from tests.helpers import get_expected_command_policies
@@ -67,6 +67,25 @@ class TestAsyncCommandParser:
             for numkeys in cases:
                 await commands_parser.get_keys("LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
         assert server.call_count == len(cases)
+
+    @pytest.mark.asyncio
+    @skip_if_server_version_lt("7.0.0")
+    async def test_key_count_is_read_from_the_encoded_bytes(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        args = ["lmpop", "2", "{a}x", "{b}y", "LEFT"]
+        assert commands_parser._get_keys_from_specs("lmpop", args) == ["{a}x", "{b}y"]
+        # The server would get b"2\x00" and reject it.
+        commands_parser._encoder = Encoder("utf-16-le", "strict", False)
+        assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    @pytest.mark.asyncio
+    async def test_empty_key_range_yields_no_keys(self, r):
+        commands_parser = AsyncCommandsParser()
+        await commands_parser.initialize(node=r.get_default_node())
+        commands_parser._movablekeys_specs = {"modcmd": (("keynum", 1, 0, 1, 4),)}
+        args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
+        assert commands_parser._get_keys_from_specs("modcmd", args) == []
 
     @pytest.mark.asyncio
     @skip_if_server_version_gte("8.5.240")

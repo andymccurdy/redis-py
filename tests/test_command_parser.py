@@ -1,7 +1,7 @@
 from unittest import mock
 
 import pytest
-from redis._parsers import CommandsParser
+from redis._parsers import CommandsParser, Encoder
 from redis._parsers.commands import _compile_key_specs
 from redis.commands.metadata import RequestPolicy, ResponsePolicy
 from tests.helpers import get_expected_command_policies
@@ -118,6 +118,21 @@ class TestCommandsParser:
             for numkeys in cases:
                 commands_parser.get_keys(r, "LMPOP", numkeys, "{a}x", "{b}y", "LEFT")
         assert server.call_count == len(cases)
+
+    @skip_if_server_version_lt("7.0.0")
+    def test_key_count_is_read_from_the_encoded_bytes(self, r):
+        commands_parser = CommandsParser(r)
+        args = ["lmpop", "2", "{a}x", "{b}y", "LEFT"]
+        assert commands_parser._get_keys_from_specs("lmpop", args) == ["{a}x", "{b}y"]
+        # The server would get b"2\x00" and reject it.
+        commands_parser._encoder = Encoder("utf-16-le", "strict", False)
+        assert commands_parser._get_keys_from_specs("lmpop", args) is None
+
+    def test_empty_key_range_yields_no_keys(self, r):
+        commands_parser = CommandsParser(r)
+        commands_parser._movablekeys_specs = {"modcmd": (("keynum", 1, 0, 1, 4),)}
+        args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
+        assert commands_parser._get_keys_from_specs("modcmd", args) == []
 
     def test_compile_key_specs_follows_the_server_flags(self):
         def spec(*flags):

@@ -5511,6 +5511,20 @@ class ClusterPubSub(PubSub):
         self, timeout: float = 0.0
     ) -> Tuple[Optional[PubSub], Optional[Dict[str, Any]]]:
         """Generate messages from shard channels across all nodes."""
+        if timeout and len(self.node_pubsub_mapping) > 1:
+            # Block only when no node has data, so a busy shard does not wait
+            # out the slices of its idle siblings.
+            pubsub, message = await self._sharded_pass(0.0)
+            if message is None:
+                pubsub, message = await self._sharded_pass(timeout)
+        else:
+            pubsub, message = await self._sharded_pass(timeout)
+        if message is _DISPATCHED:
+            return None, None
+        return pubsub, message
+
+    async def _sharded_pass(self, timeout: float) -> Tuple[Optional[PubSub], Any]:
+        """Poll each node once; ``message`` may be ``_DISPATCHED``."""
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
@@ -5614,9 +5628,6 @@ class ClusterPubSub(PubSub):
                 node_name = self._find_node_name_for_pubsub(pubsub)
                 if node_name is not None:
                     self._unreachable_nodes.discard(node_name)
-            if message is _DISPATCHED:
-                # End the pass so a busy shard is not held back by idle ones.
-                return None, None
             if message is not None:
                 return pubsub, message
         if first_error is not None and failed == polled:
@@ -5624,7 +5635,7 @@ class ClusterPubSub(PubSub):
         if split and polled:
             # A message can reach a node after its slice ran out; sweep once
             # without waiting before reporting a timeout.
-            return await self._sharded_message_generator(0.0)
+            return await self._sharded_pass(0.0)
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)
         return None, None
@@ -5895,6 +5906,8 @@ class ClusterPubSub(PubSub):
             if pubsub:
                 try:
                     message = await self._poll_node_pubsub(pubsub, timeout)
+                    if message is _DISPATCHED:
+                        message = None
                 except MovedError as e:
                     # Same handling as the round-robin path: the caller cannot
                     # act on a MovedError raised out of a pubsub read, and the
@@ -5915,7 +5928,7 @@ class ClusterPubSub(PubSub):
         else:
             pubsub, message = await self._sharded_message_generator(timeout=timeout)
 
-        if message is None or message is _DISPATCHED:
+        if message is None:
             return None
         # Only sunsubscribe mutates cluster-level shard state; bypassing the
         # lock on the data-message hot path keeps smessage delivery from

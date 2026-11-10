@@ -25,7 +25,7 @@ import redis.asyncio as redis
 from redis.asyncio import Subscription
 from redis._parsers import Encoder
 from redis.asyncio.client import PubSub
-from redis.asyncio.cluster import ClusterPubSub
+from redis.asyncio.cluster import _DISPATCHED, ClusterPubSub
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.crc import key_slot
@@ -3606,9 +3606,9 @@ class TestClusterPubSubSlotMigration:
                 None,
             )
 
-        # The mock returns at once, so each node also inherits the unspent
-        # share of the ones before it; then one non-blocking sweep.
-        slices = [0.4 / 4, 0.4 / 3, 0.4 / 2, 0.4] + [0.0] * 4
+        # A non-blocking sweep, the timed pass, and a last sweep. The mock
+        # returns at once, so each node inherits the unspent share before it.
+        slices = [0.0] * 4 + [0.4 / 4, 0.4 / 3, 0.4 / 2, 0.4] + [0.0] * 4
         assert [c.args[1] for c in poll.call_args_list] == pytest.approx(
             slices, abs=0.01
         )
@@ -3629,11 +3629,11 @@ class TestClusterPubSubSlotMigration:
         ) as poll:
             await pubsub._sharded_message_generator(timeout=0.4)
 
-        assert poll.call_args_list[0].args == (healthy, pytest.approx(0.4, abs=0.01))
+        # [0] is the non-blocking sweep, which skips the cooling node too.
+        assert poll.call_args_list[0].args == (healthy, 0.0)
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
 
     async def test_sharded_message_generator_ends_pass_after_dispatch(self):
-        from redis.asyncio.cluster import _DISPATCHED
-
         pubsub = self._make_cluster_pubsub()
         nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
         pubsub.node_pubsub_mapping = {
@@ -3641,16 +3641,16 @@ class TestClusterPubSubSlotMigration:
         }
         self._prime_generator(pubsub)
 
-        # A handler took the first node's message: the idle node must not get
-        # the rest of the wait.
-        poll = AsyncMock(side_effect=[_DISPATCHED, None])
+        # The sweep finds nothing, then a handler takes the first node's message
+        # in the timed pass: the idle node must not get the rest of the wait.
+        poll = AsyncMock(side_effect=[None, None, _DISPATCHED, None])
         with patch.object(pubsub, "_poll_node_pubsub", poll):
             assert await pubsub._sharded_message_generator(timeout=0.4) == (
                 None,
                 None,
             )
 
-        assert poll.call_count == 1
+        assert poll.call_count == 3
 
     async def test_sharded_message_generator_sweeps_for_late_message(self):
         pubsub = self._make_cluster_pubsub()
@@ -3663,12 +3663,37 @@ class TestClusterPubSubSlotMigration:
 
         # The message reaches the first node only after its slice ran out.
         with patch.object(
-            pubsub, "_poll_node_pubsub", AsyncMock(side_effect=[None, None, msg])
+            pubsub,
+            "_poll_node_pubsub",
+            AsyncMock(side_effect=[None, None, None, None, msg]),
         ):
             assert await pubsub._sharded_message_generator(timeout=0.4) == (
                 idle[0],
                 msg,
             )
+
+    async def test_sharded_message_generator_does_not_block_a_busy_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        hot = self._make_node_pubsub({b"hot": None})
+        idle = self._make_node_pubsub({b"idle": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": hot, "127.0.0.1:7001": idle}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"hot", "data": b"x"}
+
+        async def poll(ps, timeout):
+            return msg if ps is hot else None
+
+        with patch.object(
+            pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)
+        ) as p:
+            # The second call starts on the idle node, after the hot one.
+            for _ in range(2):
+                assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                    hot,
+                    msg,
+                )
+
+        assert [c.args[1] for c in p.call_args_list] == [0.0, 0.0, 0.0]
 
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """

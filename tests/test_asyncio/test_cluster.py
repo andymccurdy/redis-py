@@ -5004,7 +5004,8 @@ class TestStaticMetadataRouting:
 
     The ``movablekeys`` reads are the sharp case, and get their own test. Their keys live only in
     the ``COMMAND`` key specifications, so ``first_key_pos`` is 0; their records carry the keyed
-    defaults, and the client finds the keys through ``COMMAND GETKEYS``.
+    defaults, and the client reads the keys from those specs, asking the server with
+    ``COMMAND GETKEYS`` only where a spec is incomplete.
 
     Key extraction itself is covered by ``tests/test_asyncio/test_command_parser.py``, so it is
     stubbed here and these tests assert only the node the command is dispatched to.

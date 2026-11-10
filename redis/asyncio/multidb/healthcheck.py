@@ -498,6 +498,9 @@ class AbstractHealthCheckPolicy(HealthCheckPolicy):
                         ],
                         dynamic_startup_nodes=nodes_manager._dynamic_startup_nodes,
                         address_remap=nodes_manager.address_remap,
+                        topology_refresh_min_interval=(
+                            nodes_manager._topology_refresh_min_interval
+                        ),
                         require_full_coverage=require_full_coverage,
                         retry=database.client.retry,
                         **filtered_kwargs,

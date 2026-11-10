@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 import socket
 import sys
@@ -757,19 +758,25 @@ class MaintNotificationsAbstractRedisCluster:
 # a row, the next one waits as long as the client's retry backoff says for that
 # many failures, but never less than this. Server-pushed refreshes (SMIGRATED),
 # the first initialize and direct ``NodesManager.initialize()`` calls, such as
-# the one a CLUSTERDOWN or an uncovered slot runs, are not limited.
+# the one a CLUSTERDOWN or an uncovered slot runs, are not limited. This is the
+# default of the cluster clients' ``topology_refresh_min_interval`` argument.
 _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS = 1.0
 
 
 def _topology_refresh_delay(
-    retry: Optional[AbstractRetry], failed_refreshes: int
+    retry: AbstractRetry | None,
+    failed_refreshes: int,
+    min_interval: float | None = None,
 ) -> float:
     """
     How long an error-triggered topology refresh waits after the previous one:
     the minimum interval, or what the retry backoff gives for that many failed
-    refreshes in a row, whichever is longer.
+    refreshes in a row, whichever is longer. A :min_interval: of None stands for
+    _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS.
     """
-    delay = _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS
+    if min_interval is None:
+        min_interval = _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS
+    delay = min_interval
     # A duck-typed retry policy may have no backoff to compute a delay from
     backoff = getattr(retry, "_backoff", None)
     if failed_refreshes and backoff is not None:
@@ -1159,24 +1166,25 @@ class RedisCluster(
     )
     def __init__(
         self,
-        host: Optional[str] = None,
+        host: str | None = None,
         port: int = 6379,
-        startup_nodes: Optional[List["ClusterNode"]] = None,
+        startup_nodes: List["ClusterNode"] | None = None,
         cluster_error_retry_attempts: int = DEFAULT_RETRY_COUNT,
-        retry: Optional["Retry"] = None,
+        retry: Retry | None = None,
         require_full_coverage: bool = True,
         reinitialize_steps: int = 5,
         read_from_replicas: bool = False,
-        load_balancing_strategy: Optional["LoadBalancingStrategy"] = None,
+        load_balancing_strategy: "LoadBalancingStrategy | None" = None,
         dynamic_startup_nodes: bool = True,
-        url: Optional[str] = None,
-        address_remap: Optional[Callable[[Tuple[str, int]], Tuple[str, int]]] = None,
-        cache: Optional[CacheInterface] = None,
-        cache_config: Optional[CacheConfig] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
-        policy_resolver: Optional[PolicyResolver] = None,
-        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
-        metadata_resolver: Optional[MetadataResolver] = None,
+        url: str | None = None,
+        address_remap: Callable[[Tuple[str, int]], Tuple[str, int]] | None = None,
+        cache: CacheInterface | None = None,
+        cache_config: CacheConfig | None = None,
+        event_dispatcher: EventDispatcher | None = None,
+        policy_resolver: PolicyResolver | None = None,
+        maint_notifications_config: MaintNotificationsConfig | None = None,
+        metadata_resolver: MetadataResolver | None = None,
+        topology_refresh_min_interval: float | None = None,
         **kwargs,
     ):
         """
@@ -1231,9 +1239,10 @@ class RedisCluster(
             waits a fixed 0.25 seconds before it. A topology refresh triggered
             by an error (connection errors, the ``reinitialize_steps`` MOVED
             threshold) is run by the first command attempt to start once it is
-            due, at most once per second; after refreshes that failed in a row,
-            the next one waits as long as the backoff gives for that many
-            failures, but at least one second. A command that failed with a
+            due, at most once per ``topology_refresh_min_interval``; after
+            refreshes that failed in a row, the next one waits as long as the
+            backoff gives for that many failures, but at least
+            ``topology_refresh_min_interval``. A command that failed with a
             connection error or a timeout gives up with
             :class:`~.RedisClusterUnreachableError` once a refresh that ended
             since reached no node, or when it runs out of retries while the
@@ -1257,7 +1266,7 @@ class RedisCluster(
             Every MOVED error patches its slot, so the redirect goes to the new
             owner; the refresh is only asked for, and like every refresh
             triggered by an error, it is run by the next command attempt once
-            due, at most once per second.
+            due, at most once per ``topology_refresh_min_interval``.
         :param address_remap:
             An optional callable which, when provided with an internal network
             address of a node, e.g. a `(host, port)` tuple, will return the address
@@ -1307,6 +1316,17 @@ class RedisCluster(
             If not provided and protocol is RESP3, the maintenance notifications
             will be enabled by default (logic is included in the NodesManager
             initialization).
+        :param topology_refresh_min_interval:
+            The minimum number of seconds between two topology refreshes
+            triggered by errors (connection errors, the ``reinitialize_steps``
+            MOVED threshold, pipeline failures, pubsub repair). Requests made in
+            between are collapsed into one refresh, run by the next command
+            attempt once the interval has passed. After refreshes that failed in
+            a row, the ``retry`` backoff can make the wait longer, never shorter.
+            0 lets every requested refresh run at once. Must be finite and not negative.
+            Server-pushed refreshes (SMIGRATED), the first initialization and the
+            refresh a ``CLUSTERDOWN`` or an uncovered slot runs are not limited.
+            Defaults to one second when not set.
         :**kwargs:
             Extra arguments that will be sent into Redis instance when created
             (See Official redis-py doc for supported kwargs - the only limitation
@@ -1346,6 +1366,15 @@ class RedisCluster(
         if kwargs.pop("unix_socket_path", None) is not None:
             raise RedisClusterException(
                 "RedisCluster does not currently support Unix Domain Socket connections"
+            )
+
+        if topology_refresh_min_interval is not None and (
+            not math.isfinite(topology_refresh_min_interval)
+            or topology_refresh_min_interval < 0
+        ):
+            raise RedisClusterException(
+                "Argument 'topology_refresh_min_interval' must be a finite,"
+                " non-negative number"
             )
 
         # Get the startup node/s
@@ -1459,6 +1488,7 @@ class RedisCluster(
             event_dispatcher=self._event_dispatcher,
             maint_notifications_config=maint_notifications_config,
             himport_registry=self._himport_registry,
+            topology_refresh_min_interval=topology_refresh_min_interval,
             **kwargs,
         )
 
@@ -3124,17 +3154,18 @@ class NodesManager:
         startup_nodes: list[ClusterNode],
         from_url=False,
         require_full_coverage=False,
-        lock: Optional[threading.RLock] = None,
+        lock: "threading.RLock | None" = None,
         dynamic_startup_nodes=True,
         connection_pool_class=ConnectionPool,
-        address_remap: Optional[Callable[[Tuple[str, int]], Tuple[str, int]]] = None,
-        cache: Optional[CacheInterface] = None,
-        cache_config: Optional[CacheConfig] = None,
-        cache_factory: Optional[CacheFactoryInterface] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
-        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
+        address_remap: Callable[[Tuple[str, int]], Tuple[str, int]] | None = None,
+        cache: CacheInterface | None = None,
+        cache_config: CacheConfig | None = None,
+        cache_factory: CacheFactoryInterface | None = None,
+        event_dispatcher: EventDispatcher | None = None,
+        maint_notifications_config: MaintNotificationsConfig | None = None,
         himport_registry: HImportRegistry | None = None,
-        metadata_resolver: Optional[MetadataResolver] = None,
+        metadata_resolver: MetadataResolver | None = None,
+        topology_refresh_min_interval: float | None = None,
         **kwargs,
     ):
         # Shared, cluster-wide HIMPORT registry object, injected onto every node's pool
@@ -3156,6 +3187,9 @@ class NodesManager:
         # every node must resolve command metadata - and therefore cache eligibility -
         # through the one object the cluster client was configured with.
         self._metadata_resolver = metadata_resolver
+        # The minimum interval between error-triggered refreshes, or None for
+        # _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS. See _refresh_due.
+        self._topology_refresh_min_interval = topology_refresh_min_interval
 
         self._cache: Optional[CacheInterface] = None
         if cache:
@@ -3665,7 +3699,7 @@ class NodesManager:
                 # Never a client of the topology, whatever the flag says
                 self._free_pool_connections(r.connection_pool)
 
-    def _refresh_due(self, retry: Optional[AbstractRetry] = None) -> bool:
+    def _refresh_due(self, retry: AbstractRetry | None = None) -> bool:
         """
         Whether a topology refresh triggered by an error may run now: not
         before the delay of _topology_refresh_delay has passed since the
@@ -3684,7 +3718,9 @@ class NodesManager:
                     if last_refresh_at is None:
                         return True
                     due_at = last_refresh_at + _topology_refresh_delay(
-                        retry, self._failed_refreshes
+                        retry,
+                        self._failed_refreshes,
+                        self._topology_refresh_min_interval,
                     )
                     self._refresh_due_at = due_at
         return time.monotonic() >= due_at
@@ -4895,7 +4931,7 @@ class ClusterPubSub(PubSub):
         # second finds nothing left to run (or a refresh that already completed
         # after its request) and returns without a CLUSTER SLOTS round trip.
         self._next_topology_repair = now + SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
-        # The refresh is subject to _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS like
+        # The refresh is subject to the topology refresh minimum interval like
         # every other error-triggered one: if it is not due yet, the request
         # stays and the next command, or the next repair, runs it.
         nodes_manager = self.cluster.nodes_manager

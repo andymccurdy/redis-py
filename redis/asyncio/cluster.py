@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import logging
+import math
 import random
 import threading
 import time
@@ -426,7 +427,7 @@ class RedisCluster(
           Every MOVED error patches its slot, so the redirect goes to the new owner;
           the refresh is only asked for, and like every refresh triggered by an
           error, it is run by the next command attempt once due, at most once per
-          second.
+          ``topology_refresh_min_interval``.
     :param cluster_error_retry_attempts:
         | @deprecated - Please configure the 'retry' object instead
           In case 'retry' object is set - this argument is ignored!
@@ -442,12 +443,13 @@ class RedisCluster(
           waits a fixed 0.25 seconds before it. A topology refresh triggered by an
           error (connection errors, the ``reinitialize_steps`` MOVED threshold) is
           run by the first command attempt to start once it is due, at most once
-          per second; after refreshes that failed in a row, the next one waits as
-          long as the backoff gives for that many failures, but at least one
-          second. A command that failed with a connection error or a timeout
-          gives up with :class:`~.RedisClusterUnreachableError` once a refresh
-          that ended since reached no node, or when it runs out of retries while
-          the last refresh did.
+          per ``topology_refresh_min_interval``; after refreshes that failed in a
+          row, the next one waits as long as the backoff gives for that many
+          failures, but at least ``topology_refresh_min_interval``. A command that
+          failed with a connection error or a timeout gives up with
+          :class:`~.RedisClusterUnreachableError` once a refresh that ended since
+          reached no node, or when it runs out of retries while the last refresh
+          did.
           Backoffs that keep state between calls
           (:class:`~.DecorrelatedJitterBackoff`) are not fully supported: the
           retry object is shared by every command and pipeline of the client, so
@@ -473,6 +475,17 @@ class RedisCluster(
           where the node is reachable.  This can be used to map the addresses at
           which the nodes _think_ they are, to addresses at which a client may
           reach them, such as when they sit behind a proxy.
+    :param topology_refresh_min_interval:
+        | The minimum number of seconds between two topology refreshes triggered
+          by errors (connection errors, the ``reinitialize_steps`` MOVED
+          threshold, pipeline failures, pubsub repair). Requests made in between
+          are collapsed into one refresh, run by the next command attempt once
+          the interval has passed. After refreshes that failed in a row, the
+          ``retry`` backoff can make the wait longer, never shorter. 0 lets every
+          requested refresh run at once. Must be finite and not negative.
+          Server-pushed refreshes (SMIGRATED), the first initialization and the
+          refresh a ``CLUSTERDOWN`` or an uncovered slot runs are not limited.
+          Defaults to one second when not set.
 
     | Rest of the arguments will be passed to the
       :class:`~redis.asyncio.connection.Connection` instances when created
@@ -616,6 +629,7 @@ class RedisCluster(
         policy_resolver: AsyncPolicyResolver | None = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
         metadata_resolver: AsyncMetadataResolver | None = None,
+        topology_refresh_min_interval: float | None = None,
     ) -> None:
         if db:
             raise RedisClusterException(
@@ -625,6 +639,15 @@ class RedisCluster(
         if path:
             raise RedisClusterException(
                 "Unix domain socket is not supported in cluster mode"
+            )
+
+        if topology_refresh_min_interval is not None and (
+            not math.isfinite(topology_refresh_min_interval)
+            or topology_refresh_min_interval < 0
+        ):
+            raise RedisClusterException(
+                "Argument 'topology_refresh_min_interval' must be a finite,"
+                " non-negative number"
             )
 
         port_is_provided = bool(port) or type(port) is int
@@ -764,6 +787,7 @@ class RedisCluster(
             dynamic_startup_nodes=dynamic_startup_nodes,
             address_remap=address_remap,
             event_dispatcher=self._event_dispatcher,
+            topology_refresh_min_interval=topology_refresh_min_interval,
         )
         AsyncMaintNotificationsAbstractRedisCluster.__init__(
             self,
@@ -862,15 +886,15 @@ class RedisCluster(
 
     async def initialize(
         self,
-        additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
-        last_failed_node_name: Optional[str] = None,
+        additional_startup_nodes_info: List[Tuple[str, int]] | None = None,
+        last_failed_node_name: str | None = None,
     ) -> "RedisCluster":
         """
         Get all nodes from startup nodes & creates connections if not initialized.
 
         Once initialized, this refreshes the topology only when one was asked
         for (``_initialize`` is set by the error paths), and no sooner than
-        ``_TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS`` after the previous refresh,
+        ``topology_refresh_min_interval`` after the previous refresh,
         or longer after refreshes that failed (see ``_topology_refresh_delay``).
         Until then it returns at once and the current topology keeps serving.
         It also returns at once while another task runs the refresh: only the
@@ -2805,6 +2829,7 @@ class NodesManager:
         "slots_cache",
         "startup_nodes",
         "address_remap",
+        "_topology_refresh_min_interval",
         "_last_refresh_at",
         "_failed_refreshes",
         "_refresh_due_at",
@@ -2820,13 +2845,17 @@ class NodesManager:
         require_full_coverage: bool,
         connection_kwargs: Dict[str, Any],
         dynamic_startup_nodes: bool = True,
-        address_remap: Optional[Callable[[Tuple[str, int]], Tuple[str, int]]] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
+        address_remap: Callable[[Tuple[str, int]], Tuple[str, int]] | None = None,
+        event_dispatcher: EventDispatcher | None = None,
+        topology_refresh_min_interval: float | None = None,
     ) -> None:
         self.startup_nodes = {node.name: node for node in startup_nodes}
         self.require_full_coverage = require_full_coverage
         self.connection_kwargs = connection_kwargs
         self.address_remap = address_remap
+        # The minimum interval between error-triggered refreshes, or None for
+        # _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS. See _refresh_due.
+        self._topology_refresh_min_interval = topology_refresh_min_interval
 
         self.default_node: "ClusterNode" = None
         self.nodes_cache: Dict[str, "ClusterNode"] = {}
@@ -3073,7 +3102,7 @@ class NodesManager:
                     return_exceptions=True,
                 )
 
-    def _refresh_due(self, retry: Optional[Retry] = None) -> bool:
+    def _refresh_due(self, retry: Retry | None = None) -> bool:
         """
         Whether a topology refresh triggered by an error may run now: not
         before the delay of _topology_refresh_delay has passed since the
@@ -3086,7 +3115,9 @@ class NodesManager:
             if last_refresh_at is None:
                 return True
             due_at = last_refresh_at + _topology_refresh_delay(
-                retry, self._failed_refreshes
+                retry,
+                self._failed_refreshes,
+                self._topology_refresh_min_interval,
             )
             self._refresh_due_at = due_at
         return time.monotonic() >= due_at
@@ -5750,7 +5781,7 @@ class ClusterPubSub(PubSub):
         # one that succeeds answers it, so no command repeats it
         self.cluster._request_refresh()
         if not self.cluster.nodes_manager._refresh_due(self.cluster.retry):
-            # Subject to _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS like every other
+            # Subject to the topology refresh minimum interval like every other
             # error-triggered refresh: the next command, or the next repair,
             # runs it once it is due
             return

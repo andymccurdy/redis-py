@@ -5523,9 +5523,9 @@ class ClusterPubSub(PubSub):
                 if start >= deadline:
                     break
                 pubsub, message = await self._sharded_pass(deadline - start)
-                if not self.node_pubsub_mapping:
-                    # Polls wait out their share, and a pass with every node in
-                    # cool-off sleeps; only an emptied mapping returns at once.
+                if not any(ps.connection for ps in self.node_pubsub_mapping.values()):
+                    # A pass with no connection to read returns without
+                    # suspending; looping on it would hold the event loop.
                     break
             if message is None:
                 # A message can reach a node after its slice ran out.

@@ -3763,6 +3763,27 @@ class TestClusterPubSubSlotMigration:
         # The sweep, the first timed slice, then a second pass over the rest.
         assert idle_polls[2] > 0
 
+    async def test_sharded_message_generator_stops_without_connections(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        for ps in nodes:
+            ps.connection = None
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # Every poll returns at once, so looping until the deadline would spin.
+        with patch.object(
+            pubsub, "_sharded_pass", wraps=pubsub._sharded_pass
+        ) as passes:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert passes.call_count == 3
+
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """
         Isolation must not swallow a total outage: with nothing left to poll

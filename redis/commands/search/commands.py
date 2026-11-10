@@ -12,6 +12,7 @@ from redis.commands.search.hybrid_query import (
     HybridQuery,
 )
 from redis.commands.search.hybrid_result import HybridCursorResult, HybridResult
+from redis.exceptions import DataError
 from redis.typing import KeyT
 from redis.utils import (
     check_protocol_version,
@@ -315,6 +316,9 @@ class SearchCommands:
             item_dict = pairs_to_dict(res_item, decode_keys=True)
             results.append(item_dict)
 
+        if kwargs.get("explain_score"):
+            self._split_hybrid_explain_scores(results)
+
         return HybridResult(
             total_results=int(res_dict["total_results"]),
             results=results,
@@ -455,6 +459,9 @@ class SearchCommands:
                     for key, value in item_dict.items()
                 }
             )
+
+        if kwargs.get("explain_score"):
+            self._split_hybrid_explain_scores(results)
 
         return HybridResult(
             total_results=int(res_dict["total_results"]),
@@ -629,6 +636,9 @@ class SearchCommands:
             else:
                 results.append(pairs_to_dict(res_item, decode_keys=True))
 
+        if kwargs.get("explain_score"):
+            self._split_hybrid_explain_scores(results)
+
         return HybridResult(
             total_results=int(res.get("total_results", 0)),
             results=results,
@@ -669,6 +679,9 @@ class SearchCommands:
                     }
                 )
 
+        if kwargs.get("explain_score"):
+            self._split_hybrid_explain_scores(results)
+
         return HybridResult(
             total_results=int(res.get("total_results", 0)),
             results=results,
@@ -685,6 +698,27 @@ class SearchCommands:
             if source_encodings:
                 encodings.update(source_encodings)
         return encodings or None
+
+    @staticmethod
+    def _split_hybrid_explain_scores(results):
+        """Split the ``EXPLAINSCORE`` ``score`` field of each FT.HYBRID row.
+
+        The server sends ``score`` as ``[value, explanation_tree]``; replace it
+        with a float ``score`` and a ``score_explain`` tree decoded to ``str``.
+        """
+        for row in results:
+            explained = row.get("score")
+            if isinstance(explained, list) and len(explained) == 2:
+                row["score"] = float(explained[0])
+                row["score_explain"] = SearchCommands._decode_score_explain(
+                    explained[1]
+                )
+
+    @staticmethod
+    def _decode_score_explain(tree):
+        if isinstance(tree, list):
+            return [SearchCommands._decode_score_explain(item) for item in tree]
+        return str_if_bytes(tree)
 
     @staticmethod
     def _decode_hybrid_field_value(value, key, field_encodings):
@@ -1375,6 +1409,7 @@ class SearchCommands:
         params_substitution: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
         timeout: Optional[int] = None,
         cursor: Optional[HybridCursorQuery] = None,
+        explain_score: bool = False,
     ) -> Union[HybridResult, HybridCursorResult, Pipeline]:
         """
         Execute a hybrid search using both text and vector queries
@@ -1392,10 +1427,32 @@ class SearchCommands:
             - **cursor**: HybridCursorQuery object - contains the cursor configuration.
                         ``WITHCURSOR`` for ``FT.HYBRID`` is exposed only by
                         Redis versions 8.4 to 8.10.
+            - **explain_score**: bool - if True, sends ``EXPLAINSCORE`` and each
+                        result gets a ``score`` (float) and a ``score_explain``
+                        (the server's nested explanation tree, as ``str``).
+                        With ``protocol=3`` and ``legacy_responses=True`` the
+                        native RESP3 result keeps the server's ``score`` pair,
+                        ``[score, explanation_tree]``, with ``bytes`` labels.
+                        Pipelines with ``legacy_responses=True`` also keep that
+                        raw pair; pipelines with ``legacy_responses=False``
+                        split it. Requires Redis 8.10 or later. Raises
+                        ``DataError`` when combined with ``cursor``. The server
+                        rejects it when the post processing has a ``GROUPBY``.
+                        If you load a document field named ``score``, give it
+                        an alias, such as ``load("@score", "AS", "doc_score")``.
+                        Without an alias, the field overwrites the score
+                        explanation, so the row has no ``score_explain`` key.
+                        With ``protocol=3``, the other loaded fields can also
+                        get wrong values.
 
 
         For more information see `FT.SEARCH <https://redis.io/commands/ft.hybrid>`.
         """
+        if explain_score and cursor:
+            # The cursor reads (``FT.CURSOR READ``) can't be parsed with the
+            # explanation: RESP2 turns each one into an extra row and RESP3
+            # drops it.
+            raise DataError("explain_score is not supported with cursor")
         index = self.index_name
         options = {}
         pieces = [HYBRID_CMD, index]
@@ -1405,6 +1462,9 @@ class SearchCommands:
         if post_processing:
             pieces.extend(post_processing.build_args())
             options["post_processing"] = post_processing
+        if explain_score:
+            pieces.append("EXPLAINSCORE")
+            options["explain_score"] = True
         if params_substitution:
             pieces.extend(self.get_params_args(params_substitution))
         if timeout is not None:
@@ -2027,6 +2087,7 @@ class AsyncSearchCommands(SearchCommands):
         params_substitution: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
         timeout: Optional[int] = None,
         cursor: Optional[HybridCursorQuery] = None,
+        explain_score: bool = False,
     ) -> Union[HybridResult, HybridCursorResult, Pipeline]:
         """
         Execute a hybrid search using both text and vector queries
@@ -2044,10 +2105,32 @@ class AsyncSearchCommands(SearchCommands):
             - **cursor**: HybridCursorQuery object - contains the cursor configuration.
                         ``WITHCURSOR`` for ``FT.HYBRID`` is exposed only by
                         Redis versions 8.4 to 8.10.
+            - **explain_score**: bool - if True, sends ``EXPLAINSCORE`` and each
+                        result gets a ``score`` (float) and a ``score_explain``
+                        (the server's nested explanation tree, as ``str``).
+                        With ``protocol=3`` and ``legacy_responses=True`` the
+                        native RESP3 result keeps the server's ``score`` pair,
+                        ``[score, explanation_tree]``, with ``bytes`` labels.
+                        Pipelines with ``legacy_responses=True`` also keep that
+                        raw pair; pipelines with ``legacy_responses=False``
+                        split it. Requires Redis 8.10 or later. Raises
+                        ``DataError`` when combined with ``cursor``. The server
+                        rejects it when the post processing has a ``GROUPBY``.
+                        If you load a document field named ``score``, give it
+                        an alias, such as ``load("@score", "AS", "doc_score")``.
+                        Without an alias, the field overwrites the score
+                        explanation, so the row has no ``score_explain`` key.
+                        With ``protocol=3``, the other loaded fields can also
+                        get wrong values.
 
 
         For more information see `FT.SEARCH <https://redis.io/commands/ft.hybrid>`.
         """
+        if explain_score and cursor:
+            # The cursor reads (``FT.CURSOR READ``) can't be parsed with the
+            # explanation: RESP2 turns each one into an extra row and RESP3
+            # drops it.
+            raise DataError("explain_score is not supported with cursor")
         index = self.index_name
         options = {}
         pieces = [HYBRID_CMD, index]
@@ -2057,6 +2140,9 @@ class AsyncSearchCommands(SearchCommands):
         if post_processing:
             pieces.extend(post_processing.build_args())
             options["post_processing"] = post_processing
+        if explain_score:
+            pieces.append("EXPLAINSCORE")
+            options["explain_score"] = True
         if params_substitution:
             pieces.extend(self.get_params_args(params_substitution))
         if timeout is not None:

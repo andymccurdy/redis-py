@@ -1184,6 +1184,30 @@ class TestPubSubRESP3Handler:
             self, p.get_message, ["my handler", [b"message", b"foo", b"test message"]]
         )
 
+    async def test_push_handler_not_left_on_released_connection(self, r):
+        if get_protocol_version(r) in [2, "2", None]:
+            return
+        p = r.pubsub(push_handler_func=self.my_handler)
+        await p.subscribe("foo")
+        await wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"subscribe", b"foo", 1]]
+        )
+        connection = p.connection
+        await p.aclose()
+        self.message = None
+
+        # The next pubsub gets the same pooled connection and has no handler
+        p2 = r.pubsub()
+        await p2.subscribe("foo")
+        assert p2.connection is connection
+        assert await wait_for_message(p2) == make_message("subscribe", "foo", 1)
+        assert await r.publish("foo", "test message") == 1
+        assert await wait_for_message(p2) == make_message(
+            "message", "foo", "test message"
+        )
+        assert self.message is None
+        await p2.aclose()
+
 
 @pytest.mark.onlynoncluster
 class TestPubSubAutoDecoding:

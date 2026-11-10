@@ -1292,6 +1292,29 @@ class TestPubSubRESP3Handler:
             ["my handler", [b"smessage", b"foo", b"test message"]],
         )
 
+    @pytest.mark.onlynoncluster
+    def test_push_handler_not_left_on_released_connection(self, r):
+        if is_resp2_connection(r):
+            return
+        p = r.pubsub(push_handler_func=self.my_handler)
+        p.subscribe("foo")
+        wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"subscribe", b"foo", 1]]
+        )
+        connection = p.connection
+        p.close()
+        self.message = None
+
+        # The next pubsub gets the same pooled connection and has no handler
+        p2 = r.pubsub()
+        p2.subscribe("foo")
+        assert p2.connection is connection
+        assert wait_for_message(p2) == make_message("subscribe", "foo", 1)
+        assert r.publish("foo", "test message") == 1
+        assert wait_for_message(p2) == make_message("message", "foo", "test message")
+        assert self.message is None
+        p2.close()
+
 
 class TestPubSubAutoDecoding:
     "These tests only validate that we get unicode values back"

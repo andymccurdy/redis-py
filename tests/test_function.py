@@ -161,3 +161,7 @@ class TestFunction:
         assert r.function_restore(payload, "FLUSH")
         with pytest.raises(ResponseError):
             r.fcall("get", 1, "foo")
+        # policy=None omits the policy, so the server appends like the default
+        r.function_delete("mylib")
+        assert r.function_restore(payload, None)
+        assert r.fcall("set", 1, "foo", "bar") == b"OK"

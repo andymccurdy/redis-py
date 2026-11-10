@@ -406,6 +406,11 @@ async def test_arrpop(decoded_r: redis.Redis):
     await decoded_r.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 4 == await decoded_r.json().arrpop("arr", Path.root_path(), 99)
 
+    # index=None pops the last element, like omitting it
+    await decoded_r.json().set("arr", Path.root_path(), [0, 1, 2])
+    assert 2 == await decoded_r.json().arrpop("arr", Path.root_path(), None)
+    assert [0, 1] == await decoded_r.json().get("arr")
+
     # none test
     await decoded_r.json().set("arr", Path.root_path(), [])
     assert await decoded_r.json().arrpop("arr") is None

@@ -4576,6 +4576,19 @@ class TestClusterPubSubSlotMigration:
         assert old_ps.reset_calls == 0
         assert old_node.name in pubsub.node_pubsub_mapping
 
+    @contextmanager
+    def _idle_polls(self, pubsub, time_module):
+        """Polls that find nothing and wait out their timeout on a fake clock."""
+        clock = [time.monotonic()]
+
+        def poll(ps, timeout):
+            clock[0] += timeout
+
+        with mock.patch(time_module) as fake_time:
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            with mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll) as p:
+                yield p
+
     def _prime_generator(self, pubsub):
         from redis.cluster import ClusterPubSub
 
@@ -4609,15 +4622,13 @@ class TestClusterPubSubSlotMigration:
         }
         self._prime_generator(pubsub)
 
-        with mock.patch.object(pubsub, "_poll_node_pubsub", return_value=None) as poll:
+        with self._idle_polls(pubsub, "redis.cluster.time") as poll:
             assert pubsub._sharded_message_generator(timeout=0.4) == (None, None)
 
-        # A non-blocking sweep, the timed pass, and a last sweep. The mock
-        # returns at once, so each node inherits the unspent share before it.
-        slices = [0.0] * 4 + [0.4 / 4, 0.4 / 3, 0.4 / 2, 0.4] + [0.0] * 4
-        assert [c.args[1] for c in poll.call_args_list] == pytest.approx(
-            slices, abs=0.01
-        )
+        # A non-blocking sweep, the timed pass in equal shares, a last sweep.
+        slices = [c.args[1] for c in poll.call_args_list]
+        assert slices[:8] == pytest.approx([0.0] * 4 + [0.1] * 4)
+        assert slices[-4:] == [0.0] * 4
 
     def test_sharded_message_generator_gives_skipped_share_to_others(self):
         pubsub = self._make_cluster_pubsub()
@@ -4630,7 +4641,7 @@ class TestClusterPubSubSlotMigration:
         self._prime_generator(pubsub)
         pubsub._poll_cool_off[cooling] = time.monotonic() + 30
 
-        with mock.patch.object(pubsub, "_poll_node_pubsub", return_value=None) as poll:
+        with self._idle_polls(pubsub, "redis.cluster.time") as poll:
             pubsub._sharded_message_generator(timeout=0.4)
 
         # [0] is the non-blocking sweep, which skips the cooling node too.
@@ -4695,6 +4706,7 @@ class TestClusterPubSubSlotMigration:
         self._prime_generator(pubsub)
         msg = {"type": "smessage", "channel": b"idle", "data": b"x"}
         idle_polls = []
+        clock = [time.monotonic()]
 
         def poll(ps, timeout):
             if ps is fast:
@@ -4703,11 +4715,16 @@ class TestClusterPubSubSlotMigration:
             # Arrives after the idle node's first slice, within the timeout.
             if len(idle_polls) == 3:
                 return msg
-            time.sleep(timeout)
+            clock[0] += timeout
             return None
 
-        with mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll):
-            assert pubsub._sharded_message_generator(timeout=0.2) == (idle, msg)
+        # A sub-millisecond pass still blocked on the idle node.
+        with (
+            mock.patch("redis.cluster.time") as fake_time,
+            mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll),
+        ):
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            assert pubsub._sharded_message_generator(timeout=0.001) == (idle, msg)
 
         # The sweep, the first timed slice, then a second pass over the rest.
         assert idle_polls[2] > 0

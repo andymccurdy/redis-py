@@ -4243,9 +4243,6 @@ SHARD_POLL_COOL_OFF_SECONDS = 1.0
 # Returned by _poll_node_pubsub when a handler consumed the message it read.
 _DISPATCHED = object()
 
-# A timed sharded pass shorter than this blocked on no node.
-_SHARD_PASS_MIN_BLOCK_SECONDS = 0.001
-
 # How long an unbounded sharded-pubsub poll waits for a not-yet-subscribed
 # per-node pubsub before re-checking that the pubsub is still in
 # node_pubsub_mapping. A retired one is never resubscribed and its
@@ -4642,8 +4639,9 @@ class ClusterPubSub(PubSub):
                 if start >= deadline:
                     break
                 pubsub, message = self._sharded_pass(deadline - start)
-                if time.monotonic() - start < _SHARD_PASS_MIN_BLOCK_SECONDS:
-                    # No node could block; looping would spin to the deadline.
+                if not self.node_pubsub_mapping:
+                    # Polls wait out their share, and a pass with every node in
+                    # cool-off sleeps; only an emptied mapping returns at once.
                     break
             if message is None:
                 # A message can reach a node after its slice ran out.

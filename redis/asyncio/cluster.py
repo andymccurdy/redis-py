@@ -5211,9 +5211,6 @@ SHARD_POLL_COOL_OFF_SECONDS = 1.0
 # Returned by _poll_node_pubsub when a handler consumed the message it read.
 _DISPATCHED = object()
 
-# A timed sharded pass shorter than this blocked on no node.
-_SHARD_PASS_MIN_BLOCK_SECONDS = 0.001
-
 # How often a failed sharded-pubsub poll may trigger a slots-cache refresh.
 # Reconciliation is otherwise purely event-driven, and a node that has left the
 # deployment answers ECONNREFUSED rather than MOVED - so without this the reader
@@ -5526,8 +5523,9 @@ class ClusterPubSub(PubSub):
                 if start >= deadline:
                     break
                 pubsub, message = await self._sharded_pass(deadline - start)
-                if time.monotonic() - start < _SHARD_PASS_MIN_BLOCK_SECONDS:
-                    # No node could block; looping would spin to the deadline.
+                if not self.node_pubsub_mapping:
+                    # Polls wait out their share, and a pass with every node in
+                    # cool-off sleeps; only an emptied mapping returns at once.
                     break
             if message is None:
                 # A message can reach a node after its slice ran out.

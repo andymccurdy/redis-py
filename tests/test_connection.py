@@ -5110,3 +5110,25 @@ def test_ssl_context_with_missing_certificate_file_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         _wrapped_ssl_context(conn)
+
+
+@pytest.mark.fixed_client
+class TestDeprecatedRespSymbols:
+    """``SYM_STAR`` and ``SYM_DOLLAR`` warn rather than disappearing."""
+
+    @pytest.mark.parametrize(
+        "name, value",
+        [("SYM_STAR", b"*"), ("SYM_DOLLAR", b"$")],
+    )
+    def test_warns_on_access(self, name, value):
+        import redis.connection as connection_module
+
+        with pytest.warns(DeprecationWarning, match=name):
+            assert getattr(connection_module, name) == value
+
+    def test_an_unknown_module_attribute_still_raises(self):
+        """The module ``__getattr__`` must not swallow a genuine typo."""
+        import redis.connection as connection_module
+
+        with pytest.raises(AttributeError, match="nosuchattribute"):
+            connection_module.nosuchattribute

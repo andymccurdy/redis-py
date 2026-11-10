@@ -457,7 +457,8 @@ that runs in a separate thread, essentially creating a tiny non-blocking
 event loop for you. run_in_thread() takes an optional sleep_time
 argument: how long each iteration of the loop waits on the socket for a
 message, so an idle thread notices thread.stop() within that time. A handler
-that is still running delays it; thread.stop(timeout=...) bounds the wait.
+that is still running, or a reconnect in progress, delays it;
+thread.stop(timeout=...) bounds the wait.
 The default of 0 polls without waiting and keeps a CPU core busy.
 
 Note: Since we're running in a separate thread, there's no way to handle

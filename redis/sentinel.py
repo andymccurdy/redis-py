@@ -1,6 +1,6 @@
 import random
 import weakref
-from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union
 
 from redis.client import Redis
 from redis.commands import SentinelCommands
@@ -11,6 +11,7 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+from redis.typing import EncodableT
 from redis.utils import SENTINEL
 
 DEMOTED_MASTER_UNBLOCKED_ERROR = (
@@ -416,7 +417,9 @@ class Sentinel(SentinelCommands):
         """
         return self.filter_slaves(replicas)
 
-    def discover_slaves(self, service_name):
+    def discover_slaves(
+        self, service_name: str
+    ) -> Sequence[Tuple[EncodableT, EncodableT]]:
         "Returns a list of alive slaves for service ``service_name``"
         for sentinel in self.sentinels:
             try:
@@ -428,7 +431,9 @@ class Sentinel(SentinelCommands):
                 return slaves
         return []
 
-    def discover_replicas(self, service_name):
+    def discover_replicas(
+        self, service_name: str
+    ) -> Sequence[Tuple[EncodableT, EncodableT]]:
         """Returns a list of alive replicas for service ``service_name``.
 
         This is an alias for :py:meth:`discover_slaves`,
@@ -531,9 +536,9 @@ class Sentinel(SentinelCommands):
 
     def replica_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """

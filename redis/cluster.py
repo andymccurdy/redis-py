@@ -4276,6 +4276,9 @@ class ClusterPubSubSlotsCacheListener(EventListenerInterface):
 # siblings hold undelivered messages.
 SHARD_POLL_COOL_OFF_SECONDS = 1.0
 
+# Returned by _poll_node_pubsub when a handler consumed the message it read.
+_DISPATCHED = object()
+
 # How long an unbounded sharded-pubsub poll waits for a not-yet-subscribed
 # per-node pubsub before re-checking that the pubsub is still in
 # node_pubsub_mapping. A retired one is never resubscribed and its
@@ -4660,11 +4663,52 @@ class ClusterPubSub(PubSub):
         self._pubsubs_generator = type(self)._pubsubs_generator(self)
 
     def _sharded_message_generator(self, timeout=0.0):
+        if timeout and len(self.node_pubsub_mapping) > 1:
+            # Block only when no node has data, so a busy shard does not wait
+            # out the slices of its idle siblings.
+            deadline = time.monotonic() + timeout
+            pubsub, message = self._sharded_pass(0.0)
+            while message is None:
+                # A node that returns early leaves time the nodes before it
+                # did not get; pass again until the deadline.
+                start = time.monotonic()
+                if start >= deadline:
+                    break
+                pubsub, message = self._sharded_pass(deadline - start)
+                if not self.node_pubsub_mapping:
+                    # Polls wait out their share, and a pass with every node in
+                    # cool-off sleeps; only an emptied mapping returns at once.
+                    break
+            if message is None:
+                # A message can reach a node after its slice ran out.
+                pubsub, message = self._sharded_pass(0.0)
+        else:
+            pubsub, message = self._sharded_pass(timeout)
+        if message is _DISPATCHED:
+            return None, None
+        return pubsub, message
+
+    def _sharded_pass(self, timeout):
+        """Poll each node once; ``message`` may be ``_DISPATCHED``."""
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
         next_ready: Optional[float] = None
-        for _ in range(len(self.node_pubsub_mapping)):
+        nodes = len(self.node_pubsub_mapping)
+        # Split the wait across the pass, otherwise every idle node ahead of the
+        # one with a message adds a full timeout. Each poll gets an equal share
+        # of what is left, so a skipped or fast-failing node passes its share on.
+        split = bool(timeout) and nodes > 1
+        node_timeout = timeout
+        if split:
+            pass_deadline = time.monotonic() + timeout
+            now = time.monotonic()
+            left = sum(
+                1
+                for ps in list(self.node_pubsub_mapping.values())
+                if self._poll_cool_off.get(ps, 0.0) <= now
+            )
+        for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
                 # node_pubsub_mapping was emptied between the len() above and
@@ -4679,8 +4723,11 @@ class ClusterPubSub(PubSub):
                         next_ready = deadline
                     continue
             polled += 1
+            if split:
+                node_timeout = max(pass_deadline - time.monotonic(), 0.0) / max(left, 1)
+                left -= 1
             try:
-                message = self._poll_node_pubsub(pubsub, timeout)
+                message = self._poll_node_pubsub(pubsub, node_timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next
@@ -4876,7 +4923,9 @@ class ClusterPubSub(PubSub):
                 # get_sharded_message handle the filtering after processing
                 # subscription state changes
                 return pubsub.handle_message(response, ignore_subscribe_messages=False)
-        return pubsub.handle_message(response, ignore_subscribe_messages=False)
+        message = pubsub.handle_message(response, ignore_subscribe_messages=False)
+        # None here means a handler took it, which is not an empty poll.
+        return _DISPATCHED if message is None else message
 
     @staticmethod
     def _is_publish_response(response) -> bool:
@@ -5045,6 +5094,8 @@ class ClusterPubSub(PubSub):
             if pubsub is not None:
                 try:
                     message = self._poll_node_pubsub(pubsub, timeout)
+                    if message is _DISPATCHED:
+                        message = None
                 except MovedError as e:
                     # Same handling as the round-robin path: the caller cannot
                     # act on a MovedError raised out of a pubsub read, and the

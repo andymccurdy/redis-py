@@ -5239,6 +5239,9 @@ class ClusterPubSubSlotsCacheListener(AsyncEventListenerInterface):
 # siblings hold undelivered messages.
 SHARD_POLL_COOL_OFF_SECONDS = 1.0
 
+# Returned by _poll_node_pubsub when a handler consumed the message it read.
+_DISPATCHED = object()
+
 # How often a failed sharded-pubsub poll may trigger a slots-cache refresh.
 # Reconciliation is otherwise purely event-driven, and a node that has left the
 # deployment answers ECONNREFUSED rather than MOVED - so without this the reader
@@ -5539,11 +5542,53 @@ class ClusterPubSub(PubSub):
         self, timeout: float = 0.0
     ) -> Tuple[Optional[PubSub], Optional[Dict[str, Any]]]:
         """Generate messages from shard channels across all nodes."""
+        if timeout and len(self.node_pubsub_mapping) > 1:
+            # Block only when no node has data, so a busy shard does not wait
+            # out the slices of its idle siblings.
+            deadline = time.monotonic() + timeout
+            pubsub, message = await self._sharded_pass(0.0)
+            while message is None:
+                # A node that returns early leaves time the nodes before it
+                # did not get; pass again until the deadline.
+                start = time.monotonic()
+                if start >= deadline:
+                    break
+                pubsub, message = await self._sharded_pass(deadline - start)
+                if not any(ps.connection for ps in self.node_pubsub_mapping.values()):
+                    # A pass with no connection to read returns without
+                    # suspending; looping on it would hold the event loop.
+                    break
+            if message is None:
+                # A message can reach a node after its slice ran out.
+                pubsub, message = await self._sharded_pass(0.0)
+        else:
+            pubsub, message = await self._sharded_pass(timeout)
+        if message is _DISPATCHED:
+            return None, None
+        return pubsub, message
+
+    async def _sharded_pass(self, timeout: float) -> Tuple[Optional[PubSub], Any]:
+        """Poll each node once; ``message`` may be ``_DISPATCHED``."""
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
+        unconnected = 0
         next_ready: Optional[float] = None
-        for _ in range(len(self.node_pubsub_mapping)):
+        nodes = len(self.node_pubsub_mapping)
+        # Split the wait across the pass, otherwise every idle node ahead of the
+        # one with a message adds a full timeout. Each poll gets an equal share
+        # of what is left, so a skipped or fast-failing node passes its share on.
+        split = bool(timeout) and nodes > 1
+        node_timeout = timeout
+        if split:
+            pass_deadline = time.monotonic() + timeout
+            now = time.monotonic()
+            left = sum(
+                1
+                for ps in list(self.node_pubsub_mapping.values())
+                if ps.connection is not None and self._poll_cool_off.get(ps, 0.0) <= now
+            )
+        for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
                 # node_pubsub_mapping was emptied between the len() above and
@@ -5557,9 +5602,17 @@ class ClusterPubSub(PubSub):
                     if next_ready is None or deadline < next_ready:
                         next_ready = deadline
                     continue
+            if pubsub.connection is None:
+                # Nothing to read and no wait: not a poll, so a pass whose
+                # other nodes are cooling off still sleeps below.
+                unconnected += 1
+                continue
             polled += 1
+            if split:
+                node_timeout = max(pass_deadline - time.monotonic(), 0.0) / max(left, 1)
+                left -= 1
             try:
-                message = await self._poll_node_pubsub(pubsub, timeout)
+                message = await self._poll_node_pubsub(pubsub, node_timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next
@@ -5627,7 +5680,8 @@ class ClusterPubSub(PubSub):
                     self._unreachable_nodes.discard(node_name)
             if message is not None:
                 return pubsub, message
-        if first_error is not None and failed == polled:
+        # An unconnected node is not down, so it keeps the error from surfacing.
+        if first_error is not None and failed == polled + unconnected:
             raise first_error
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)
@@ -5666,9 +5720,7 @@ class ClusterPubSub(PubSub):
             return nullcontext()
         return self._pubsub_io_lock(pubsub)
 
-    async def _poll_node_pubsub(
-        self, pubsub: PubSub, timeout: Optional[float]
-    ) -> Optional[Dict[str, Any]]:
+    async def _poll_node_pubsub(self, pubsub: PubSub, timeout: Optional[float]) -> Any:
         """Read one message from a per-node pubsub, dispatching outside the lock.
 
         Splits ``PubSub.get_message`` so the per-node I/O lock covers the wire
@@ -5726,7 +5778,9 @@ class ClusterPubSub(PubSub):
                 return await pubsub.handle_message(
                     response, ignore_subscribe_messages=False
                 )
-        return await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        message = await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        # None here means a handler took it, which is not an empty poll.
+        return _DISPATCHED if message is None else message
 
     @staticmethod
     def _is_publish_response(response: Any) -> bool:
@@ -5897,6 +5951,8 @@ class ClusterPubSub(PubSub):
             if pubsub:
                 try:
                     message = await self._poll_node_pubsub(pubsub, timeout)
+                    if message is _DISPATCHED:
+                        message = None
                 except MovedError as e:
                     # Same handling as the round-robin path: the caller cannot
                     # act on a MovedError raised out of a pubsub read, and the

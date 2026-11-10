@@ -136,8 +136,7 @@ class TestCommandsParser:
 
     def test_empty_key_range_yields_no_keys(self, r):
         commands_parser = CommandsParser(r)
-        commands_parser.commands["modcmd"] = {"arity": -2}
-        commands_parser._movablekeys_specs = {"modcmd": (("keynum", 1, 0, 1, 4),)}
+        commands_parser._movablekeys_specs = {"modcmd": (-2, (("keynum", 1, 0, 1, 4),))}
         args = ["modcmd", 0, "a", "b", "c", "d", "e", "f", "g"]
         assert commands_parser._get_keys_from_specs("modcmd", args) == []
 

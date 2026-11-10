@@ -89,12 +89,12 @@ class AbstractCommandsParser:
         initialize(), the way the server does, which saves the COMMAND GETKEYS
         round trip. Returns None when the server has to be asked.
         """
-        specs = self._movablekeys_specs.get(cmd_name)
-        if specs is None:
+        compiled = self._movablekeys_specs.get(cmd_name)
+        if compiled is None:
             return None
+        arity, specs = compiled
         argc = len(args)
         # COMMAND GETKEYS rejects a wrong argument count before reading specs.
-        arity = int(self.commands[cmd_name]["arity"])
         if argc < abs(arity) or (arity > 0 and argc != arity):
             return None
         keys = []
@@ -147,7 +147,7 @@ def _parse_numkeys(value, encoder):
 
 def _compile_movablekeys_specs(commands):
     """
-    Compile the key specs of every movablekeys command into tuples that
+    Compile every movablekeys command into an ``(arity, specs)`` pair that
     _get_keys_from_specs evaluates, or None where COMMAND GETKEYS has to be
     asked: no specs, a spec flagged incomplete or variable_flags (the server
     then ignores the specs too), or a search the client does not implement.
@@ -155,7 +155,10 @@ def _compile_movablekeys_specs(commands):
     compiled = {}
     for name, command in commands.items():
         if "movablekeys" in command["flags"]:
-            compiled[name] = _compile_key_specs(command.get("key_specifications"))
+            specs = _compile_key_specs(command.get("key_specifications"))
+            if specs is not None:
+                specs = (int(command["arity"]), specs)
+            compiled[name] = specs
     return compiled
 
 

@@ -1,7 +1,9 @@
 import asyncio
+from unittest import mock
 
 import pytest
 import redis.asyncio as redis
+from redis.asyncio.client import Monitor
 from redis.exceptions import MaxConnectionsError, NoPermissionError
 from tests.conftest import (
     skip_if_redis_enterprise,
@@ -98,6 +100,20 @@ class TestMonitor:
             assert isinstance(response["client_address"], str)
             assert isinstance(response["client_port"], str)
             assert response["command"] == "PING"
+
+    async def test_empty_client_info(self):
+        monitor = Monitor(mock.Mock())
+        monitor.connection = mock.AsyncMock()
+        monitor.connection.read_response.return_value = '1700000000.5 [0 ] "GET" "x"'
+        response = await monitor.next_command()
+        assert response == {
+            "time": 1700000000.5,
+            "db": 0,
+            "client_address": "",
+            "client_port": "",
+            "client_type": "unknown",
+            "command": "GET x",
+        }
 
     async def test_command_with_quoted_key(self, r):
         async with r.monitor() as m:

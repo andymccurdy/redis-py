@@ -5668,6 +5668,9 @@ class ClusterPipeline(RedisCluster):
     def exists(self, *keys):
         return self._execution_strategy.exists(*keys)
 
+    def touch(self, *keys):
+        return self._execution_strategy.touch(*keys)
+
     def eval(self):
         """ """
         return self._execution_strategy.eval()
@@ -6000,6 +6003,9 @@ class ExecutionStrategy(ABC):
     @abstractmethod
     def exists(self, *keys):
         pass
+
+    def touch(self, *keys):
+        return self.execute_command("TOUCH", *keys)
 
     @abstractmethod
     def eval(self):

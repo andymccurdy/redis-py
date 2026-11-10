@@ -8,7 +8,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
-from redis import ResponseError
+from redis import DataError, ResponseError
 import redis
 
 import redis.commands.search.aggregation as aggregations
@@ -44,7 +44,7 @@ from redis.commands.search.query import (
 )
 from redis.commands.search.result import Result
 from redis.commands.search.suggestion import Suggestion
-from redis.utils import SENTINEL, safe_str
+from redis.utils import SENTINEL, safe_str, str_if_bytes
 
 from .conftest import (
     _get_client,
@@ -52,6 +52,7 @@ from .conftest import (
     expects_resp3_shape,
     expects_unified_shape,
     get_protocol_version,
+    is_resp2_connection,
     skip_if_redis_enterprise,
     skip_if_server_version_gte,
     skip_if_server_version_lt,
@@ -6532,6 +6533,268 @@ class TestHybridSearch(SearchTestsBase):
             assert len(res["results"]) == 6
             assert res["results"] == expected_results
             assert res["warnings"] == []
+
+    @staticmethod
+    def _explain_score_text(tree, leaf_type):
+        # The explanation tree is nested lists of labels; check that every
+        # label is ``leaf_type`` and return them all as one text.
+        if isinstance(tree, list):
+            return " ".join(
+                TestHybridSearch._explain_score_text(item, leaf_type) for item in tree
+            )
+        assert isinstance(tree, leaf_type)
+        return tree.decode() if leaf_type is bytes else tree
+
+    @staticmethod
+    def _assert_explained_results(client, res, expected_keywords, pipeline=False):
+        # ``expected_keywords`` maps each expected key, in result order, to
+        # keywords its explanation must mention. The explanation text is the
+        # server's own, so only its shape and keywords are checked.
+        if pipeline and expects_resp2_shape(client):
+            # Legacy pipelines return the raw flat reply, which keeps the
+            # server's ``[score, tree]`` pair. The score is a string on a
+            # RESP2 wire and a double on a RESP3 wire. Pipelines don't apply
+            # ``NEVER_DECODE``, so the decoded client gets str labels.
+            reply = {str_if_bytes(k): v for k, v in zip(res[::2], res[1::2])}
+            results = [
+                {str_if_bytes(k): v for k, v in zip(row[::2], row[1::2])}
+                for row in reply["results"]
+            ]
+            wire_score_type = str if is_resp2_connection(client) else float
+            for result in results:
+                assert isinstance(result["score"][0], wire_score_type)
+            explained = [
+                [float(result["score"][0]), result["score"][1]] for result in results
+            ]
+            leaf_type = str
+        elif expects_resp3_shape(client):
+            # The native RESP3 shape keeps the server's ``[score, tree]``
+            # pair, with bytes labels outside a pipeline.
+            results = res["results"]
+            explained = [result["score"] for result in results]
+            leaf_type = str if pipeline else bytes
+        else:
+            results = res.results
+            for result in results:
+                assert set(result.keys()) == {
+                    "__key",
+                    "__score",
+                    "score",
+                    "score_explain",
+                }
+            explained = [
+                [result["score"], result["score_explain"]] for result in results
+            ]
+            leaf_type = str
+
+        assert [result["__key"] for result in results] == list(expected_keywords)
+        for result, (score, tree), keywords in zip(
+            results, explained, expected_keywords.values()
+        ):
+            assert isinstance(score, float)
+            assert score == pytest.approx(float(result["__score"]))
+            text = TestHybridSearch._explain_score_text(tree, leaf_type)
+            for keyword in ("final score", *keywords):
+                assert keyword in text, f"{keyword!r} not in {text!r}"
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    def test_hybrid_search_query_with_explain_score(self, client):
+        # Create index and add data
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client, items_sets=1)
+
+        hybrid_query = HybridQuery(
+            HybridSearchQuery("@color:{red}"),
+            HybridVsimQuery(
+                vector_field_name="@embedding",
+                vector_data="$vec",
+                vsim_search_method=VectorSearchMethods.KNN,
+                vsim_search_method_params={"K": 3},
+            ),
+        )
+        combine_method = CombineResultsMethod(CombinationMethods.RRF, WINDOW=20)
+        params = {"vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()}
+
+        res = client.ft().hybrid_search(
+            query=hybrid_query,
+            combine_method=combine_method,
+            params_substitution=params,
+            explain_score=True,
+        )
+
+        # item:0 and item:2 match both queries; item:1 is only a vector match.
+        self._assert_explained_results(
+            client,
+            res,
+            {
+                b"item:0": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                b"item:2": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                b"item:1": ("RRF", "no match", "KNN", "vector rank"),
+            },
+        )
+
+        # Without the flag the server sends no explanation.
+        res = client.ft().hybrid_search(
+            query=hybrid_query,
+            combine_method=combine_method,
+            params_substitution=params,
+        )
+
+        results = res["results"] if expects_resp3_shape(client) else res.results
+        assert [result["__key"] for result in results] == [
+            b"item:0",
+            b"item:2",
+            b"item:1",
+        ]
+        for result in results:
+            assert set(result.keys()) == {"__key", "__score"}
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    def test_hybrid_search_query_with_explain_score_linear_range(self, client):
+        # Create index and add data
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client, items_sets=1)
+
+        res = client.ft().hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{green}"),
+                HybridVsimQuery(
+                    vector_field_name="@embedding",
+                    vector_data="$vec",
+                    vsim_search_method=VectorSearchMethods.RANGE,
+                    vsim_search_method_params={"RADIUS": 5},
+                ),
+            ),
+            combine_method=CombineResultsMethod(
+                CombinationMethods.LINEAR, ALPHA=0.5, BETA=0.5
+            ),
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+
+        # item:1 matches both queries; item:0 is only a vector match.
+        self._assert_explained_results(
+            client,
+            res,
+            {
+                b"item:0": ("LINEAR", "no match", "RANGE", "radius"),
+                b"item:1": ("LINEAR", "BM25", "RANGE", "radius"),
+            },
+        )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    def test_hybrid_search_query_with_explain_score_and_groupby(self, client):
+        # Create index and add data
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client, items_sets=1)
+
+        postprocessing_config = HybridPostProcessingConfig()
+        postprocessing_config.load("@color")
+        postprocessing_config.group_by(["@color"], reducers.count())
+
+        with pytest.raises(ResponseError, match="EXPLAINSCORE"):
+            client.ft().hybrid_search(
+                query=HybridQuery(
+                    HybridSearchQuery("@color:{red}"),
+                    HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+                ),
+                post_processing=postprocessing_config,
+                params_substitution={
+                    "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+                },
+                explain_score=True,
+            )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    def test_hybrid_search_query_with_explain_score_and_pipeline(self, client):
+        # Create index and add data
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client, items_sets=1)
+
+        p = client.ft().pipeline()
+        p.hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{red}"),
+                HybridVsimQuery(
+                    vector_field_name="@embedding",
+                    vector_data="$vec",
+                    vsim_search_method=VectorSearchMethods.KNN,
+                    vsim_search_method_params={"K": 3},
+                ),
+            ),
+            combine_method=CombineResultsMethod(CombinationMethods.RRF, WINDOW=20),
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+        (res,) = p.execute()
+
+        # item:0 and item:2 match both queries; item:1 is only a vector match.
+        # The pipeline decodes the keys too.
+        self._assert_explained_results(
+            client,
+            res,
+            {
+                "item:0": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                "item:2": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                "item:1": ("RRF", "no match", "KNN", "vector rank"),
+            },
+            pipeline=True,
+        )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    def test_hybrid_search_query_with_explain_score_and_score_field(self, client):
+        # Create index and add data
+        self._create_hybrid_search_index(client)
+        self._add_data_for_hybrid_search(client, items_sets=1)
+
+        postprocessing_config = HybridPostProcessingConfig()
+        postprocessing_config.load("@price", "AS", "score")
+
+        res = client.ft().hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{red}"),
+                HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+            ),
+            post_processing=postprocessing_config,
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+
+        # The loaded field takes the ``score`` name, so the row keeps the
+        # document value as it is and gets no ``score_explain``.
+        results = res["results"] if expects_resp3_shape(client) else res.results
+        for result in results:
+            assert set(result.keys()) == {"score"}
+        assert sorted(result["score"] for result in results) == [
+            b"15",
+            b"15",
+            b"16",
+            b"17",
+            b"18",
+        ]
+
+    @pytest.mark.redismod
+    def test_hybrid_search_query_with_explain_score_and_cursor(self, client):
+        with pytest.raises(DataError, match="explain_score is not supported"):
+            client.ft().hybrid_search(
+                query=HybridQuery(
+                    HybridSearchQuery("@color:{red}"),
+                    HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+                ),
+                cursor=HybridCursorQuery(count=5),
+                explain_score=True,
+            )
 
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.4")

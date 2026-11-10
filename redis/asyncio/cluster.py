@@ -5689,9 +5689,7 @@ class ClusterPubSub(PubSub):
             return nullcontext()
         return self._pubsub_io_lock(pubsub)
 
-    async def _poll_node_pubsub(
-        self, pubsub: PubSub, timeout: Optional[float]
-    ) -> Optional[Dict[str, Any]]:
+    async def _poll_node_pubsub(self, pubsub: PubSub, timeout: Optional[float]) -> Any:
         """Read one message from a per-node pubsub, dispatching outside the lock.
 
         Splits ``PubSub.get_message`` so the per-node I/O lock covers the wire

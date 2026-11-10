@@ -392,6 +392,11 @@ def test_arrpop(client):
     client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 4 == client.json().arrpop("arr", Path.root_path(), 99)
 
+    # index=None pops the last element, like omitting it
+    client.json().set("arr", Path.root_path(), [0, 1, 2])
+    assert 2 == client.json().arrpop("arr", Path.root_path(), None)
+    assert [0, 1] == client.json().get("arr")
+
     # none test
     client.json().set("arr", Path.root_path(), [])
     assert client.json().arrpop("arr") is None

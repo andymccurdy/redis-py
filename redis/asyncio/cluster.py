@@ -5555,7 +5555,7 @@ class ClusterPubSub(PubSub):
             left = sum(
                 1
                 for ps in list(self.node_pubsub_mapping.values())
-                if self._poll_cool_off.get(ps, 0.0) <= now
+                if ps.connection is not None and self._poll_cool_off.get(ps, 0.0) <= now
             )
         for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)

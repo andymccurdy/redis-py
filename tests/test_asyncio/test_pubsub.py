@@ -3667,6 +3667,24 @@ class TestClusterPubSubSlotMigration:
         assert poll.call_args_list[0].args == (healthy, 0.0)
         assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
 
+    async def test_sharded_message_generator_gives_unconnected_share_to_others(
+        self,
+    ):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        unconnected = self._make_node_pubsub({b"b": None})
+        unconnected.connection = None
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": unconnected,
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
     async def test_sharded_message_generator_ends_pass_after_dispatch(self):
         pubsub = self._make_cluster_pubsub()
         nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]

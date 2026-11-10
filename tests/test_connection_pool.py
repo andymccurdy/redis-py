@@ -343,6 +343,19 @@ class TestBlockingConnectionPool:
         with pytest.raises(redis.ConnectionError):
             pool.get_connection()
 
+    def test_lock_released_after_checkout_in_maintenance(self):
+        pool = self.get_pool()
+        pool.set_in_maintenance(True)
+        # get_connection() and the nested make_connection() both take the
+        # lock; they used to share one flag deciding whether to release it.
+        pool.release(pool.get_connection())
+
+        acquired = []
+        t = Thread(target=lambda: acquired.append(pool._lock.acquire(timeout=1)))
+        t.start()
+        t.join()
+        assert acquired == [True]
+
     def test_connection_pool_blocks_until_timeout(self, master_host):
         "When out of connections, block for timeout seconds, then raise"
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}

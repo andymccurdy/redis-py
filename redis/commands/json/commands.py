@@ -207,9 +207,15 @@ class JSONCommands:
         """Pop the element at ``index`` in the array JSON value under
         ``path`` at key ``name``.
 
+        ``index`` defaults to -1 (the last element). ``None`` omits it, which
+        the server also treats as the last element.
+
         For more information see `JSON.ARRPOP <https://redis.io/commands/json.arrpop>`_.
         """  # noqa
-        return self.execute_command("JSON.ARRPOP", name, _path_arg(path), index)
+        pieces = [name, _path_arg(path)]
+        if index is not None:
+            pieces.append(index)
+        return self.execute_command("JSON.ARRPOP", *pieces)
 
     @overload
     def arrtrim(

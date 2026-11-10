@@ -5541,6 +5541,7 @@ class ClusterPubSub(PubSub):
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
+        unconnected = 0
         next_ready: Optional[float] = None
         nodes = len(self.node_pubsub_mapping)
         # Split the wait across the pass, otherwise every idle node ahead of the
@@ -5573,6 +5574,7 @@ class ClusterPubSub(PubSub):
             if pubsub.connection is None:
                 # Nothing to read and no wait: not a poll, so a pass whose
                 # other nodes are cooling off still sleeps below.
+                unconnected += 1
                 continue
             polled += 1
             if split:
@@ -5647,7 +5649,8 @@ class ClusterPubSub(PubSub):
                     self._unreachable_nodes.discard(node_name)
             if message is not None:
                 return pubsub, message
-        if first_error is not None and failed == polled:
+        # An unconnected node is not down, so it keeps the error from surfacing.
+        if first_error is not None and failed == polled + unconnected:
             raise first_error
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)

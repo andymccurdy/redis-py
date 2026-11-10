@@ -3813,6 +3813,20 @@ class TestClusterPubSubSlotMigration:
 
         assert passes.call_count == 3
 
+    async def test_sharded_message_generator_unconnected_shard_is_not_down(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        bad = self._make_node_pubsub({b"b": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": bad,
+        }
+        self._prime_generator(pubsub)
+
+        assert await pubsub._sharded_message_generator(timeout=0) == (None, None)
+
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """
         Isolation must not swallow a total outage: with nothing left to poll

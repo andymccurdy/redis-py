@@ -73,6 +73,24 @@ class TestEncodingErrors:
         assert r.get("a") == "foo\ufffd"
 
 
+class TestEncoder:
+    def test_decode_bytearray(self):
+        encoder = redis._parsers.encoders.Encoder("utf-8", "strict", True)
+        assert encoder.decode(bytearray(b"hello")) == "hello"
+
+    def test_decode_bytearray_without_decode_responses(self):
+        encoder = redis._parsers.encoders.Encoder("utf-8", "strict", False)
+        assert encoder.decode(bytearray(b"hello")) == bytearray(b"hello")
+        assert encoder.decode(bytearray(b"hello"), force=True) == "hello"
+
+    def test_decode_bytearray_errors(self):
+        replace_encoder = redis._parsers.encoders.Encoder("utf-8", "replace", True)
+        assert replace_encoder.decode(bytearray(b"foo\xff")) == "foo\ufffd"
+
+        ignore_encoder = redis._parsers.encoders.Encoder("utf-8", "ignore", True)
+        assert ignore_encoder.decode(bytearray(b"foo\xff")) == "foo"
+
+
 class TestCommandsAreNotEncoded:
     @pytest.fixture()
     def r(self, request):

@@ -39,6 +39,7 @@ from .conftest import (
     _get_client,
     is_resp2_connection,
     skip_if_redis_enterprise,
+    skip_if_resp_version,
     skip_if_server_version_lt,
 )
 
@@ -2875,13 +2876,12 @@ class TestPubSubTimeoutPropagation:
 
         assert wait_for_message(p, timeout=1.0)["data"] == b"hello"
 
+    @skip_if_resp_version(2)
     def test_get_message_timeout_with_push_handler_reaches_retry_layer(self, r):
         """
         Test that with a push handler, which can raise TimeoutError itself,
         a read timeout is still left to the retry layer.
         """
-        if is_resp2_connection(r):
-            return
         p = r.pubsub(push_handler_func=lambda message: None)
         p.subscribe("partly-received")
         assert p.connection.can_read(timeout=1.0)

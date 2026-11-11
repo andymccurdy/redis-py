@@ -1,7 +1,16 @@
 import asyncio
 import random
 import weakref
-from typing import AsyncIterator, Iterable, Mapping, Optional, Sequence, Tuple, Type
+from typing import (
+    Any,
+    AsyncIterator,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 from redis.asyncio.client import Redis
 from redis.asyncio.connection import (
@@ -228,12 +237,12 @@ class Sentinel(AsyncSentinelCommands):
 
     def __init__(
         self,
-        sentinels,
-        min_other_sentinels=0,
-        sentinel_kwargs=None,
-        force_master_ip=None,
-        **connection_kwargs,
-    ):
+        sentinels: Iterable[Tuple[str, int]],
+        min_other_sentinels: int = 0,
+        sentinel_kwargs: Mapping[str, Any] | None = None,
+        force_master_ip: str | None = None,
+        **connection_kwargs: Any,
+    ) -> None:
         # if sentinel_kwargs isn't defined, use the socket_* options from
         # connection_kwargs
         if sentinel_kwargs is None:

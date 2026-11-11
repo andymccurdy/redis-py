@@ -6632,8 +6632,39 @@ class PipelineStrategy(AbstractStrategy):
                     n.connection.disconnect()
                 n.connection_pool.release(n.connection)
 
+        # The copies whose connection error a ONE_SUCCEEDED success dropped. No command
+        # is resent for them, so no retry finds their node down: a node that held
+        # nothing else is tried last here instead.
+        dropped = None
         for c, copies, splits in fanned_out:
             c.result = self._merge_node_results(c, copies, splits)
+            # Only a ONE_SUCCEEDED command succeeds while a node failed
+            if (
+                c.command_policies.response_policy is ResponsePolicy.ONE_SUCCEEDED
+                and not isinstance(c.result, Exception)
+            ):
+                for node_command in copies.values():
+                    if isinstance(
+                        node_command.result, (ConnectionError, TimeoutError)
+                    ) and not isinstance(
+                        node_command.result, RedisCluster.NOT_NODE_FAILURE_ERRORS
+                    ):
+                        if dropped is None:
+                            dropped = set()
+                        dropped.add(node_command)
+        if dropped is not None:
+            for node_name, n in nodes.items():
+                if all(cmd in dropped for cmd in n.commands):
+                    # As for a connection error on any other command: move the
+                    # failed node to the end of the cached nodes, so the refresh
+                    # does not pick it as the default node while it is still a
+                    # primary, and ask for a refresh that tries it last
+                    self._nodes_manager.move_node_to_end_of_cached_nodes(node_name)
+                    self._nodes_manager._request_refresh(
+                        last_failed_node_name=node_name
+                    )
+                    if node_objs[node_name] == self._pipe.get_default_node():
+                        self._pipe.replace_default_node()
 
         # if the response isn't an exception it is a
         # valid response from the node

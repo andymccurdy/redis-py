@@ -1940,6 +1940,135 @@ class TestTopologyRefreshKeepsConnections:
         assert list(nm.nodes_cache)[-1] == failed.name
         assert nm._requested_last_failed_node_name is None
 
+    @staticmethod
+    async def _one_succeeded_pipeline_client() -> RedisCluster:
+        # RANDOMKEY sent to every primary, answered by the first success
+        resolver = AsyncDynamicMetadataResolver(
+            {
+                "core": {
+                    "randomkey": CommandMetadata(
+                        request_policy=RequestPolicy.ALL_SHARDS,
+                        response_policy=ResponsePolicy.ONE_SUCCEEDED,
+                    )
+                }
+            }
+        )
+        return await get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(NoBackoff(), 0),
+            metadata_resolver=resolver,
+        )
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("default", [False, True], ids=["other", "default"])
+    async def test_pipeline_keeps_a_one_succeeded_success_over_a_node_error(
+        self, default: bool
+    ) -> None:
+        """
+        A node whose write fails holds only a copy of a ONE_SUCCEEDED command that
+        another node answered: the pipeline answers with the success once the retries
+        run out, and the failed node is still tried last on the next refresh. A failed
+        default node is replaced.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        nm = r.nodes_manager
+        default_node = r.get_default_node()
+        primaries = r.get_primaries()
+        assert len(primaries) > 1
+        failed = (
+            default_node
+            if default
+            else next(p for p in primaries if p.name != default_node.name)
+        )
+        assert list(nm.nodes_cache)[-1] != failed.name
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name == failed.name:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                assert await pipe.execute() == [b"key"]
+
+        assert list(nm.nodes_cache)[-1] == failed.name
+        assert nm._requested_last_failed_node_name == failed.name
+        if default:
+            assert r.get_default_node().name != failed.name
+        else:
+            assert r.get_default_node() is default_node
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    async def test_pipeline_raises_a_node_task_s_cancellation(self) -> None:
+        """
+        A node task that is cancelled fails the ONE_SUCCEEDED command it held a copy
+        of, even though another node answered it, and the cancellation is raised.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        cancelled = r.get_primaries()[0]
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name == cancelled.name:
+                raise asyncio.CancelledError()
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                with pytest.raises(asyncio.CancelledError):
+                    await pipe.execute()
+
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "case", ["keyed_command_on_failed_node", "every_node_fails"]
+    )
+    async def test_pipeline_raises_a_node_error_that_fails_a_command(
+        self, case: str
+    ) -> None:
+        """
+        The error of a node whose write fails is raised when it fails a command: one
+        the node held on its own, or a ONE_SUCCEEDED command no node answered.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        failed = r.get_node_from_key("foo")
+        failing = (
+            {failed.name}
+            if case == "keyed_command_on_failed_node"
+            else {node.name for node in r.get_primaries()}
+        )
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name in failing:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                if case == "keyed_command_on_failed_node":
+                    pipe.get("foo")
+                with pytest.raises(ConnectionError, match="down"):
+                    await pipe.execute()
+
+        await r.aclose()
+
     @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     async def test_pipeline_retry_waits_for_sibling_node_tasks(self) -> None:

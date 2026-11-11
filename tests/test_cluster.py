@@ -5744,6 +5744,125 @@ class TestTopologyRefreshPacing:
         assert list(nm.nodes_cache)[-1] == failed.name
         assert nm._requested_last_failed_node_name == failed.name
 
+    @staticmethod
+    def _one_succeeded_pipeline(failing, keyed_command=False):
+        """
+        Send RANDOMKEY, routed to every primary and answered by the first success, in a
+        pipeline whose write fails with a connection error on the ``failing`` nodes, and
+        return the client and the results.
+        """
+        resolver = DynamicMetadataResolver(
+            {
+                "core": {
+                    "randomkey": CommandMetadata(
+                        request_policy=RequestPolicy.ALL_SHARDS,
+                        response_policy=ResponsePolicy.ONE_SUCCEEDED,
+                    )
+                }
+            }
+        )
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(NoBackoff(), 0),
+            metadata_resolver=resolver,
+        )
+
+        def get_connection(redis_node):
+            kwargs = redis_node.get_connection_kwargs()
+            return Mock(host=kwargs["host"], port=kwargs["port"], db=0)
+
+        def write(node_commands):
+            connection = node_commands.connection
+            if f"{connection.host}:{connection.port}" in failing(rc):
+                for c in node_commands.commands:
+                    c.result = ConnectionError("down")
+
+        def read(node_commands):
+            for c in node_commands.commands:
+                if c.result is redis.cluster._UNANSWERED:
+                    c.result = b"key"
+
+        with (
+            patch("redis.cluster.get_connection", side_effect=get_connection),
+            patch.object(ConnectionPool, "release", autospec=True),
+            patch.object(redis.cluster.NodeCommands, "write", write),
+            patch.object(redis.cluster.NodeCommands, "read", read),
+            patch.object(NodesManager, "initialize", autospec=True),
+        ):
+            pipe = rc.pipeline()
+            # A command resent on its own fails the same way
+            pipe.parent_execute_command = Mock(side_effect=ConnectionError("down"))
+            pipe.execute_command("RANDOMKEY")
+            if keyed_command:
+                pipe.get("foo")
+            try:
+                return rc, pipe.execute()
+            except ConnectionError as e:
+                return rc, e
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("default", [False, True], ids=["other", "default"])
+    def test_pipeline_keeps_a_one_succeeded_success_over_a_node_error(self, default):
+        """
+        A node whose write fails holds only a copy of a ONE_SUCCEEDED command that
+        another node answered: the pipeline answers with the success, and the failed
+        node is tried last on the next refresh, as for any other connection error. A
+        failed default node is replaced.
+        """
+        failed = []
+        default_node = []
+
+        def failing(rc):
+            if not failed:
+                default_node.append(rc.get_default_node())
+                primaries = rc.get_primaries()
+                assert len(primaries) > 1
+                node = (
+                    default_node[0]
+                    if default
+                    else next(p for p in primaries if p.name != default_node[0].name)
+                )
+                assert list(rc.nodes_manager.nodes_cache)[-1] != node.name
+                failed.append(node.name)
+            return failed
+
+        rc, result = self._one_succeeded_pipeline(failing)
+
+        assert result == [b"key"]
+        nm = rc.nodes_manager
+        assert list(nm.nodes_cache)[-1] == failed[0]
+        assert nm._requested_last_failed_node_name == failed[0]
+        if default:
+            assert rc.get_default_node().name != failed[0]
+        else:
+            assert rc.get_default_node() is default_node[0]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "case", ["keyed_command_on_failed_node", "every_node_fails"]
+    )
+    def test_pipeline_raises_a_node_error_that_fails_a_command(self, case):
+        """
+        The error of a node whose write fails is raised when it fails a command: one
+        the node held on its own, or a ONE_SUCCEEDED command no node answered.
+        """
+        if case == "keyed_command_on_failed_node":
+
+            def failing(rc):
+                return {rc.get_node_from_key("foo").name}
+
+        else:
+
+            def failing(rc):
+                return {node.name for node in rc.get_primaries()}
+
+        _, result = self._one_succeeded_pipeline(
+            failing, keyed_command=case == "keyed_command_on_failed_node"
+        )
+
+        assert isinstance(result, ConnectionError)
+
     @pytest.mark.fixed_client
     def test_pubsub_topology_repair_is_a_paced_request(self):
         rc = get_mocked_redis_client(host=default_host, port=default_port)

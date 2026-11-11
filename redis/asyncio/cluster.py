@@ -4174,6 +4174,8 @@ class PipelineStrategy(AbstractStrategy):
             # A node whose task raised answered none of its commands, so its copies are
             # not taken for successes when they are merged - and the slots of a split
             # command that did succeed are kept for the attempt the error leads to.
+            # A command the merge answered with a success keeps it, as ONE_SUCCEEDED
+            # asks, even though one of its nodes failed.
             for (_, commands), e in zip(nodes.values(), errors):
                 if isinstance(e, BaseException):
                     for queued_command in commands:
@@ -4182,8 +4184,19 @@ class PipelineStrategy(AbstractStrategy):
                 cmd.result = self._merge_node_results(
                     client, cmd, command, copies, splits
                 )
-        for (node, _), e in zip(nodes.values(), errors):
+        for (node, commands), e in zip(nodes.values(), errors):
             if isinstance(e, BaseException):
+                # A copy shares the position of the command it was made from, which
+                # is that command's index in the stack. When every command the node
+                # held is a copy of a command that merged to a success, the error
+                # fails nothing, so it is not raised. The loop below still tries
+                # the node last on the next refresh.
+                if fanned_out and all(
+                    c is not stack[c.position]
+                    and not isinstance(stack[c.position].result, BaseException)
+                    for c in commands
+                ):
+                    continue
                 # The write failed (the connection connects lazily on it): the
                 # error carries no node, so take it from the task that raised it
                 if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(

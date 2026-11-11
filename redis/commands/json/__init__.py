@@ -102,7 +102,6 @@ class _JSONBase(JSONCommands):
         }
 
         self.client = client
-        self.execute_command = client.execute_command
         self.MODULE_VERSION = version
 
         self._MODULE_CALLBACKS = apply_module_callbacks(
@@ -116,8 +115,96 @@ class _JSONBase(JSONCommands):
             resp3_to_resp2_legacy=_RESP3_TO_RESP2_LEGACY_MODULE_CALLBACKS,
         )
 
-        for key, value in self._MODULE_CALLBACKS.items():
-            self.client.set_response_callback(key, value)
+        # Don't register JSON callbacks on the parent client — that would
+        # mutate the shared response_callbacks dict and break bare
+        # execute_command("JSON.GET") calls on the parent (issue #3937).
+        # Each JSON sub-client decodes responses itself in execute_command().
+
+        # When the client is a Pipeline (r.pipeline().json()), we do need
+        # callbacks merged in so Pipeline.execute() can decode at batch time.
+        # Always copy before merging to avoid polluting the parent's dict.
+        if isinstance(client, (redis.client.Pipeline, redis.asyncio.client.Pipeline)):
+            client.response_callbacks = dict(client.response_callbacks)
+            client.response_callbacks.update(self._MODULE_CALLBACKS)
+        elif isinstance(client, redis.cluster.ClusterPipeline):
+            # Copy cluster_response_callbacks so we don't touch the parent.
+            client.cluster_response_callbacks = dict(
+                client.cluster_response_callbacks
+            )
+            client.cluster_response_callbacks.update(self._MODULE_CALLBACKS)
+        elif isinstance(client, redis.asyncio.cluster.ClusterPipeline):
+            # Async ClusterPipeline: never touch cluster_client.response_callbacks
+            # — it is shared across all ClusterNode instances and mutating it
+            # re-introduces #3937 for the async cluster path.
+            #
+            # Instead, wrap the strategy's execution method to post-process JSON
+            # results after dispatch, using a local closure over _MODULE_CALLBACKS.
+            # Only _json_path is forwarded to callbacks (mirrors the execute_command
+            # path); redis-internal kwargs like keys= are stripped.
+            #
+            # _json_callbacks_installed guards against double-wrapping when
+            # p.json() is called more than once on the same pipeline instance.
+            _strategy = client._execution_strategy
+            if not getattr(_strategy, "_json_callbacks_installed", False):
+                _strategy._json_callbacks_installed = True
+                _cbs = self._MODULE_CALLBACKS
+
+                def _decode_results(results, stack):
+                    out = []
+                    for r, cmd in zip(results, stack):
+                        if cmd.args and not isinstance(r, Exception):
+                            cmd_name = cmd.args[0]
+                            # Match the case-insensitive-lookup guard used in
+                            # JSON.execute_command / AsyncJSON.execute_command:
+                            # command names are always str in practice, but
+                            # guard against unexpected bytes/other types
+                            # rather than raising AttributeError on .upper().
+                            key = (
+                                cmd_name.upper()
+                                if isinstance(cmd_name, str)
+                                else cmd_name
+                            )
+                            if key in _cbs:
+                                cb_kwargs = {}
+                                if "_json_path" in cmd.kwargs:
+                                    cb_kwargs["_json_path"] = cmd.kwargs["_json_path"]
+                                r = _cbs[key](r, **cb_kwargs)
+                        out.append(r)
+                    return out
+
+                if not client._transaction:
+                    # Non-transactional (PipelineStrategy): results come from
+                    # ClusterNode.execute_pipeline() with no JSON decoding.
+                    _orig_execute = _strategy._execute
+
+                    async def _json_decode_execute(
+                        cluster_client_arg, stack,
+                        raise_on_error=True, allow_redirections=True,
+                    ):
+                        results = await _orig_execute(
+                            cluster_client_arg, stack,
+                            raise_on_error, allow_redirections,
+                        )
+                        return _decode_results(results, stack)
+
+                    _strategy._execute = _json_decode_execute
+                else:
+                    # Transactional (TransactionStrategy): results come from
+                    # EXEC; non-JSON commands are already decoded but JSON
+                    # commands are not (no JSON callbacks on cluster_client).
+                    # Snapshot _command_queue at execute-time to match results.
+                    _orig_txn_execute = _strategy.execute
+
+                    async def _json_decode_txn_execute(
+                        raise_on_error=True, allow_redirections=True,
+                    ):
+                        cmd_queue = list(_strategy._command_queue)
+                        results = await _orig_txn_execute(
+                            raise_on_error, allow_redirections,
+                        )
+                        return _decode_results(results, cmd_queue)
+
+                    _strategy.execute = _json_decode_txn_execute
 
         self.__encoder__ = encoder
         self.__decoder__ = decoder
@@ -241,12 +328,17 @@ class _JSONBase(JSONCommands):
         pipe.jsonget('notakey')
         """
         if isinstance(self.client, redis.RedisCluster):
+            # Merge JSON callbacks into a copy of the cluster callbacks so
+            # ClusterPipeline decodes JSON.* responses correctly without
+            # mutating the parent client's shared callback dict.
+            cluster_callbacks = dict(self.client.cluster_response_callbacks)
+            cluster_callbacks.update(self._MODULE_CALLBACKS)
             p = ClusterPipeline(
                 nodes_manager=self.client.nodes_manager,
                 commands_parser=self.client.commands_parser,
                 startup_nodes=self.client.nodes_manager.startup_nodes,
                 result_callbacks=self.client.result_callbacks,
-                cluster_response_callbacks=self.client.cluster_response_callbacks,
+                cluster_response_callbacks=cluster_callbacks,
                 cluster_error_retry_attempts=self.client.retry.get_retries(),
                 read_from_replicas=self.client.read_from_replicas,
                 reinitialize_steps=self.client.reinitialize_steps,
@@ -254,9 +346,14 @@ class _JSONBase(JSONCommands):
             )
 
         else:
+            # Merge parent callbacks with JSON module callbacks into the
+            # pipeline's private copy.  This keeps the parent client clean
+            # while still letting the pipeline decode JSON.* responses.
+            pipeline_callbacks = dict(self.client.response_callbacks)
+            pipeline_callbacks.update(self._MODULE_CALLBACKS)
             p = Pipeline(
                 connection_pool=self.client.connection_pool,
-                response_callbacks=dict(self.client.response_callbacks),
+                response_callbacks=pipeline_callbacks,
                 transaction=transaction,
                 shard_hint=shard_hint,
             )
@@ -277,9 +374,79 @@ class Pipeline(JSONCommands, redis.client.Pipeline):
 class JSON(_JSONBase):
     _is_async_client: Literal[False] = False
 
+    def execute_command(self, *args, **kwargs):
+        """Execute a command and apply any JSON module response callback.
+
+        Callbacks are applied locally on this sub-client instance rather than
+        being registered on the parent Redis client (see issue #3937).
+
+        Only JSON-module kwargs (``_json_path``) are forwarded to the
+        callback; redis-internal kwargs (``keys``, ``options``, etc.) are
+        intentionally stripped to avoid TypeError when callbacks don't
+        accept arbitrary keyword arguments.
+        """
+        cmd = args[0] if args else ""
+        response = self.client.execute_command(*args, **kwargs)
+
+        # FIX #1: Pipeline guard — when self.client is a Pipeline,
+        # execute_command() returns the pipeline object for chaining,
+        # not an actual Redis response.  Callbacks will be applied
+        # later by Pipeline.execute() from its response_callbacks.
+        if isinstance(
+            response,
+            (
+                redis.client.Pipeline,
+                redis.asyncio.client.Pipeline,
+                redis.cluster.ClusterPipeline,
+                redis.asyncio.cluster.ClusterPipeline,
+            ),
+        ):
+            return response
+
+        # FIX #2: Case-insensitive lookup — the original
+        # response_callbacks was a CaseInsensitiveDict, so
+        # j.execute_command("json.get", "k") worked.  We must
+        # upper-case the command name before lookup.
+        cmd_upper = cmd.upper() if isinstance(cmd, str) else cmd
+        if cmd_upper in self._MODULE_CALLBACKS:
+            cb_kwargs = {}
+            if "_json_path" in kwargs:
+                cb_kwargs["_json_path"] = kwargs["_json_path"]
+            return self._MODULE_CALLBACKS[cmd_upper](response, **cb_kwargs)
+        return response
+
 
 class AsyncJSON(_JSONBase):
     _is_async_client: Literal[True] = True
+
+    async def execute_command(self, *args, **kwargs):
+        """Execute a command and apply any JSON module response callback.
+
+        Async version — same logic as JSON.execute_command.
+        """
+        cmd = args[0] if args else ""
+        response = await self.client.execute_command(*args, **kwargs)
+
+        # Pipeline guard (same as sync path)
+        if isinstance(
+            response,
+            (
+                redis.client.Pipeline,
+                redis.asyncio.client.Pipeline,
+                redis.cluster.ClusterPipeline,
+                redis.asyncio.cluster.ClusterPipeline,
+            ),
+        ):
+            return response
+
+        # Case-insensitive callback lookup (same as sync path)
+        cmd_upper = cmd.upper() if isinstance(cmd, str) else cmd
+        if cmd_upper in self._MODULE_CALLBACKS:
+            cb_kwargs = {}
+            if "_json_path" in kwargs:
+                cb_kwargs["_json_path"] = kwargs["_json_path"]
+            return self._MODULE_CALLBACKS[cmd_upper](response, **cb_kwargs)
+        return response
 
     async def set_file(
         self,

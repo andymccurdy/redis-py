@@ -94,6 +94,19 @@ redis-py supports RESP3 starting with version 5.0. Starting with redis-py 8.0,
 clients use RESP3 on the wire by default while preserving legacy
 RESP2-compatible Python response shapes for existing applications.
 
+When *protocol* is left unset, a server or proxy that rejects `HELLO` with
+an unknown-command or `NOPROTO` error triggers a fallback to RESP2 and a warning.
+Authentication and other server errors still propagate. Automatic fallback is
+disabled when *protocol=3* is explicit, client-side caching is configured, or
+maintenance notifications are explicitly enabled.
+
+Automatic fallback adapts core command response callbacks only. Module commands
+(JSON, Search, TimeSeries, Bloom, and vector sets) still select their response
+parsers from the configured protocol and can return incorrect results after a
+fallback, including empty results from `FT.SEARCH`. When using these commands
+with a server or proxy that does not support `HELLO`, set *protocol=2* explicitly
+when creating the client.
+
 Set *protocol=3* explicitly when your application should receive
 RESP3-specific response shapes or when you want the wire protocol choice to be
 visible in code. To force RESP2 on the wire, set *protocol=2*. To opt in to

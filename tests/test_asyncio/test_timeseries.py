@@ -245,8 +245,8 @@ async def test_create_and_delete_rule(decoded_r: redis.Redis):
     await decoded_r.ts().add(KEY1, time * 2, 1.5)
     assert round((await decoded_r.ts().get(KEY2))[1], 5) == 1.5
     info = await decoded_r.ts().info(KEY1)
-    if is_resp2_connection(decoded_r):
-        assert info.rules[0][1] == 100
+    if expects_resp2_shape(decoded_r):
+        assert info.rules[0][:2] == [KEY2, 100]
     else:
         assert info["rules"][KEY2][0] == 100
 

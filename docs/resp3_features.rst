@@ -155,12 +155,21 @@ part of the public API.
 Chained this way the server answers only for the commands the shipped table does not carry;
 swap the order to let the server override it.
 
-The static table stays the more trustworthy source of the two. It carries the commands
-whose server metadata is incomplete or wrong - ``TOUCH`` and ``VRANDMEMBER``, and the
-read-only script runners on servers older than 8.10 - and it withholds the routing policies of
-the ``movablekeys`` reads (``SINTERCARD``, ``ZDIFF``, ``ZINTER``, ``ZINTERCARD``, ``ZUNION``,
-``XREAD``) so the Cluster client keeps resolving their keys itself instead of routing them by
-derived keyless policies.
+The static table is the more trustworthy of the two sources. For some commands, the server
+metadata is incomplete or wrong. These are ``TOUCH``, ``VRANDMEMBER``, and the read-only
+script runners on servers older than 8.10. The static table has correct entries for them.
+
+Some read commands do not keep their keys at fixed argument positions. Redis marks these
+commands with the ``movablekeys`` flag. Examples are ``SINTERCARD``, ``ZDIFF``, ``ZINTER``,
+``ZINTERCARD``, ``ZUNION`` and ``XREAD``. Both sources mark these commands as keyed:
+
+- The static table lists them as keyed commands.
+- With the server metadata, the parser reads their key specs and marks them as keyed.
+
+In both cases, the Cluster client finds their keys from the key specs that ``COMMAND``
+reports and routes the command by those keys. It asks the server with ``COMMAND GETKEYS``
+only when the specs are not enough: a server older than 7.0 without key specs, a spec
+flagged ``incomplete`` or ``variable_flags``, or a keyword search.
 
 The same argument is accepted by ``ConnectionPool`` (configure it there when you supply your
 own ``connection_pool=``) and by ``RedisCluster``, which shares the one resolver with every

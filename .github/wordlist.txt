@@ -200,6 +200,8 @@ repo
 resharding
 resolver's
 resolvers
+retryability
+retryable
 runtime
 sedrik
 serializers

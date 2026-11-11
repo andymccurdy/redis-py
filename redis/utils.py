@@ -1,10 +1,13 @@
 import datetime
 import inspect
 import logging
+import os
 import sys
 import textwrap
+import threading
 import warnings
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from functools import cache, wraps
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, TypeVar, Union
@@ -48,6 +51,77 @@ from importlib import metadata
 # explicit value. Import this object from redis.utils instead of creating local
 # sentinels, and compare it by identity only (`is` / `is not`).
 SENTINEL = object()
+
+# Weak values: a context stays cached only while a live connection holds it.
+_SHARED_SSL_CONTEXTS: "weakref.WeakValueDictionary[Any, ssl.SSLContext]" = (
+    weakref.WeakValueDictionary()
+)
+_SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+def _reset_shared_ssl_contexts_lock() -> None:
+    # A fork while another thread builds a context would leave the child with a lock
+    # that nothing can release.
+    global _SHARED_SSL_CONTEXTS_LOCK
+    _SHARED_SSL_CONTEXTS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_shared_ssl_contexts_lock)
+
+
+def _file_signature(path: Any) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        # Left for the context build to report, as it would without the cache
+        return None
+    return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
+
+
+def get_shared_ssl_context(
+    build: Callable[[], "ssl.SSLContext"], settings: Any, files: Iterable[Any]
+) -> "ssl.SSLContext":
+    """
+    Return an SSLContext shared by the connections with the same TLS configuration.
+
+    Building a context loads the CA bundle into a new certificate store, which costs
+    far more memory than the TLS connection using it.
+
+    Args:
+        build: Builds the context when no live one matches.
+        settings: Hashable values that determine the context.
+        files: The certificate files and directories the context is loaded from.
+            They are identified by their timestamps, size and inode, so that a rotated
+            file is picked up by the next context built for it. The default CA
+            locations are always included, as is SSLKEYLOGFILE, which
+            ssl.create_default_context() reads.
+    """
+    defaults = ssl.get_default_verify_paths()
+    paths = (*files, defaults.cafile, defaults.capath)
+    key = (
+        settings,
+        os.environ.get("SSLKEYLOGFILE"),
+        tuple((path, _file_signature(path)) for path in paths),
+    )
+    try:
+        hash(key)
+    except (TypeError, ValueError):
+        # An unhashable setting, such as ssl_ca_data given as a bytearray or a
+        # writable memoryview
+        return build()
+    with _SHARED_SSL_CONTEXTS_LOCK:
+        context = _SHARED_SSL_CONTEXTS.get(key)
+    if context is None:
+        # Built outside the lock, so a slow CA load or ssl_password callback does not
+        # stall other connects. A build that loses the race is dropped before any
+        # socket wraps it.
+        built = build()
+        with _SHARED_SSL_CONTEXTS_LOCK:
+            context = _SHARED_SSL_CONTEXTS.get(key)
+            if context is None:
+                context = _SHARED_SSL_CONTEXTS[key] = built
+    return context
 
 
 def from_url(url: str, **kwargs: Any) -> "Redis":
@@ -266,24 +340,19 @@ def deprecated_args(
     warned = tuple(args_to_warn) if args_to_warn is not None else ("*",)
     allowed = tuple(allowed_args) if allowed_args is not None else ()
 
-    def _check_deprecated_args(func, filterable_args):
-        """Check and warn about deprecated arguments."""
-        for arg in warned:
-            if arg == "*" and len(filterable_args) > 0:
-                warn_deprecated_arg_usage(
-                    list(filterable_args.keys()),
-                    func.__name__,
-                    reason,
-                    version,
-                    stacklevel=5,
-                )
-            elif arg in filterable_args:
-                warn_deprecated_arg_usage(
-                    arg, func.__name__, reason, version, stacklevel=5
-                )
-
     def decorator(func: C) -> C:
-        min_idx, keys_ok, names = _get_warn_check(func, warned, allowed)
+        # Stacked @deprecated_args decorators collapse into one wrapper, so a
+        # call pays for a single extra frame however many layers there are.
+        # Layers are kept outermost first, which is the order they warn in.
+        layers = ((warned, allowed, reason, version),)
+        stacked = getattr(func, "_deprecated_args_layers", None)
+        # functools.wraps copies the tag onto any decorator wrapping ours, so
+        # merge only when func is our wrapper of the recorded target.
+        if stacked is not None and getattr(func, "__wrapped__", None) is stacked[0]:
+            func = stacked[0]
+            layers += stacked[1]
+        checks = _get_layer_checks(func, layers)
+        min_idx, keys_ok, names = _merge_warn_checks(checks)
 
         if inspect.iscoroutinefunction(func):
 
@@ -292,10 +361,10 @@ def deprecated_args(
                 if len(args) > min_idx or (
                     kwargs and not keys_ok(kwargs.keys(), names)
                 ):
-                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
-                    _check_deprecated_args(func, filterable_args)
+                    _check_deprecated_layers(func, checks, args, kwargs)
                 return await func(*args, **kwargs)
 
+            async_wrapper._deprecated_args_layers = (func, layers)
             return async_wrapper
         else:
 
@@ -304,13 +373,70 @@ def deprecated_args(
                 if len(args) > min_idx or (
                     kwargs and not keys_ok(kwargs.keys(), names)
                 ):
-                    filterable_args = _get_filterable_args(func, args, kwargs, allowed)
-                    _check_deprecated_args(func, filterable_args)
+                    _check_deprecated_layers(func, checks, args, kwargs)
                 return func(*args, **kwargs)
 
+            wrapper._deprecated_args_layers = (func, layers)
             return wrapper
 
     return decorator
+
+
+def _get_layer_checks(func: Callable, layers: tuple) -> tuple:
+    """
+    Build the per-layer checks of a (possibly merged) @deprecated_args wrapper.
+    """
+    return tuple(
+        (*_get_warn_check(func, warned, allowed), warned, allowed, reason, version)
+        for warned, allowed, reason, version in layers
+    )
+
+
+def _merge_warn_checks(
+    checks: tuple,
+) -> tuple[int, Callable[[Any, frozenset], bool], frozenset]:
+    """
+    Combine the per-layer pre-checks into one that passes exactly when every
+    layer's would: below every layer's positional index, and kwargs disjoint
+    from every named layer's names and within every wildcard layer's allowed
+    names.
+    """
+    if len(checks) == 1:
+        return checks[0][:3]
+    min_idx = min(check[0] for check in checks)
+    named = frozenset().union(
+        *(check[2] for check in checks if check[1] is _DictKeys.isdisjoint)
+    )
+    wildcard = [check[2] for check in checks if check[1] is not _DictKeys.isdisjoint]
+    if wildcard:
+        return min_idx, _DictKeys.__le__, frozenset.intersection(*wildcard) - named
+    return min_idx, _DictKeys.isdisjoint, named
+
+
+def _check_deprecated_layers(
+    func: Callable, checks: tuple, args: tuple, kwargs: dict
+) -> None:
+    """
+    Check and warn about deprecated arguments, one layer at a time. Every
+    layer warns with stacklevel 4, the caller of the single wrapper frame.
+    """
+    for min_idx, keys_ok, names, warned, allowed, reason, version in checks:
+        if len(args) <= min_idx and (not kwargs or keys_ok(kwargs.keys(), names)):
+            continue
+        filterable_args = _get_filterable_args(func, args, kwargs, allowed)
+        for arg in warned:
+            if arg == "*" and len(filterable_args) > 0:
+                warn_deprecated_arg_usage(
+                    list(filterable_args.keys()),
+                    func.__name__,
+                    reason,
+                    version,
+                    stacklevel=4,
+                )
+            elif arg in filterable_args:
+                warn_deprecated_arg_usage(
+                    arg, func.__name__, reason, version, stacklevel=4
+                )
 
 
 def _set_info_logger():
@@ -407,6 +533,19 @@ def ensure_string(key):
         raise TypeError("Key must be either a string or bytes")
 
 
+_ZERO_TIMEDELTA = datetime.timedelta(0)
+_ONE_MILLISECOND = datetime.timedelta(milliseconds=1)
+
+
+def _timedelta_to_ms(td: datetime.timedelta) -> int:
+    # Integer arithmetic: total_seconds() * 1000 goes through a float and can
+    # come out 1 ms low (1.001 * 1000 == 1000.9999999999999). Truncates toward
+    # zero, as int() did.
+    if td < _ZERO_TIMEDELTA:
+        return -(-td // _ONE_MILLISECOND)
+    return td // _ONE_MILLISECOND
+
+
 def extract_expire_flags(
     ex: ExpiryT | str | None = None,
     px: ExpiryT | str | None = None,
@@ -427,7 +566,7 @@ def extract_expire_flags(
     elif px is not None:
         exp_options.append("PX")
         if isinstance(px, datetime.timedelta):
-            exp_options.append(int(px.total_seconds() * 1000))
+            exp_options.append(_timedelta_to_ms(px))
         elif isinstance(px, int):
             exp_options.append(px)
         elif isinstance(px, str) and px.isdecimal():

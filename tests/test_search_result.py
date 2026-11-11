@@ -10,6 +10,7 @@ import pytest
 
 from redis.commands.search import Search
 from redis.commands.search.aggregation import AggregateRequest
+from redis.commands.search.query import Query
 from redis.commands.search.result import Result
 
 
@@ -104,6 +105,107 @@ class TestResultFromResp3:
             assert r.total == 0
             assert r.docs == []
             assert r.warnings == []
+
+
+@pytest.mark.fixed_client
+class TestResultFieldsNamedLikeDocumentAttributes:
+    """A document field named ``payload`` or ``score`` used to raise
+    ``TypeError: Document() got multiple values for keyword argument``."""
+
+    def test_resp2_field_named_payload(self):
+        res = [1, b"doc1", [b"payload", b"hello", b"title", b"t"]]
+
+        result = Result(res, hascontent=True)
+
+        assert result.docs[0].id == "doc1"
+        assert result.docs[0].payload == "hello"
+        assert result.docs[0].title == "t"
+
+    def test_resp2_field_named_score_with_scores(self):
+        res = [1, b"doc1", b"1.5", [b"score", b"10"]]
+
+        result = Result(res, hascontent=True, with_scores=True)
+
+        assert result.docs[0].score == 1.5
+
+    def test_resp2_field_named_payload_with_payloads(self):
+        res = [1, b"doc1", b"server-payload", [b"payload", b"field-value"]]
+
+        result = Result(res, hascontent=True, has_payload=True)
+
+        assert result.docs[0].payload == "server-payload"
+
+    def test_resp2_field_named_score_without_scores(self):
+        res = [1, b"doc1", [b"score", b"10"]]
+
+        result = Result(res, hascontent=True)
+
+        assert result.docs[0].score == "10"
+        assert result.docs[0].payload is None
+
+    def test_resp3_field_named_payload(self):
+        res = {
+            "total_results": 1,
+            "results": [
+                {"id": "doc1", "extra_attributes": {"payload": "hello"}},
+            ],
+        }
+
+        result = Result.from_resp3(res)
+
+        assert result.docs[0].id == "doc1"
+        assert result.docs[0].payload == "hello"
+
+    def test_resp3_field_named_score_with_scores(self):
+        res = {
+            "total_results": 1,
+            "results": [
+                {"id": "doc1", "score": 1.5, "extra_attributes": {"score": "10"}},
+            ],
+        }
+
+        result = Result.from_resp3(res, with_scores=True)
+
+        assert result.docs[0].score == 1.5
+
+    def test_resp3_with_payloads(self):
+        res = {
+            "total_results": 1,
+            "results": [
+                {
+                    "id": "doc1",
+                    "payload": b"server-payload",
+                    "extra_attributes": {"payload": "field-value"},
+                },
+            ],
+        }
+
+        query = Query("*").with_payloads()
+
+        result = _make_search()._parse_search_resp3(res, query=query)
+
+        assert result.docs[0].payload == "server-payload"
+
+    def test_resp3_profile_with_payloads(self):
+        res = {
+            "Results": {
+                "total_results": 1,
+                "results": [
+                    {
+                        "id": "doc1",
+                        "payload": b"server-payload",
+                        "extra_attributes": {"payload": "field-value"},
+                    },
+                ],
+            },
+            "Profile": {"Shards": [], "Coordinator": {}},
+        }
+
+        query = Query("*").with_payloads()
+
+        result, _ = _make_search()._parse_profile_resp3(res, query=query)
+
+        assert result.docs[0].payload == "server-payload"
 
 
 def _make_search():

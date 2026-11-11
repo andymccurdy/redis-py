@@ -29,7 +29,7 @@ from .commands import (
     REVRANGE_CMD,
     TimeSeriesCommands,
 )
-from .info import TSInfo
+from .info import TSInfo, parse_info_unified
 from .utils import (
     parse_get,
     parse_get_unified,
@@ -83,7 +83,7 @@ class _TimeSeriesBase(TimeSeriesCommands):
         _RESP2_UNIFIED_MODULE_CALLBACKS = {
             DEL_CMD: int,
             GET_CMD: parse_get_unified,
-            INFO_CMD: TSInfo,
+            INFO_CMD: parse_info_unified,
             MGET_CMD: parse_m_get_unified,
             MRANGE_CMD: parse_m_range_unified,
             MREVRANGE_CMD: parse_m_range_unified,
@@ -94,7 +94,7 @@ class _TimeSeriesBase(TimeSeriesCommands):
         _RESP3_UNIFIED_MODULE_CALLBACKS = {
             DEL_CMD: int,
             GET_CMD: parse_get_unified,
-            INFO_CMD: TSInfo,
+            INFO_CMD: parse_info_unified,
             MGET_CMD: parse_m_get_unified,
             MRANGE_CMD: parse_m_range_unified,
             MREVRANGE_CMD: parse_m_range_unified,

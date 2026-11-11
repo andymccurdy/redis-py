@@ -366,6 +366,14 @@ async def test_arrindex(decoded_r: redis.Redis):
 
 
 @pytest.mark.redismod
+async def test_arrindex_stop_without_start(decoded_r: redis.Redis):
+    r_path = Path.root_path()
+    await decoded_r.json().set("arr", r_path, [0, 1, 2, 3, 4])
+    assert -1 == await decoded_r.json().arrindex("arr", r_path, 4, stop=3)
+    assert 2 == await decoded_r.json().arrindex("arr", r_path, 2, stop=3)
+
+
+@pytest.mark.redismod
 async def test_arrinsert(decoded_r: redis.Redis):
     await decoded_r.json().set("arr", Path.root_path(), [0, 4])
     assert 5 == await decoded_r.json().arrinsert("arr", Path.root_path(), 1, *[1, 2, 3])
@@ -397,6 +405,11 @@ async def test_arrpop(decoded_r: redis.Redis):
     # test out of bounds
     await decoded_r.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 4 == await decoded_r.json().arrpop("arr", Path.root_path(), 99)
+
+    # index=None pops the last element, like omitting it
+    await decoded_r.json().set("arr", Path.root_path(), [0, 1, 2])
+    assert 2 == await decoded_r.json().arrpop("arr", Path.root_path(), None)
+    assert [0, 1] == await decoded_r.json().get("arr")
 
     # none test
     await decoded_r.json().set("arr", Path.root_path(), [])

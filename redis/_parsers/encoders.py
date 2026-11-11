@@ -39,6 +39,6 @@ class Encoder:
         if self.decode_responses or force:
             if isinstance(value, memoryview):
                 value = value.tobytes()
-            if isinstance(value, bytes):
+            if isinstance(value, (bytes, bytearray)):
                 value = value.decode(self.encoding, self.encoding_errors)
         return value

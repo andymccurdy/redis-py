@@ -38,6 +38,31 @@ If no ``retry`` is provided, a default one is created with  :class:`~.Exponentia
 and 3 retries.
 
 
+Opt-in retryability checker
+***************************
+
+A :class:`~.Retry` object accepts an optional ``is_retryable`` callable. When it
+is set, an error is retried only if its type is one of the ``supported_errors``
+AND the callable returns ``True`` for it. The default (``None``) leaves the
+retry behavior unchanged.
+
+``redis.retry.is_retryable_connect_error`` is a ready-made checker that
+returns ``False`` for definitively unrecoverable connection errors - currently
+a missing Unix socket path (``ENOENT``) - while leaving transient errors such as
+``ECONNREFUSED`` retryable. Use it to fail fast instead of spending the whole
+backoff budget on a socket path that does not exist:
+
+>>> from redis import Redis
+>>> from redis.backoff import ExponentialBackoff
+>>> from redis.retry import Retry, is_retryable_connect_error
+>>> retry = Retry(
+...     ExponentialBackoff(), 3, is_retryable=is_retryable_connect_error
+... )
+>>> r = Redis(unix_socket_path="/tmp/does-not-exist.sock", retry=retry)
+
+The same checker works with ``redis.asyncio.retry.Retry``.
+
+
 Retry with asyncio
 ******************
 
@@ -98,6 +123,6 @@ Let's consider the following example:
    a refresh of the cluster topology, which tries the failed node last. The request is
    shared by the whole client: the first command attempt that starts once the refresh
    is due runs it, whether that is the retry of this command or another command.
-   Refreshes run at most once per second, so a retry inside that second still uses the
-   current topology.
+   Refreshes run at most once per ``topology_refresh_min_interval`` seconds (one second
+   by default), so a retry inside that interval still uses the current topology.
 #. the cluster client waits as long as the backoff says and retries the command, until it either succeeds or the max number of retries is reached.

@@ -353,6 +353,13 @@ def test_arrindex(client):
 
 
 @pytest.mark.redismod
+def test_arrindex_stop_without_start(client):
+    client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
+    assert -1 == client.json().arrindex("arr", Path.root_path(), 4, stop=3)
+    assert 2 == client.json().arrindex("arr", Path.root_path(), 2, stop=3)
+
+
+@pytest.mark.redismod
 def test_arrinsert(client):
     client.json().set("arr", Path.root_path(), [0, 4])
     assert 5 - -client.json().arrinsert("arr", Path.root_path(), 1, *[1, 2, 3])
@@ -384,6 +391,11 @@ def test_arrpop(client):
     # test out of bounds
     client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 4 == client.json().arrpop("arr", Path.root_path(), 99)
+
+    # index=None pops the last element, like omitting it
+    client.json().set("arr", Path.root_path(), [0, 1, 2])
+    assert 2 == client.json().arrpop("arr", Path.root_path(), None)
+    assert [0, 1] == client.json().get("arr")
 
     # none test
     client.json().set("arr", Path.root_path(), [])

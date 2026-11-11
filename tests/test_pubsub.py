@@ -2853,13 +2853,15 @@ class TestPubSubTimeoutPropagation:
 
     def test_get_message_resumes_a_partly_received_message(self, r):
         """
-        A message that is only partly readable when get_message() polls is
-        returned by a later call, not dropped by a reconnect.
+        Test that a message only partly readable when get_message() polls is
+        returned by a later call instead of being dropped by a reconnect.
         """
         p = r.pubsub()
-        p.subscribe("foo")
+        # A channel no other test publishes to, so a late PUBLISH from an
+        # earlier test on a cluster cannot be the message read below.
+        p.subscribe("partly-received")
         assert wait_for_message(p, timeout=1.0) is not None
-        r.publish("foo", "hello")
+        r.publish("partly-received", "hello")
         assert p.connection.can_read(timeout=1.0)
 
         # What the parser raises when the rest of the message does not arrive
@@ -2872,6 +2874,24 @@ class TestPubSubTimeoutPropagation:
         reconnect.assert_not_called()
 
         assert wait_for_message(p, timeout=1.0)["data"] == b"hello"
+
+    def test_get_message_timeout_with_push_handler_reaches_retry_layer(self, r):
+        """
+        Test that with a push handler, which can raise TimeoutError itself,
+        a read timeout is still left to the retry layer.
+        """
+        if is_resp2_connection(r):
+            return
+        p = r.pubsub(push_handler_func=lambda message: None)
+        p.subscribe("partly-received")
+        assert p.connection.can_read(timeout=1.0)
+
+        with (
+            mock.patch.object(p.connection, "read_response", side_effect=TimeoutError),
+            mock.patch.object(p, "_reconnect"),
+        ):
+            with pytest.raises(TimeoutError):
+                p.get_message(timeout=0)
 
     def test_timeout_with_pattern_subscribe(self, r):
         """

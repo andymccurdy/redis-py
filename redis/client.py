@@ -1520,12 +1520,12 @@ class PubSub:
                     disconnect_on_error=False, push_request=True, timeout=read_timeout
                 )
             except TimeoutError:
-                if block:
+                # Only part of a message arrived in time. The parser keeps it,
+                # so the next call resumes it, while the retry layer would
+                # reconnect and drop it. A push handler can raise TimeoutError
+                # itself, so that case still goes to the retry layer.
+                if block or self.push_handler_func is not None:
                     raise
-                # Only part of the message arrived within the timeout. The
-                # parser keeps what it has read, so the next call resumes the
-                # same message; letting the timeout reach the retry layer
-                # would reconnect and drop it.
                 return None
 
         response = self._execute(conn, try_read)

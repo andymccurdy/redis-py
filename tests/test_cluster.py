@@ -72,6 +72,7 @@ from redis.exceptions import (
     AskError,
     AuthenticationError,
     ClusterDownError,
+    ClusterError,
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
@@ -4148,13 +4149,10 @@ class TestResponsePolicies:
         finally:
             busy.redis_connection.function_delete("spinlib")
 
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
     @pytest.mark.parametrize(
-        "error",
-        [
-            TryAgainError("TRYAGAIN"),
-            AskError("1 127.0.0.1:7001"),
-            ConnectionError("lost"),
-        ],
+        "error", [ClusterError("TTL exhausted."), ConnectionError("lost")]
     )
     def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r, error
@@ -4175,9 +4173,9 @@ class TestResponsePolicies:
 
         assert len(sent) == len(r.get_primaries())
 
-    @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
-    )
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
+    @pytest.mark.parametrize("error", [ClusterError("TTL exhausted.")])
     def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
         self, r, error
     ):

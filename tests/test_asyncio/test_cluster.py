@@ -81,6 +81,7 @@ from redis.exceptions import (
     AskError,
     AuthenticationError,
     ClusterDownError,
+    ClusterError,
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
@@ -5821,6 +5822,26 @@ class TestResponsePolicies:
 
         assert len(sent) == len(r.get_primaries())
 
+    @pytest.mark.parametrize("method", ["script_kill", "function_kill"])
+    async def test_one_succeeded_reports_the_error_of_the_shard_running_the_script(
+        self, r: RedisCluster, method: str
+    ) -> None:
+        """
+        The shard running a script that already wrote answers UNKILLABLE, and that is the
+        error reported, not the NOTBUSY of every other shard. The UNKILLABLE is injected:
+        a real one leaves the shard busy until it is shut down.
+        """
+        busy = r.get_primaries()[-1]
+
+        def fail(node: ClusterNode, args: tuple) -> Optional[Exception]:
+            if node.name == busy.name:
+                return ResponseError("UNKILLABLE Sorry the script already executed")
+            return None
+
+        with _sent_commands(fail):
+            with pytest.raises(ResponseError, match="UNKILLABLE"):
+                await getattr(r, method)()
+
     async def test_script_kill_stops_the_script_on_whichever_shard_runs_it(
         self, r: RedisCluster
     ) -> None:
@@ -5844,13 +5865,10 @@ class TestResponsePolicies:
         finally:
             await busy.execute_command("FUNCTION DELETE", "spinlib")
 
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
     @pytest.mark.parametrize(
-        "error",
-        [
-            TryAgainError("TRYAGAIN"),
-            AskError("1 127.0.0.1:7001"),
-            ConnectionError("lost"),
-        ],
+        "error", [ClusterError("TTL exhausted."), ConnectionError("lost")]
     )
     async def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r: RedisCluster, error: Exception
@@ -5866,9 +5884,9 @@ class TestResponsePolicies:
 
         assert len(sent) == len(r.get_primaries())
 
-    @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
-    )
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
+    @pytest.mark.parametrize("error", [ClusterError("TTL exhausted.")])
     async def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
         self, r: RedisCluster, error: Exception
     ) -> None:
@@ -6137,6 +6155,13 @@ class TestMultiShardRequests:
                 assert await pipe.execute() == [0]
         assert keyslot.call_count == len(keys)
 
+    async def test_a_single_key_is_not_split(self, r: RedisCluster) -> None:
+        """It has nothing to split, so its slot is left to the keyed routing to compute."""
+        with mock.patch.object(r, "keyslot", wraps=r.keyslot) as keyslot:
+            assert r._split_multi_shard_command("EXISTS", "single") is None
+
+        keyslot.assert_not_called()
+
     @skip_if_server_version_lt("8.4")
     async def test_keys_that_cannot_be_located_are_not_split(
         self, r: RedisCluster, monkeypatch
@@ -6230,6 +6255,37 @@ class TestMultiShardRequests:
             connection=r.get_node_from_key(keys[-1]),
             is_internal=False,
         )
+
+    async def test_a_requested_refresh_runs_before_the_slots_are_routed(
+        self, r: RedisCluster, monkeypatch
+    ) -> None:
+        """As a command sent on its own: the slots are routed by the refreshed topology."""
+        keys = _keys_on_every_shard(r, "refresh")
+        events: List[str] = []
+        initialize = NodesManager.initialize
+        get_node_from_slot = NodesManager.get_node_from_slot
+
+        async def run_requested_refresh(
+            self: NodesManager, *args: Any, **kwargs: Any
+        ) -> None:
+            events.append("refresh")
+            return await initialize(self, *args, **kwargs)
+
+        def route(self: NodesManager, *args: Any, **kwargs: Any) -> ClusterNode:
+            events.append("route")
+            return get_node_from_slot(self, *args, **kwargs)
+
+        r._request_refresh()
+        # Due at once, so the command runs it rather than leaving it for a later one
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        # NodesManager has __slots__, so the methods are patched on the class
+        monkeypatch.setattr(NodesManager, "initialize", run_requested_refresh)
+        monkeypatch.setattr(NodesManager, "get_node_from_slot", route)
+
+        assert await r.execute_command("EXISTS", *keys) == 0
+
+        assert events[0] == "refresh"
+        assert "route" in events
 
     async def test_a_retry_does_not_resend_a_slot_that_answered(
         self, r: RedisCluster, monkeypatch

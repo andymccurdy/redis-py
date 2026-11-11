@@ -110,10 +110,11 @@ NO_SUCH_FIELDSET_ERROR = {
     "no such fieldset": NoSuchFieldsetError,
 }
 
-# The code a Redis error reply starts with (ERR, WRONGTYPE, NOGROUP, ...). An
-# unmapped error keeps its first word as the status code only in this shape, so
-# free-form messages such as "Syntax error at offset 3" don't become one.
-_ERROR_CODE_PATTERN = re.compile(r"[A-Z]{1,32}")
+# The code a Redis error reply starts with (ERR, WRONGTYPE, NOGROUP, and module
+# codes such as SEARCH_SYNTAX). An unmapped error keeps its first word as the
+# status code only in this shape, so free-form messages such as "Syntax error at
+# offset 3" don't become one.
+_ERROR_CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
 logger = logging.getLogger(__name__)
 

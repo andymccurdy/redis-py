@@ -131,9 +131,14 @@ class MockSocket:
         ),
         ("NOGROUP No such key 'k' or consumer group 'g'", "NOGROUP"),
         ("BUSYGROUP Consumer Group name already exists", "BUSYGROUP"),
+        ("SEARCH_SYNTAX Parsing/Syntax error for query string", "SEARCH_SYNTAX"),
+        (
+            "SEARCH_FLEX_SEARCH_NOCONTENT_OR_RETURN_0_REQUIRED NOCONTENT or RETURN 0",
+            "SEARCH_FLEX_SEARCH_NOCONTENT_OR_RETURN_0_REQUIRED",
+        ),
         ("Cursor not found, id: 42", None),
         ("Syntax error at offset 3 near foo", None),
-        ("X" * 33 + " is too long to be an error code", None),
+        ("X" * 65 + " is too long to be an error code", None),
     ],
 )
 def test_unmapped_response_error_status_code(response, status_code):

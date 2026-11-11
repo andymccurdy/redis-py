@@ -71,7 +71,11 @@ class DummyAsyncStream:
         self._buffer = bytearray(buffer)
         self.eof = eof
         self._exception = exception
+        self._limit = 2**16
         self.read_called = False
+
+    def _maybe_resume_transport(self):
+        pass
 
     def at_eof(self):
         return self.eof and not self._buffer
@@ -1036,7 +1040,10 @@ async def test_connection_disconect_race(parser_class, connect_args):
     # The parsers consult the stream's private buffer to decide whether a
     # read can wait; a spec'd Mock has no such attribute unless it is set.
     # The mocked reads below serve the data, so the buffer stays empty.
+    # Give it the other attributes the fast paths consult too.
     reader._buffer = bytearray()
+    reader._exception = None
+    reader._limit = 2**16
 
     # for HiredisParser
     reader.read.side_effect = read

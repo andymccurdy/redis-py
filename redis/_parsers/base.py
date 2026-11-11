@@ -652,19 +652,18 @@ class _AsyncRESPBase(AsyncBaseParser):
             try:
                 remaining = want - len(tail)
                 buffer = stream._buffer
-                if (
-                    isinstance(stream, StreamReader)
-                    and len(buffer) >= remaining
-                    and stream._exception is None
-                ):
+                if len(buffer) >= remaining and stream._exception is None:
                     # The whole remainder is already buffered: take it
                     # straight out of the stream buffer. These are the
                     # same bytes readexactly() would return, without a
                     # readexactly() coroutine - and without the flag
                     # checks below - for a read that cannot wait at all.
-                    # Only a real StreamReader offers this buffer; other
-                    # stream doubles keep the readexactly() path below.
-                    data = bytes(memoryview(buffer)[:remaining])
+                    # Release the views before resizing the buffer: on
+                    # PyPy a temporary view stays exported until
+                    # garbage collection, so `del` would raise
+                    # BufferError there.
+                    with memoryview(buffer) as view, view[:remaining] as part:
+                        data = bytes(part)
                     del buffer[:remaining]
                     stream._maybe_resume_transport()
                     self._chunks.append(data)
@@ -807,29 +806,31 @@ class _AsyncRESPBase(AsyncBaseParser):
             # the stream buffer: the same bytes readline() would return,
             # without a timeout context or a readline() coroutine for a
             # read that cannot wait. The find doubles as the guard, so a
-            # buffered line pays no flag checks either. Only a real
-            # StreamReader offers this buffer; other stream doubles keep
-            # the readline() path below.
+            # buffered line pays no flag checks either.
             data = None
-            if isinstance(stream, StreamReader):
-                buffer = stream._buffer
-                idx = buffer.find(10)
-                if idx >= 0 and stream._exception is None:
-                    if idx > stream._limit:
-                        # StreamReader.readline() discards a complete
-                        # over-limit line before raising ValueError; do
-                        # the same, so a caller that retains the
-                        # connection (disconnect_on_error=False) can
-                        # reach the following frames instead of raising
-                        # on these bytes on every later read.
-                        del buffer[: idx + 1]
-                        stream._maybe_resume_transport()
-                        raise ValueError(
-                            "Separator is found, but chunk is longer than limit"
-                        )
-                    data = bytes(memoryview(buffer)[: idx + 1])
+            buffer = stream._buffer
+            idx = buffer.find(10)
+            if idx >= 0 and stream._exception is None:
+                if idx > stream._limit:
+                    # StreamReader.readline() discards a complete
+                    # over-limit line before raising ValueError; do
+                    # the same, so a caller that retains the
+                    # connection (disconnect_on_error=False) can
+                    # reach the following frames instead of raising
+                    # on these bytes on every later read.
                     del buffer[: idx + 1]
                     stream._maybe_resume_transport()
+                    raise ValueError(
+                        "Separator is found, but chunk is longer than limit"
+                    )
+                # Release the views before resizing the buffer: on
+                # PyPy a temporary view stays exported until
+                # garbage collection, so `del` would raise
+                # BufferError there.
+                with memoryview(buffer) as view, view[: idx + 1] as part:
+                    data = bytes(part)
+                del buffer[: idx + 1]
+                stream._maybe_resume_transport()
             if data is None:
                 # Each line gets a fresh socket_timeout window, like each
                 # read in _read_exactly: the deadline must not be shared

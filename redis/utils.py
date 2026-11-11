@@ -476,10 +476,15 @@ _UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 def _datetime_to_unix_ms(dt: datetime.datetime) -> int:
-    # Subtract the epoch for exact microsecond arithmetic. Converting an aware
-    # datetime to UTC first can overflow near the limits of datetime's range.
     if dt.utcoffset() is None:
-        dt = dt.astimezone(datetime.timezone.utc)
+        # Resolve local time at whole-second precision, then add the original
+        # microseconds separately to avoid float rounding and UTC overflow.
+        seconds = int(dt.replace(tzinfo=None, microsecond=0).timestamp())
+        return _timedelta_to_ms(
+            datetime.timedelta(seconds=seconds, microseconds=dt.microsecond)
+        )
+
+    # Aware subtraction is exact even when conversion to UTC would overflow.
     return _timedelta_to_ms(dt - _UNIX_EPOCH)
 
 

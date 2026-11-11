@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import functools
 import inspect
+import time
 import warnings
 import pytest
 from redis.exceptions import DataError
@@ -743,6 +744,19 @@ class TestExtractExpireFlags:
     )
     def test_pxat_as_aware_datetime_outside_utc_range(self, when, expected):
         assert extract_expire_flags(pxat=when) == ["PXAT", expected]
+
+    @pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+    def test_pxat_as_naive_datetime_at_upper_boundary(self, monkeypatch):
+        try:
+            with monkeypatch.context() as local_env:
+                local_env.setenv("TZ", "UTC0")
+                time.tzset()
+                assert extract_expire_flags(pxat=datetime.max) == [
+                    "PXAT",
+                    253402300799999,
+                ]
+        finally:
+            time.tzset()
 
     def test_ex_takes_precedence_over_px(self):
         # The flags are checked in order; ex wins when several are given.

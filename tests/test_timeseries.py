@@ -1358,6 +1358,44 @@ def test_mrange_unified_metadata_bytes_keys():
         }
 
 
+@pytest.mark.onlynoncluster
+@pytest.mark.redismod
+def test_mrange_groupby_unified_metadata_matches_on_both_protocols(request, stack_url):
+    results = {}
+    for protocol in (2, 3):
+        with _get_client(
+            redis.Redis,
+            request,
+            decode_responses=True,
+            from_url=stack_url,
+            protocol=protocol,
+            legacy_responses=False,
+        ) as r:
+            r.flushdb()
+            r.ts().create("t1", labels={"team": "ny"})
+            r.ts().create("t2", labels={"team": "ny"})
+            for i in range(4):
+                r.ts().add("t1", 1000 + i, i)
+                r.ts().add("t2", 1000 + i, i * 2)
+            results[protocol] = [
+                r.ts().mrange("-", "+", ["team=ny"], groupby="team", reduce="SUM"),
+                r.ts().mrevrange(
+                    "-",
+                    "+",
+                    ["team=ny"],
+                    aggregation_type="avg",
+                    bucket_size_msec=2,
+                    groupby="team",
+                    reduce="max",
+                ),
+            ]
+
+    assert results[2] == results[3]
+    mrange, mrevrange = results[2]
+    assert mrange["team=ny"][1] == {"reducers": ["sum"]}
+    assert mrevrange["team=ny"][1] == {"reducers": ["max"]}
+
+
 @pytest.mark.redismod
 @pytest.mark.fixed_client
 @pytest.mark.parametrize(

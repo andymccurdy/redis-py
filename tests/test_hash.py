@@ -256,7 +256,7 @@ def test_hpexpireat_with_datetime(r):
 
 def test_hpexpireat_datetime_ms_is_exact():
     # Argument level only: constructs its own client, so it needs no server.
-    # int(when.timestamp() * 1000) landed 1 ms low for instants whose seconds
+    # int(when.timestamp() * 1000) can land 1 ms low for instants whose seconds
     # part sits just above a power of two (2**31 seconds is
     # 2038-01-19T03:14:08Z).
     r = redis.Redis()

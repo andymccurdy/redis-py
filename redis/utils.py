@@ -476,14 +476,11 @@ _UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 def _datetime_to_unix_ms(dt: datetime.datetime) -> int:
-    # int(dt.timestamp() * 1000) goes through two float roundings and can land
-    # 1 ms low when the seconds part of the instant sits just above a power of
-    # two: 2038-01-19T03:14:08.002Z converts to 2147483648001 instead of
-    # 2147483648002. Subtracting the epoch yields the exact microsecond count,
-    # and _timedelta_to_ms keeps the truncation toward zero that int()
-    # applied to pre-epoch instants. astimezone() interprets a naive datetime
-    # in the system timezone, the same way datetime.timestamp() does.
-    return _timedelta_to_ms(dt.astimezone(datetime.timezone.utc) - _UNIX_EPOCH)
+    # Subtract the epoch for exact microsecond arithmetic. Converting an aware
+    # datetime to UTC first can overflow near the limits of datetime's range.
+    if dt.utcoffset() is None:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return _timedelta_to_ms(dt - _UNIX_EPOCH)
 
 
 def extract_expire_flags(

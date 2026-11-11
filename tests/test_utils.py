@@ -728,6 +728,22 @@ class TestExtractExpireFlags:
         when = datetime(1969, 12, 31, 23, 59, 58, 999500, tzinfo=timezone.utc)
         assert extract_expire_flags(pxat=when) == ["PXAT", -1000]
 
+    @pytest.mark.parametrize(
+        ("when", "expected"),
+        [
+            (
+                datetime.min.replace(tzinfo=timezone(timedelta(hours=1))),
+                -62135600400000,
+            ),
+            (
+                datetime.max.replace(tzinfo=timezone(timedelta(hours=-1))),
+                253402304399999,
+            ),
+        ],
+    )
+    def test_pxat_as_aware_datetime_outside_utc_range(self, when, expected):
+        assert extract_expire_flags(pxat=when) == ["PXAT", expected]
+
     def test_ex_takes_precedence_over_px(self):
         # The flags are checked in order; ex wins when several are given.
         assert extract_expire_flags(ex=5, px=999) == ["EX", 5]

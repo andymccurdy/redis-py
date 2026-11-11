@@ -4,7 +4,8 @@ import time
 import pytest
 import redis
 from redis.commands.timeseries.commands import TimeSeriesCommands
-from redis.commands.timeseries.info import TSInfo
+from redis.commands.timeseries.info import TSInfo, parse_info_unified
+from redis.commands.timeseries.utils import parse_m_range_unified
 from redis.utils import SENTINEL
 
 from .conftest import (
@@ -234,8 +235,8 @@ def test_create_and_delete_rule(client):
     client.ts().add(1, time * 2, 1.5)
     assert round(client.ts().get(2)[1], 5) == 1.5
     info = client.ts().info(1)
-    if is_resp2_connection(client):
-        assert info.rules[0][1] == 100
+    if expects_resp2_shape(client):
+        assert info.rules[0][:2] == ["2", 100]
     else:
         assert info["rules"]["2"][0] == 100
 
@@ -1314,10 +1315,47 @@ def test_info_resp3_bytes_keys():
 
 
 @pytest.mark.fixed_client
+def test_info_resp3_rules():
+    # Server-free: the RESP3 rules map must parse like the RESP2 list.
+    resp2 = TSInfo([b"rules", [[b"dst", 100, b"AVG", 0]], b"labels", []])
+    resp3 = TSInfo({b"rules": {b"dst": [100, b"AVG", 0]}, b"labels": {}})
+    for info in (resp2, resp3):
+        assert info.rules == [[b"dst", 100, b"AVG", 0]]
+    assert TSInfo({b"rules": {}, b"labels": {}}).rules == []
+
+
+@pytest.mark.fixed_client
+def test_info_unified_rules():
+    # Server-free: unified responses key the rules by destination on both wires.
+    resp2 = parse_info_unified([b"rules", [[b"dst", 100, b"AVG", 0]], b"labels", []])
+    resp3 = parse_info_unified({b"rules": {b"dst": [100, b"AVG", 0]}, b"labels": {}})
+    for info in (resp2, resp3):
+        assert info.rules == {b"dst": [100, b"AVG", 0]}
+    assert parse_info_unified([b"rules", [], b"labels", []]).rules == {}
+    assert parse_info_unified({b"rules": {}, b"labels": {}}).rules == {}
+
+
+@pytest.mark.fixed_client
 def test_info_resp3_keeps_null_labels():
     # Server-free: a decoded RESP3 map keeps a literal "null" label as is.
     info = TSInfo({"labels": {"null": "null", "currentLabel": "currentData"}})
     assert info.labels == {"null": "null", "currentLabel": "currentData"}
+
+
+@pytest.mark.fixed_client
+def test_mrange_unified_metadata_bytes_keys():
+    # Server-free: without decode_responses the RESP3 metadata map has bytes
+    # keys and values and must parse like the metadata built for RESP2.
+    resp2 = parse_m_range_unified(
+        [[b"t", [[b"sensor", b"a"]], [[1000, b"1.5"]]]], aggregation_type="avg"
+    )
+    resp3 = parse_m_range_unified(
+        {b"t": [{b"sensor": b"a"}, {b"aggregators": [b"avg"]}, [[1000, 1.5]]]}
+    )
+    for res in (resp2, resp3):
+        assert res == {
+            b"t": [{b"sensor": b"a"}, {"aggregators": ["avg"]}, [[1000, 1.5]]]
+        }
 
 
 @pytest.mark.redismod

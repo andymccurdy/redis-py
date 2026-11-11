@@ -9,7 +9,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import pytest_asyncio
-from redis import ResponseError
+from redis import DataError, ResponseError
 import redis.asyncio as redis
 import redis.commands.search.aggregation as aggregations
 from redis.commands.search.hybrid_query import (
@@ -37,12 +37,13 @@ from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import GeoFilter, NumericFilter, Query, SortbyField
 from redis.commands.search.result import Result
 from redis.commands.search.suggestion import Suggestion
-from redis.utils import safe_str
+from redis.utils import safe_str, str_if_bytes
 from tests.conftest import (
     expects_resp2_shape,
     expects_resp3_shape,
     expects_unified_shape,
     get_protocol_version,
+    is_resp2_connection,
     skip_if_redis_enterprise,
     skip_if_server_version_gte,
     skip_if_server_version_lt,
@@ -1390,6 +1391,27 @@ class TestBaseSearchFunctionality(AsyncSearchTestsBase):
             "The text field is not decoded correctly"
         )
 
+    @pytest.mark.redismod
+    async def test_syndump(self, decoded_r):
+        client = decoded_r
+        definition = IndexDefinition(index_type=IndexType.HASH)
+        await client.ft().create_index(
+            (TextField("title"), TextField("body")), definition=definition
+        )
+
+        await client.ft().synupdate("id1", False, "boy", "child", "offspring")
+        await client.ft().synupdate("id2", False, "baby", "child")
+        await client.ft().synupdate("id3", False, "tree", "wood")
+        res = await client.ft().syndump()
+        assert res == {
+            "boy": ["id1"],
+            "tree": ["id3"],
+            "wood": ["id3"],
+            "child": ["id1", "id2"],
+            "baby": ["id2"],
+            "offspring": ["id1"],
+        }
+
 
 class TestSearchLanguages(AsyncSearchTestsBase):
     """Functional coverage for indexing and searching text in languages other
@@ -2595,6 +2617,172 @@ class TestAggregations(AsyncSearchTestsBase):
             assert len(res.rows) == 2
             for row in res.rows:
                 len(row) == 6
+
+
+class TestProfile(AsyncSearchTestsBase):
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @pytest.mark.fixed_client
+    @skip_if_redis_enterprise()
+    @skip_if_server_version_lt("6.3.0")
+    @pytest.mark.parametrize(
+        "protocol,legacy_responses",
+        [(None, True), (None, False), (2, True), (2, False), (3, False)],
+    )
+    @pytest.mark.parametrize("limited", [False, True])
+    @pytest.mark.parametrize("with_scores", [False, True])
+    async def test_profile_field_encodings(
+        self, create_redis, stack_url, protocol, legacy_responses, limited, with_scores
+    ):
+        options = {"decode_responses": False, "legacy_responses": legacy_responses}
+        if protocol is not None:
+            options["protocol"] = protocol
+        client = await create_redis(url=stack_url, **options)
+        await client.flushdb()
+        await client.ft().create_index((TextField("title"),))
+        binary = b"\x00\x01\x82\xff"
+        await client.hset(
+            "doc:1", mapping={"title": "hello", "vector": binary, "label": b"caf\xe9"}
+        )
+        decoded_client = await create_redis(url=stack_url, decode_responses=True)
+        await self.waitForIndex(decoded_client, "idx")
+        query = (
+            Query("hello")
+            .return_field("vector", as_field="embedding", decode_field=False)
+            .return_field("label", encoding="latin-1")
+            .return_field("title")
+        )
+        if with_scores:
+            query.with_scores()
+
+        result, profile = await client.ft().profile(query, limited=limited)
+
+        assert result.total == 1
+        assert result.docs[0].embedding == binary
+        assert result.docs[0].label == "café"
+        assert result.docs[0].title == "hello"
+        if with_scores:
+            assert isinstance(result.docs[0].score, float)
+        assert profile.info
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_redis_enterprise()
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index((TextField("t"),))
+        await client.ft().client.hset("1", "t", "hello")
+        await client.ft().client.hset("2", "t", "world")
+
+        # check using Query
+        q = Query("hello|world").no_content()
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q)
+            det = det.info
+
+            assert isinstance(det, list)
+            assert len(res.docs) == 2  # check also the search result
+
+            # check using AggregateRequest
+            req = (
+                aggregations.AggregateRequest("*")
+                .load("t")
+                .apply(prefix="startswith(@t, 'hel')")
+            )
+            res, det = await client.ft().profile(req)
+            det = det.info
+            assert isinstance(det, list)
+            assert len(res.rows) == 2  # check also the search result
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q)
+            res = res.info
+
+            assert isinstance(res, dict)
+            assert len(res["results"]) == 2  # check also the search result
+
+            # check using AggregateRequest
+            req = (
+                aggregations.AggregateRequest("*")
+                .load("t")
+                .apply(prefix="startswith(@t, 'hel')")
+            )
+            res = await client.ft().profile(req)
+            res = res.info
+
+            assert isinstance(res, dict)
+            assert len(res["results"]) == 2  # check also the search result
+
+    @pytest.mark.redismod
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile_limited(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index((TextField("t"),))
+        await client.ft().client.hset("1", "t", "hello")
+        await client.ft().client.hset("2", "t", "hell")
+        await client.ft().client.hset("3", "t", "help")
+        await client.ft().client.hset("4", "t", "helowa")
+
+        q = Query("%hell% hel*")
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q, limited=True)
+            det = det.info
+            assert det[4][1][7][9] == "The number of iterators in the union is 3"
+            assert det[4][1][8][9] == "The number of iterators in the union is 4"
+            assert det[4][1][1] == "INTERSECT"
+            assert len(res.docs) == 3  # check also the search result
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q, limited=True)
+            res = res.info
+            iterators_profile = res["profile"]["Iterators profile"]
+            assert (
+                iterators_profile[0]["Child iterators"][0]["Child iterators"]
+                == "The number of iterators in the union is 3"
+            )
+            assert (
+                iterators_profile[0]["Child iterators"][1]["Child iterators"]
+                == "The number of iterators in the union is 4"
+            )
+            assert iterators_profile[0]["Type"] == "INTERSECT"
+            assert len(res["results"]) == 3  # check also the search result
+
+    @pytest.mark.redismod
+    @skip_ifmodversion_lt("2.4.3", "search")
+    @skip_if_server_version_gte("7.9.0")
+    @skip_if_server_version_lt("6.3.0")
+    async def test_profile_query_params(self, decoded_r):
+        client = decoded_r
+        await client.ft().create_index(
+            (
+                VectorField(
+                    "v", "HNSW", {"TYPE": "FLOAT32", "DIM": 2, "DISTANCE_METRIC": "L2"}
+                ),
+            )
+        )
+        await client.hset("a", "v", "aaaaaaaa")
+        await client.hset("b", "v", "aaaabaaa")
+        await client.hset("c", "v", "aaaaabaa")
+        query = "*=>[KNN 2 @v $vec]"
+        q = Query(query).return_field("__v_score").sort_by("__v_score", True)
+        if expects_resp2_shape(client) or expects_unified_shape(client):
+            res, det = await client.ft().profile(q, query_params={"vec": "aaaaaaaa"})
+            det = det.info
+            assert det[4][1][5] == 2.0
+            assert det[4][1][1] == "VECTOR"
+            assert res.total == 2
+            assert "a" == res.docs[0].id
+            assert "0" == res.docs[0].__getattribute__("__v_score")
+        elif expects_resp3_shape(client):
+            res = await client.ft().profile(q, query_params={"vec": "aaaaaaaa"})
+            res = res.info
+            assert res["profile"]["Iterators profile"][0]["Counter"] == 2
+            assert res["profile"]["Iterators profile"][0]["Type"] == "VECTOR"
+            assert res["total_results"] == 2
+            assert "a" == res["results"][0]["id"]
+            assert "0" == res["results"][0]["extra_attributes"]["__v_score"]
 
 
 class TestPipeline(AsyncSearchTestsBase):
@@ -4280,7 +4468,12 @@ class TestHybridSearch(AsyncSearchTestsBase):
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.3.224")
     @pytest.mark.timeout(60)
-    async def test_hybrid_search_query_with_timeout(self, decoded_r):
+    async def test_hybrid_search_query_with_timeout(self, create_redis, stack_url):
+        # the server checks its 1 ms TIMEOUT only at checkpoints, so a slow runner
+        # can answer later than the default 5 s socket timeout
+        decoded_r = await create_redis(
+            decode_responses=True, url=stack_url, socket_timeout=30
+        )
         await self._create_hybrid_search_timeout_index(decoded_r)
         await self._add_data_for_hybrid_search_timeout(decoded_r)
 
@@ -4415,6 +4608,270 @@ class TestHybridSearch(AsyncSearchTestsBase):
             assert res["results"] == expected_results
             assert res["warnings"] == []
 
+    @staticmethod
+    def _explain_score_text(tree, leaf_type):
+        # The explanation tree is nested lists of labels; check that every
+        # label is ``leaf_type`` and return them all as one text.
+        if isinstance(tree, list):
+            return " ".join(
+                TestHybridSearch._explain_score_text(item, leaf_type) for item in tree
+            )
+        assert isinstance(tree, leaf_type)
+        return tree.decode() if leaf_type is bytes else tree
+
+    @staticmethod
+    def _assert_explained_results(client, res, expected_keywords, pipeline=False):
+        # ``expected_keywords`` maps each expected key, in result order, to
+        # keywords its explanation must mention. The explanation text is the
+        # server's own, so only its shape and keywords are checked.
+        if pipeline and expects_resp2_shape(client):
+            # Legacy pipelines return the raw flat reply, which keeps the
+            # server's ``[score, tree]`` pair. The score is a string on a
+            # RESP2 wire and a double on a RESP3 wire. Pipelines don't apply
+            # ``NEVER_DECODE``, so the decoded client gets str labels.
+            reply = {str_if_bytes(k): v for k, v in zip(res[::2], res[1::2])}
+            results = [
+                {str_if_bytes(k): v for k, v in zip(row[::2], row[1::2])}
+                for row in reply["results"]
+            ]
+            wire_score_type = str if is_resp2_connection(client) else float
+            for result in results:
+                assert isinstance(result["score"][0], wire_score_type)
+            explained = [
+                [float(result["score"][0]), result["score"][1]] for result in results
+            ]
+            leaf_type = str
+        elif expects_resp3_shape(client):
+            # The native RESP3 shape keeps the server's ``[score, tree]``
+            # pair, with bytes labels outside a pipeline.
+            results = res["results"]
+            explained = [result["score"] for result in results]
+            leaf_type = str if pipeline else bytes
+        else:
+            results = res.results
+            for result in results:
+                assert set(result.keys()) == {
+                    "__key",
+                    "__score",
+                    "score",
+                    "score_explain",
+                }
+            explained = [
+                [result["score"], result["score_explain"]] for result in results
+            ]
+            leaf_type = str
+
+        assert [result["__key"] for result in results] == list(expected_keywords)
+        for result, (score, tree), keywords in zip(
+            results, explained, expected_keywords.values()
+        ):
+            assert isinstance(score, float)
+            assert score == pytest.approx(float(result["__score"]))
+            text = TestHybridSearch._explain_score_text(tree, leaf_type)
+            for keyword in ("final score", *keywords):
+                assert keyword in text, f"{keyword!r} not in {text!r}"
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    async def test_hybrid_search_query_with_explain_score(self, decoded_r):
+        # Create index and add data
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r, items_sets=1)
+
+        hybrid_query = HybridQuery(
+            HybridSearchQuery("@color:{red}"),
+            HybridVsimQuery(
+                vector_field_name="@embedding",
+                vector_data="$vec",
+                vsim_search_method=VectorSearchMethods.KNN,
+                vsim_search_method_params={"K": 3},
+            ),
+        )
+        combine_method = CombineResultsMethod(CombinationMethods.RRF, WINDOW=20)
+        params = {"vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()}
+
+        res = await decoded_r.ft().hybrid_search(
+            query=hybrid_query,
+            combine_method=combine_method,
+            params_substitution=params,
+            explain_score=True,
+        )
+
+        # item:0 and item:2 match both queries; item:1 is only a vector match.
+        self._assert_explained_results(
+            decoded_r,
+            res,
+            {
+                b"item:0": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                b"item:2": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                b"item:1": ("RRF", "no match", "KNN", "vector rank"),
+            },
+        )
+
+        # Without the flag the server sends no explanation.
+        res = await decoded_r.ft().hybrid_search(
+            query=hybrid_query,
+            combine_method=combine_method,
+            params_substitution=params,
+        )
+
+        results = res["results"] if expects_resp3_shape(decoded_r) else res.results
+        assert [result["__key"] for result in results] == [
+            b"item:0",
+            b"item:2",
+            b"item:1",
+        ]
+        for result in results:
+            assert set(result.keys()) == {"__key", "__score"}
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    async def test_hybrid_search_query_with_explain_score_linear_range(self, decoded_r):
+        # Create index and add data
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r, items_sets=1)
+
+        res = await decoded_r.ft().hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{green}"),
+                HybridVsimQuery(
+                    vector_field_name="@embedding",
+                    vector_data="$vec",
+                    vsim_search_method=VectorSearchMethods.RANGE,
+                    vsim_search_method_params={"RADIUS": 5},
+                ),
+            ),
+            combine_method=CombineResultsMethod(
+                CombinationMethods.LINEAR, ALPHA=0.5, BETA=0.5
+            ),
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+
+        # item:1 matches both queries; item:0 is only a vector match.
+        self._assert_explained_results(
+            decoded_r,
+            res,
+            {
+                b"item:0": ("LINEAR", "no match", "RANGE", "radius"),
+                b"item:1": ("LINEAR", "BM25", "RANGE", "radius"),
+            },
+        )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    async def test_hybrid_search_query_with_explain_score_and_groupby(self, decoded_r):
+        # Create index and add data
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r, items_sets=1)
+
+        postprocessing_config = HybridPostProcessingConfig()
+        postprocessing_config.load("@color")
+        postprocessing_config.group_by(["@color"], reducers.count())
+
+        with pytest.raises(ResponseError, match="EXPLAINSCORE"):
+            await decoded_r.ft().hybrid_search(
+                query=HybridQuery(
+                    HybridSearchQuery("@color:{red}"),
+                    HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+                ),
+                post_processing=postprocessing_config,
+                params_substitution={
+                    "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+                },
+                explain_score=True,
+            )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    async def test_hybrid_search_query_with_explain_score_and_pipeline(self, decoded_r):
+        # Create index and add data
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r, items_sets=1)
+
+        p = decoded_r.ft().pipeline()
+        await p.hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{red}"),
+                HybridVsimQuery(
+                    vector_field_name="@embedding",
+                    vector_data="$vec",
+                    vsim_search_method=VectorSearchMethods.KNN,
+                    vsim_search_method_params={"K": 3},
+                ),
+            ),
+            combine_method=CombineResultsMethod(CombinationMethods.RRF, WINDOW=20),
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+        (res,) = await p.execute()
+
+        # item:0 and item:2 match both queries; item:1 is only a vector match.
+        # The pipeline decodes the keys too.
+        self._assert_explained_results(
+            decoded_r,
+            res,
+            {
+                "item:0": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                "item:2": ("RRF", "text rank", "BM25", "KNN", "vector rank"),
+                "item:1": ("RRF", "no match", "KNN", "vector rank"),
+            },
+            pipeline=True,
+        )
+
+    @pytest.mark.redismod
+    @skip_if_server_version_lt("8.10.0")
+    async def test_hybrid_search_query_with_explain_score_and_score_field(
+        self, decoded_r
+    ):
+        # Create index and add data
+        await self._create_hybrid_search_index(decoded_r)
+        await self._add_data_for_hybrid_search(decoded_r, items_sets=1)
+
+        postprocessing_config = HybridPostProcessingConfig()
+        postprocessing_config.load("@price", "AS", "score")
+
+        res = await decoded_r.ft().hybrid_search(
+            query=HybridQuery(
+                HybridSearchQuery("@color:{red}"),
+                HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+            ),
+            post_processing=postprocessing_config,
+            params_substitution={
+                "vec": np.array([1, 2, 7, 8], dtype=np.float32).tobytes()
+            },
+            explain_score=True,
+        )
+
+        # The loaded field takes the ``score`` name, so the row keeps the
+        # document value as it is and gets no ``score_explain``.
+        results = res["results"] if expects_resp3_shape(decoded_r) else res.results
+        for result in results:
+            assert set(result.keys()) == {"score"}
+        assert sorted(result["score"] for result in results) == [
+            b"15",
+            b"15",
+            b"16",
+            b"17",
+            b"18",
+        ]
+
+    @pytest.mark.redismod
+    async def test_hybrid_search_query_with_explain_score_and_cursor(self, decoded_r):
+        with pytest.raises(DataError, match="explain_score is not supported"):
+            await decoded_r.ft().hybrid_search(
+                query=HybridQuery(
+                    HybridSearchQuery("@color:{red}"),
+                    HybridVsimQuery(vector_field_name="@embedding", vector_data="$vec"),
+                ),
+                cursor=HybridCursorQuery(count=5),
+                explain_score=True,
+            )
+
     @pytest.mark.redismod
     @skip_if_server_version_lt("8.4")
     @skip_if_server_version_gte("8.11")
@@ -4495,5 +4952,5 @@ async def _queue_parsed_commands(ft):
         ft.sugget("ac", "he"),
         ft.sugget("ac", "he", with_scores=True),
     ]
-    # ``profile`` and ``syndump`` are inherited from the sync commands.
+    # ``profile`` and ``syndump`` queue synchronously on pipelines.
     return [await res if asyncio.iscoroutine(res) else res for res in queued]

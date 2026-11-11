@@ -19,6 +19,8 @@ from redis.asyncio.connection import (
     EncodableT,
     SSLConnection,
 )
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.commands import AsyncSentinelCommands
 from redis.exceptions import (
     ConnectionError,
@@ -223,7 +225,11 @@ class Sentinel(AsyncSentinelCommands):
     connecting to sentinel instances. Any argument that can be passed to
     a normal Redis connection can be specified here. If ``sentinel_kwargs`` is
     not specified, any socket_timeout and socket_keepalive options specified
-    in ``connection_kwargs`` will be used.
+    in ``connection_kwargs`` will be used. Unless ``sentinel_kwargs`` contains
+    ``retry``, the sentinel clients don't retry a failed command (or retry it
+    once when ``retry_on_timeout`` or ``retry_on_error`` is set), since master
+    discovery already moves on to the next sentinel; pass a ``Retry`` object
+    as ``retry`` to use another policy.
 
     ``connection_kwargs`` are keyword arguments that will be used when
     establishing a connection to a Redis server.
@@ -243,6 +249,18 @@ class Sentinel(AsyncSentinelCommands):
             sentinel_kwargs = {
                 k: v for k, v in connection_kwargs.items() if k.startswith("socket_")
             }
+        else:
+            sentinel_kwargs = dict(sentinel_kwargs)
+        if "retry" not in sentinel_kwargs:
+            # Master discovery already moves on to the next sentinel when one
+            # fails, so the client's default retry policy would only multiply
+            # the timeout of an unreachable sentinel. Keep the connection-level
+            # behaviour instead: no retries, or a single one when
+            # retry_on_timeout or retry_on_error is set.
+            retry_once = sentinel_kwargs.get("retry_on_timeout") or sentinel_kwargs.get(
+                "retry_on_error"
+            )
+            sentinel_kwargs["retry"] = Retry(NoBackoff(), 1 if retry_once else 0)
         self.sentinel_kwargs = sentinel_kwargs
 
         self.sentinels = [
@@ -342,8 +360,12 @@ class Sentinel(AsyncSentinelCommands):
         for sentinel_no, sentinel in enumerate(self.sentinels):
             try:
                 masters = await sentinel.sentinel_masters()
-            except (ConnectionError, TimeoutError) as e:
-                collected_errors.append(f"{sentinel} - {e!r}")
+            except (ConnectionError, ResponseError, TimeoutError) as e:
+                # repr() names only the class; str() keeps the reply text
+                error = f"{sentinel} - {e!r}"
+                if str(e):
+                    error += f": {e}"
+                collected_errors.append(error)
                 continue
             state = masters.get(service_name)
             if state and self.check_master_state(state, service_name):

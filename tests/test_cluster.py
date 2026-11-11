@@ -161,6 +161,14 @@ class ProxyRequestHandler(socketserver.BaseRequestHandler):
             conn.close()
 
 
+# Three primaries, so one can answer while two others fail
+three_primary_cluster_slots = [
+    [0, 5460, ["127.0.0.1", 7000, "node_0"]],
+    [5461, 10922, ["127.0.0.1", 7001, "node_1"]],
+    [10923, 16383, ["127.0.0.1", 7002, "node_2"]],
+]
+
+
 class NodeProxy:
     """A class to proxy a node connection to a different port"""
 
@@ -5745,7 +5753,9 @@ class TestTopologyRefreshPacing:
         assert nm._requested_last_failed_node_name == failed.name
 
     @staticmethod
-    def _one_succeeded_pipeline(failing, keyed_command=False):
+    def _one_succeeded_pipeline(
+        failing, keyed_command=False, cluster_slots=default_cluster_slots
+    ):
         """
         Send RANDOMKEY, routed to every primary and answered by the first success, in a
         pipeline whose write fails with a connection error on the ``failing`` nodes, and
@@ -5766,6 +5776,7 @@ class TestTopologyRefreshPacing:
             port=default_port,
             retry=Retry(NoBackoff(), 0),
             metadata_resolver=resolver,
+            cluster_slots=cluster_slots,
         )
 
         def get_connection(redis_node):
@@ -5862,6 +5873,34 @@ class TestTopologyRefreshPacing:
         )
 
         assert isinstance(result, ConnectionError)
+
+    @pytest.mark.fixed_client
+    def test_pipeline_raised_node_error_tries_a_copy_only_node_last(self):
+        """
+        Two writes fail: one on a node that holds only a copy of a ONE_SUCCEEDED command
+        another node answered, and one on a node that holds a keyed command of its own.
+        The keyed command's error is raised, and the copy-only node is still tried last
+        on the next refresh.
+        """
+        # The copy-only node, then the keyed node
+        failed = []
+
+        def failing(rc):
+            if not failed:
+                keyed = rc.get_node_from_key("foo").name
+                copy_only = next(p for p in rc.get_primaries() if p.name != keyed).name
+                assert list(rc.nodes_manager.nodes_cache)[-1] != copy_only
+                failed.extend((copy_only, keyed))
+            return failed
+
+        rc, result = self._one_succeeded_pipeline(
+            failing, keyed_command=True, cluster_slots=three_primary_cluster_slots
+        )
+
+        assert isinstance(result, ConnectionError)
+        # The keyed command is resent through a mocked main client, which does not
+        # try its node last as the real one does
+        assert list(rc.nodes_manager.nodes_cache)[-1] == failed[0]
 
     @pytest.mark.fixed_client
     def test_pubsub_topology_repair_is_a_paced_request(self):

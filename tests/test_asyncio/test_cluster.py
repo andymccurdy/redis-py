@@ -132,6 +132,14 @@ default_cluster_slots = [
 ]
 
 
+# Three primaries, so one can answer while two others fail
+three_primary_cluster_slots = [
+    [0, 5460, ["127.0.0.1", 7000, "node_0"]],
+    [5461, 10922, ["127.0.0.1", 7001, "node_1"]],
+    [10923, 16383, ["127.0.0.1", 7002, "node_2"]],
+]
+
+
 class NodeProxy:
     """A class to proxy a node connection to a different port"""
 
@@ -1941,7 +1949,9 @@ class TestTopologyRefreshKeepsConnections:
         assert nm._requested_last_failed_node_name is None
 
     @staticmethod
-    async def _one_succeeded_pipeline_client() -> RedisCluster:
+    async def _one_succeeded_pipeline_client(
+        cluster_slots: list = default_cluster_slots,
+    ) -> RedisCluster:
         # RANDOMKEY sent to every primary, answered by the first success
         resolver = AsyncDynamicMetadataResolver(
             {
@@ -1958,6 +1968,7 @@ class TestTopologyRefreshKeepsConnections:
             port=default_port,
             retry=Retry(NoBackoff(), 0),
             metadata_resolver=resolver,
+            cluster_slots=cluster_slots,
         )
 
     @pytest.mark.fixed_client
@@ -2067,6 +2078,48 @@ class TestTopologyRefreshKeepsConnections:
                 with pytest.raises(ConnectionError, match="down"):
                     await pipe.execute()
 
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("keyed_first", [False, True], ids=["copy", "keyed"])
+    async def test_pipeline_raised_node_error_tries_a_copy_only_node_last(
+        self, keyed_first: bool
+    ) -> None:
+        """
+        Two writes fail: one on a node that holds only a copy of a ONE_SUCCEEDED command
+        another node answered, and one on a node that holds a keyed command of its own.
+        The keyed command's error is raised, and the copy-only node is still tried last
+        on the next refresh, whichever of the two nodes is handled first. The node the
+        error came from is tried after it, as the last one.
+        """
+        r = await self._one_succeeded_pipeline_client(three_primary_cluster_slots)
+        nm = r.nodes_manager
+        keyed = r.get_node_from_key("foo")
+        copy_only = next(p for p in r.get_primaries() if p.name != keyed.name)
+        failing = {keyed.name, copy_only.name}
+        assert copy_only.name not in list(nm.nodes_cache)[-2:]
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name in failing:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                if keyed_first:
+                    pipe.get("foo")
+                pipe.execute_command("RANDOMKEY")
+                if not keyed_first:
+                    pipe.get("foo")
+                with pytest.raises(ConnectionError, match="down"):
+                    await pipe.execute()
+
+        assert list(nm.nodes_cache)[-2:] == [copy_only.name, keyed.name]
+        assert nm._requested_last_failed_node_name == keyed.name
         await r.aclose()
 
     @pytest.mark.fixed_client

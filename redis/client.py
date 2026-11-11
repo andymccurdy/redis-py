@@ -66,6 +66,7 @@ from redis.exceptions import (
     PubSubError,
     RedisError,
     ResponseError,
+    TimeoutError,
     WatchError,
 )
 from redis.himport import HImportRegistry, parse_himport_set_args
@@ -1514,9 +1515,18 @@ class PubSub:
                 # (and restore the original socket_timeout afterwards), so the
                 # configured socket_timeout does not abort the read.
                 read_timeout = None
-            return conn.read_response(
-                disconnect_on_error=False, push_request=True, timeout=read_timeout
-            )
+            try:
+                return conn.read_response(
+                    disconnect_on_error=False, push_request=True, timeout=read_timeout
+                )
+            except TimeoutError:
+                if block:
+                    raise
+                # Only part of the message arrived within the timeout. The
+                # parser keeps what it has read, so the next call resumes the
+                # same message; letting the timeout reach the retry layer
+                # would reconnect and drop it.
+                return None
 
         response = self._execute(conn, try_read)
 

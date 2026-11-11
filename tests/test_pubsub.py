@@ -2851,6 +2851,28 @@ class TestPubSubTimeoutPropagation:
         assert messages[1]["data"] == b"msg2"
         assert messages[2]["data"] == b"msg3"
 
+    def test_get_message_resumes_a_partly_received_message(self, r):
+        """
+        A message that is only partly readable when get_message() polls is
+        returned by a later call, not dropped by a reconnect.
+        """
+        p = r.pubsub()
+        p.subscribe("foo")
+        assert wait_for_message(p, timeout=1.0) is not None
+        r.publish("foo", "hello")
+        assert p.connection.can_read(timeout=1.0)
+
+        # What the parser raises when the rest of the message does not arrive
+        # within the read timeout; the unread data stays on the connection.
+        with (
+            mock.patch.object(p.connection, "read_response", side_effect=TimeoutError),
+            mock.patch.object(p, "_reconnect") as reconnect,
+        ):
+            assert p.get_message(timeout=0) is None
+        reconnect.assert_not_called()
+
+        assert wait_for_message(p, timeout=1.0)["data"] == b"hello"
+
     def test_timeout_with_pattern_subscribe(self, r):
         """
         Test that timeout works correctly with pattern subscriptions.

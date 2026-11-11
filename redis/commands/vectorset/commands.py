@@ -113,6 +113,8 @@ class VectorSetCommands(CommandsProtocol):
         """
         Add vector ``vector`` for element ``element`` to a vector set ``key``.
 
+        ``element`` may be an empty string or bytestring.
+
         ``reduce_dim`` sets the dimensions to reduce the vector to.
                 If not provided, the vector is not reduced.
 
@@ -139,7 +141,7 @@ class VectorSetCommands(CommandsProtocol):
 
         For more information, see https://redis.io/commands/vadd.
         """
-        if not vector or not element:
+        if not vector or element is None:
             raise DataError("Both vector and element must be provided")
 
         pieces = []
@@ -227,6 +229,8 @@ class VectorSetCommands(CommandsProtocol):
         """
         Compare a vector or element ``input``  with the other vectors in a vector set ``key``.
 
+        A string ``input`` names an existing element and may be empty.
+
         ``with_scores`` sets if similarity scores should be returned for each element in the result.
 
         ``with_attribs`` ``with_attribs`` sets if the results should be returned with the
@@ -251,7 +255,7 @@ class VectorSetCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/vsim.
         """
 
-        if not input:
+        if not input and not isinstance(input, str):
             raise DataError("'input' should be provided")
 
         pieces = []

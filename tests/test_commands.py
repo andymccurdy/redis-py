@@ -206,6 +206,12 @@ class TestRedisCommands:
         with pytest.raises(redis.ResponseError):
             r["a"]
 
+    def test_unmapped_error_keeps_its_status_code(self, r):
+        r.lpush("a", "1")
+        with pytest.raises(redis.ResponseError) as e:
+            r["a"]
+        assert e.value.status_code == "WRONGTYPE"
+
     # SERVER INFORMATION
     @skip_if_server_version_lt("6.0.0")
     def test_acl_cat_no_category(self, r):

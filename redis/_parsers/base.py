@@ -1,4 +1,5 @@
 import logging
+import re
 from abc import ABC, abstractmethod
 from asyncio import IncompleteReadError, StreamReader
 from typing import Awaitable, Callable, List, Optional, Protocol, Union
@@ -109,6 +110,11 @@ NO_SUCH_FIELDSET_ERROR = {
     "no such fieldset": NoSuchFieldsetError,
 }
 
+# The code a Redis error reply starts with (ERR, WRONGTYPE, NOGROUP, ...). An
+# unmapped error keeps its first word as the status code only in this shape, so
+# free-form messages such as "Syntax error at offset 3" don't become one.
+_ERROR_CODE_PATTERN = re.compile(r"[A-Z]{1,32}")
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,7 +165,8 @@ class BaseParser(ABC):
             if isinstance(exception_class, dict):
                 exception_class = exception_class.get(response, ResponseError)
             return exception_class(response, status_code=error_code)
-        return ResponseError(response)
+        status_code = error_code if _ERROR_CODE_PATTERN.fullmatch(error_code) else None
+        return ResponseError(response, status_code=status_code)
 
     @abstractmethod
     def on_disconnect(self):

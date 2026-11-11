@@ -1940,9 +1940,9 @@ _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 # Reading a reply only suspends when the socket buffer is empty, so a large
 # pipeline whose replies are already buffered never yields while it reads them
 # or runs their callbacks (#3416). A pipeline of at least this many commands
-# yields to the event loop once per this many commands in those loops: ~1000
-# replies take a few ms to process, and a yield costs a few microseconds.
-# Smaller pipelines never yield.
+# yields to the event loop once per this many commands in those loops, but not
+# after the last one: ~1000 replies take a few ms to process, and a yield costs
+# a few microseconds. Smaller pipelines never yield.
 _PIPELINE_YIELD_MIN_COMMANDS = 1000
 
 
@@ -1959,6 +1959,24 @@ async def _pack_pipeline_commands(
     if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
         return connection.pack_commands(commands)
     return await asyncio.to_thread(connection.pack_commands, commands)
+
+
+async def _yield_in_read_loop(connection: Connection) -> None:
+    """Yield to the event loop from a loop that reads a batch of replies.
+
+    The task can be cancelled at the yield: a task.cancel(), an expired
+    asyncio.timeout() or wait_for() around execute(), or Ctrl+C under
+    asyncio.run(). The rest of the batch's replies (for a transaction, the rest
+    of the QUEUED replies and the EXEC reply) are still on the socket, so the
+    connection is dropped rather than let them be read as the reply to a later
+    command, such as the UNWATCH that reset() sends while WATCHing, or by the
+    next caller that borrows it from the pool.
+    """
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        await connection.disconnect(nowait=True)
+        raise
 
 
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
@@ -2227,6 +2245,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         # and all the other commands
         for i, command in enumerate(commands):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await _yield_in_read_loop(connection)
             if EMPTY_RESPONSE in command[1]:
                 errors.append((i, command[1][EMPTY_RESPONSE]))
             else:
@@ -2235,23 +2255,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 except ResponseError as err:
                     self.annotate_exception(err, i + 1, command[0])
                     errors.append((i, err))
-            if (
-                may_yield
-                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
-            ):
-                try:
-                    await asyncio.sleep(0)
-                except asyncio.CancelledError:
-                    # The task was cancelled at the yield: a task.cancel(), an
-                    # expired asyncio.timeout() or wait_for() around execute(),
-                    # or Ctrl+C under asyncio.run(). The rest of the QUEUED
-                    # replies and the EXEC reply are still on the socket. Drop
-                    # the connection rather than let them be read as the reply
-                    # to a later command, such as the UNWATCH that reset() sends
-                    # while WATCHing, or by the next caller that borrows it from
-                    # the pool.
-                    await connection.disconnect(nowait=True)
-                    raise
 
         # parse the EXEC.
         try:
@@ -2285,6 +2288,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # We have to run response callbacks manually
         data = []
         for i, (r, cmd) in enumerate(zip(response, commands)):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             if not isinstance(r, Exception):
                 args, options = cmd
                 command_name = args[0]
@@ -2303,11 +2308,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)
-            if (
-                may_yield
-                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
-            ):
-                await asyncio.sleep(0)
         return data
 
     async def _execute_pipeline(
@@ -2340,18 +2340,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
         try:
             for i, (args, options) in enumerate(commands):
+                if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                    await asyncio.sleep(0)
                 try:
                     response.append(
                         await self.parse_response(connection, args[0], **options)
                     )
                 except ResponseError as e:
                     response.append(e)
-                if (
-                    may_yield
-                    and i % _PIPELINE_YIELD_MIN_COMMANDS
-                    == _PIPELINE_YIELD_MIN_COMMANDS - 1
-                ):
-                    await asyncio.sleep(0)
         except BaseException:
             # A response callback raised, or the task was cancelled at the yield,
             # so the replies of the rest of the batch are still on the socket.

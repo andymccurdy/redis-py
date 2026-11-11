@@ -7964,13 +7964,17 @@ class TestClusterNodeConnectionHandling:
 
     @pytest.mark.parametrize(
         "count",
-        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
     )
     async def test_execute_pipeline_read_loop_yields_to_event_loop(self, count) -> None:
         """
         Reading buffered replies never suspends, so a large batch yields every
-        _PIPELINE_YIELD_MIN_COMMANDS replies (#3416). Smaller batches never
-        yield.
+        _PIPELINE_YIELD_MIN_COMMANDS replies (#3416), but never after the last
+        one. Smaller batches never yield.
         """
         node, connection, commands = self._mock_node_for_pipeline(count)
         ticks = 0
@@ -8003,7 +8007,7 @@ class TestClusterNodeConnectionHandling:
             ticker.cancel()
             await asyncio.gather(ticker, return_exceptions=True)
 
-        assert ticks - ticks_before == count // _PIPELINE_YIELD_MIN_COMMANDS
+        assert ticks - ticks_before == (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
         assert [cmd.result for cmd in commands] == [b"value"] * count
         connection.disconnect.assert_not_called()
         assert node._free[0] is connection
@@ -9550,13 +9554,18 @@ class TestClusterPipelineMocked:
 
     @pytest.mark.parametrize(
         "count",
-        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
     )
     async def test_transaction_reply_loops_yield_to_event_loop(self, count) -> None:
         """
         Reading buffered replies never suspends, so a large transaction yields
         every _PIPELINE_YIELD_MIN_COMMANDS commands in the QUEUED read loop and
-        in the callback loop (#3416). Smaller transactions never yield.
+        in the callback loop (#3416), but never after the last command. Smaller
+        transactions never yield.
         """
         r = await get_mocked_redis_client(host=default_host, port=default_port)
         try:
@@ -9568,7 +9577,7 @@ class TestClusterPipelineMocked:
             await r.aclose()
 
         assert result == [b"value"] * count
-        assert ticks - baseline == 2 * (count // _PIPELINE_YIELD_MIN_COMMANDS)
+        assert ticks - baseline == 2 * ((count - 1) // _PIPELINE_YIELD_MIN_COMMANDS)
         connection.disconnect.assert_not_called()
 
     async def test_transaction_cancelled_at_queued_loop_yield_disconnects(
@@ -9592,13 +9601,17 @@ class TestClusterPipelineMocked:
 
     @pytest.mark.parametrize(
         "count",
-        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
     )
     async def test_pipeline_routing_loop_yields_to_event_loop(self, count) -> None:
         """
         Routing a command does not suspend, so a large pipeline yields every
-        _PIPELINE_YIELD_MIN_COMMANDS commands while it routes them (#3416). Smaller
-        pipelines never yield.
+        _PIPELINE_YIELD_MIN_COMMANDS commands while it routes them (#3416), but
+        never after the last one. Smaller pipelines never yield.
         """
 
         async def execute_pipeline(node, commands):
@@ -9649,7 +9662,7 @@ class TestClusterPipelineMocked:
         finally:
             await r.aclose()
 
-        assert ticks - baseline == count // _PIPELINE_YIELD_MIN_COMMANDS
+        assert ticks - baseline == (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
 
     async def test_transaction_keeps_held_connection_when_slot_owner_changes(
         self,

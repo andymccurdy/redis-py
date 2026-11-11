@@ -215,14 +215,18 @@ class TestPipeline:
     @pytest.mark.parametrize("transaction", (False, True))
     @pytest.mark.parametrize(
         "count",
-        (_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS),
+        (
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ),
     )
     async def test_pipeline_reply_loops_yield_to_event_loop(self, transaction, count):
         """
         Reading buffered replies never suspends, so a large pipeline yields every
         _PIPELINE_YIELD_MIN_COMMANDS commands in the read loop and, for a
-        transaction, in the callback loop too (#3416). Smaller pipelines never
-        yield.
+        transaction, in the callback loop too (#3416), but never after the last
+        command. Smaller pipelines never yield.
         """
         pipeline, connection, commands = self._mock_pipeline_execution(
             transaction, count
@@ -257,7 +261,7 @@ class TestPipeline:
             await asyncio.gather(ticker, return_exceptions=True)
 
         assert result == [True] * count
-        yields_per_loop = count // _PIPELINE_YIELD_MIN_COMMANDS
+        yields_per_loop = (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
         loops = 2 if transaction else 1
         assert ticks - ticks_before == yields_per_loop * loops
         connection.disconnect.assert_not_called()

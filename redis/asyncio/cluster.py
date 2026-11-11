@@ -52,9 +52,11 @@ from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import (
+    _PIPELINE_YIELD_MIN_COMMANDS,
     PubSub,
     ResponseCallbackT,
     _pack_pipeline_commands,
+    _yield_in_read_loop,
 )
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -2743,7 +2745,10 @@ class ClusterNode:
             # Read responses
             ret = False
             marked = False
-            for cmd in commands:
+            may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
+            for i, cmd in enumerate(commands):
+                if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                    await _yield_in_read_loop(connection)
                 try:
                     cmd.result = await self.parse_response(
                         connection, cmd.args[0], **cmd.kwargs
@@ -4057,7 +4062,13 @@ class PipelineStrategy(AbstractStrategy):
                 Optional[List[_MultiShardSplit]],
             ]
         ] = []
-        for cmd in todo:
+        # Routing does not suspend either, so a large batch yields to the event loop
+        # while it is routed, as the reply loops do. A cancellation at the yield comes
+        # before anything is sent, and execute() resets the pipeline.
+        may_yield = len(todo) >= _PIPELINE_YIELD_MIN_COMMANDS
+        for i, cmd in enumerate(todo):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             passed_targets = cmd.kwargs.pop("target_nodes", cmd.target_nodes)
             target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
                 passed_targets
@@ -4924,6 +4935,7 @@ class TransactionStrategy(AbstractStrategy):
 
         await connection.send_packed_command(packed_commands)
         errors = []
+        may_yield = len(self._command_queue) >= _PIPELINE_YIELD_MIN_COMMANDS
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -4941,6 +4953,8 @@ class TransactionStrategy(AbstractStrategy):
 
         # and all the other commands
         for i, command in enumerate(self._command_queue):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await _yield_in_read_loop(connection)
             if EMPTY_RESPONSE in command.kwargs:
                 errors.append((i, command.kwargs[EMPTY_RESPONSE]))
             else:
@@ -4997,7 +5011,9 @@ class TransactionStrategy(AbstractStrategy):
 
         # We have to run response callbacks manually
         data = []
-        for r, cmd in zip(response, self._command_queue):
+        for i, (r, cmd) in enumerate(zip(response, self._command_queue)):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
                 if connection._resp2_fallback:

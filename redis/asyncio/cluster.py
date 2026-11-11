@@ -3489,10 +3489,11 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
             .delete("A", "B", "K")
             .execute()
         )
-        # result = [True, "1", 1, {"F": "V"}, True, True, "2", "3", 1, 1, 1]
+        # result = [True, "1", 1, {"F": "V"}, True, True, "2", "3", 3]
 
-    Note: For commands `DELETE`, `EXISTS`, `TOUCH`, `mset_nonatomic`, which are split
-    across multiple nodes, you'll get multiple results for them in the array.
+    Note: `mset_nonatomic` is split across multiple nodes, so you'll get one result per
+    hash slot of its keys in the array. `DELETE`, `EXISTS` and `TOUCH` give one result,
+    the sum of the per-slot replies.
 
     Which methods must be awaited:
 
@@ -3682,10 +3683,9 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
     def _split_command_across_slots(
         self, command: str, *keys: KeyT
     ) -> "ClusterPipeline":
-        for slot_keys in self.cluster_client._partition_keys_by_slot(keys).values():
-            self.execute_command(command, *slot_keys)
-
-        return self
+        # Queued as one command: ``execute`` splits a MULTI_SHARD command by slot and
+        # sums the per-slot replies, so the pipeline answers with one result for it.
+        return self.execute_command(command, *keys)
 
     async def reset(self):
         """

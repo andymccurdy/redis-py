@@ -652,6 +652,18 @@ class TestWithheldRoutingPolicies:
         for name in ("eval_ro", "evalsha_ro", "fcall_ro"):
             assert static_resolver.resolve(name).is_script_runner is True, name
 
+    def test_del_is_split_by_slot_and_summed(self):
+        """DEL records the server's ``multi_shard`` / ``agg_sum`` tips, as EXISTS does."""
+        static_resolver = StaticMetadataResolver()
+        metadata = static_resolver.resolve("del")
+
+        assert metadata is not None
+        assert policy_pair(metadata) == MULTI_SHARD_SUMMED_POLICIES
+        assert metadata.is_readonly is False
+        assert metadata.has_key_argument is True
+        assert static_resolver.is_cacheable("del") is False
+        assert static_resolver.is_replica_safe("del") is False
+
     def test_keyless_reads_withhold_routing_and_are_replica_safe(self):
         static_resolver = StaticMetadataResolver()
         for name in WITHHELD_KEYLESS_READS:

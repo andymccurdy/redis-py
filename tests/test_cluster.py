@@ -4352,15 +4352,16 @@ class TestMultiShardRequests:
     """
 
     def test_the_counts_of_a_summed_command_are_added_up(self, r):
-        """The shipped table tips EXISTS and TOUCH multi_shard / agg_sum."""
+        """The shipped table tips EXISTS, TOUCH and DEL multi_shard / agg_sum."""
         keys = _keys_on_every_shard(r, "sum")
         r.mset_nonatomic({key: 1 for key in keys})
 
         with _pipelined_commands() as batches, _sent_commands() as sent:
             assert r.execute_command("EXISTS", *keys, keys[0] + "missing") == len(keys)
             assert r.execute_command("TOUCH", *keys) == len(keys)
+            assert r.execute_command("DEL", *keys) == len(keys)
 
-        assert sum(len(batch) for batch in batches) == 2 * len(keys)
+        assert sum(len(batch) for batch in batches) == 3 * len(keys)
         assert not sent
 
     def test_a_nodes_flag_keeps_each_primary_s_count(self, r):
@@ -4583,6 +4584,24 @@ class TestMultiShardRequests:
 
         assert events[0] == "refresh"
         assert "route" in events
+
+    def test_a_pipeline_answers_a_multi_key_helper_once(self, r):
+        """
+        ``exists``, ``touch`` and ``delete`` queue one command, which is split by slot
+        when the pipeline runs, so each answers with one summed count.
+        """
+        keys = _keys_on_every_shard(r, "pipehelper")
+        r.mset_nonatomic({key: 1 for key in keys})
+        missing = keys[0] + "missing"
+
+        with r.pipeline() as pipe:
+            pipe.exists(*keys, missing)
+            pipe.touch(*keys, missing)
+            pipe.delete(*keys, missing)
+            assert len(pipe) == 3
+            assert pipe.execute() == [len(keys)] * 3
+
+        assert r.exists(*keys) == 0
 
     def test_a_pipeline_merges_a_split_command_per_slot(self, r, monkeypatch):
         _route_by_live_tips(r, monkeypatch)
@@ -8173,15 +8192,16 @@ class TestClusterPipeline:
             pipe.delete("a")
             assert pipe.execute() == [1]
 
-    def test_multi_delete_unsupported_cross_slot(self, r):
+    def test_multi_delete_cross_slot(self, r):
         """
-        Test that multi delete operation is unsupported
+        Test that multi delete across slots is queued as one command and answers with
+        the summed count
         """
         with r.pipeline(transaction=False) as pipe:
             r["a"] = 1
             r["b"] = 2
-            with pytest.raises(RedisClusterException):
-                pipe.delete("a", "b")
+            pipe.delete("a", "b")
+            assert pipe.execute() == [2]
 
     def test_multi_delete_supported_single_slot(self, r):
         """

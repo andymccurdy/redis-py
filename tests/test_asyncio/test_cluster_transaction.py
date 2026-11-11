@@ -111,6 +111,17 @@ class TestClusterTransaction:
                 await tx.watch("key1", "key2")
 
     @pytest.mark.onlycluster
+    async def test_throws_exception_on_multi_key_helper_on_different_hash_slots(
+        self, r
+    ):
+        async with r.pipeline(transaction=True) as tx:
+            with pytest.raises(
+                RedisClusterException,
+                match="DEL - all keys must map to the same key slot",
+            ):
+                tx.delete("{foo}bar", "{foobar}baz")
+
+    @pytest.mark.onlycluster
     async def test_transaction_with_watched_keys(self, r):
         await r.set("a", 0)
 

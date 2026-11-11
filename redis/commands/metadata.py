@@ -1297,6 +1297,15 @@ _WRITE_KEYED = CommandMetadata(
     has_complete_metadata=True,
 )
 
+# Same, for a write the server tips ``request_policy:multi_shard`` and
+# ``response_policy:agg_sum``: the cluster client splits its keys by hash slot and sums the
+# per-slot counts.
+_WRITE_MULTI_SHARD_SUMMED = replace(
+    _WRITE_KEYED,
+    request_policy=RequestPolicy.MULTI_SHARD,
+    response_policy=ResponsePolicy.AGG_SUM,
+)
+
 # The same three shapes for the commands the server tips ``dont_cache``. The search module
 # tips nearly its whole surface that way, including the write commands, where the marker is
 # redundant - rule 1 already excludes them. It is recorded anyway so the table keeps
@@ -1394,6 +1403,10 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
                 # the 2-word COMMAND COUNT, COMMAND LIST, COMMAND GETKEYS default-node flags.
                 "command": _WRITE_KEYLESS_WITHHELD_ROUTING,
                 "dbsize": _READONLY_KEYLESS_WITHHELD_ROUTING,
+                # Tipped request_policy:multi_shard / response_policy:agg_sum, like EXISTS:
+                # the cluster client splits the keys by hash slot and sums the counts, as
+                # ``delete`` already does. Keys that share a slot are sent as one command.
+                "del": _WRITE_MULTI_SHARD_SUMMED,
                 "digest": _CACHEABLE_KEYED,
                 "dump": _NONDETERMINISTIC_KEYED,
                 # Not cacheable: script_runner. See the shape's note for why all three are

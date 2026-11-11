@@ -1,7 +1,18 @@
 Redis Modules Commands
 ######################
 
-Accessing redis module commands requires the installation of the supported `Redis module <https://docs.redis.com/latest/modules/>`_. For a quick start with redis modules, try the `Redismod docker <https://hub.docker.com/r/redislabs/redismod>`_.
+Redis Open Source 8.0 and later include Search, JSON, time series, and
+probabilistic commands. You can run the examples below without installing
+separate modules. To start a local Redis 8 server with Docker:
+
+.. code-block:: console
+
+    docker run --rm -p 127.0.0.1:6379:6379 redis:8
+
+For older Redis versions, use a server with the corresponding modules enabled,
+such as Redis Stack. See the `Redis module lifecycle documentation
+<https://redis.io/docs/latest/operate/oss_and_stack/stack-with-enterprise/modules-lifecycle/>`_
+for version details.
 
 
 RedisBloom Commands

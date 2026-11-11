@@ -4697,10 +4697,16 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         ) and self._release_cache_connection(connection):
             return
         # Sentinel may already reject a cached connection at entry. Its
-        # disconnect must not invoke completion listeners under the pool lock.
+        # disconnect must not invoke completion listeners or join a nested
+        # shutdown's idle drains under the pool lock.
         with (
             (
                 _defer_maintenance_events()
+                if isinstance(connection, CacheProxyConnection)
+                else nullcontext()
+            ),
+            (
+                self._defer_cached_disconnects()
                 if isinstance(connection, CacheProxyConnection)
                 else nullcontext()
             ),
@@ -4835,7 +4841,12 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         """
         self._checkpid()
         cached_connections = []
-        with self._lock:
+        with (
+            self._defer_cached_disconnects()
+            if self.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             if inuse_connections:
                 connections = chain(
                     self._available_connections, self._in_use_connections

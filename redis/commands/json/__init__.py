@@ -347,10 +347,6 @@ class AsyncJSON(_JSONBase):
         for file_path in file_paths:
             try:
                 # Strip only the extension of the final path component.
-                # os.path.splitext handles a dot in a directory (v1.2), a
-                # file with no extension, and dotfiles, none of which
-                # rsplit(".", 1) gets right, e.g. /data/v1.2/file.json ->
-                # /data/v1.2/file and /data/v1.2/README -> /data/v1.2/README.
                 file_name = os.path.splitext(file_path)[0]
                 await self.set_file(
                     file_name,

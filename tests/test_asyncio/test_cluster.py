@@ -27,7 +27,10 @@ import pytest
 import pytest_asyncio
 from _pytest.fixtures import FixtureRequest
 from redis._parsers import AsyncCommandsParser
-from redis.asyncio.client import _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS
+from redis.asyncio.client import (
+    _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS,
+    _PIPELINE_YIELD_MIN_COMMANDS,
+)
 from redis.asyncio.cluster import (
     ClusterNode,
     NodesManager,
@@ -7891,6 +7894,93 @@ class TestClusterNodeConnectionHandling:
         assert [cmd.result for cmd in commands] == [b"value"] * count
         assert node._free[0] is connection
 
+    @staticmethod
+    def _mock_node_for_pipeline(count):
+        node = ClusterNode(default_host, 7000)
+        connection = mock.MagicMock(spec=Connection)
+        connection.is_connected = False
+        connection.should_reconnect.return_value = False
+        connection.pack_commands.return_value = [b"packed"]
+        node._connections.append(connection)
+        node._free.append(connection)
+        commands = [PipelineCommand(i, "GET", "key") for i in range(count)]
+        return node, connection, commands
+
+    @pytest.mark.parametrize(
+        "count",
+        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+    )
+    async def test_execute_pipeline_read_loop_yields_to_event_loop(self, count) -> None:
+        """
+        Reading buffered replies never suspends, so a large batch yields every
+        _PIPELINE_YIELD_MIN_COMMANDS replies (#3416). Smaller batches never
+        yield.
+        """
+        node, connection, commands = self._mock_node_for_pipeline(count)
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        ticks_before = ticks
+        try:
+            with (
+                mock.patch.object(
+                    ClusterNode,
+                    "parse_response",
+                    new=mock.AsyncMock(return_value=b"value"),
+                ),
+                # Packing is offloaded at this size; a mock keeps it from
+                # suspending
+                mock.patch(
+                    "redis.asyncio.client.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=[b"offloaded"]),
+                ),
+            ):
+                assert await node.execute_pipeline(commands) is False
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+        assert ticks - ticks_before == count // _PIPELINE_YIELD_MIN_COMMANDS
+        assert [cmd.result for cmd in commands] == [b"value"] * count
+        connection.disconnect.assert_not_called()
+        assert node._free[0] is connection
+
+    async def test_execute_pipeline_cancelled_at_read_loop_yield_disconnects(
+        self,
+    ) -> None:
+        """
+        A cancellation at a read loop yield leaves the rest of the replies on the
+        socket, so the connection is dropped before it is released to the pool.
+        """
+        node, connection, commands = self._mock_node_for_pipeline(
+            _PIPELINE_YIELD_MIN_COMMANDS + 1
+        )
+        parse_response = mock.AsyncMock(return_value=b"value")
+        with (
+            mock.patch.object(ClusterNode, "parse_response", new=parse_response),
+            mock.patch(
+                "redis.asyncio.client.asyncio.to_thread",
+                new=mock.AsyncMock(return_value=[b"offloaded"]),
+            ),
+        ):
+            task = asyncio.create_task(node.execute_pipeline(commands))
+            # The task runs until the first yield, then is cancelled there
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        connection.disconnect.assert_awaited_once_with(nowait=True)
+        assert parse_response.await_count == _PIPELINE_YIELD_MIN_COMMANDS
+        assert node._free[0] is connection
+
     async def test_execute_command_releases_connection_after_disconnect_error(
         self,
     ) -> None:
@@ -9340,6 +9430,170 @@ class TestClusterPipelineMocked:
             assert packed[-1] == ("EXEC",)
         finally:
             await r.aclose()
+
+    @staticmethod
+    async def _run_mocked_transaction(r, count, cancel=False):
+        """
+        Execute a transaction of ``count`` GETs whose replies are already
+        buffered, so parse_response never suspends. Return the event loop turns
+        another task got during the execution, the result and the mocks.
+        """
+        node = r.get_node(host=default_host, port=7000)
+        connection = mock.MagicMock(spec=Connection)
+        connection.should_reconnect.return_value = False
+        connection._resp2_fallback = False
+        connection.host, connection.port, connection.db = default_host, 7000, 0
+        stack = [PipelineCommand(i, "GET", "key") for i in range(count)]
+        strategy = r.pipeline(transaction=True)._execution_strategy
+        strategy._command_queue = stack
+        parse_response = mock.AsyncMock(
+            side_effect=[b"OK", *[b"QUEUED"] * count, [b"value"] * count]
+        )
+        result = None
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        ticks_before = ticks
+        try:
+            with (
+                mock.patch.object(
+                    type(strategy),
+                    "_get_client_and_connection_for_transaction",
+                    return_value=(node, connection),
+                ),
+                mock.patch.object(ClusterNode, "parse_response", new=parse_response),
+                # Packing is offloaded at this size; a mock keeps it from
+                # suspending
+                mock.patch(
+                    "redis.asyncio.client.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=[b"offloaded"]),
+                ),
+            ):
+                execution = strategy._execute_transaction(stack, raise_on_error=True)
+                if cancel:
+                    task = asyncio.create_task(execution)
+                    # The task runs until the first yield, then is cancelled
+                    # there
+                    await asyncio.sleep(0)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    result = await execution
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+        return ticks - ticks_before, result, connection, parse_response
+
+    @pytest.mark.parametrize(
+        "count",
+        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+    )
+    async def test_transaction_reply_loops_yield_to_event_loop(self, count) -> None:
+        """
+        Reading buffered replies never suspends, so a large transaction yields
+        every _PIPELINE_YIELD_MIN_COMMANDS commands in the QUEUED read loop and
+        in the callback loop (#3416). Smaller transactions never yield.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            # The turns a one-command transaction gives away come from elsewhere
+            # in the execution, so they are subtracted
+            baseline, *_ = await self._run_mocked_transaction(r, 1)
+            ticks, result, connection, _ = await self._run_mocked_transaction(r, count)
+        finally:
+            await r.aclose()
+
+        assert result == [b"value"] * count
+        assert ticks - baseline == 2 * (count // _PIPELINE_YIELD_MIN_COMMANDS)
+        connection.disconnect.assert_not_called()
+
+    async def test_transaction_cancelled_at_queued_loop_yield_disconnects(
+        self,
+    ) -> None:
+        """
+        A cancellation at a QUEUED read loop yield leaves the rest of the
+        replies on the socket, so the connection is dropped.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            _, _, connection, parse_response = await self._run_mocked_transaction(
+                r, _PIPELINE_YIELD_MIN_COMMANDS + 1, cancel=True
+            )
+        finally:
+            await r.aclose()
+
+        connection.disconnect.assert_awaited_once_with(nowait=True)
+        # MULTI, plus the QUEUED replies read before the yield
+        assert parse_response.await_count == _PIPELINE_YIELD_MIN_COMMANDS + 1
+
+    @pytest.mark.parametrize(
+        "count",
+        [_PIPELINE_YIELD_MIN_COMMANDS - 1, 2 * _PIPELINE_YIELD_MIN_COMMANDS],
+    )
+    async def test_pipeline_routing_loop_yields_to_event_loop(self, count) -> None:
+        """
+        Routing a command does not suspend, so a large pipeline yields every
+        _PIPELINE_YIELD_MIN_COMMANDS commands while it routes them (#3416). Smaller
+        pipelines never yield.
+        """
+
+        async def execute_pipeline(node, commands):
+            # Replies that are already buffered: answering never suspends
+            for cmd in commands:
+                cmd.result = True
+            return False
+
+        async def run(r, count):
+            pipe = r.pipeline()
+            for i in range(count):
+                pipe.set("foo", i)
+            ticks = 0
+
+            async def tick():
+                nonlocal ticks
+                while True:
+                    ticks += 1
+                    await asyncio.sleep(0)
+
+            ticker = asyncio.create_task(tick())
+            await asyncio.sleep(0)
+            ticks_before = ticks
+            try:
+                result = await pipe.execute()
+            finally:
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+            assert result == [True] * count
+            return ticks - ticks_before
+
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            with (
+                mock.patch.object(
+                    ClusterNode, "execute_pipeline", new=execute_pipeline
+                ),
+                mock.patch.object(
+                    r,
+                    "_determine_slot",
+                    new=mock.AsyncMock(return_value=r.keyslot("foo")),
+                ),
+            ):
+                # The turns a one-command pipeline gives away come from elsewhere
+                # in the execution (the node tasks), so they are subtracted
+                baseline = await run(r, 1)
+                ticks = await run(r, count)
+        finally:
+            await r.aclose()
+
+        assert ticks - baseline == count // _PIPELINE_YIELD_MIN_COMMANDS
 
     async def test_transaction_keeps_held_connection_when_slot_owner_changes(
         self,

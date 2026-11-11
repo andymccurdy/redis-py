@@ -52,6 +52,7 @@ from redis._parsers.helpers import decode_info, get_response_callbacks
 from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import (
+    _PIPELINE_YIELD_MIN_COMMANDS,
     PubSub,
     ResponseCallbackT,
     _pack_pipeline_commands,
@@ -2743,7 +2744,8 @@ class ClusterNode:
             # Read responses
             ret = False
             marked = False
-            for cmd in commands:
+            may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
+            for i, cmd in enumerate(commands):
                 try:
                     cmd.result = await self.parse_response(
                         connection, cmd.args[0], **cmd.kwargs
@@ -2755,6 +2757,22 @@ class ClusterNode:
                         marked = self._mark_free_connections_for_reconnect_on_error(e)
                     cmd.result = e
                     ret = True
+                if (
+                    may_yield
+                    and i % _PIPELINE_YIELD_MIN_COMMANDS
+                    == _PIPELINE_YIELD_MIN_COMMANDS - 1
+                ):
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        # The task was cancelled at the yield: a task.cancel(),
+                        # an expired asyncio.timeout() or wait_for() around
+                        # execute(), or Ctrl+C under asyncio.run(). The replies
+                        # of the rest of the batch are still on the socket.
+                        # Drop the connection rather than hand them to the next
+                        # caller that borrows it from the pool.
+                        await connection.disconnect(nowait=True)
+                        raise
 
             return ret
         finally:
@@ -4057,7 +4075,11 @@ class PipelineStrategy(AbstractStrategy):
                 Optional[List[_MultiShardSplit]],
             ]
         ] = []
-        for cmd in todo:
+        # Routing does not suspend either, so a large batch yields to the event loop
+        # while it is routed, as the reply loops do. A cancellation at the yield comes
+        # before anything is sent, and execute() resets the pipeline.
+        may_yield = len(todo) >= _PIPELINE_YIELD_MIN_COMMANDS
+        for i, cmd in enumerate(todo):
             passed_targets = cmd.kwargs.pop("target_nodes", cmd.target_nodes)
             target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
                 passed_targets
@@ -4159,6 +4181,11 @@ class PipelineStrategy(AbstractStrategy):
                 if node.name not in nodes:
                     nodes[node.name] = (node, [])
                 nodes[node.name][1].append(queued_command)
+            if (
+                may_yield
+                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
+            ):
+                await asyncio.sleep(0)
 
         # Start timing for observability
         start_time = time.monotonic()
@@ -4924,6 +4951,7 @@ class TransactionStrategy(AbstractStrategy):
 
         await connection.send_packed_command(packed_commands)
         errors = []
+        may_yield = len(self._command_queue) >= _PIPELINE_YIELD_MIN_COMMANDS
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -4956,6 +4984,23 @@ class TransactionStrategy(AbstractStrategy):
                 except ResponseError as e:
                     self._annotate_exception(e, i + 1, command.args)
                     errors.append(e)
+            if (
+                may_yield
+                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
+            ):
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    # The task was cancelled at the yield: a task.cancel(), an
+                    # expired asyncio.timeout() or wait_for() around execute(),
+                    # or Ctrl+C under asyncio.run(). The rest of the QUEUED
+                    # replies and the EXEC reply are still on the socket. Drop
+                    # the connection rather than let them be read as the reply
+                    # to a later command, such as the UNWATCH that reset() sends
+                    # while WATCHing, or by the next caller that borrows it from
+                    # the pool.
+                    await connection.disconnect(nowait=True)
+                    raise
 
         response = None
         # parse the EXEC.
@@ -4997,7 +5042,7 @@ class TransactionStrategy(AbstractStrategy):
 
         # We have to run response callbacks manually
         data = []
-        for r, cmd in zip(response, self._command_queue):
+        for i, (r, cmd) in enumerate(zip(response, self._command_queue)):
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
                 if connection._resp2_fallback:
@@ -5016,6 +5061,11 @@ class TransactionStrategy(AbstractStrategy):
                     cmd.kwargs.pop("keys", None)
                     r = callback(r, **cmd.kwargs)
             data.append(r)
+            if (
+                may_yield
+                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
+            ):
+                await asyncio.sleep(0)
 
         await record_operation_duration(
             command_name="TRANSACTION",

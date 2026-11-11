@@ -1937,6 +1937,14 @@ CommandStackT = List[CommandT]
 # existing synchronous path and never touch the loop's default executor.
 _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 
+# Reading a reply only suspends when the socket buffer is empty, so a large
+# pipeline whose replies are already buffered never yields while it reads them
+# or runs their callbacks (#3416). A pipeline of at least this many commands
+# yields to the event loop once per this many commands in those loops: ~1000
+# replies take a few ms to process, and a yield costs a few microseconds.
+# Smaller pipelines never yield.
+_PIPELINE_YIELD_MIN_COMMANDS = 1000
+
 
 async def _pack_pipeline_commands(
     connection: Connection, commands: Sequence[Iterable[EncodableT]]
@@ -2206,6 +2214,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         await connection.send_packed_command(all_cmds)
         errors = []
+        may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -2226,6 +2235,23 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 except ResponseError as err:
                     self.annotate_exception(err, i + 1, command[0])
                     errors.append((i, err))
+            if (
+                may_yield
+                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
+            ):
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    # The task was cancelled at the yield: a task.cancel(), an
+                    # expired asyncio.timeout() or wait_for() around execute(),
+                    # or Ctrl+C under asyncio.run(). The rest of the QUEUED
+                    # replies and the EXEC reply are still on the socket. Drop
+                    # the connection rather than let them be read as the reply
+                    # to a later command, such as the UNWATCH that reset() sends
+                    # while WATCHing, or by the next caller that borrows it from
+                    # the pool.
+                    await connection.disconnect(nowait=True)
+                    raise
 
         # parse the EXEC.
         try:
@@ -2258,7 +2284,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         # We have to run response callbacks manually
         data = []
-        for r, cmd in zip(response, commands):
+        for i, (r, cmd) in enumerate(zip(response, commands)):
             if not isinstance(r, Exception):
                 args, options = cmd
                 command_name = args[0]
@@ -2277,6 +2303,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)
+            if (
+                may_yield
+                and i % _PIPELINE_YIELD_MIN_COMMANDS == _PIPELINE_YIELD_MIN_COMMANDS - 1
+            ):
+                await asyncio.sleep(0)
         return data
 
     async def _execute_pipeline(
@@ -2306,18 +2337,26 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
 
         response = []
+        may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
         try:
-            for args, options in commands:
+            for i, (args, options) in enumerate(commands):
                 try:
                     response.append(
                         await self.parse_response(connection, args[0], **options)
                     )
                 except ResponseError as e:
                     response.append(e)
+                if (
+                    may_yield
+                    and i % _PIPELINE_YIELD_MIN_COMMANDS
+                    == _PIPELINE_YIELD_MIN_COMMANDS - 1
+                ):
+                    await asyncio.sleep(0)
         except BaseException:
-            # A response callback raised, so the replies of the rest of the batch
-            # are still on the socket. Drop the connection rather than hand them to
-            # the next caller that borrows it from the pool.
+            # A response callback raised, or the task was cancelled at the yield,
+            # so the replies of the rest of the batch are still on the socket.
+            # Drop the connection rather than hand them to the next caller that
+            # borrows it from the pool.
             await connection.disconnect(nowait=True)
             raise
 

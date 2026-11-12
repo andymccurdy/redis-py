@@ -146,6 +146,7 @@ from redis.exceptions import (
     MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -1874,7 +1875,10 @@ class RedisCluster(
                     **kwargs,
                 )
             except Exception as e:
-                if retry_attempts > 0 and type(e) in self.__class__.ERRORS_ALLOW_RETRY:
+                if retry_attempts > 0 and (
+                    type(e) in self.__class__.ERRORS_ALLOW_RETRY
+                    or getattr(e, "_demoted_primary", False)
+                ):
                     if is_default_node:
                         # Replace the default cluster node
                         self.replace_default_node()
@@ -2204,6 +2208,25 @@ class RedisCluster(
                     error=e,
                     connection=target_node,
                 )
+            except ReadOnlyError as e:
+                # A node cached as a primary answered READONLY: it was demoted
+                # (failover) and the cached topology is stale. Ask for a
+                # refresh, run by the next attempt, and let the command be
+                # retried. A replica answering READONLY is a real error.
+                if target_node.server_type == PRIMARY:
+                    e._demoted_primary = True
+                    self.nodes_manager.move_node_to_end_of_cached_nodes(
+                        target_node.name
+                    )
+                    self._request_refresh(last_failed_node_name=target_node.name)
+                e.connection = target_node
+                await self._record_command_metric(
+                    command_name=command,
+                    duration_seconds=time.monotonic() - start_time,
+                    connection=target_node,
+                    error=e,
+                )
+                raise
             except ResponseError as e:
                 e.connection = target_node
                 await self._record_command_metric(

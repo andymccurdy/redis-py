@@ -83,6 +83,7 @@ from redis.exceptions import (
     MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -2527,7 +2528,10 @@ class RedisCluster(
                     **kwargs,
                 )
             except Exception as e:
-                if retry_attempts > 0 and type(e) in self.__class__.ERRORS_ALLOW_RETRY:
+                if retry_attempts > 0 and (
+                    type(e) in self.__class__.ERRORS_ALLOW_RETRY
+                    or getattr(e, "_demoted_primary", False)
+                ):
                     if is_default_node:
                         # Replace the default cluster node
                         self.replace_default_node()
@@ -2923,6 +2927,27 @@ class RedisCluster(
                 # object which contains the host and port info
                 # this is used to report the metrics based on host and port info
                 e.connection = connection if connection else target_node
+                self._record_command_metric(
+                    command_name=command,
+                    duration_seconds=time.monotonic() - start_time,
+                    connection=e.connection,
+                    error=e,
+                )
+                raise
+            except ReadOnlyError as e:
+                # A node cached as a primary answered READONLY: it was demoted
+                # (failover) and the cached topology is stale. Ask for a
+                # refresh, run by the next attempt, and let the command be
+                # retried. A replica answering READONLY is a real error.
+                e.connection = connection if connection else target_node
+                if target_node.server_type == PRIMARY:
+                    e._demoted_primary = True
+                    self.nodes_manager.move_node_to_end_of_cached_nodes(
+                        target_node.name
+                    )
+                    self.nodes_manager._request_refresh(
+                        last_failed_node_name=target_node.name
+                    )
                 self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,

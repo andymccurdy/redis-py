@@ -81,6 +81,7 @@ from redis.exceptions import (
     MaxConnectionsError,
     MovedError,
     NoPermissionError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -5597,6 +5598,74 @@ class TestTopologyRefreshPacing:
         assert [c.args[0] for c in sleep.call_args_list] == [0.001, 0.002, 0.003]
         # A new run of failures starts from a reset backoff
         assert backoff.resets == 1
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_readonly_from_demoted_primary_refreshes_and_retries(self):
+        """
+        A node cached as a primary that answers READONLY was demoted by a
+        failover: the topology refresh is asked for and the command is retried
+        on the node that now owns the slot.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        rc.nodes_manager._last_refresh_at = rc.nodes_manager._refresh_due_at = None
+        responses = [
+            ReadOnlyError("You can't write against a read only replica."),
+            b"value",
+        ]
+
+        def parse_response(connection, command, **kwargs):
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(Redis, "parse_response", side_effect=parse_response),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            assert rc.get("foo") == b"value"
+            init.assert_called_once()
+        assert responses == []
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_readonly_keeps_error_when_retries_are_exhausted(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        calls = []
+
+        def parse_response(connection, command, **kwargs):
+            calls.append(command)
+            raise ReadOnlyError("You can't write against a read only replica.")
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(Redis, "parse_response", side_effect=parse_response),
+            patch.object(NodesManager, "initialize", autospec=True),
+        ):
+            with pytest.raises(ReadOnlyError):
+                rc.get("foo")
+        assert len(calls) == rc.retry.get_retries() + 1
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_readonly_from_replica_is_not_retried(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_node_from_key("foo")
+        node.server_type = "replica"
+        calls = []
+
+        def parse_response(connection, command, **kwargs):
+            calls.append(command)
+            raise ReadOnlyError("You can't write against a read only replica.")
+
+        with (
+            patch("redis.cluster.get_connection"),
+            patch.object(Redis, "parse_response", side_effect=parse_response),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            with pytest.raises(ReadOnlyError):
+                rc.get("foo")
+            init.assert_not_called()
+        assert len(calls) == 1
 
     @pytest.mark.fixed_client
     @pytest.mark.parametrize("due", [True, False])

@@ -668,10 +668,20 @@ class AsyncMaintNotificationsAbstractConnection:
         self, relaxed_timeout: float | None = None
     ) -> None:
         timeout = relaxed_timeout if relaxed_timeout != -1 else self.socket_timeout
+        # Push the new value to the parser unconditionally, because read_response
+        # resets the parser's read timeout on every call, so no stale value can
+        # leak into the next response. Reads that start after this update use the
+        # relaxed/restored timeout rather than the one captured when the in-flight
+        # response started.
+        self._parser._read_timeout = timeout
         self._reschedule_active_read_timeout(timeout)
 
     def _reschedule_active_read_timeout(self, timeout: float | None) -> None:
-        timeout_context = getattr(self, "_active_read_timeout", None)
+        # Per-read deadlines live on the parser, including the context of
+        # the stream read currently in flight.
+        timeout_context = getattr(
+            getattr(self, "_parser", None), "_active_read_timeout", None
+        )
         if timeout_context is None:
             # No read_response call is currently inside its socket timeout
             # context, so there is no in-flight deadline to relax or restore.
@@ -748,7 +758,6 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         "_reader",
         "_writer",
         "_parser",
-        "_active_read_timeout",
         "_connect_callbacks",
         "_buffer_cutoff",
         "_lock",
@@ -868,7 +877,6 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._socket_read_size = socket_read_size
-        self._active_read_timeout = None
         self._connect_callbacks: List[weakref.WeakMethod[ConnectCallbackT]] = []
         self._buffer_cutoff = 6000
         self._re_auth_token: Optional[TokenInterface] = None
@@ -1041,9 +1049,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             pass
 
         # Unlike the sync client there is no timeout armed on the socket; the
-        # deadline lives in the timeout context wrapping the in-flight read.
+        # deadline lives in the timeout context wrapping the in-flight read
+        # (on the parser, which applies socket_timeout per stream read).
         active_read_timeout = None
-        timeout_context = self._active_read_timeout
+        timeout_context = getattr(self._parser, "_active_read_timeout", None)
         if timeout_context is not None:
             try:
                 when = timeout_context.when()
@@ -1635,25 +1644,33 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             read_timeout = timeout if timeout is not None else self.socket_timeout
         host_error = self._host_error()
         try:
-            if read_timeout is not None:
-                timeout_context = async_timeout(read_timeout)
-                if timeout is None:
-                    async with timeout_context as active_timeout:
-                        self._active_read_timeout = active_timeout
-                        try:
-                            response = await self._read_response_from_parser(
-                                disable_decoding=disable_decoding,
-                                push_request=push_request,
-                            )
-                        finally:
-                            self._active_read_timeout = None
-                else:
-                    async with timeout_context:
-                        response = await self._read_response_from_parser(
-                            disable_decoding=disable_decoding,
-                            push_request=push_request,
-                        )
+            if timeout is None:
+                # Default path: socket_timeout is a per-read deadline, not
+                # a single deadline for the whole response. The parser
+                # applies it around each individual stream read, matching
+                # the sync client, where the OS socket timeout bounds every
+                # recv(). A slow response whose reads keep arriving within
+                # socket_timeout of each other must not time out just
+                # because the whole response takes longer than that.
+                self._parser._apply_read_timeout = True
+                self._parser._read_timeout = read_timeout
+                response = await self._read_response_from_parser(
+                    disable_decoding=disable_decoding,
+                    push_request=push_request,
+                )
+            elif read_timeout is not None:
+                # An explicit caller timeout still bounds this whole read,
+                # so the parser must not apply per-read deadlines inside it
+                # (e.g. a blocking command granted longer than
+                # socket_timeout).
+                self._parser._apply_read_timeout = False
+                async with async_timeout(read_timeout):
+                    response = await self._read_response_from_parser(
+                        disable_decoding=disable_decoding,
+                        push_request=push_request,
+                    )
             else:
+                self._parser._apply_read_timeout = False
                 response = await self._read_response_from_parser(
                     disable_decoding=disable_decoding,
                     push_request=push_request,

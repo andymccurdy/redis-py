@@ -6,6 +6,7 @@ import pytest
 
 import redis.asyncio as redis
 from redis._defaults import DEFAULT_SOCKET_CONNECT_TIMEOUT, DEFAULT_SOCKET_TIMEOUT
+from redis._parsers.resp2 import _AsyncRESP2Parser
 from redis._parsers.resp3 import _AsyncRESP3Parser
 from redis.asyncio.connection import (
     BlockingConnectionPool,
@@ -2266,35 +2267,61 @@ async def test_async_pool_ensure_connection_handles_pending_push_after_reconnect
 @pytest.mark.fixed_client
 @pytest.mark.asyncio
 async def test_read_response_reschedules_active_socket_timeout():
-    connection = Connection(socket_timeout=0.01)
+    connection = Connection(socket_timeout=0.01, socket_read_size=16384, protocol=2)
+    parser = _AsyncRESP2Parser(16384)
+    connection._parser = parser
+    reader = asyncio.StreamReader()
+    connection._reader = reader
+    connection._writer = mock.Mock()
+    parser.on_connect(connection)
+    connection.disconnect = mock.AsyncMock()
 
-    class RelaxingParser:
-        async def read_response(self, disable_decoding=False, push_request=False):
-            connection.update_current_socket_timeout(0.2)
-            await asyncio.sleep(0.05)
-            return b"OK"
+    task = asyncio.create_task(connection.read_response())
+    for _ in range(1000):
+        if parser._active_read_timeout is not None:
+            break
+        await asyncio.sleep(0.001)
+    assert parser._active_read_timeout is not None
 
-    connection._parser = RelaxingParser()
+    connection.update_current_socket_timeout(0.2)
+    # Wait well past the original 0.01 deadline: if the reschedule had not
+    # reached the in-flight read, it would have timed out by now.
+    await asyncio.sleep(0.05)
+    reader.feed_data(b"$2\r\nOK\r\n")
+    reader.feed_eof()
 
-    assert await connection.read_response() == b"OK"
-    assert connection._active_read_timeout is None
+    assert await task == b"OK"
+    assert parser._active_read_timeout is None
 
 
 @pytest.mark.fixed_client
 @pytest.mark.asyncio
 async def test_read_response_reschedules_active_socket_timeout_to_blocking():
-    connection = Connection(socket_timeout=0.01)
+    connection = Connection(socket_timeout=0.01, socket_read_size=16384, protocol=2)
+    parser = _AsyncRESP2Parser(16384)
+    connection._parser = parser
+    reader = asyncio.StreamReader()
+    connection._reader = reader
+    connection._writer = mock.Mock()
+    parser.on_connect(connection)
+    connection.disconnect = mock.AsyncMock()
 
-    class RelaxingParser:
-        async def read_response(self, disable_decoding=False, push_request=False):
-            connection.update_current_socket_timeout(None)
-            await asyncio.sleep(0.05)
-            return b"OK"
+    task = asyncio.create_task(connection.read_response())
+    for _ in range(1000):
+        if parser._active_read_timeout is not None:
+            break
+        await asyncio.sleep(0.001)
+    assert parser._active_read_timeout is not None
 
-    connection._parser = RelaxingParser()
+    connection.update_current_socket_timeout(None)
+    # Wait well past the original 0.01 deadline: if it had not been
+    # cleared, the in-flight read would have timed out by now.
+    await asyncio.sleep(0.05)
+    reader.feed_data(b"$2\r\nOK\r\n")
+    reader.feed_eof()
 
-    assert await connection.read_response() == b"OK"
-    assert connection._active_read_timeout is None
+    assert await task == b"OK"
+    assert parser._active_read_timeout is None
 
 
 @pytest.mark.fixed_client

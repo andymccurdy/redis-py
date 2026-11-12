@@ -2946,10 +2946,6 @@ class RedisCluster(
                     connection=e.connection,
                     error=e,
                 )
-                self._record_error_metric(
-                    error=e,
-                    connection=e.connection,
-                )
                 raise
             except ResponseError as e:
                 # this is used to report the metrics based on host and port info
@@ -7084,6 +7080,7 @@ class TransactionStrategy(AbstractStrategy):
         OSError,
         ClusterDownError,
         SlotNotCoveredError,
+        ReadOnlyError,
     )
 
     def __init__(self, pipe: ClusterPipeline):
@@ -7332,7 +7329,9 @@ class TransactionStrategy(AbstractStrategy):
                 self._release_transaction_connection()
 
             self._pipe.reinitialize_counter += 1
-            should_request_refresh = _should_request_refresh(
+            should_request_refresh = isinstance(
+                error, ReadOnlyError
+            ) or _should_request_refresh(
                 self._pipe.reinitialize_steps, self._pipe.reinitialize_counter
             )
             if isinstance(error, AskError):

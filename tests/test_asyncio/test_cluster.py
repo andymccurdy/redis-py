@@ -1530,6 +1530,32 @@ class TestTopologyRefreshPacing:
         )
 
     @pytest.mark.fixed_client
+    async def test_transaction_readonly_requests_refresh_immediately(self) -> None:
+        """
+        A READONLY reply in a transaction means the primary was demoted: it
+        requests a topology refresh at once, not after reinitialize_steps
+        errors, so the retry does not keep hitting the stale node.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        strategy = r.pipeline(transaction=True)._execution_strategy
+        owner = r.get_node_from_key("foo")
+        with (
+            mock.patch.object(NodesManager, "initialize", autospec=True) as init,
+            mock.patch.object(NodesManager, "move_slot", autospec=True) as move_slot,
+        ):
+            strategy._transaction_node = owner
+            await strategy._reinitialize_on_error(
+                ReadOnlyError("READONLY You can't write against a read only replica."),
+                1,
+            )
+
+        move_slot.assert_not_called()
+        init.assert_not_called()
+        assert r._initialize is True
+        assert r.reinitialize_counter == 0
+        assert r.nodes_manager._requested_last_failed_node_name == owner.name
+
+    @pytest.mark.fixed_client
     @pytest.mark.parametrize("watch", [False, True])
     async def test_transaction_attempt_runs_a_requested_refresh(self, watch) -> None:
         """

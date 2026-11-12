@@ -13115,7 +13115,12 @@ class FunctionCommands:
         """
         Load a library to Redis.
         :param code: the source code (must start with
-        Shebang statement that provides a metadata about the library)
+        Shebang statement that provides a metadata about the library).
+        The code is sent to the server unchanged, so nothing may come
+        before the ``#!`` line, not even a newline or whitespace.
+        Otherwise the server raises ``Missing library metadata``.
+        Triple-quoted strings usually start with a newline, so pass
+        ``code.strip()`` for them.
         :param replace: changes the behavior to overwrite the existing library
         with the new contents.
         Return the library name that was loaded.

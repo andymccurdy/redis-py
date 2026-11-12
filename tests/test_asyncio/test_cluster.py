@@ -5573,6 +5573,73 @@ class TestStaticMetadataRouting:
         await rc.aclose()
 
     @pytest.mark.fixed_client
+    async def test_routing_errors_redact_credentials(self) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        async with aclosing(rc):
+            with mock.patch.object(
+                rc.commands_parser,
+                "get_keys",
+                mock.AsyncMock(return_value=None),
+            ):
+                with pytest.raises(
+                    RedisClusterException, match="No way to dispatch"
+                ) as ex:
+                    await rc._determine_slot("CONFIG SET", "requirepass", "s3cret")
+        assert "Command: CONFIG SET <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "error, label",
+        [
+            (MovedError(f"{key_slot(b'foo')} {default_host}:7000"), "MOVED error"),
+            (TryAgainError(), "TRYAGAIN error"),
+            (ConnectionError("down"), "ConnectionError"),
+        ],
+    )
+    async def test_execute_command_retry_debug_logs_command_name_only(
+        self, caplog, error, label
+    ) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        node = rc.get_node_from_key("foo")
+        calls = []
+
+        async def execute_command(target, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise error
+            return True
+
+        async with aclosing(rc):
+            with (
+                mock.patch.object(
+                    ClusterNode,
+                    "execute_command",
+                    autospec=True,
+                    side_effect=execute_command,
+                ),
+                mock.patch.object(NodesManager, "move_slot", autospec=True),
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    mock.AsyncMock(return_value=key_slot(b"foo")),
+                ),
+                caplog.at_level(logging.DEBUG, logger="redis.asyncio.cluster"),
+            ):
+                if isinstance(error, ConnectionError):
+                    with pytest.raises(ConnectionError):
+                        await rc._execute_command(node, "SET", "foo", "s3cret")
+                else:
+                    assert await rc._execute_command(node, "SET", "foo", "s3cret")
+
+        messages = [
+            r.getMessage() for r in caplog.records if r.name == "redis.asyncio.cluster"
+        ]
+        expected = f"{label} received for command SET, on node {node.name}"
+        assert any(m.startswith(expected) for m in messages), messages
+        assert not any("s3cret" in m or "foo" in m for m in messages), messages
+
+    @pytest.mark.fixed_client
     async def test_split_command_routing_applies_load_balancing_strategy(self) -> None:
         rc = await get_mocked_redis_client(
             host=default_host,

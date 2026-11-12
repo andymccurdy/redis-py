@@ -3541,6 +3541,26 @@ class TestStaticMetadataRouting:
                 pipe._determine_nodes("UNRECOGNIZED_COMMAND", request_policy=None)
 
     @pytest.mark.fixed_client
+    def test_routing_errors_redact_credentials(self):
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+        with pytest.raises(RedisClusterException) as ex:
+            rc._determine_nodes("AUTH", "user", "s3cret", request_policy=None)
+        assert "AUTH <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
+        with rc.pipeline() as pipe:
+            with pytest.raises(RedisClusterException) as ex:
+                pipe._determine_nodes("AUTH", "user", "s3cret", request_policy=None)
+        assert "AUTH <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
+        with patch.object(rc, "_get_command_keys", return_value=None):
+            with pytest.raises(RedisClusterException, match="No way to dispatch") as ex:
+                rc.determine_slot("CONFIG SET", "requirepass", "s3cret")
+        assert "Command: CONFIG SET <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
+    @pytest.mark.fixed_client
     def test_pipeline_determine_nodes_honors_resolved_metadata_policy(self):
         resolver = DynamicMetadataResolver(
             {

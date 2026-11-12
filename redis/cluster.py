@@ -1689,12 +1689,15 @@ class RedisCluster(
         """
         return self.nodes_manager.default_node
 
-    def get_nodes_from_slot(self, command: str, *args):
+    def get_nodes_from_slot(self, command: str, *args, slot: int | None = None):
         """
         Returns a list of nodes that hold the specified keys' slots.
+
+        ``slot`` is the slot of the keys when the caller already computed it.
         """
         # get the node that holds the key's slot
-        slot = self.determine_slot(*args)
+        if slot is None:
+            slot = self.determine_slot(*args)
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and self._is_replica_safe(command)
@@ -2043,9 +2046,10 @@ class RedisCluster(
 
     def _resolve_command_policies(
         self, *args, target_nodes_specified: bool = False
-    ) -> Tuple[str, Union[CommandPolicies, CommandMetadata]]:
+    ) -> Tuple[str, CommandPolicies | CommandMetadata, int | None]:
         """
-        Resolves the policies a command routes and aggregates by.
+        Resolves the policies a command routes and aggregates by, and the slot of its
+        keys when finding the policies took computing it.
 
         Returns the name the policies were decided by along with the record, because the
         name a command is known by is not always ``args[0]``: a container command is
@@ -2061,6 +2065,10 @@ class RedisCluster(
         fallbacks are the command's ``COMMAND_FLAGS`` entry and then whether the command
         carries a key. ``target_nodes_specified`` says the caller picked the targets, as
         named nodes or as a nodes flag.
+
+        That last fallback computes the command's slot, which is returned so the caller
+        can pass it to ``_determine_nodes`` instead of computing it again. Every other
+        branch returns ``None`` for the slot.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
@@ -2074,40 +2082,49 @@ class RedisCluster(
             # the loop over the nodes the caller picked, or fold their replies into one.
             # Answer with the record that aggregates nothing, and skip the resolver: with
             # the targets given, neither of its answers is used.
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         policies = self._policy_resolver.resolve(args[0].lower())
         if policies:
-            return command, policies
+            return command, policies, None
 
         command_flag = self.command_flags.get(command)
         if command_flag:
             if command_flag in self._command_flags_mapping:
-                return command, _METADATA_BY_REQUEST_POLICY[
-                    self._command_flags_mapping[command_flag]
-                ]
-            return command, _DEFAULT_KEYLESS_METADATA
+                return (
+                    command,
+                    _METADATA_BY_REQUEST_POLICY[
+                        self._command_flags_mapping[command_flag]
+                    ],
+                    None,
+                )
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         # Unflagged and unresolved, so the command routes by its key. Without a default
         # node the topology is not known yet and there is no slot to route by.
         if not self.get_default_node():
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         slot = self.determine_slot(*args)
         if slot is None:
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
-        return command, _DEFAULT_KEYED_METADATA
+        return command, _DEFAULT_KEYED_METADATA, slot
 
     def _determine_nodes(
-        self, *args, request_policy: Optional[RequestPolicy] = None, **kwargs
+        self,
+        *args,
+        request_policy: RequestPolicy | None = None,
+        slot: int | None = None,
+        **kwargs,
     ) -> List["ClusterNode"]:
         """
         Determines a nodes the command should be executed on.
 
         The caller resolves the command's own policy - see
         ``_resolve_command_policies`` - so the only decision left here is an explicit
-        nodes flag, which overrides it.
+        nodes flag, which overrides it. ``slot`` is the slot that resolution already
+        computed, if it did, so a keyed command is not hashed twice.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
@@ -2124,7 +2141,11 @@ class RedisCluster(
                 f"No targets were found to execute {args} command on"
             )
 
-        nodes = _REQUEST_POLICY_CALLBACKS[request_policy](self, command, *args)
+        if slot is not None:
+            # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
+            nodes = self.get_nodes_from_slot(command, *args, slot=slot)
+        else:
+            nodes = _REQUEST_POLICY_CALLBACKS[request_policy](self, command, *args)
 
         if args[0].lower() == "ft.aggregate":
             self._aggregate_nodes = nodes
@@ -2344,7 +2365,7 @@ class RedisCluster(
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
-        command, command_policies = self._resolve_command_policies(
+        command, command_policies, slot = self._resolve_command_policies(
             *args, target_nodes_specified=target_nodes_specified or nodes_flag
         )
 
@@ -2416,7 +2437,11 @@ class RedisCluster(
                             *args,
                             request_policy=command_policies.request_policy,
                             nodes_flag=passed_targets,
+                            slot=slot,
                         )
+                        # A retry computes the slot again, as a command without keys
+                        # gets a new random slot on each attempt
+                        slot = None
                     elif len(splits) > 1:
                         if replies is None:
                             replies = {}

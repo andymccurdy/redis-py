@@ -409,6 +409,16 @@ class TestRedisClusterObj:
             cluster = RedisCluster.from_url(redis_url)
         assert cluster.get_node(host=default_host, port=default_port) is not None
 
+    def test_keyed_command_computes_its_slot_once(self, r):
+        """
+        A keyed command the policy resolver does not know is routed by the slot that
+        resolving its policies computed, instead of hashing its keys a second time.
+        """
+        with patch.object(r, "determine_slot", wraps=r.determine_slot) as determine:
+            assert r.set("foo", "bar") is True
+
+        determine.assert_called_once_with("SET", "foo", "bar")
+
     def test_execute_command_errors(self, r):
         """
         Test that if no key is provided then exception should be raised.
@@ -3414,7 +3424,7 @@ class TestStaticMetadataRouting:
         primaries = rc.get_primaries()
         assert len(primaries) > 1
 
-        _, policies = rc._resolve_command_policies("scan")
+        _, policies, _ = rc._resolve_command_policies("scan")
         nodes = rc._determine_nodes("scan", request_policy=policies.request_policy)
         assert set(nodes) == set(primaries)
 
@@ -3424,7 +3434,7 @@ class TestStaticMetadataRouting:
         rc = get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = rc._resolve_command_policies(command)
+        _, policies, _ = rc._resolve_command_policies(command)
         nodes = rc._determine_nodes(command, request_policy=policies.request_policy)
         assert nodes == [default_node]
 
@@ -3434,7 +3444,7 @@ class TestStaticMetadataRouting:
         rc = get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = rc._resolve_command_policies("dbsize")
+        _, policies, _ = rc._resolve_command_policies("dbsize")
         nodes = rc._determine_nodes(
             "dbsize",
             request_policy=policies.request_policy,
@@ -3469,7 +3479,7 @@ class TestStaticMetadataRouting:
         rc = get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = rc._resolve_command_policies("COMMAND", "COUNT")
+        _, policies, _ = rc._resolve_command_policies("COMMAND", "COUNT")
         nodes = rc._determine_nodes(
             "COMMAND", "COUNT", request_policy=policies.request_policy
         )
@@ -3506,6 +3516,32 @@ class TestStaticMetadataRouting:
 
         assert execute.call_count == len(nodes)
         assert result == 7 * len(nodes)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_retry_computes_the_slot_again(self):
+        """
+        Only the first attempt is routed by the slot that resolving the policies
+        computed. A retry computes it again, as a command without keys gets a new
+        random slot on each attempt.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+        with (
+            patch.object(
+                RedisCluster,
+                "_execute_command",
+                side_effect=[ConnectionError("mocked error"), True],
+            ) as execute,
+            patch.object(
+                rc, "determine_slot", return_value=rc.keyslot("foo")
+            ) as determine,
+        ):
+            assert rc.set("foo", "bar") is True
+
+        assert execute.call_count == 2
+        # once to resolve the policies, which the first attempt reuses, once more
+        # for the retry
+        assert determine.call_count == 2
 
     @pytest.mark.fixed_client
     def test_determine_nodes_raises_exception_when_no_policy_resolved(self):

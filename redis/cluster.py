@@ -1047,6 +1047,7 @@ class AbstractRedisCluster:
         TimeoutError,
         ClusterDownError,
         SlotNotCoveredError,
+        ReadOnlyError,
     )
 
     # Connection errors that do not mean the node failed: the client's own pool
@@ -2949,9 +2950,7 @@ class RedisCluster(
                     error=e,
                     connection=e.connection,
                 )
-                if ttl <= 0:
-                    raise
-                continue
+                raise
             except ResponseError as e:
                 # this is used to report the metrics based on host and port info
                 # ResponseError typically happens after get_connection() succeeds,

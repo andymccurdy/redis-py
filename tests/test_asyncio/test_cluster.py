@@ -3457,10 +3457,14 @@ class TestRedisClusterObjMocked:
                 node,
                 ReadOnlyError("READONLY You can't write against a read only replica."),
             )
-            with mock.patch.object(rc, "_request_refresh") as request_refresh:
+            with (
+                mock.patch.object(rc, "_initialize_due", return_value=True),
+                mock.patch.object(rc, "initialize", new=mock.AsyncMock()) as initialize,
+            ):
                 with pytest.raises(ReadOnlyError):
                     await rc.get("foo")
-            assert request_refresh.called
+            assert rc._initialize is True
+            assert initialize.await_count > 0
         finally:
             await rc.aclose()
 

@@ -1158,11 +1158,11 @@ class TestRedisClusterObjMocked:
                     "READONLY You can't write against a read only replica."
                 ),
             ) as parse_response,
-            patch.object(rc.nodes_manager, "_request_refresh") as request_refresh,
+            patch.object(rc.nodes_manager, "_run_requested_refresh") as run_refresh,
         ):
             with pytest.raises(ReadOnlyError):
                 rc.get("foo")
-        assert request_refresh.called
+        assert run_refresh.called
         assert parse_response.call_count > 1
 
     @pytest.mark.parametrize(

@@ -2221,9 +2221,7 @@ class RedisCluster(
                     error=e,
                     connection=target_node,
                 )
-                if ttl <= 0:
-                    raise
-                continue
+                raise
             except ResponseError as e:
                 e.connection = target_node
                 await self._record_command_metric(

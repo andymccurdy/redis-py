@@ -2511,6 +2511,19 @@ class TestRedisCommands:
         assert await r.pexpireat("a", expire_at)
         assert 0 < await r.pttl("a") <= 61000
 
+    async def test_pexpireat_datetime_ms_is_exact(self):
+        # Argument level only: constructs its own client, so it needs no
+        # server. int(when.timestamp() * 1000) can land 1 ms low for instants
+        # whose seconds part sits just above a power of two (2**31 seconds
+        # is 2038-01-19T03:14:08Z).
+        r = redis.Redis()
+        when = datetime.datetime(
+            2038, 1, 19, 3, 14, 8, 2000, tzinfo=datetime.timezone.utc
+        )
+        with patch.object(r, "execute_command", AsyncMock(return_value=True)) as cmd:
+            assert await r.pexpireat("a", when) is True
+        assert cmd.call_args.args == ("PEXPIREAT", "a", 2147483648002)
+
     @skip_if_server_version_lt("2.6.0")
     async def test_pexpireat_no_key(self, r: redis.Redis):
         expire_at = await redis_server_time(r) + datetime.timedelta(minutes=1)
@@ -4138,6 +4151,26 @@ class TestRedisCommands:
             int(exp_time.timestamp() * 1000),
             -1,
         ]
+
+    async def test_spexpireat_datetime_ms_is_exact(self):
+        # Argument level only: constructs its own client, so it needs no
+        # server. int(when.timestamp() * 1000) can land 1 ms low for instants
+        # whose seconds part sits just above a power of two (2**31 seconds
+        # is 2038-01-19T03:14:08Z).
+        r = redis.Redis()
+        when = datetime.datetime(
+            2038, 1, 19, 3, 14, 8, 2000, tzinfo=datetime.timezone.utc
+        )
+        with patch.object(r, "execute_command", AsyncMock(return_value=[1])) as cmd:
+            assert await r.spexpireat("test:set", when, "member1") == [1]
+        assert cmd.call_args.args == (
+            "SPEXPIREAT",
+            "test:set",
+            2147483648002,
+            "MEMBERS",
+            1,
+            "member1",
+        )
 
     @skip_if_server_version_lt("8.11.240")
     async def test_sexpireat_multiple_condition_flags_error(self, r: redis.Redis):

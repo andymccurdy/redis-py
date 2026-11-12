@@ -1286,15 +1286,12 @@ class RedisCluster(
         """
         return random.choice(self.get_primaries())
 
-    async def get_nodes_from_slot(self, command: str, *args, slot: int | None = None):
+    async def get_nodes_from_slot(self, command: str, *args):
         """
         Returns a list of nodes that hold the specified keys' slots.
-
-        ``slot`` is the slot of the keys when the caller already computed it.
         """
         # get the node that holds the key's slot
-        if slot is None:
-            slot = await self._determine_slot(command, *args)
+        slot = await self._determine_slot(command, *args)
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and await self._is_replica_safe(command)
@@ -1568,14 +1565,18 @@ class RedisCluster(
                 f"No targets were found to execute {command} command on"
             )
 
-        policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
-        if policy_callback is None:
-            # A keyed policy. A MULTI_SHARD command routed here was not split - its keys
-            # share a slot, or are not at fixed positions - so it is routed by its keys as
-            # a whole.
-            nodes = await self.get_nodes_from_slot(command, *args, slot=slot)
+        if slot is not None:
+            # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
+            nodes = [await self._get_node_from_slot(command, slot)]
         else:
-            nodes = await policy_callback(self, command, *args)
+            policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
+            if policy_callback is None:
+                # A keyed policy. A MULTI_SHARD command routed here was not split - its
+                # keys share a slot, or are not at fixed positions - so it is routed by
+                # its keys as a whole.
+                nodes = await self.get_nodes_from_slot(command, *args)
+            else:
+                nodes = await policy_callback(self, command, *args)
 
         if command.lower() == "ft.aggregate":
             self._aggregate_nodes = nodes
@@ -1796,16 +1797,17 @@ class RedisCluster(
             try:
                 if not target_nodes_specified:
                     if splits is None:
+                        # Only the first attempt reuses the slot. A retry computes it
+                        # again, as a command without keys gets a new random slot on
+                        # each attempt - also after an attempt that found no node for it
+                        attempt_slot, slot = slot, None
                         # Determine the nodes to execute the command on
                         target_nodes = await self._determine_nodes(
                             *args,
                             request_policy=command_policies.request_policy,
                             node_flag=passed_targets,
-                            slot=slot,
+                            slot=attempt_slot,
                         )
-                        # A retry computes the slot again, as a command without keys
-                        # gets a new random slot on each attempt
-                        slot = None
                     else:
                         # One slot: sent as it is, to the node of the slot the split
                         # already computed

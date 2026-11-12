@@ -419,6 +419,24 @@ class TestRedisClusterObj:
 
         determine.assert_called_once_with("SET", "foo", "bar")
 
+    def test_pipeline_keyed_command_finds_its_keys_once(self, r):
+        """
+        The pipeline routes each keyed command by the slot of the keys that resolving
+        its policies found, instead of finding its keys a second time.
+        """
+        with r.pipeline() as pipe:
+            with patch.object(
+                pipe, "_get_command_keys", wraps=pipe._get_command_keys
+            ) as get_keys:
+                pipe.set("foo", "bar")
+                pipe.set("bar", "foo")
+                assert pipe.execute() == [True, True]
+
+        assert get_keys.call_args_list == [
+            call("SET", "foo", "bar"),
+            call("SET", "bar", "foo"),
+        ]
+
     def test_execute_command_errors(self, r):
         """
         Test that if no key is provided then exception should be raised.
@@ -3542,6 +3560,28 @@ class TestStaticMetadataRouting:
         # once to resolve the policies, which the first attempt reuses, once more
         # for the retry
         assert determine.call_count == 2
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_retry_after_an_uncovered_random_slot_picks_another(self):
+        """
+        A command without keys is sent to a random slot. When no node covers that
+        slot, the retry picks another random slot instead of the same one again.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=7000)
+        node = rc.get_default_node()
+        with (
+            patch.object(RedisCluster, "_execute_command", return_value=1),
+            patch.object(rc, "determine_slot", side_effect=[100, 200]),
+            patch.object(
+                rc.nodes_manager,
+                "get_node_from_slot",
+                side_effect=[SlotNotCoveredError("mocked error"), node],
+            ) as get_node,
+        ):
+            assert rc.eval("return 1", 0) == 1
+
+        assert [c.args[0] for c in get_node.call_args_list] == [100, 200]
 
     @pytest.mark.fixed_client
     def test_determine_nodes_raises_exception_when_no_policy_resolved(self):

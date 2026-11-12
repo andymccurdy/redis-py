@@ -6,7 +6,7 @@ few microseconds per command, far below the round-trip noise run_bench works
 with, so it is timed here without sending anything. The client connects to
 the cluster once to learn the topology, then only the per-node execution is
 replaced, so everything that routes a command runs the tree's own code.
-Three scenarios:
+Two scenarios, each run on the sync and the async client:
 
 - execute_keyed (sync and async): RedisCluster.set() with
   RedisCluster._execute_command replaced. It times the routing of one keyed

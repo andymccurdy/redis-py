@@ -3230,6 +3230,35 @@ class TestRedisClusterObjMocked:
         assert determine.await_count == 2
 
     @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_retry_after_an_uncovered_random_slot_picks_another(self) -> None:
+        """
+        A command without keys is sent to a random slot. When no node covers that
+        slot, the retry picks another random slot instead of the same one again.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_default_node()
+        try:
+            with (
+                mock.patch.object(RedisCluster, "_execute_command", return_value=1),
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    new=mock.AsyncMock(side_effect=[100, 200]),
+                ),
+                # patched on the class, as the slotted instance allows no patching
+                mock.patch.object(
+                    NodesManager,
+                    "get_node_from_slot",
+                    side_effect=[SlotNotCoveredError("mocked error"), node],
+                ) as get_node,
+            ):
+                assert await rc.eval("return 1", 0) == 1
+        finally:
+            await rc.aclose()
+
+        assert [c.args[0] for c in get_node.call_args_list] == [100, 200]
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("error", RedisCluster.ERRORS_ALLOW_RETRY)
     async def test_cluster_down_overreaches_retry_attempts(
         self,

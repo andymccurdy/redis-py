@@ -1689,15 +1689,12 @@ class RedisCluster(
         """
         return self.nodes_manager.default_node
 
-    def get_nodes_from_slot(self, command: str, *args, slot: int | None = None):
+    def get_nodes_from_slot(self, command: str, *args):
         """
         Returns a list of nodes that hold the specified keys' slots.
-
-        ``slot`` is the slot of the keys when the caller already computed it.
         """
         # get the node that holds the key's slot
-        if slot is None:
-            slot = self.determine_slot(*args)
+        slot = self.determine_slot(*args)
         replica_safe = (
             self.read_from_replicas or self.load_balancing_strategy is not None
         ) and self._is_replica_safe(command)
@@ -2143,7 +2140,7 @@ class RedisCluster(
 
         if slot is not None:
             # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
-            nodes = self.get_nodes_from_slot(command, *args, slot=slot)
+            nodes = [self._get_node_from_slot(command, slot)]
         else:
             nodes = _REQUEST_POLICY_CALLBACKS[request_policy](self, command, *args)
 
@@ -2282,6 +2279,14 @@ class RedisCluster(
                     f"target nodes.\nCommand: {args}"
                 )
 
+        return self._slot_of_keys(command, keys)
+
+    def _slot_of_keys(self, command: str, keys: List[Any] | Tuple[Any, ...]) -> int:
+        """
+        Returns the slot the given keys of a command map to.
+
+        Raises a RedisClusterException if the keys don't all map to the same key slot.
+        """
         # single key command
         if len(keys) == 1:
             return self.keyslot(keys[0])
@@ -2432,16 +2437,17 @@ class RedisCluster(
                 res = {}
                 if not target_nodes_specified:
                     if splits is None:
+                        # Only the first attempt reuses the slot. A retry computes it
+                        # again, as a command without keys gets a new random slot on
+                        # each attempt - also after an attempt that found no node for it
+                        attempt_slot, slot = slot, None
                         # Determine the nodes to execute the command on
                         target_nodes = self._determine_nodes(
                             *args,
                             request_policy=command_policies.request_policy,
                             nodes_flag=passed_targets,
-                            slot=slot,
+                            slot=attempt_slot,
                         )
-                        # A retry computes the slot again, as a command without keys
-                        # gets a new random slot on each attempt
-                        slot = None
                     elif len(splits) > 1:
                         if replies is None:
                             replies = {}
@@ -6414,6 +6420,8 @@ class PipelineStrategy(AbstractStrategy):
                 # exists in the cluster, which is why we do this in a loop)
                 passed_targets = c.options.pop("target_nodes", c.target_nodes)
                 splits = None
+                # The slot of the keys, when resolving the policies took finding them
+                slot = None
                 if passed_targets and not self._is_nodes_flag(passed_targets):
                     target_nodes = self._parse_target_nodes(passed_targets)
 
@@ -6458,6 +6466,9 @@ class PipelineStrategy(AbstractStrategy):
                                     command_policies = _DEFAULT_KEYLESS_METADATA
                                 else:
                                     command_policies = _DEFAULT_KEYED_METADATA
+                                    # Routed by these keys, so they are not found
+                                    # again to pick the node
+                                    slot = self._pipe._slot_of_keys(c.args[0], keys)
                         else:
                             if command_flag in self._pipe._command_flags_mapping:
                                 command_policies = _METADATA_BY_REQUEST_POLICY[
@@ -6482,6 +6493,7 @@ class PipelineStrategy(AbstractStrategy):
                             *c.args,
                             request_policy=request_policy,
                             nodes_flag=passed_targets,
+                            slot=slot,
                         )
                         if not target_nodes:
                             raise RedisClusterException(
@@ -6917,7 +6929,11 @@ class PipelineStrategy(AbstractStrategy):
         return nodes
 
     def _determine_nodes(
-        self, *args, request_policy: Optional[RequestPolicy] = None, **kwargs
+        self,
+        *args,
+        request_policy: RequestPolicy | None = None,
+        slot: int | None = None,
+        **kwargs,
     ) -> List["ClusterNode"]:
         # Determine which nodes should be executed the command on.
         # Returns a list of target nodes.
@@ -6930,7 +6946,8 @@ class PipelineStrategy(AbstractStrategy):
 
         # The caller resolves the command's own policy - see
         # ``RedisCluster._resolve_command_policies`` - so the only decision left here is
-        # an explicit nodes flag, which overrides it.
+        # an explicit nodes flag, which overrides it. ``slot`` is the slot of the keys
+        # that resolution already found, if it did, so they are not found twice.
         nodes_flag = kwargs.pop("nodes_flag", None)
         if nodes_flag and self._is_nodes_flag(nodes_flag):
             # nodes flag passed by the user
@@ -6942,7 +6959,13 @@ class PipelineStrategy(AbstractStrategy):
                 f"No targets were found to execute {args} command on"
             )
 
-        nodes = _REQUEST_POLICY_CALLBACKS[request_policy](self._pipe, command, *args)
+        if slot is not None:
+            # Only the keyed fallback of the policy resolution computes a slot
+            nodes = [self._pipe._get_node_from_slot(command, slot)]
+        else:
+            nodes = _REQUEST_POLICY_CALLBACKS[request_policy](
+                self._pipe, command, *args
+            )
 
         if args[0].lower() == "ft.aggregate":
             self._aggregate_nodes = nodes

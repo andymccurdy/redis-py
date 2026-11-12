@@ -1,6 +1,6 @@
 import random
 import weakref
-from typing import Optional, Union
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union
 
 from redis.backoff import NoBackoff
 from redis.client import Redis
@@ -13,6 +13,7 @@ from redis.exceptions import (
     TimeoutError,
 )
 from redis.retry import Retry
+from redis.typing import EncodableT
 from redis.utils import SENTINEL
 
 DEMOTED_MASTER_UNBLOCKED_ERROR = (
@@ -274,12 +275,12 @@ class Sentinel(SentinelCommands):
 
     def __init__(
         self,
-        sentinels,
-        min_other_sentinels=0,
-        sentinel_kwargs=None,
-        force_master_ip=None,
-        **connection_kwargs,
-    ):
+        sentinels: Iterable[Tuple[str, int]],
+        min_other_sentinels: int = 0,
+        sentinel_kwargs: Mapping[str, Any] | None = None,
+        force_master_ip: str | None = None,
+        **connection_kwargs: Any,
+    ) -> None:
         # if sentinel_kwargs isn't defined, use the socket_* options from
         # connection_kwargs
         if sentinel_kwargs is None:
@@ -382,7 +383,7 @@ class Sentinel(SentinelCommands):
             return False
         return True
 
-    def discover_master(self, service_name):
+    def discover_master(self, service_name: str):
         """
         Asks sentinel servers for the Redis master's address corresponding
         to the service labeled ``service_name``.
@@ -438,7 +439,9 @@ class Sentinel(SentinelCommands):
         """
         return self.filter_slaves(replicas)
 
-    def discover_slaves(self, service_name):
+    def discover_slaves(
+        self, service_name: str
+    ) -> Sequence[Tuple[EncodableT, EncodableT]]:
         "Returns a list of alive slaves for service ``service_name``"
         for sentinel in self.sentinels:
             try:
@@ -450,7 +453,9 @@ class Sentinel(SentinelCommands):
                 return slaves
         return []
 
-    def discover_replicas(self, service_name):
+    def discover_replicas(
+        self, service_name: str
+    ) -> Sequence[Tuple[EncodableT, EncodableT]]:
         """Returns a list of alive replicas for service ``service_name``.
 
         This is an alias for :py:meth:`discover_slaves`,
@@ -460,9 +465,9 @@ class Sentinel(SentinelCommands):
 
     def master_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """
@@ -510,9 +515,9 @@ class Sentinel(SentinelCommands):
 
     def slave_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """
@@ -553,9 +558,9 @@ class Sentinel(SentinelCommands):
 
     def replica_for(
         self,
-        service_name,
-        redis_class=Redis,
-        connection_pool_class=SentinelConnectionPool,
+        service_name: str,
+        redis_class: Type[Redis] = Redis,
+        connection_pool_class: Type[SentinelConnectionPool] = SentinelConnectionPool,
         **kwargs,
     ):
         """

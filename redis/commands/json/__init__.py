@@ -346,10 +346,8 @@ class AsyncJSON(_JSONBase):
 
         for file_path in file_paths:
             try:
-                # TODO: rsplit(".") splits on all dots, mishandling paths
-                # with dots in directories (e.g. /data/v1.2/file.json).
-                # Should be rsplit(".", 1) — fix in a separate PR.
-                file_name = file_path.rsplit(".")[0]
+                # Strip only the extension of the final path component.
+                file_name = os.path.splitext(file_path)[0]
                 await self.set_file(
                     file_name,
                     json_path,

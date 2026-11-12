@@ -93,6 +93,7 @@ from redis.exceptions import (
     MaxConnectionsError,
     MovedError,
     NoPermissionError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -3445,6 +3446,23 @@ class TestRedisClusterObjMocked:
             await rc.aclose()
 
         assert [c.args[0] for c in get_node.call_args_list] == [100, 200]
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_readonly_error_requests_refresh_and_retries(self) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_node_from_key("foo")
+        assert node is not None
+        try:
+            mock_node_resp_exc(
+                node,
+                ReadOnlyError("READONLY You can't write against a read only replica."),
+            )
+            with mock.patch.object(rc, "_request_refresh") as request_refresh:
+                with pytest.raises(ReadOnlyError):
+                    await rc.get("foo")
+            assert request_refresh.called
+        finally:
+            await rc.aclose()
 
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("error", RedisCluster.ERRORS_ALLOW_RETRY)

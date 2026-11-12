@@ -83,6 +83,7 @@ from redis.exceptions import (
     MaxClientsReachedError,
     MaxConnectionsError,
     MovedError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -2930,6 +2931,27 @@ class RedisCluster(
                     error=e,
                 )
                 raise
+            except ReadOnlyError as e:
+                # A READONLY reply from a cached primary means the topology
+                # changed. Request a refresh and retry; the server did not
+                # execute the command.
+                self.nodes_manager._request_refresh(
+                    last_failed_node_name=target_node.name
+                )
+                e.connection = connection if connection else target_node
+                self._record_command_metric(
+                    command_name=command,
+                    duration_seconds=time.monotonic() - start_time,
+                    connection=e.connection,
+                    error=e,
+                )
+                self._record_error_metric(
+                    error=e,
+                    connection=e.connection,
+                )
+                if ttl <= 0:
+                    raise
+                continue
             except ResponseError as e:
                 # this is used to report the metrics based on host and port info
                 # ResponseError typically happens after get_connection() succeeds,

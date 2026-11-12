@@ -81,6 +81,7 @@ from redis.exceptions import (
     MaxConnectionsError,
     MovedError,
     NoPermissionError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -1142,6 +1143,27 @@ class TestRedisClusterObjMocked:
                 rc.get("bar")
             # retry counts retries, so the first attempt is one more.
             assert execute_command.failed_calls == rc.retry.get_retries() + 1
+
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_readonly_error_requests_refresh_and_retries(self):
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        with (
+            patch.object(Connection, "connect"),
+            patch.object(Connection, "can_read", return_value=False),
+            patch.object(Connection, "send_command"),
+            patch.object(
+                Redis,
+                "parse_response",
+                side_effect=ReadOnlyError(
+                    "READONLY You can't write against a read only replica."
+                ),
+            ) as parse_response,
+            patch.object(rc.nodes_manager, "_request_refresh") as request_refresh,
+        ):
+            with pytest.raises(ReadOnlyError):
+                rc.get("foo")
+        assert request_refresh.called
+        assert parse_response.call_count > 1
 
     @pytest.mark.parametrize(
         "pool_kwargs",

@@ -81,6 +81,7 @@ from redis.exceptions import (
     MaxConnectionsError,
     MovedError,
     NoPermissionError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -5468,6 +5469,111 @@ class TestTopologyRefreshPacing:
             rc.nodes_manager._last_refresh_at = rc.nodes_manager._refresh_due_at = None
             assert rc.get("foo") == b"value"
             init.assert_called_once()
+
+    @staticmethod
+    def _readonly():
+        return ReadOnlyError("You can't write against a read only replica.")
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("due", [True, False])
+    def test_readonly_from_a_primary_asks_for_a_refresh_and_is_retried(self, due):
+        """
+        Only a replica answers READONLY, so a node cached as a primary that
+        does was demoted by a failover. A command without keys gets no MOVED to
+        learn that from: the error asks for a topology refresh, which the retry
+        of the command runs once due.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        if due:
+            nm._last_refresh_at = nm._refresh_due_at = None
+        # The first primary answers READONLY, then every primary answers
+        replies = [self._readonly()] + [b"OK"] * len(rc.get_primaries())
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(Redis, "parse_response", side_effect=replies) as parse,
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            rc.execute_command("FLUSHALL")
+
+        assert parse.call_count == len(replies)
+        if due:
+            init.assert_called_once()
+            assert nm._refresh_requested is False
+        else:
+            init.assert_not_called()
+            assert nm._refresh_requested is True
+
+    @pytest.mark.fixed_client
+    def test_readonly_from_a_primary_is_raised_once_out_of_retries(self):
+        rc = get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 2)
+        )
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(
+                Redis, "parse_response", side_effect=self._readonly()
+            ) as parse,
+        ):
+            with pytest.raises(ReadOnlyError):
+                rc.execute_command("FLUSHALL")
+
+        assert parse.call_count == 3
+        assert rc.nodes_manager._refresh_requested is True
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("pipeline", [False, True], ids=["command", "pipeline"])
+    def test_readonly_from_a_replica_is_raised_at_once(self, pipeline):
+        """
+        A write sent to a replica, here by a nodes flag, is answered READONLY
+        whatever the topology is: no refresh is asked for, and it is not retried.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        replicas = len(rc.get_replicas())
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(
+                Redis, "parse_response", side_effect=self._readonly()
+            ) as parse,
+        ):
+            with pytest.raises(ReadOnlyError):
+                if pipeline:
+                    pipe = rc.pipeline()
+                    pipe.execute_command("FLUSHALL", target_nodes=RedisCluster.REPLICAS)
+                    pipe.execute()
+                else:
+                    rc.execute_command("FLUSHALL", target_nodes=RedisCluster.REPLICAS)
+
+        # The pipeline reads every replica it wrote to; the command stops at
+        # the first error
+        assert parse.call_count == (replicas if pipeline else 1)
+        assert rc.nodes_manager._refresh_requested is False
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    def test_pipeline_readonly_from_a_primary_asks_for_a_refresh_and_is_retried(self):
+        """
+        A pipeline retries a READONLY reply of a node cached as a primary as a
+        command does, after the refresh it asked for, and resends only the
+        command that got it.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._last_refresh_at = nm._refresh_due_at = None
+        replies = [b"value", self._readonly(), b"OK"]
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(Redis, "parse_response", side_effect=replies) as parse,
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            pipe = rc.pipeline()
+            pipe.get("foo")
+            pipe.execute_command("FT.CREATE", "idx", "SCHEMA", "t", "TEXT")
+            assert pipe.execute() == [b"value", b"OK"]
+
+        assert parse.call_count == len(replies)
+        init.assert_called_once()
 
     @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])

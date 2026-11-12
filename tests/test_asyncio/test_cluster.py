@@ -93,6 +93,7 @@ from redis.exceptions import (
     MaxConnectionsError,
     MovedError,
     NoPermissionError,
+    ReadOnlyError,
     RedisClusterException,
     RedisClusterUnreachableError,
     RedisError,
@@ -1141,6 +1142,157 @@ class TestTopologyRefreshPacing:
         assert nodes_manager._failed_refreshes == 1
         assert "Redis Cluster cannot be connected" in str(raised.value)
         assert type(raised.value.__cause__) is ConnectionError
+
+    @staticmethod
+    def _readonly() -> ReadOnlyError:
+        return ReadOnlyError("You can't write against a read only replica.")
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("due", [True, False])
+    async def test_readonly_from_a_primary_asks_for_a_refresh_and_is_retried(
+        self, due
+    ) -> None:
+        """
+        Only a replica answers READONLY, so a node cached as a primary that
+        does was demoted by a failover. A command without keys gets no MOVED to
+        learn that from: the error asks for a topology refresh, which the retry
+        of the command runs once due.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        if due:
+            r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        primaries = len(r.get_primaries())
+        # One primary answers READONLY; the retry asks only that shard again
+        execute_command, _ = TestTopologyRefreshKeepsConnections._command_side_effect(
+            [self._readonly()]
+        )
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_command",
+                autospec=True,
+                side_effect=execute_command,
+            ) as execute,
+            mock.patch.object(
+                RedisCluster, "_refresh_topology", autospec=True
+            ) as refresh,
+        ):
+            await r.execute_command("FLUSHALL")
+
+        assert execute.call_count == primaries + 1
+        if due:
+            refresh.assert_awaited_once()
+            assert r._initialize is False
+        else:
+            refresh.assert_not_called()
+            assert r._initialize is True
+
+    @pytest.mark.fixed_client
+    async def test_readonly_from_a_primary_is_raised_once_out_of_retries(
+        self,
+    ) -> None:
+        r = await get_mocked_redis_client(
+            host=default_host, port=default_port, retry=Retry(NoBackoff(), 2)
+        )
+        primaries = len(r.get_primaries())
+        with mock.patch.object(
+            ClusterNode, "execute_command", autospec=True, side_effect=self._readonly()
+        ) as execute:
+            with pytest.raises(ReadOnlyError):
+                await r.execute_command("FLUSHALL")
+
+        assert execute.call_count == 3 * primaries
+        assert r._initialize is True
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("pipeline", [False, True], ids=["command", "pipeline"])
+    async def test_readonly_from_a_replica_is_raised_at_once(self, pipeline) -> None:
+        """
+        A write sent to a replica, here by a nodes flag, is answered READONLY
+        whatever the topology is: no refresh is asked for, and it is not retried.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        replicas = len(r.get_replicas())
+
+        async def execute_pipeline(node, commands) -> bool:
+            for command in commands:
+                command.result = self._readonly()
+            return True
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_command",
+                autospec=True,
+                side_effect=self._readonly(),
+            ) as execute,
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ) as execute_pipe,
+        ):
+            with pytest.raises(ReadOnlyError):
+                if pipeline:
+                    async with r.pipeline() as pipe:
+                        pipe.execute_command(
+                            "FLUSHALL", target_nodes=RedisCluster.REPLICAS
+                        )
+                        await pipe.execute()
+                else:
+                    await r.execute_command(
+                        "FLUSHALL", target_nodes=RedisCluster.REPLICAS
+                    )
+
+        assert (execute_pipe if pipeline else execute).call_count == replicas
+        assert r._initialize is False
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_pipeline_readonly_from_a_primary_asks_for_a_refresh_and_is_retried(
+        self,
+    ) -> None:
+        """
+        A pipeline retries a READONLY reply of a node cached as a primary as a
+        command does, after the refresh it asked for, and resends only the
+        command that got it.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        sent = []
+
+        async def execute_pipeline(node, commands) -> bool:
+            failed = False
+            for command in commands:
+                name = command.args[0]
+                if name == "FT.CREATE" and name not in sent:
+                    command.result = self._readonly()
+                    failed = True
+                else:
+                    command.result = b"value"
+                sent.append(name)
+            return failed
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ),
+            mock.patch.object(
+                RedisCluster, "_refresh_topology", autospec=True
+            ) as refresh,
+        ):
+            async with r.pipeline() as pipe:
+                pipe.get("foo")
+                pipe.execute_command("FT.CREATE", "idx", "SCHEMA", "t", "TEXT")
+                assert await pipe.execute() == [b"value", b"value"]
+
+        assert sorted(sent) == ["FT.CREATE", "FT.CREATE", "GET"]
+        refresh.assert_awaited_once()
 
     @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])

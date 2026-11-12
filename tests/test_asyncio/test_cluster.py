@@ -3486,9 +3486,16 @@ class TestRedisClusterObjMocked:
             with (
                 mock.patch.object(rc, "_initialize_due", return_value=True),
                 mock.patch.object(rc, "initialize", new=mock.AsyncMock()) as initialize,
+                mock.patch.object(
+                    NodesManager,
+                    "move_node_to_end_of_cached_nodes",
+                    autospec=True,
+                ) as move_node,
             ):
                 with pytest.raises(ReadOnlyError):
                     await rc.get("foo")
+            assert move_node.called
+            assert move_node.call_args.args[1] == node.name
             assert rc._initialize is True
             assert initialize.await_count > 0
         finally:

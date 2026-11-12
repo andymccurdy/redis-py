@@ -1147,6 +1147,7 @@ class TestRedisClusterObjMocked:
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     def test_readonly_error_requests_refresh_and_retries(self):
         rc = get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_node_from_key("foo")
         with (
             patch.object(Connection, "connect"),
             patch.object(Connection, "can_read", return_value=False),
@@ -1158,10 +1159,15 @@ class TestRedisClusterObjMocked:
                     "READONLY You can't write against a read only replica."
                 ),
             ) as parse_response,
+            patch.object(
+                rc.nodes_manager, "move_node_to_end_of_cached_nodes"
+            ) as move_node,
             patch.object(rc.nodes_manager, "_run_requested_refresh") as run_refresh,
         ):
             with pytest.raises(ReadOnlyError):
                 rc.get("foo")
+        assert move_node.called
+        assert move_node.call_args.args[0] == node.name
         assert run_refresh.called
         assert parse_response.call_count > 1
 

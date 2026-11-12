@@ -2934,8 +2934,11 @@ class RedisCluster(
                 raise
             except ReadOnlyError as e:
                 # A READONLY reply from a cached primary means the topology
-                # changed. Request a refresh and retry; the server did not
-                # execute the command.
+                # changed. Move the failed node to the end of the cached nodes
+                # so the refresh does not pick it as the default node while it
+                # is still a primary, then request a refresh and retry; the
+                # server did not execute the command.
+                self.nodes_manager.move_node_to_end_of_cached_nodes(target_node.name)
                 self.nodes_manager._request_refresh(
                     last_failed_node_name=target_node.name
                 )

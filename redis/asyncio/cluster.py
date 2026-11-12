@@ -174,6 +174,7 @@ from redis.utils import (
     deprecated_args,
     deprecated_function,
     experimental_method,
+    safe_str,
     str_if_bytes,
     truncate_text,
 )
@@ -1602,7 +1603,8 @@ class RedisCluster(
             # command syntax: EVAL "script body" num_keys ...
             if len(args) < 2:
                 raise RedisClusterException(
-                    f"Invalid args in command: {command, *args}"
+                    "Invalid args in command: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
             keys = args[2 : 2 + int(args[1])]
             # if there are 0 keys, that means the script can be run on any node
@@ -1619,7 +1621,8 @@ class RedisCluster(
                 raise RedisClusterException(
                     "No way to dispatch this command to Redis Cluster. "
                     "Missing key.\nYou can execute the command by specifying "
-                    f"target nodes.\nCommand: {args}"
+                    "target nodes.\nCommand: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
 
         # single key command
@@ -1818,7 +1821,8 @@ class RedisCluster(
                         ]
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(args))} command on"
                         )
                     is_default_node = (
                         len(target_nodes) == 1
@@ -2047,6 +2051,14 @@ class RedisCluster(
                 )
                 raise
             except (ConnectionError, TimeoutError) as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"{type(e).__name__} received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 # Connection retries are being handled in the node's
                 # Retry object. The failed connection has disconnected itself;
                 # the node's in-use connections are kept, and a timeout keeps the
@@ -2107,6 +2119,14 @@ class RedisCluster(
                 )
                 raise
             except MovedError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"MOVED error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
@@ -2142,6 +2162,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"ASK error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
@@ -2156,6 +2184,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except TryAgainError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"TRYAGAIN error received for command {args_log_str}, "
+                        f"on node {target_node.name}"
+                    )
                 if ttl < self.RedisClusterRequestTTL / 2:
                     await asyncio.sleep(0.05)
                 await self._record_command_metric(
@@ -4123,7 +4159,8 @@ class PipelineStrategy(AbstractStrategy):
                     )
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {cmd.args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(cmd.args))} command on"
                         )
             cmd.command_policies = command_policies
             # Kept for a retry, which would otherwise route the command by its own policy:

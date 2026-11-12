@@ -3199,6 +3199,7 @@ class TestRedisClusterObjMocked:
             assert called == 1
         await cluster.aclose()
 
+    @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     async def test_retry_computes_the_slot_again(self) -> None:
         """
@@ -3229,6 +3230,7 @@ class TestRedisClusterObjMocked:
         # for the retry
         assert determine.await_count == 2
 
+    @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     async def test_retry_after_an_uncovered_random_slot_picks_another(self) -> None:
         """

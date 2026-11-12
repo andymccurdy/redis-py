@@ -115,6 +115,28 @@ class TestClusterTransaction:
             assert pipe.execute() == [b"OK"]
 
     @pytest.mark.onlycluster
+    def test_reset_does_not_reconnect_for_unwatch_on_dropped_connection(self, r):
+        """
+        A dropped connection already cleared the server-side WATCH, so reset()
+        must not reconnect just to send UNWATCH.
+        """
+        r["a"] = 0
+
+        pipe = r.pipeline(transaction=True)
+        pipe.watch("a")
+        strategy = pipe._execution_strategy
+        leased = strategy._transaction_connection
+        leased.disconnect()
+
+        with patch.object(leased, "connect", wraps=leased.connect) as connect:
+            pipe.reset()
+
+        connect.assert_not_called()
+        assert not leased.is_connected
+        assert strategy._watching is False
+        assert strategy._transaction_connection is None
+
+    @pytest.mark.onlycluster
     @pytest.mark.parametrize(
         "error_type",
         [

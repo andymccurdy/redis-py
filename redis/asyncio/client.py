@@ -2044,8 +2044,9 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         self.scripts = set()
         try:
             # make sure to reset the connection state in the event that we were
-            # watching something
-            if self.watching and self.connection:
+            # watching something. A dropped connection has already lost its
+            # WATCHes, so skip the UNWATCH instead of reconnecting to send it.
+            if self.watching and self.connection and self.connection.is_connected:
                 try:
                     # call this manually since our unwatch or
                     # immediate_execute_command methods can call reset()

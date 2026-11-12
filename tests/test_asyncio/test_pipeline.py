@@ -421,6 +421,51 @@ class TestPipeline:
         assert pipe.connection is None
         assert leased not in pool._in_use_connections
 
+    @pytest.mark.onlynoncluster
+    async def test_cancelled_watch_transaction_does_not_reconnect_for_unwatch(self, r):
+        """
+        A cancel mid-read drops the connection, which already clears the
+        server-side WATCH, so reset() must not reconnect just to send UNWATCH.
+        """
+        await r.set("a", 0)
+
+        pool = r.connection_pool
+        pipe = r.pipeline()
+        await pipe.watch("a")
+        leased = pipe.connection
+        pipe.multi()
+        pipe.set("a", 1)
+
+        started = asyncio.Event()
+        original = leased._parser.read_response
+        calls = 0
+
+        async def hang_once(*args, **kwargs):
+            # Hang on the MULTI reply only, so a reconnect for UNWATCH would
+            # still be answered instead of blocking the test.
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await asyncio.sleep(60)
+            return await original(*args, **kwargs)
+
+        with (
+            mock.patch.object(leased._parser, "read_response", side_effect=hang_once),
+            mock.patch.object(leased, "connect", wraps=leased.connect) as connect,
+        ):
+            task = asyncio.create_task(pipe.execute())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        connect.assert_not_called()
+        assert not leased.is_connected
+        assert pipe.watching is False
+        assert pipe.connection is None
+        assert leased not in pool._in_use_connections
+
     async def test_exec_error_in_response(self, r):
         """
         an invalid pipeline command at exec time adds the exception instance
@@ -1142,6 +1187,10 @@ class TestAsyncPipelineRetryChecker:
         def __init__(self, retry):
             self.retry = retry
             self.disconnected = False
+
+        @property
+        def is_connected(self):
+            return not self.disconnected
 
         async def send_command(self, *args, **kwargs):
             if args[0] == "GET":

@@ -72,6 +72,7 @@ from redis.exceptions import (
     AskError,
     AuthenticationError,
     ClusterDownError,
+    ClusterError,
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
@@ -159,6 +160,14 @@ class ProxyRequestHandler(socketserver.BaseRequestHandler):
             stop = True  # for safety
             thread.join()
             conn.close()
+
+
+# Three primaries, so one can answer while two others fail
+three_primary_cluster_slots = [
+    [0, 5460, ["127.0.0.1", 7000, "node_0"]],
+    [5461, 10922, ["127.0.0.1", 7001, "node_1"]],
+    [10923, 16383, ["127.0.0.1", 7002, "node_2"]],
+]
 
 
 class NodeProxy:
@@ -2133,6 +2142,20 @@ class TestClusterRedisCommands:
         for key, value in stats.items():
             if key.startswith("db."):
                 assert not isinstance(value, list)
+
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_status(self, r):
+        node = r.get_primaries()[0]
+        status = r.backup_status(target_nodes=node)
+        assert status[b"state"] in (
+            b"idle",
+            b"pending",
+            b"snapshotting",
+            b"incrementing",
+            b"sealed",
+            b"failed",
+        )
 
     @skip_if_redis_enterprise()
     def test_lastsave(self, r):
@@ -4224,13 +4247,10 @@ class TestResponsePolicies:
         finally:
             busy.redis_connection.function_delete("spinlib")
 
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
     @pytest.mark.parametrize(
-        "error",
-        [
-            TryAgainError("TRYAGAIN"),
-            AskError("1 127.0.0.1:7001"),
-            ConnectionError("lost"),
-        ],
+        "error", [ClusterError("TTL exhausted."), ConnectionError("lost")]
     )
     def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r, error
@@ -4251,9 +4271,9 @@ class TestResponsePolicies:
 
         assert len(sent) == len(r.get_primaries())
 
-    @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
-    )
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
+    @pytest.mark.parametrize("error", [ClusterError("TTL exhausted.")])
     def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
         self, r, error
     ):
@@ -5819,6 +5839,156 @@ class TestTopologyRefreshPacing:
 
         assert list(nm.nodes_cache)[-1] == failed.name
         assert nm._requested_last_failed_node_name == failed.name
+
+    @staticmethod
+    def _one_succeeded_pipeline(
+        failing, keyed_command=False, cluster_slots=default_cluster_slots
+    ):
+        """
+        Send RANDOMKEY, routed to every primary and answered by the first success, in a
+        pipeline whose write fails with a connection error on the ``failing`` nodes, and
+        return the client and the results.
+        """
+        resolver = DynamicMetadataResolver(
+            {
+                "core": {
+                    "randomkey": CommandMetadata(
+                        request_policy=RequestPolicy.ALL_SHARDS,
+                        response_policy=ResponsePolicy.ONE_SUCCEEDED,
+                    )
+                }
+            }
+        )
+        rc = get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(NoBackoff(), 0),
+            metadata_resolver=resolver,
+            cluster_slots=cluster_slots,
+        )
+
+        def get_connection(redis_node):
+            kwargs = redis_node.get_connection_kwargs()
+            return Mock(host=kwargs["host"], port=kwargs["port"], db=0)
+
+        def write(node_commands):
+            connection = node_commands.connection
+            if f"{connection.host}:{connection.port}" in failing(rc):
+                for c in node_commands.commands:
+                    c.result = ConnectionError("down")
+
+        def read(node_commands):
+            for c in node_commands.commands:
+                if c.result is redis.cluster._UNANSWERED:
+                    c.result = b"key"
+
+        with (
+            patch("redis.cluster.get_connection", side_effect=get_connection),
+            patch.object(ConnectionPool, "release", autospec=True),
+            patch.object(redis.cluster.NodeCommands, "write", write),
+            patch.object(redis.cluster.NodeCommands, "read", read),
+            patch.object(NodesManager, "initialize", autospec=True),
+        ):
+            pipe = rc.pipeline()
+            # A command resent on its own fails the same way
+            pipe.parent_execute_command = Mock(side_effect=ConnectionError("down"))
+            pipe.execute_command("RANDOMKEY")
+            if keyed_command:
+                pipe.get("foo")
+            try:
+                return rc, pipe.execute()
+            except ConnectionError as e:
+                return rc, e
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("default", [False, True], ids=["other", "default"])
+    def test_pipeline_keeps_a_one_succeeded_success_over_a_node_error(self, default):
+        """
+        A node whose write fails holds only a copy of a ONE_SUCCEEDED command that
+        another node answered: the pipeline answers with the success, and the failed
+        node is tried last on the next refresh, as for any other connection error. A
+        failed default node is replaced.
+        """
+        failed = []
+        default_node = []
+
+        def failing(rc):
+            if not failed:
+                default_node.append(rc.get_default_node())
+                primaries = rc.get_primaries()
+                assert len(primaries) > 1
+                node = (
+                    default_node[0]
+                    if default
+                    else next(p for p in primaries if p.name != default_node[0].name)
+                )
+                assert list(rc.nodes_manager.nodes_cache)[-1] != node.name
+                failed.append(node.name)
+            return failed
+
+        rc, result = self._one_succeeded_pipeline(failing)
+
+        assert result == [b"key"]
+        nm = rc.nodes_manager
+        assert list(nm.nodes_cache)[-1] == failed[0]
+        assert nm._requested_last_failed_node_name == failed[0]
+        if default:
+            assert rc.get_default_node().name != failed[0]
+        else:
+            assert rc.get_default_node() is default_node[0]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "case", ["keyed_command_on_failed_node", "every_node_fails"]
+    )
+    def test_pipeline_raises_a_node_error_that_fails_a_command(self, case):
+        """
+        The error of a node whose write fails is raised when it fails a command: one
+        the node held on its own, or a ONE_SUCCEEDED command no node answered.
+        """
+        if case == "keyed_command_on_failed_node":
+
+            def failing(rc):
+                return {rc.get_node_from_key("foo").name}
+
+        else:
+
+            def failing(rc):
+                return {node.name for node in rc.get_primaries()}
+
+        _, result = self._one_succeeded_pipeline(
+            failing, keyed_command=case == "keyed_command_on_failed_node"
+        )
+
+        assert isinstance(result, ConnectionError)
+
+    @pytest.mark.fixed_client
+    def test_pipeline_raised_node_error_tries_a_copy_only_node_last(self):
+        """
+        Two writes fail: one on a node that holds only a copy of a ONE_SUCCEEDED command
+        another node answered, and one on a node that holds a keyed command of its own.
+        The keyed command's error is raised, and the copy-only node is still tried last
+        on the next refresh.
+        """
+        # The copy-only node, then the keyed node
+        failed = []
+
+        def failing(rc):
+            if not failed:
+                keyed = rc.get_node_from_key("foo").name
+                copy_only = next(p for p in rc.get_primaries() if p.name != keyed).name
+                assert list(rc.nodes_manager.nodes_cache)[-1] != copy_only
+                failed.extend((copy_only, keyed))
+            return failed
+
+        rc, result = self._one_succeeded_pipeline(
+            failing, keyed_command=True, cluster_slots=three_primary_cluster_slots
+        )
+
+        assert isinstance(result, ConnectionError)
+        # The keyed command is resent through a mocked main client, which does not
+        # try its node last as the real one does
+        assert list(rc.nodes_manager.nodes_cache)[-1] == failed[0]
 
     @pytest.mark.fixed_client
     def test_pubsub_topology_repair_is_a_paced_request(self):

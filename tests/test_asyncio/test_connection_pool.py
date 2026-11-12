@@ -72,7 +72,7 @@ class TestRedisAutoReleaseConnectionPool:
     async def test_do_not_auto_disconnect_redis_created_pool(self, r2: redis.Redis):
         assert r2.auto_close_connection_pool is False, (
             "The connection pool should not be disconnected as a manually created "
-            "connection pool was passed in in conftest.py"
+            "connection pool was passed in conftest.py"
         )
         new_conn = await self.create_two_conn(r2)
         assert self.get_total_connected_connections(r2.connection_pool) == 2
@@ -88,7 +88,7 @@ class TestRedisAutoReleaseConnectionPool:
         await r.aclose()
         assert self.get_total_connected_connections(r.connection_pool) == 2, (
             "The connection pool should not be disconnected as a manually created "
-            "connection pool was passed in in conftest.py"
+            "connection pool was passed in conftest.py"
         )
         assert self.has_no_connected_connections(r.connection_pool)
 

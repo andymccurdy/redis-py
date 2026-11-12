@@ -1432,6 +1432,54 @@ class TestCache:
         r2.set("user:42", "bob")
         assert wait_for_invalidated_value(r, "user:42", [b"bob"]) == b"bob"
 
+    @pytest.mark.parametrize(
+        "r",
+        [
+            {
+                "cache": DefaultCache(CacheConfig(max_size=5000)),
+                "single_connection_client": True,
+            },
+        ],
+        ids=["single"],
+        indirect=True,
+    )
+    @pytest.mark.onlynoncluster
+    def test_invalidation_burst_during_a_blocking_command(self, r, r2):
+        """
+        The server pushes one invalidation per key, so writes from another client
+        to keys this client has cached queue up ahead of the reply of a command it
+        is blocked on. The parser has to read past every one of them to reach the
+        reply.
+        """
+        keys = [f"burst:{i}" for i in range(2000)]
+        r2.mset(dict.fromkeys(keys, "v"))
+        for key in keys:
+            r.get(key)
+        assert r.get_cache().size == len(keys)
+
+        def write_once_blocked():
+            deadline = time.monotonic() + 5
+            while r2.info("clients")["blocked_clients"] < 1:
+                if time.monotonic() > deadline:
+                    return
+                time.sleep(0.01)
+            pipe = r2.pipeline(transaction=False)
+            for key in keys:
+                pipe.set(key, "w")
+            pipe.lpush("burst:queue", "job")
+            pipe.execute()
+
+        writer = threading.Thread(target=write_once_blocked)
+        writer.start()
+        try:
+            reply = r.blpop("burst:queue", timeout=5)
+        finally:
+            writer.join()
+
+        assert reply is not None
+        assert reply[1] == b"job"
+        assert r.get_cache().size == 0
+
 
 @pytest.mark.onlycluster
 @skip_if_resp_version(2)

@@ -40,6 +40,26 @@ async def test_add_elem_with_values(d_client):
 
 
 @skip_if_server_version_lt("7.9.0")
+@pytest.mark.parametrize("element", ["", b""])
+async def test_add_elem_with_empty_name(d_client, r, element):
+    assert await d_client.vset().vadd("myset", [1.0, 0.0], element) == 1
+    assert await d_client.vset().vcard("myset") == 1
+    assert await d_client.vset().vemb("myset", element) == [1.0, 0.0]
+
+    name = await r.vset().vrandmember("myset")
+    assert name == b""
+    assert await r.vset().vadd("myset_copy", [1.0, 0.0], name) == 1
+    assert await r.vset().vemb("myset_copy", name) == [1.0, 0.0]
+
+
+@skip_if_server_version_lt("7.9.0")
+async def test_vsim_with_empty_element_name(d_client):
+    await d_client.execute_command("VADD", "myset", "VALUES", 2, 1.0, 0.0, "")
+
+    assert await d_client.vset().vsim("myset", "") == [""]
+
+
+@skip_if_server_version_lt("7.9.0")
 async def test_add_elem_with_vector(d_client):
     float_array = [1, 4.32, 0.11]
     # Convert the list of floats to a byte array in fp32 format
@@ -401,8 +421,9 @@ async def test_vsim_with_different_vector_input_types(d_client):
     assert isinstance(sim_to_fp32_vector, list)
     assert sim_to_float_array == sim_to_fp32_vector
 
-    with pytest.raises(redis.DataError):
-        await d_client.vset().vsim("myset", input=None)
+    for invalid_input in (None, [], b""):
+        with pytest.raises(redis.DataError):
+            await d_client.vset().vsim("myset", input=invalid_input)
 
 
 @skip_if_server_version_lt("7.9.0")

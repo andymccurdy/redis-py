@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import logging
+import math
 import random
 import threading
 import time
@@ -48,11 +49,14 @@ from redis._defaults import (
 )
 from redis._parsers import AsyncCommandsParser, Encoder
 from redis._parsers.helpers import decode_info, get_response_callbacks
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.client import (
+    _PIPELINE_YIELD_MIN_COMMANDS,
     PubSub,
     ResponseCallbackT,
     _pack_pipeline_commands,
+    _yield_in_read_loop,
 )
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -170,6 +174,7 @@ from redis.utils import (
     deprecated_args,
     deprecated_function,
     experimental_method,
+    safe_str,
     str_if_bytes,
     truncate_text,
 )
@@ -425,7 +430,7 @@ class RedisCluster(
           Every MOVED error patches its slot, so the redirect goes to the new owner;
           the refresh is only asked for, and like every refresh triggered by an
           error, it is run by the next command attempt once due, at most once per
-          second.
+          ``topology_refresh_min_interval``.
     :param cluster_error_retry_attempts:
         | @deprecated - Please configure the 'retry' object instead
           In case 'retry' object is set - this argument is ignored!
@@ -441,12 +446,13 @@ class RedisCluster(
           waits a fixed 0.25 seconds before it. A topology refresh triggered by an
           error (connection errors, the ``reinitialize_steps`` MOVED threshold) is
           run by the first command attempt to start once it is due, at most once
-          per second; after refreshes that failed in a row, the next one waits as
-          long as the backoff gives for that many failures, but at least one
-          second. A command that failed with a connection error or a timeout
-          gives up with :class:`~.RedisClusterUnreachableError` once a refresh
-          that ended since reached no node, or when it runs out of retries while
-          the last refresh did.
+          per ``topology_refresh_min_interval``; after refreshes that failed in a
+          row, the next one waits as long as the backoff gives for that many
+          failures, but at least ``topology_refresh_min_interval``. A command that
+          failed with a connection error or a timeout gives up with
+          :class:`~.RedisClusterUnreachableError` once a refresh that ended since
+          reached no node, or when it runs out of retries while the last refresh
+          did.
           Backoffs that keep state between calls
           (:class:`~.DecorrelatedJitterBackoff`) are not fully supported: the
           retry object is shared by every command and pipeline of the client, so
@@ -472,6 +478,17 @@ class RedisCluster(
           where the node is reachable.  This can be used to map the addresses at
           which the nodes _think_ they are, to addresses at which a client may
           reach them, such as when they sit behind a proxy.
+    :param topology_refresh_min_interval:
+        | The minimum number of seconds between two topology refreshes triggered
+          by errors (connection errors, the ``reinitialize_steps`` MOVED
+          threshold, pipeline failures, pubsub repair). Requests made in between
+          are collapsed into one refresh, run by the next command attempt once
+          the interval has passed. After refreshes that failed in a row, the
+          ``retry`` backoff can make the wait longer, never shorter. 0 lets every
+          requested refresh run at once. Must be finite and not negative.
+          Server-pushed refreshes (SMIGRATED), the first initialization and the
+          refresh a ``CLUSTERDOWN`` or an uncovered slot runs are not limited.
+          Defaults to one second when not set.
 
     | Rest of the arguments will be passed to the
       :class:`~redis.asyncio.connection.Connection` instances when created
@@ -615,6 +632,7 @@ class RedisCluster(
         policy_resolver: AsyncPolicyResolver | None = None,
         maint_notifications_config: MaintNotificationsConfig | None = None,
         metadata_resolver: AsyncMetadataResolver | None = None,
+        topology_refresh_min_interval: float | None = None,
     ) -> None:
         if db:
             raise RedisClusterException(
@@ -624,6 +642,15 @@ class RedisCluster(
         if path:
             raise RedisClusterException(
                 "Unix domain socket is not supported in cluster mode"
+            )
+
+        if topology_refresh_min_interval is not None and (
+            not math.isfinite(topology_refresh_min_interval)
+            or topology_refresh_min_interval < 0
+        ):
+            raise RedisClusterException(
+                "Argument 'topology_refresh_min_interval' must be a finite,"
+                " non-negative number"
             )
 
         port_is_provided = bool(port) or type(port) is int
@@ -763,6 +790,7 @@ class RedisCluster(
             dynamic_startup_nodes=dynamic_startup_nodes,
             address_remap=address_remap,
             event_dispatcher=self._event_dispatcher,
+            topology_refresh_min_interval=topology_refresh_min_interval,
         )
         AsyncMaintNotificationsAbstractRedisCluster.__init__(
             self,
@@ -861,15 +889,15 @@ class RedisCluster(
 
     async def initialize(
         self,
-        additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
-        last_failed_node_name: Optional[str] = None,
+        additional_startup_nodes_info: List[Tuple[str, int]] | None = None,
+        last_failed_node_name: str | None = None,
     ) -> "RedisCluster":
         """
         Get all nodes from startup nodes & creates connections if not initialized.
 
         Once initialized, this refreshes the topology only when one was asked
         for (``_initialize`` is set by the error paths), and no sooner than
-        ``_TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS`` after the previous refresh,
+        ``topology_refresh_min_interval`` after the previous refresh,
         or longer after refreshes that failed (see ``_topology_refresh_delay``).
         Until then it returns at once and the current topology keeps serving.
         It also returns at once while another task runs the refresh: only the
@@ -1449,9 +1477,10 @@ class RedisCluster(
 
     async def _resolve_command_policies(
         self, *args: Any, target_nodes_specified: bool = False
-    ) -> Tuple[str, Union[CommandPolicies, CommandMetadata]]:
+    ) -> Tuple[str, CommandPolicies | CommandMetadata, int | None]:
         """
-        Resolves the policies a command routes and aggregates by.
+        Resolves the policies a command routes and aggregates by, and the slot of its
+        keys when finding the policies took computing it.
 
         Returns the name the policies were decided by along with the record, because the
         name a command is known by is not always ``args[0]``: a container command is
@@ -1470,6 +1499,10 @@ class RedisCluster(
         targets, the command's ``COMMAND_FLAGS`` entry, and finally whether the command
         carries a key. ``target_nodes_specified`` says the caller picked the targets, as
         named nodes or as a nodes flag.
+
+        That last fallback computes the command's slot, which is returned so the caller
+        can pass it to ``_determine_nodes`` instead of computing it again. Every other
+        branch returns ``None`` for the slot.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
@@ -1483,43 +1516,49 @@ class RedisCluster(
             # the loop over the nodes the caller picked, or fold their replies into one.
             # Answer with the record that aggregates nothing, and skip the resolver: with
             # the targets given, neither of its answers is used.
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         policies = await self._policy_resolver.resolve(args[0].lower())
         if policies:
-            return command, policies
+            return command, policies, None
 
         command_flag = self.command_flags.get(command)
         if command_flag:
             if command_flag in self._command_flags_mapping:
-                return command, _METADATA_BY_REQUEST_POLICY[
-                    self._command_flags_mapping[command_flag]
-                ]
-            return command, _DEFAULT_KEYLESS_METADATA
+                return (
+                    command,
+                    _METADATA_BY_REQUEST_POLICY[
+                        self._command_flags_mapping[command_flag]
+                    ],
+                    None,
+                )
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         # Unflagged and unresolved, so the command routes by its key. Without a default
         # node the topology is not known yet and there is no slot to route by.
         if not self.get_default_node():
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         slot = await self._determine_slot(*args)
         if slot is None:
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
-        return command, _DEFAULT_KEYED_METADATA
+        return command, _DEFAULT_KEYED_METADATA, slot
 
     async def _determine_nodes(
         self,
         command: str,
         *args: Any,
-        request_policy: Optional[RequestPolicy] = None,
-        node_flag: Optional[str] = None,
+        request_policy: RequestPolicy | None = None,
+        node_flag: str | None = None,
+        slot: int | None = None,
     ) -> List["ClusterNode"]:
         # Determine which nodes should be executed the command on.
         # Returns a list of target nodes.
         # The caller resolves the command's own policy - see
         # ``_resolve_command_policies`` - so the only decision left here is an explicit
-        # node flag, which overrides it.
+        # node flag, which overrides it. ``slot`` is the slot that resolution already
+        # computed, if it did, so a keyed command is not hashed twice.
         if node_flag and self._is_node_flag(node_flag):
             if node_flag in self._command_flags_mapping:
                 request_policy = self._command_flags_mapping[node_flag]
@@ -1529,14 +1568,18 @@ class RedisCluster(
                 f"No targets were found to execute {command} command on"
             )
 
-        policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
-        if policy_callback is None:
-            # A keyed policy. A MULTI_SHARD command routed here was not split - its keys
-            # share a slot, or are not at fixed positions - so it is routed by its keys as
-            # a whole.
-            nodes = await self.get_nodes_from_slot(command, *args)
+        if slot is not None:
+            # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
+            nodes = [await self._get_node_from_slot(command, slot)]
         else:
-            nodes = await policy_callback(self, command, *args)
+            policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
+            if policy_callback is None:
+                # A keyed policy. A MULTI_SHARD command routed here was not split - its
+                # keys share a slot, or are not at fixed positions - so it is routed by
+                # its keys as a whole.
+                nodes = await self.get_nodes_from_slot(command, *args)
+            else:
+                nodes = await policy_callback(self, command, *args)
 
         if command.lower() == "ft.aggregate":
             self._aggregate_nodes = nodes
@@ -1560,7 +1603,8 @@ class RedisCluster(
             # command syntax: EVAL "script body" num_keys ...
             if len(args) < 2:
                 raise RedisClusterException(
-                    f"Invalid args in command: {command, *args}"
+                    "Invalid args in command: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
             keys = args[2 : 2 + int(args[1])]
             # if there are 0 keys, that means the script can be run on any node
@@ -1577,7 +1621,8 @@ class RedisCluster(
                 raise RedisClusterException(
                     "No way to dispatch this command to Redis Cluster. "
                     "Missing key.\nYou can execute the command by specifying "
-                    f"target nodes.\nCommand: {args}"
+                    "target nodes.\nCommand: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
 
         # single key command
@@ -1698,7 +1743,7 @@ class RedisCluster(
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
-        command, command_policies = await self._resolve_command_policies(
+        command, command_policies, slot = await self._resolve_command_policies(
             *args, target_nodes_specified=target_nodes_specified or node_flag
         )
 
@@ -1757,11 +1802,16 @@ class RedisCluster(
             try:
                 if not target_nodes_specified:
                     if splits is None:
+                        # Only the first attempt reuses the slot. A retry computes it
+                        # again, as a command without keys gets a new random slot on
+                        # each attempt - also after an attempt that found no node for it
+                        attempt_slot, slot = slot, None
                         # Determine the nodes to execute the command on
                         target_nodes = await self._determine_nodes(
                             *args,
                             request_policy=command_policies.request_policy,
                             node_flag=passed_targets,
+                            slot=attempt_slot,
                         )
                     else:
                         # One slot: sent as it is, to the node of the slot the split
@@ -1771,7 +1821,8 @@ class RedisCluster(
                         ]
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(args))} command on"
                         )
                     is_default_node = (
                         len(target_nodes) == 1
@@ -2000,6 +2051,14 @@ class RedisCluster(
                 )
                 raise
             except (ConnectionError, TimeoutError) as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"{type(e).__name__} received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 # Connection retries are being handled in the node's
                 # Retry object. The failed connection has disconnected itself;
                 # the node's in-use connections are kept, and a timeout keeps the
@@ -2060,6 +2119,14 @@ class RedisCluster(
                 )
                 raise
             except MovedError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"MOVED error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
@@ -2095,6 +2162,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"ASK error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
@@ -2109,6 +2184,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except TryAgainError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"TRYAGAIN error received for command {args_log_str}, "
+                        f"on node {target_node.name}"
+                    )
                 if ttl < self.RedisClusterRequestTTL / 2:
                     await asyncio.sleep(0.05)
                 await self._record_command_metric(
@@ -2598,8 +2681,14 @@ class ClusterNode:
         kwargs.pop("keys", None)
 
         # Return response
-        if command in self.response_callbacks:
-            return self.response_callbacks[command](response, **kwargs)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command)
+        if callback is not None:
+            return callback(response, **kwargs)
 
         return response
 
@@ -2712,7 +2801,10 @@ class ClusterNode:
             # Read responses
             ret = False
             marked = False
-            for cmd in commands:
+            may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
+            for i, cmd in enumerate(commands):
+                if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                    await _yield_in_read_loop(connection)
                 try:
                     cmd.result = await self.parse_response(
                         connection, cmd.args[0], **cmd.kwargs
@@ -2798,6 +2890,7 @@ class NodesManager:
         "slots_cache",
         "startup_nodes",
         "address_remap",
+        "_topology_refresh_min_interval",
         "_last_refresh_at",
         "_failed_refreshes",
         "_refresh_due_at",
@@ -2813,13 +2906,17 @@ class NodesManager:
         require_full_coverage: bool,
         connection_kwargs: Dict[str, Any],
         dynamic_startup_nodes: bool = True,
-        address_remap: Optional[Callable[[Tuple[str, int]], Tuple[str, int]]] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
+        address_remap: Callable[[Tuple[str, int]], Tuple[str, int]] | None = None,
+        event_dispatcher: EventDispatcher | None = None,
+        topology_refresh_min_interval: float | None = None,
     ) -> None:
         self.startup_nodes = {node.name: node for node in startup_nodes}
         self.require_full_coverage = require_full_coverage
         self.connection_kwargs = connection_kwargs
         self.address_remap = address_remap
+        # The minimum interval between error-triggered refreshes, or None for
+        # _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS. See _refresh_due.
+        self._topology_refresh_min_interval = topology_refresh_min_interval
 
         self.default_node: "ClusterNode" = None
         self.nodes_cache: Dict[str, "ClusterNode"] = {}
@@ -3066,7 +3163,7 @@ class NodesManager:
                     return_exceptions=True,
                 )
 
-    def _refresh_due(self, retry: Optional[Retry] = None) -> bool:
+    def _refresh_due(self, retry: Retry | None = None) -> bool:
         """
         Whether a topology refresh triggered by an error may run now: not
         before the delay of _topology_refresh_delay has passed since the
@@ -3079,7 +3176,9 @@ class NodesManager:
             if last_refresh_at is None:
                 return True
             due_at = last_refresh_at + _topology_refresh_delay(
-                retry, self._failed_refreshes
+                retry,
+                self._failed_refreshes,
+                self._topology_refresh_min_interval,
             )
             self._refresh_due_at = due_at
         return time.monotonic() >= due_at
@@ -4019,14 +4118,20 @@ class PipelineStrategy(AbstractStrategy):
                 Optional[List[_MultiShardSplit]],
             ]
         ] = []
-        for cmd in todo:
+        # Routing does not suspend either, so a large batch yields to the event loop
+        # while it is routed, as the reply loops do. A cancellation at the yield comes
+        # before anything is sent, and execute() resets the pipeline.
+        may_yield = len(todo) >= _PIPELINE_YIELD_MIN_COMMANDS
+        for i, cmd in enumerate(todo):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             passed_targets = cmd.kwargs.pop("target_nodes", cmd.target_nodes)
             target_nodes_specified = bool(passed_targets) and not client._is_node_flag(
                 passed_targets
             )
             # A nodes flag picks the targets too, in ``_determine_nodes`` below, and the
             # command's own aggregation must not apply to the replies either
-            command, command_policies = await client._resolve_command_policies(
+            command, command_policies, slot = await client._resolve_command_policies(
                 *cmd.args, target_nodes_specified=bool(passed_targets)
             )
 
@@ -4050,10 +4155,12 @@ class PipelineStrategy(AbstractStrategy):
                         *cmd.args,
                         request_policy=request_policy,
                         node_flag=passed_targets,
+                        slot=slot,
                     )
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {cmd.args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(cmd.args))} command on"
                         )
             cmd.command_policies = command_policies
             # Kept for a retry, which would otherwise route the command by its own policy:
@@ -4136,6 +4243,8 @@ class PipelineStrategy(AbstractStrategy):
             # A node whose task raised answered none of its commands, so its copies are
             # not taken for successes when they are merged - and the slots of a split
             # command that did succeed are kept for the attempt the error leads to.
+            # A command the merge answered with a success keeps it, as ONE_SUCCEEDED
+            # asks, even though one of its nodes failed.
             for (_, commands), e in zip(nodes.values(), errors):
                 if isinstance(e, BaseException):
                     for queued_command in commands:
@@ -4144,15 +4253,37 @@ class PipelineStrategy(AbstractStrategy):
                 cmd.result = self._merge_node_results(
                     client, cmd, command, copies, splits
                 )
-        for (node, _), e in zip(nodes.values(), errors):
-            if isinstance(e, BaseException):
-                # The write failed (the connection connects lazily on it): the
-                # error carries no node, so take it from the task that raised it
-                if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
-                    e, RedisCluster.NOT_NODE_FAILURE_ERRORS
-                ):
-                    self._try_failed_node_last(client, node)
-                raise e
+        # The first node error that fails a command is raised, but only after every
+        # node whose error fails nothing has been tried last, so the raise skips none
+        # of them and the node it came from is still the one tried last.
+        raised: tuple["ClusterNode", BaseException] | None = None
+        for (node, commands), e in zip(nodes.values(), errors):
+            if not isinstance(e, BaseException):
+                continue
+            # A copy shares the position of the command it was made from, which is
+            # that command's index in the stack. When every command the node held is
+            # a copy of a command that merged to a success, the error fails nothing,
+            # so it is not raised.
+            if not fanned_out or not all(
+                c is not stack[c.position]
+                and not isinstance(stack[c.position].result, BaseException)
+                for c in commands
+            ):
+                if raised is None:
+                    raised = (node, e)
+            # The write failed (the connection connects lazily on it): the error
+            # carries no node, so take it from the task that raised it
+            elif isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+        if raised is not None:
+            node, e = raised
+            if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+            raise e
 
         # Record operation duration for each node
         for (node, commands), failed in zip(nodes.values(), errors):
@@ -4163,7 +4294,8 @@ class PipelineStrategy(AbstractStrategy):
                     node_error = cmd.result
                     break
 
-            if failed:
+            # A node task that raised was tried last above
+            if failed is True:
                 # A read failed. Commands before it may have been redirected,
                 # so look past the first error for a connection error
                 for cmd in commands:
@@ -4886,6 +5018,7 @@ class TransactionStrategy(AbstractStrategy):
 
         await connection.send_packed_command(packed_commands)
         errors = []
+        may_yield = len(self._command_queue) >= _PIPELINE_YIELD_MIN_COMMANDS
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -4903,6 +5036,8 @@ class TransactionStrategy(AbstractStrategy):
 
         # and all the other commands
         for i, command in enumerate(self._command_queue):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await _yield_in_read_loop(connection)
             if EMPTY_RESPONSE in command.kwargs:
                 errors.append((i, command.kwargs[EMPTY_RESPONSE]))
             else:
@@ -4959,16 +5094,26 @@ class TransactionStrategy(AbstractStrategy):
 
         # We have to run response callbacks manually
         data = []
-        for r, cmd in zip(response, self._command_queue):
+        for i, (r, cmd) in enumerate(zip(response, self._command_queue)):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             if not isinstance(r, Exception):
                 command_name = cmd.args[0]
-                if command_name in self._pipe.cluster_client.response_callbacks:
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self._pipe.cluster_client.response_callbacks,
+                        command_name,
+                        connection,
+                    )
+                else:
+                    callback = self._pipe.cluster_client.response_callbacks.get(
+                        command_name
+                    )
+                if callback is not None:
                     # The keys option is only for the client cache and is
                     # not an option of the callbacks
                     cmd.kwargs.pop("keys", None)
-                    r = self._pipe.cluster_client.response_callbacks[command_name](
-                        r, **cmd.kwargs
-                    )
+                    r = callback(r, **cmd.kwargs)
             data.append(r)
 
         await record_operation_duration(
@@ -5192,6 +5337,9 @@ class ClusterPubSubSlotsCacheListener(AsyncEventListenerInterface):
 # the single reader from spending every pass on that node while its healthy
 # siblings hold undelivered messages.
 SHARD_POLL_COOL_OFF_SECONDS = 1.0
+
+# Returned by _poll_node_pubsub when a handler consumed the message it read.
+_DISPATCHED = object()
 
 # How often a failed sharded-pubsub poll may trigger a slots-cache refresh.
 # Reconciliation is otherwise purely event-driven, and a node that has left the
@@ -5493,11 +5641,53 @@ class ClusterPubSub(PubSub):
         self, timeout: float = 0.0
     ) -> Tuple[Optional[PubSub], Optional[Dict[str, Any]]]:
         """Generate messages from shard channels across all nodes."""
+        if timeout and len(self.node_pubsub_mapping) > 1:
+            # Block only when no node has data, so a busy shard does not wait
+            # out the slices of its idle siblings.
+            deadline = time.monotonic() + timeout
+            pubsub, message = await self._sharded_pass(0.0)
+            while message is None:
+                # A node that returns early leaves time the nodes before it
+                # did not get; pass again until the deadline.
+                start = time.monotonic()
+                if start >= deadline:
+                    break
+                pubsub, message = await self._sharded_pass(deadline - start)
+                if not any(ps.connection for ps in self.node_pubsub_mapping.values()):
+                    # A pass with no connection to read returns without
+                    # suspending; looping on it would hold the event loop.
+                    break
+            if message is None:
+                # A message can reach a node after its slice ran out.
+                pubsub, message = await self._sharded_pass(0.0)
+        else:
+            pubsub, message = await self._sharded_pass(timeout)
+        if message is _DISPATCHED:
+            return None, None
+        return pubsub, message
+
+    async def _sharded_pass(self, timeout: float) -> Tuple[Optional[PubSub], Any]:
+        """Poll each node once; ``message`` may be ``_DISPATCHED``."""
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
+        unconnected = 0
         next_ready: Optional[float] = None
-        for _ in range(len(self.node_pubsub_mapping)):
+        nodes = len(self.node_pubsub_mapping)
+        # Split the wait across the pass, otherwise every idle node ahead of the
+        # one with a message adds a full timeout. Each poll gets an equal share
+        # of what is left, so a skipped or fast-failing node passes its share on.
+        split = bool(timeout) and nodes > 1
+        node_timeout = timeout
+        if split:
+            pass_deadline = time.monotonic() + timeout
+            now = time.monotonic()
+            left = sum(
+                1
+                for ps in list(self.node_pubsub_mapping.values())
+                if ps.connection is not None and self._poll_cool_off.get(ps, 0.0) <= now
+            )
+        for _ in range(nodes):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
                 # node_pubsub_mapping was emptied between the len() above and
@@ -5511,9 +5701,17 @@ class ClusterPubSub(PubSub):
                     if next_ready is None or deadline < next_ready:
                         next_ready = deadline
                     continue
+            if pubsub.connection is None:
+                # Nothing to read and no wait: not a poll, so a pass whose
+                # other nodes are cooling off still sleeps below.
+                unconnected += 1
+                continue
             polled += 1
+            if split:
+                node_timeout = max(pass_deadline - time.monotonic(), 0.0) / max(left, 1)
+                left -= 1
             try:
-                message = await self._poll_node_pubsub(pubsub, timeout)
+                message = await self._poll_node_pubsub(pubsub, node_timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next
@@ -5581,7 +5779,8 @@ class ClusterPubSub(PubSub):
                     self._unreachable_nodes.discard(node_name)
             if message is not None:
                 return pubsub, message
-        if first_error is not None and failed == polled:
+        # An unconnected node is not down, so it keeps the error from surfacing.
+        if first_error is not None and failed == polled + unconnected:
             raise first_error
         if polled == 0 and next_ready is not None:
             await self._wait_out_cool_off(next_ready, timeout)
@@ -5620,9 +5819,7 @@ class ClusterPubSub(PubSub):
             return nullcontext()
         return self._pubsub_io_lock(pubsub)
 
-    async def _poll_node_pubsub(
-        self, pubsub: PubSub, timeout: Optional[float]
-    ) -> Optional[Dict[str, Any]]:
+    async def _poll_node_pubsub(self, pubsub: PubSub, timeout: Optional[float]) -> Any:
         """Read one message from a per-node pubsub, dispatching outside the lock.
 
         Splits ``PubSub.get_message`` so the per-node I/O lock covers the wire
@@ -5680,7 +5877,9 @@ class ClusterPubSub(PubSub):
                 return await pubsub.handle_message(
                     response, ignore_subscribe_messages=False
                 )
-        return await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        message = await pubsub.handle_message(response, ignore_subscribe_messages=False)
+        # None here means a handler took it, which is not an empty poll.
+        return _DISPATCHED if message is None else message
 
     @staticmethod
     def _is_publish_response(response: Any) -> bool:
@@ -5735,7 +5934,7 @@ class ClusterPubSub(PubSub):
         # one that succeeds answers it, so no command repeats it
         self.cluster._request_refresh()
         if not self.cluster.nodes_manager._refresh_due(self.cluster.retry):
-            # Subject to _TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS like every other
+            # Subject to the topology refresh minimum interval like every other
             # error-triggered refresh: the next command, or the next repair,
             # runs it once it is due
             return
@@ -5851,6 +6050,8 @@ class ClusterPubSub(PubSub):
             if pubsub:
                 try:
                     message = await self._poll_node_pubsub(pubsub, timeout)
+                    if message is _DISPATCHED:
+                        message = None
                 except MovedError as e:
                     # Same handling as the round-robin path: the caller cannot
                     # act on a MovedError raised out of a pubsub read, and the

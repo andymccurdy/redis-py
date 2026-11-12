@@ -7,6 +7,7 @@ import time
 import weakref
 from collections import defaultdict
 from collections.abc import Coroutine
+from contextlib import contextmanager
 from typing import Optional
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -25,7 +26,7 @@ import redis.asyncio as redis
 from redis.asyncio import Subscription
 from redis._parsers import Encoder
 from redis.asyncio.client import PubSub
-from redis.asyncio.cluster import ClusterPubSub
+from redis.asyncio.cluster import _DISPATCHED, ClusterPubSub
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.crc import key_slot
@@ -1183,6 +1184,30 @@ class TestPubSubRESP3Handler:
         await wait_for_handled_message(
             self, p.get_message, ["my handler", [b"message", b"foo", b"test message"]]
         )
+
+    async def test_push_handler_not_left_on_released_connection(self, r):
+        if get_protocol_version(r) in [2, "2", None]:
+            return
+        p = r.pubsub(push_handler_func=self.my_handler)
+        await p.subscribe("foo")
+        await wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"subscribe", b"foo", 1]]
+        )
+        connection = p.connection
+        await p.aclose()
+        self.message = None
+
+        # The next pubsub gets the same pooled connection and has no handler
+        p2 = r.pubsub()
+        await p2.subscribe("foo")
+        assert p2.connection is connection
+        assert await wait_for_message(p2) == make_message("subscribe", "foo", 1)
+        assert await r.publish("foo", "test message") == 1
+        assert await wait_for_message(p2) == make_message(
+            "message", "foo", "test message"
+        )
+        assert self.message is None
+        await p2.aclose()
 
 
 @pytest.mark.onlynoncluster
@@ -3565,6 +3590,21 @@ class TestClusterPubSubSlotMigration:
         assert old_ps.aclose_calls == 0
         assert old_node.name in pubsub.node_pubsub_mapping
 
+    @contextmanager
+    def _idle_polls(self, pubsub, time_module):
+        """Polls that find nothing and wait out their timeout on a fake clock."""
+        clock = [time.monotonic()]
+
+        def poll(ps, timeout):
+            clock[0] += timeout
+
+        with patch(time_module) as fake_time:
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            with patch.object(
+                pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)
+            ) as p:
+                yield p
+
     def _prime_generator(self, pubsub):
         from redis.asyncio.cluster import ClusterPubSub
 
@@ -3589,6 +3629,221 @@ class TestClusterPubSubSlotMigration:
 
         assert source is good
         assert delivered is message
+
+    async def test_sharded_message_generator_splits_timeout_across_nodes(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(4)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        # A non-blocking sweep, the timed pass in equal shares, a last sweep.
+        slices = [c.args[1] for c in poll.call_args_list]
+        assert slices[:8] == pytest.approx([0.0] * 4 + [0.1] * 4)
+        assert slices[-4:] == [0.0] * 4
+
+    async def test_sharded_message_generator_gives_skipped_share_to_others(self):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[cooling] = time.monotonic() + 30
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        # [0] is the non-blocking sweep, which skips the cooling node too.
+        assert poll.call_args_list[0].args == (healthy, 0.0)
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
+    async def test_sharded_message_generator_gives_unconnected_share_to_others(
+        self,
+    ):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        unconnected = self._make_node_pubsub({b"b": None})
+        unconnected.connection = None
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": unconnected,
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
+    async def test_sharded_message_generator_ends_pass_after_dispatch(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # The sweep finds nothing, then a handler takes the first node's message
+        # in the timed pass: the idle node must not get the rest of the wait.
+        poll = AsyncMock(side_effect=[None, None, _DISPATCHED, None])
+        with patch.object(pubsub, "_poll_node_pubsub", poll):
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert poll.call_count == 3
+
+    async def test_sharded_message_generator_sweeps_for_late_message(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"c0", "data": b"late"}
+
+        # The message reaches the first node only after its slice ran out.
+        with patch.object(
+            pubsub,
+            "_poll_node_pubsub",
+            AsyncMock(side_effect=[None, None, None, None, msg]),
+        ):
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                idle[0],
+                msg,
+            )
+
+    async def test_sharded_message_generator_does_not_block_a_busy_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        hot = self._make_node_pubsub({b"hot": None})
+        idle = self._make_node_pubsub({b"idle": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": hot, "127.0.0.1:7001": idle}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"hot", "data": b"x"}
+
+        async def poll(ps, timeout):
+            return msg if ps is hot else None
+
+        with patch.object(
+            pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)
+        ) as p:
+            # The second call starts on the idle node, after the hot one.
+            for _ in range(2):
+                assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                    hot,
+                    msg,
+                )
+
+        assert [c.args[1] for c in p.call_args_list] == [0.0, 0.0, 0.0]
+
+    async def test_sharded_message_generator_reuses_time_a_fast_shard_left(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = self._make_node_pubsub({b"idle": None})
+        fast = self._make_node_pubsub({b"fast": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": idle, "127.0.0.1:7001": fast}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"idle", "data": b"x"}
+        idle_polls = []
+        clock = [time.monotonic()]
+
+        async def poll(ps, timeout):
+            if ps is fast:
+                return None
+            idle_polls.append(timeout)
+            # Arrives after the idle node's first slice, within the timeout.
+            if len(idle_polls) == 3:
+                return msg
+            clock[0] += timeout
+            return None
+
+        # A sub-millisecond pass still blocked on the idle node.
+        with (
+            patch("redis.asyncio.cluster.time") as fake_time,
+            patch.object(pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)),
+        ):
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            assert await pubsub._sharded_message_generator(timeout=0.001) == (
+                idle,
+                msg,
+            )
+
+        # The sweep, the first timed slice, then a second pass over the rest.
+        assert idle_polls[2] > 0
+
+    async def test_sharded_message_generator_stops_without_connections(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        for ps in nodes:
+            ps.connection = None
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # Every poll returns at once, so looping until the deadline would spin.
+        with patch.object(
+            pubsub, "_sharded_pass", wraps=pubsub._sharded_pass
+        ) as passes:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert passes.call_count == 3
+
+    async def test_sharded_message_generator_sleeps_past_unconnected_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        clock = [time.monotonic()]
+        pubsub._poll_cool_off[cooling] = clock[0] + 30
+
+        async def sleep(next_ready, timeout):
+            clock[0] += timeout
+
+        with (
+            patch("redis.asyncio.cluster.time") as fake_time,
+            patch.object(pubsub, "_wait_out_cool_off", AsyncMock(side_effect=sleep)),
+            patch.object(pubsub, "_sharded_pass", wraps=pubsub._sharded_pass) as passes,
+        ):
+            # Ticks on each read, so a pass that never sleeps still ends.
+            fake_time.monotonic.side_effect = (
+                lambda: clock.__setitem__(0, clock[0] + 0.001) or clock[0]
+            )
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert passes.call_count == 3
+
+    async def test_sharded_message_generator_unconnected_shard_is_not_down(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        bad = self._make_node_pubsub({b"b": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": bad,
+        }
+        self._prime_generator(pubsub)
+
+        assert await pubsub._sharded_message_generator(timeout=0) == (None, None)
 
     async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """

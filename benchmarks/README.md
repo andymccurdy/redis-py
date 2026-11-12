@@ -195,6 +195,9 @@ python -m benchmarks.measure_read_path.parser_micro --trees $TREES
 
 # Observability recorder, disabled, no network: sync and async
 python -m benchmarks.measure_read_path.recorder_micro --trees $TREES
+
+# Cluster command routing, no network after setup: sync and async
+python -m benchmarks.measure_read_path.routing_micro --trees $TREES
 ```
 
 `run_bench` covers the pure-Python parser and hiredis, each on RESP3 and RESP2,
@@ -245,13 +248,27 @@ run the tree's own code without a server. Both run on the sync and the async
 client. The recorder's cost is a fraction of a microsecond per command, which
 the round-trip scenarios cannot resolve.
 
+`routing_micro` times the CPU work a cluster client does to route a keyed
+command: resolving its policies and picking the node that owns its slot. The
+client connects to the cluster on `--cluster-port` (default 16379) once to
+learn the topology, then the per-node execution is replaced, so nothing is
+sent and no key is written. `execute_keyed` routes one `SET` through
+`RedisCluster.set()`. `pipeline_1k` queues 1000 `SET`s to keys in many slots
+on a `ClusterPipeline` and executes it: it times queuing, routing, grouping
+by node and collecting the results, with only the per-node send and read
+replaced. Both run on the sync and the async client. Before timing, each
+scenario checks that every command went to the node that owns its key's
+slot. Routing costs a few microseconds per command, which the
+round-trip scenarios cannot resolve either.
+
 Every tool reports how long each test took, and writes JSON and Markdown
 results under `benchmarks/measure_read_path/results/` (ignored by git), with the
 tree SHAs in the file name. Use `--output-dir` to write them elsewhere.
 
 ### Regression gate
 
-`run_bench`, `mem_probe`, `parser_micro`, `recorder_micro` and `csc_bench`
+`run_bench`, `mem_probe`, `parser_micro`, `recorder_micro`, `routing_micro` and
+`csc_bench`
 end with a regression summary for every `--compare candidate:baseline`
 pair: whether
 the gate passed, and for every regressed or inconclusive cell the baseline
@@ -259,7 +276,7 @@ and candidate numbers and the delta. A cell regresses when the candidate
 is worse by more than `--allowed-regression` percent (default 5) and by
 more than the uncertainty of the delta. The delta compares the two trees'
 medians over rounds (`run_bench`) or passes (`mem_probe`, `parser_micro`,
-`recorder_micro`, `csc_bench`), so its uncertainty is how far those medians
+`recorder_micro`, `routing_micro`, `csc_bench`), so its uncertainty is how far those medians
 could move, not how much one round varies: 1.5 times half the 95% bootstrap interval of the
 delta. More rounds narrow it, and with fewer than 4 per tree a cell gets no
 verdict. The
@@ -298,10 +315,10 @@ gates on request, not on every pull request:
   commit it was merged onto, so only the PR's own effect is measured.
 
 `ci_matrix.py` generates the jobs: one each for peak memory, the
-parser-only benchmark, the observability recorder benchmark and the
-client-side cache on each topology, and one
+parser-only benchmark, the observability recorder benchmark, the cluster
+routing benchmark and the client-side cache on each topology, and one
 `run_bench` job per config, every client, topology, pool class, parser,
-protocol and socket timeout combination (61 jobs). The `run_bench` jobs
+protocol and socket timeout combination (62 jobs). The `run_bench` jobs
 leave out `get_small_seq` and `set_small_seq`: they send one small command
 per round trip, so on a shared runner they time the network more than the
 client. They also run `get_200kb` instead of

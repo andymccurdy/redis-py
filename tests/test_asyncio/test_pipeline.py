@@ -11,7 +11,11 @@ from .compat import aclosing
 from .conftest import wait_for_command
 
 from unittest.mock import MagicMock, patch, AsyncMock
-from redis.asyncio.client import Pipeline, _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS
+from redis.asyncio.client import (
+    Pipeline,
+    _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS,
+    _PIPELINE_YIELD_MIN_COMMANDS,
+)
 from redis.himport import HImportRegistry
 from redis.asyncio.observability import recorder as async_recorder
 from redis.asyncio.retry import Retry
@@ -185,6 +189,113 @@ class TestPipeline:
         assert packed[0] == ("HIMPORT", "PREPARE", "fs", "a", "b")
         assert packed[1] == ("HIMPORT", "SET", "key", "fs", "v1", "v2")
         assert len(packed) == len(commands) + 1
+
+    @staticmethod
+    def _mock_pipeline_execution(transaction, count):
+        pipeline = Pipeline(
+            connection_pool=mock.MagicMock(),
+            response_callbacks={"PING": lambda response, **options: response},
+            transaction=transaction,
+            shard_hint=None,
+        )
+        connection = mock.MagicMock()
+        connection._resp2_fallback = False
+        connection.send_packed_command = mock.AsyncMock()
+        connection.disconnect = mock.AsyncMock()
+        commands = [(("PING",), {})] * count
+        command_responses = [True] * count
+        # Replies that are already buffered: parse_response never suspends
+        pipeline.parse_response = mock.AsyncMock(
+            side_effect=[None, *command_responses, command_responses]
+            if transaction
+            else command_responses
+        )
+        return pipeline, connection, commands
+
+    @pytest.mark.parametrize("transaction", (False, True))
+    @pytest.mark.parametrize(
+        "count",
+        (
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ),
+    )
+    async def test_pipeline_reply_loops_yield_to_event_loop(self, transaction, count):
+        """
+        Reading buffered replies never suspends, so a large pipeline yields every
+        _PIPELINE_YIELD_MIN_COMMANDS commands in the read loop and, for a
+        transaction, in the callback loop too (#3416), but never after the last
+        command. Smaller pipelines never yield.
+        """
+        pipeline, connection, commands = self._mock_pipeline_execution(
+            transaction, count
+        )
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        ticks_before = ticks
+        try:
+            # Packing is offloaded at this size; a mock keeps it from suspending
+            with mock.patch(
+                "redis.asyncio.client.asyncio.to_thread",
+                new=mock.AsyncMock(return_value=[]),
+            ):
+                if transaction:
+                    result = await pipeline._execute_transaction(
+                        connection, commands, True
+                    )
+                else:
+                    result = await pipeline._execute_pipeline(
+                        connection, commands, True
+                    )
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+        assert result == [True] * count
+        yields_per_loop = (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
+        loops = 2 if transaction else 1
+        assert ticks - ticks_before == yields_per_loop * loops
+        connection.disconnect.assert_not_called()
+
+    @pytest.mark.parametrize("transaction", (False, True))
+    async def test_pipeline_cancelled_at_reply_loop_yield_disconnects(
+        self, transaction
+    ):
+        """
+        A cancellation at a read loop yield leaves the rest of the replies on the
+        socket, so the connection is dropped instead of returned to the pool.
+        """
+        pipeline, connection, commands = self._mock_pipeline_execution(
+            transaction, _PIPELINE_YIELD_MIN_COMMANDS + 1
+        )
+        with mock.patch(
+            "redis.asyncio.client.asyncio.to_thread",
+            new=mock.AsyncMock(return_value=[]),
+        ):
+            if transaction:
+                execution = pipeline._execute_transaction(connection, commands, True)
+            else:
+                execution = pipeline._execute_pipeline(connection, commands, True)
+            task = asyncio.create_task(execution)
+            # The task runs until the first yield, then is cancelled there
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        connection.disconnect.assert_awaited_once_with(nowait=True)
+        # MULTI, plus the replies read before the yield
+        reads = _PIPELINE_YIELD_MIN_COMMANDS + (1 if transaction else 0)
+        assert pipeline.parse_response.await_count == reads
 
     async def test_pipeline_is_true(self, r):
         """Ensure pipeline instances are not false-y"""
@@ -1026,6 +1137,7 @@ class TestAsyncPipelineRetryChecker:
         host = "localhost"
         port = 6379
         db = 0
+        _resp2_fallback = False
 
         def __init__(self, retry):
             self.retry = retry

@@ -166,11 +166,18 @@ TABLE_ROUTED_FLAG_COMMANDS = {
     "randomkey": (RequestPolicy.ALL_SHARDS, ResponsePolicy.SPECIAL),
 }
 
-# Every entry of the static table whose routing view is None. BLESS SCAN and COMMAND are
-# keyless and withhold their routing like the reads above, but neither is flagged readonly.
+# Every entry of the static table whose routing view is None. The BACKUP subcommands, BLESS
+# SCAN and COMMAND are keyless and withhold their routing like the reads above, but none is
+# flagged readonly.
 ALL_WITHHELD_ROUTING_COMMANDS = (
     *WITHHELD_INELIGIBLE_RECORD_COMMANDS,
     *WITHHELD_KEYLESS_READS,
+    "backup abort",
+    "backup cleanup",
+    "backup list",
+    "backup seal",
+    "backup start",
+    "backup status",
     "bless scan",
     "command",
 )
@@ -293,8 +300,8 @@ def slot_routed_args(name: str) -> tuple[Any, ...]:
     Arguments that put the key ``{foo}a`` where ``name`` reads its keys from.
 
     The read-only EVAL variants count their keys after the script, and the cluster client
-    reads them from there itself rather than asking the server; every other command is
-    resolved through ``COMMAND GETKEYS``, which the routing tests stub.
+    reads them from there itself; every other command is resolved through its key specs
+    (or ``COMMAND GETKEYS``), which the routing tests stub.
     """
     if name in ("eval_ro", "evalsha_ro"):
         return "return 1", 1, "{foo}a"
@@ -549,7 +556,7 @@ class TestWithheldRoutingPolicies:
     records that exist only for their cacheability inputs. Withholding makes a policy resolver
     report the command the way it reports one the records do not carry, which is what sends the
     cluster client back to its own target resolution. The ``movablekeys`` reads do not withhold:
-    they are recorded keyed, and ``determine_slot`` -> ``COMMAND GETKEYS`` finds their keys.
+    they are recorded keyed, and ``determine_slot`` finds their keys from the key specs.
 
     Only the sync suite covers the projection function and the shipped table: both are
     module-level and shared by the two stacks. The resolver behaviour is mirrored in the async
@@ -614,16 +621,16 @@ class TestWithheldRoutingPolicies:
             # XREAD is the one exclusion here, and the blocking flag is what excludes it.
             assert static_resolver.is_cacheable(name) is (name != "xread"), name
 
-    def test_the_ineligible_records_withhold_their_policies(self):
+    def test_the_ineligible_records_state_only_the_server_s_policies(self):
         """
-        The records that state their own ineligibility must not state a routing policy the
-        server does not give them.
+        The records that state their own ineligibility state only the routing policies the
+        server gives them.
 
         The table backs both the metadata resolver and ``StaticPolicyResolver``, so a record
         added for its cacheability inputs alone would otherwise start routing a command the
-        cluster client resolves for itself today. The script runners are the exception: they
-        are ``movablekeys`` reads, recorded keyed like the others, and TOUCH carries the
-        ``multi_shard`` tip the server gives it.
+        cluster client resolves for itself today. The script runners are ``movablekeys``
+        reads, recorded keyed like the others, TOUCH carries the ``multi_shard`` tip the
+        server gives it, and VRANDMEMBER withholds its policies.
         """
         static_resolver = StaticMetadataResolver()
 

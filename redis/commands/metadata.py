@@ -1140,9 +1140,9 @@ _METADATA_BY_REQUEST_POLICY: Mapping[RequestPolicy, CommandMetadata] = MappingPr
 #
 # This includes the ``movablekeys`` commands. Their ``first_key_pos`` is 0, but they do take
 # keys, so ``has_key_argument`` is True. The cluster client routes them like any other keyed
-# command: ``determine_slot`` asks the server for their keys with ``COMMAND GETKEYS``. The
-# parsers read their key specs and also mark them keyed, so a live resolver agrees with this
-# record.
+# command: ``determine_slot`` reads their keys from the ``COMMAND`` key specs, and asks the
+# server with ``COMMAND GETKEYS`` only where a spec is incomplete. The parsers also mark them
+# keyed, so a live resolver agrees with this record.
 _CACHEABLE_KEYED = CommandMetadata(
     request_policy=RequestPolicy.DEFAULT_KEYED,
     response_policy=ResponsePolicy.DEFAULT_KEYED,
@@ -1358,6 +1358,17 @@ _STATIC_COMMAND_METADATA: CommandMetadataRecordsCache = MappingProxyType(
     {
         "core": MappingProxyType(
             {
+                # The BACKUP container, keyed by subcommand. Keyless admin commands that the
+                # server flags neither ``readonly`` nor ``write`` and tips nothing. Routing
+                # policies are withheld because the cluster client sends them to the default
+                # node through their COMMAND_FLAGS entry, as it does SAVE and LASTSAVE: a
+                # backup belongs to one node, so a caller picks others with ``target_nodes``.
+                "backup abort": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup cleanup": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup list": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup seal": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup start": _WRITE_KEYLESS_WITHHELD_ROUTING,
+                "backup status": _WRITE_KEYLESS_WITHHELD_ROUTING,
                 "bitcount": _CACHEABLE_KEYED,
                 "bitfield_ro": _CACHEABLE_KEYED,
                 "bitpos": _CACHEABLE_KEYED,

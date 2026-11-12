@@ -40,6 +40,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers.helpers import bool_ok, decode_info
+from redis._parsers.response_callbacks import _get_response_callback
 from redis.asyncio import _himport_exec
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -1054,10 +1055,14 @@ class Redis(
         # Remove keys entry, it needs only for cache.
         options.pop("keys", None)
 
-        if command_name in self.response_callbacks:
-            # Mypy bug: https://github.com/python/mypy/issues/10977
-            command_name = cast(str, command_name)
-            retval = self.response_callbacks[command_name](response, **options)
+        if connection._resp2_fallback:
+            callback = _get_response_callback(
+                self.response_callbacks, command_name, connection
+            )
+        else:
+            callback = self.response_callbacks.get(command_name)
+        if callback is not None:
+            retval = callback(response, **options)
             return await retval if inspect.isawaitable(retval) else retval
         return response
 
@@ -1183,9 +1188,14 @@ class Monitor:
             client_port = client_info[5:]
             client_type = "unix"
         else:
-            # use rsplit as ipv6 addresses contain colons
-            client_address, client_port = client_info.rsplit(":", 1)
-            client_type = "tcp"
+            if client_info == "":
+                client_address = ""
+                client_port = ""
+                client_type = "unknown"
+            else:
+                # use rsplit as ipv6 addresses contain colons
+                client_address, client_port = client_info.rsplit(":", 1)
+                client_type = "tcp"
         return {
             "time": float(command_time),
             "db": int(db_id),
@@ -1314,6 +1324,18 @@ class PubSub:
                 # the transport.  See https://github.com/redis/redis-py/issues/3941
                 await self.connection.disconnect(nowait=True)
                 self.connection.deregister_connect_callback(self.on_connect)
+                if self.push_handler_func is not None:
+                    # The handler is set on the parser of a pooled connection:
+                    # put the parser's own back, or the next PubSub that gets
+                    # this connection has its messages handed to ours
+                    parser = self.connection._get_parser()
+                    if (
+                        getattr(parser, "pubsub_push_handler_func", None)
+                        is self.push_handler_func
+                    ):
+                        parser.set_pubsub_push_handler(
+                            parser.handle_pubsub_push_response
+                        )
                 # Detach before awaiting release, as Pipeline.reset() does, so
                 # the pubsub never holds a connection that is back in the pool.
                 connection, self.connection = self.connection, None
@@ -1915,6 +1937,14 @@ CommandStackT = List[CommandT]
 # existing synchronous path and never touch the loop's default executor.
 _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS = 1000
 
+# Reading a reply only suspends when the socket buffer is empty, so a large
+# pipeline whose replies are already buffered never yields while it reads them
+# or runs their callbacks (#3416). A pipeline of at least this many commands
+# yields to the event loop once per this many commands in those loops, but not
+# after the last one: ~1000 replies take a few ms to process, and a yield costs
+# a few microseconds. Smaller pipelines never yield.
+_PIPELINE_YIELD_MIN_COMMANDS = 1000
+
 
 async def _pack_pipeline_commands(
     connection: Connection, commands: Sequence[Iterable[EncodableT]]
@@ -1929,6 +1959,24 @@ async def _pack_pipeline_commands(
     if len(commands) < _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS:
         return connection.pack_commands(commands)
     return await asyncio.to_thread(connection.pack_commands, commands)
+
+
+async def _yield_in_read_loop(connection: Connection) -> None:
+    """Yield to the event loop from a loop that reads a batch of replies.
+
+    The task can be cancelled at the yield: a task.cancel(), an expired
+    asyncio.timeout() or wait_for() around execute(), or Ctrl+C under
+    asyncio.run(). The rest of the batch's replies (for a transaction, the rest
+    of the QUEUED replies and the EXEC reply) are still on the socket, so the
+    connection is dropped rather than let them be read as the reply to a later
+    command, such as the UNWATCH that reset() sends while WATCHing, or by the
+    next caller that borrows it from the pool.
+    """
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        await connection.disconnect(nowait=True)
+        raise
 
 
 class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
@@ -2184,6 +2232,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
         await connection.send_packed_command(all_cmds)
         errors = []
+        may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
 
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
@@ -2196,6 +2245,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         # and all the other commands
         for i, command in enumerate(commands):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await _yield_in_read_loop(connection)
             if EMPTY_RESPONSE in command[1]:
                 errors.append((i, command[1][EMPTY_RESPONSE]))
             else:
@@ -2236,7 +2287,9 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         # We have to run response callbacks manually
         data = []
-        for r, cmd in zip(response, commands):
+        for i, (r, cmd) in enumerate(zip(response, commands)):
+            if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                await asyncio.sleep(0)
             if not isinstance(r, Exception):
                 args, options = cmd
                 command_name = args[0]
@@ -2244,8 +2297,14 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 # Remove keys entry, it needs only for cache.
                 options.pop("keys", None)
 
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
+                if connection._resp2_fallback:
+                    callback = _get_response_callback(
+                        self.response_callbacks, command_name, connection
+                    )
+                else:
+                    callback = self.response_callbacks.get(command_name)
+                if callback is not None:
+                    r = callback(r, **options)
                     if inspect.isawaitable(r):
                         r = await r
             data.append(r)
@@ -2278,8 +2337,11 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         )
 
         response = []
+        may_yield = len(commands) >= _PIPELINE_YIELD_MIN_COMMANDS
         try:
-            for args, options in commands:
+            for i, (args, options) in enumerate(commands):
+                if may_yield and i and not i % _PIPELINE_YIELD_MIN_COMMANDS:
+                    await asyncio.sleep(0)
                 try:
                     response.append(
                         await self.parse_response(connection, args[0], **options)
@@ -2287,9 +2349,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 except ResponseError as e:
                     response.append(e)
         except BaseException:
-            # A response callback raised, so the replies of the rest of the batch
-            # are still on the socket. Drop the connection rather than hand them to
-            # the next caller that borrows it from the pool.
+            # A response callback raised, or the task was cancelled at the yield,
+            # so the replies of the rest of the batch are still on the socket.
+            # Drop the connection rather than hand them to the next caller that
+            # borrows it from the pool.
             await connection.disconnect(nowait=True)
             raise
 

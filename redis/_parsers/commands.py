@@ -20,10 +20,16 @@ from redis.commands.metadata import (
     RequestPolicy,
     ResponsePolicy,
 )
-from redis.exceptions import IncorrectPolicyType, RedisError, ResponseError
+from redis.exceptions import (
+    DataError,
+    IncorrectPolicyType,
+    RedisError,
+    ResponseError,
+)
 from redis.utils import deprecated_function, str_if_bytes
 
 if TYPE_CHECKING:
+    from redis._parsers.encoders import Encoder
     from redis.asyncio.cluster import ClusterNode
 
 # The record type ``_build_command_records`` builds per command: policies or full metadata.
@@ -77,18 +83,145 @@ class AbstractCommandsParser:
     def parse_subcommand(self, command, **options):
         return _parse_subcommand(command)
 
+    def _get_keys_from_specs(self, cmd_name, args):
+        """
+        Find the keys of a movablekeys command from the key specs compiled in
+        initialize(), the way the server does, which saves the COMMAND GETKEYS
+        round trip. Returns None when the server has to be asked.
+        """
+        compiled = self._movablekeys_specs.get(cmd_name)
+        if compiled is None:
+            return None
+        arity, specs = compiled
+        argc = len(args)
+        # COMMAND GETKEYS rejects a wrong argument count before reading specs.
+        if argc < abs(arity) or (arity > 0 and argc != arity):
+            return None
+        keys = []
+        for find_type, first, a, b, step in specs:
+            if find_type == "range":
+                lastkey, limit = a, b
+                if lastkey >= 0:
+                    last = first + lastkey
+                elif not limit:
+                    last = argc + lastkey
+                else:
+                    last = first + (argc - first) // limit + lastkey
+            else:
+                keynumidx, firstkey = a, b
+                if first + keynumidx >= argc:
+                    return None
+                numkeys = _parse_numkeys(args[first + keynumidx], self._encoder)
+                if numkeys is None or numkeys < 0:
+                    return None
+                first += firstkey
+                last = first + (numkeys - 1) * step
+            if last < first:
+                # No keys, as for the server; a negative slice end would wrap.
+                continue
+            if last >= argc:
+                return None
+            keys.extend(args[first : last + 1 : step])
+        return keys
+
+
+def _parse_numkeys(value, encoder):
+    """
+    The key count as the server reads it, or None for a value it rejects.
+    Checks the bytes the client sends: int() also accepts "+2", " 2", "02",
+    "2_0" and 2.5, and a str is sent in the client's encoding.
+    """
+    try:
+        raw = encoder.encode(value)
+    except DataError:
+        return None
+    if not isinstance(raw, (bytes, bytearray)) or not raw.isdigit():
+        return None
+    if len(raw) > 1 and raw.startswith(b"0"):
+        return None
+    # More digits than a signed 64-bit count; int() would also refuse 4300+.
+    if len(raw) > 19:
+        return None
+    return int(raw)
+
+
+def _compile_movablekeys_specs(commands):
+    """
+    Compile every movablekeys command into an ``(arity, specs)`` pair that
+    _get_keys_from_specs evaluates, or None where COMMAND GETKEYS has to be
+    asked: no specs, a spec flagged incomplete or variable_flags (the server
+    then ignores the specs too), or a search the client does not implement.
+    """
+    compiled = {}
+    for name, command in commands.items():
+        if "movablekeys" in command["flags"]:
+            specs = _compile_key_specs(command.get("key_specifications"))
+            if specs is not None:
+                specs = (int(command["arity"]), specs)
+            compiled[name] = specs
+    return compiled
+
+
+def _compile_key_specs(specs):
+    if not specs:
+        return None
+    compiled = []
+    for spec in specs:
+        flags = _key_spec_flags(spec)
+        if "incomplete" in flags or "variable_flags" in flags:
+            return None
+        if "not_key" in flags:
+            continue
+        spec = _spec_dict(spec)
+        begin = _spec_dict(spec.get("begin_search", ()))
+        find = _spec_dict(spec.get("find_keys", ()))
+        if str_if_bytes(begin.get("type")) != "index":
+            return None
+        first = _spec_dict(begin["spec"])["index"]
+        find_type = str_if_bytes(find.get("type"))
+        find_spec = _spec_dict(find.get("spec", ()))
+        step = find_spec.get("keystep", 0)
+        if first < 1 or step < 1:
+            return None
+        if find_type == "range":
+            compiled.append(
+                (find_type, first, find_spec["lastkey"], find_spec["limit"], step)
+            )
+        elif find_type == "keynum":
+            compiled.append(
+                (
+                    find_type,
+                    first,
+                    find_spec["keynumidx"],
+                    find_spec["firstkey"],
+                    step,
+                )
+            )
+        else:
+            return None
+    return tuple(compiled)
+
+
+def _spec_dict(spec):
+    # RESP2 sends a key spec as a flat [name, value, ...] list, RESP3 as a map.
+    if isinstance(spec, dict):
+        return {str_if_bytes(k): v for k, v in spec.items()}
+    return {str_if_bytes(k): v for k, v in zip(spec[::2], spec[1::2])}
+
 
 class CommandsParser(AbstractCommandsParser):
     """
     Parses Redis commands to get command keys.
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with
-    'movablekeys', and these commands' keys are determined by the command
-    'COMMAND GETKEYS'.
+    'movablekeys'. Their keys are read from the command's key specs, and
+    'COMMAND GETKEYS' is asked only when the specs are not enough.
     """
 
     def __init__(self, redis_connection):
         self.commands = {}
+        self._movablekeys_specs = {}
+        self._encoder = None
         self.redis_connection = redis_connection
         self.initialize(self.redis_connection)
 
@@ -101,6 +234,8 @@ class CommandsParser(AbstractCommandsParser):
         for cmd in uppercase_commands:
             commands[cmd.lower()] = commands.pop(cmd)
         self.commands = commands
+        self._movablekeys_specs = _compile_movablekeys_specs(commands)
+        self._encoder = r.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -140,7 +275,9 @@ class CommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = self._get_moveable_keys(redis_conn, *args)
+            keys = self._get_keys_from_specs(cmd_name, args)
+            if keys is None:
+                keys = self._get_moveable_keys(redis_conn, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -255,8 +392,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
 
     COMMAND output is used to determine key locations.
-    Commands that do not have a predefined key location are flagged with 'movablekeys',
-    and these commands' keys are determined by the command 'COMMAND GETKEYS'.
+    Commands that do not have a predefined key location are flagged with 'movablekeys'.
+    Their keys are read from the command's key specs, and 'COMMAND GETKEYS' is asked
+    only when the specs are not enough.
 
     NOTE: Due to a bug in redis<7.0, this does not work properly
     for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -266,10 +404,12 @@ class AsyncCommandsParser(AbstractCommandsParser):
     So, don't use this with EVAL or EVALSHA.
     """
 
-    __slots__ = ("commands", "node")
+    __slots__ = ("commands", "node", "_movablekeys_specs")
 
     def __init__(self) -> None:
         self.commands: Dict[str, Union[int, Dict[str, Any]]] = {}
+        self._movablekeys_specs: Dict[str, Optional[Tuple]] = {}
+        self._encoder: Optional["Encoder"] = None
 
     async def initialize(self, node: Optional["ClusterNode"] = None) -> None:
         if node:
@@ -277,6 +417,8 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         commands = await self.node.execute_command("COMMAND")
         self.commands = {cmd.lower(): command for cmd, command in commands.items()}
+        self._movablekeys_specs = _compile_movablekeys_specs(self.commands)
+        self._encoder = self.node.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -316,7 +458,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = await self._get_moveable_keys(*args)
+            keys = self._get_keys_from_specs(cmd_name, args)
+            if keys is None:
+                keys = await self._get_moveable_keys(*args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:

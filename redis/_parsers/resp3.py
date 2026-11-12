@@ -64,111 +64,118 @@ class _RESP3Parser(_RESPBase, PushNotificationsParser):
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
     ):
-        raw = self._buffer.readline(timeout=timeout)
-        if not raw:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        while True:
+            raw = self._buffer.readline(timeout=timeout)
+            if not raw:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
-        byte, response = raw[:1], raw[1:]
+            byte, response = raw[:1], raw[1:]
 
-        # server returned an error
-        if byte in (b"-", b"!"):
-            if byte == b"!":
+            # server returned an error
+            if byte in (b"-", b"!"):
+                if byte == b"!":
+                    response = self._buffer.read(
+                        _parse_int(response, raw), timeout=timeout
+                    )
+                response = response.decode("utf-8", errors="replace")
+                error = self.parse_error(response)
+                # if the error is a ConnectionError, raise immediately so the user
+                # is notified
+                if isinstance(error, ConnectionError):
+                    raise error
+                # otherwise, we're dealing with a ResponseError that might belong
+                # inside a pipeline response. the connection's read_response()
+                # and/or the pipeline's execute() will raise this error if
+                # necessary, so just return the exception instance here.
+                return error
+            # single value
+            elif byte == b"+":
+                pass
+            # null value
+            elif byte == b"_":
+                return None
+            # int and big int values
+            elif byte in (b":", b"("):
+                return _parse_int(response, raw)
+            # double value
+            elif byte == b",":
+                return _parse_float(response, raw)
+            # bool value
+            elif byte == b"#":
+                return response == b"t"
+            # bulk response
+            elif byte == b"$":
                 response = self._buffer.read(_parse_int(response, raw), timeout=timeout)
-            response = response.decode("utf-8", errors="replace")
-            error = self.parse_error(response)
-            # if the error is a ConnectionError, raise immediately so the user
-            # is notified
-            if isinstance(error, ConnectionError):
-                raise error
-            # otherwise, we're dealing with a ResponseError that might belong
-            # inside a pipeline response. the connection's read_response()
-            # and/or the pipeline's execute() will raise this error if
-            # necessary, so just return the exception instance here.
-            return error
-        # single value
-        elif byte == b"+":
-            pass
-        # null value
-        elif byte == b"_":
-            return None
-        # int and big int values
-        elif byte in (b":", b"("):
-            return _parse_int(response, raw)
-        # double value
-        elif byte == b",":
-            return _parse_float(response, raw)
-        # bool value
-        elif byte == b"#":
-            return response == b"t"
-        # bulk response
-        elif byte == b"$":
-            response = self._buffer.read(_parse_int(response, raw), timeout=timeout)
-        # verbatim string response
-        elif byte == b"=":
-            response = self._buffer.read(_parse_int(response, raw), timeout=timeout)[4:]
-        # array response
-        elif byte == b"*":
-            response = [
-                self._read_response(disable_decoding=disable_decoding, timeout=timeout)
-                for _ in range(_parse_int(response, raw))
-            ]
-        # set response
-        elif byte == b"~":
-            # redis can return unhashable types (like dict) in a set,
-            # so we return sets as list, all the time, for predictability
-            response = [
-                self._read_response(disable_decoding=disable_decoding, timeout=timeout)
-                for _ in range(_parse_int(response, raw))
-            ]
-        # map response
-        elif byte == b"%":
-            # We cannot use a dict-comprehension to parse stream.
-            # Evaluation order of key:val expression in dict comprehension only
-            # became defined to be left-right in version 3.8
-            resp_dict = {}
-            for _ in range(_parse_int(response, raw)):
-                key = self._read_response(
-                    disable_decoding=disable_decoding, timeout=timeout
-                )
-                resp_dict[key] = self._read_response(
-                    disable_decoding=disable_decoding,
-                    push_request=push_request,
-                    timeout=timeout,
-                )
-            response = resp_dict
-        # push response
-        elif byte == b">":
-            response = [
-                self._read_response(
-                    disable_decoding=disable_decoding,
-                    push_request=push_request,
-                    timeout=timeout,
-                )
-                for _ in range(_parse_int(response, raw))
-            ]
-            response = self.handle_push_response(response)
+            # verbatim string response
+            elif byte == b"=":
+                response = self._buffer.read(
+                    _parse_int(response, raw), timeout=timeout
+                )[4:]
+            # array response
+            elif byte == b"*":
+                response = [
+                    self._read_response(
+                        disable_decoding=disable_decoding, timeout=timeout
+                    )
+                    for _ in range(_parse_int(response, raw))
+                ]
+            # set response
+            elif byte == b"~":
+                # redis can return unhashable types (like dict) in a set,
+                # so we return sets as list, all the time, for predictability
+                response = [
+                    self._read_response(
+                        disable_decoding=disable_decoding, timeout=timeout
+                    )
+                    for _ in range(_parse_int(response, raw))
+                ]
+            # map response
+            elif byte == b"%":
+                # We cannot use a dict-comprehension to parse stream.
+                # Evaluation order of key:val expression in dict comprehension only
+                # became defined to be left-right in version 3.8
+                resp_dict = {}
+                for _ in range(_parse_int(response, raw)):
+                    key = self._read_response(
+                        disable_decoding=disable_decoding, timeout=timeout
+                    )
+                    resp_dict[key] = self._read_response(
+                        disable_decoding=disable_decoding,
+                        push_request=push_request,
+                        timeout=timeout,
+                    )
+                response = resp_dict
+            # push response
+            elif byte == b">":
+                response = [
+                    self._read_response(
+                        disable_decoding=disable_decoding,
+                        push_request=push_request,
+                        timeout=timeout,
+                    )
+                    for _ in range(_parse_int(response, raw))
+                ]
+                response = self.handle_push_response(response)
 
-            # if this is a push request return the push response
-            if push_request:
-                return response
+                # if this is a push request return the push response
+                if push_request:
+                    return response
 
-            # `timeout` has to be forwarded here too: it is the caller's bound
-            # for this read, and dropping it would silently fall back to the
-            # connection's socket_timeout for the rest of the response just
-            # because a push message happened to interleave. The hiredis parser
-            # already forwards it on the same continuation.
-            return self._read_response(
-                disable_decoding=disable_decoding,
-                push_request=push_request,
-                timeout=timeout,
-            )
-        else:
-            raise InvalidResponse(f"Protocol Error: {raw!r}")
+                # Otherwise read the reply the push interleaved with. Looping
+                # instead of recursing keeps a burst of consecutive push frames
+                # from growing the stack, and keeps `timeout`, the caller's bound
+                # for this whole read, in force for the rest of the response.
+                # A push handler may have disconnected, so check before reading on.
+                if self._buffer is None:
+                    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+                continue
+            else:
+                raise InvalidResponse(f"Protocol Error: {raw!r}")
 
-        if isinstance(response, bytes) and disable_decoding is False:
-            response = self.encoder.decode(response)
+            if isinstance(response, bytes) and disable_decoding is False:
+                response = self.encoder.decode(response)
 
-        return response
+            return response
 
 
 class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
@@ -202,98 +209,102 @@ class _AsyncRESP3Parser(_AsyncRESPBase, AsyncPushNotificationsParser):
     async def _read_response(
         self, disable_decoding: bool = False, push_request: bool = False
     ) -> Union[EncodableT, ResponseError, None]:
-        if not self._stream or not self.encoder:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
-        raw = await self._readline()
-        response: Any
-        byte, response = raw[:1], raw[1:]
+        while True:
+            if not self._stream or not self.encoder:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+            raw = await self._readline()
+            response: Any
+            byte, response = raw[:1], raw[1:]
 
-        # if byte not in (b"-", b"+", b":", b"$", b"*"):
-        #     raise InvalidResponse(f"Protocol Error: {raw!r}")
+            # if byte not in (b"-", b"+", b":", b"$", b"*"):
+            #     raise InvalidResponse(f"Protocol Error: {raw!r}")
 
-        # server returned an error
-        if byte in (b"-", b"!"):
-            if byte == b"!":
+            # server returned an error
+            if byte in (b"-", b"!"):
+                if byte == b"!":
+                    response = await self._read(_parse_int(response, raw))
+                response = response.decode("utf-8", errors="replace")
+                error = self.parse_error(response)
+                # if the error is a ConnectionError, raise immediately so the user
+                # is notified
+                if isinstance(error, ConnectionError):
+                    self._clear()  # Successful parse
+                    raise error
+                # otherwise, we're dealing with a ResponseError that might belong
+                # inside a pipeline response. the connection's read_response()
+                # and/or the pipeline's execute() will raise this error if
+                # necessary, so just return the exception instance here.
+                return error
+            # single value
+            elif byte == b"+":
+                pass
+            # null value
+            elif byte == b"_":
+                return None
+            # int and big int values
+            elif byte in (b":", b"("):
+                return _parse_int(response, raw)
+            # double value
+            elif byte == b",":
+                return _parse_float(response, raw)
+            # bool value
+            elif byte == b"#":
+                return response == b"t"
+            # bulk response
+            elif byte == b"$":
                 response = await self._read(_parse_int(response, raw))
-            response = response.decode("utf-8", errors="replace")
-            error = self.parse_error(response)
-            # if the error is a ConnectionError, raise immediately so the user
-            # is notified
-            if isinstance(error, ConnectionError):
-                self._clear()  # Successful parse
-                raise error
-            # otherwise, we're dealing with a ResponseError that might belong
-            # inside a pipeline response. the connection's read_response()
-            # and/or the pipeline's execute() will raise this error if
-            # necessary, so just return the exception instance here.
-            return error
-        # single value
-        elif byte == b"+":
-            pass
-        # null value
-        elif byte == b"_":
-            return None
-        # int and big int values
-        elif byte in (b":", b"("):
-            return _parse_int(response, raw)
-        # double value
-        elif byte == b",":
-            return _parse_float(response, raw)
-        # bool value
-        elif byte == b"#":
-            return response == b"t"
-        # bulk response
-        elif byte == b"$":
-            response = await self._read(_parse_int(response, raw))
-        # verbatim string response
-        elif byte == b"=":
-            response = (await self._read(_parse_int(response, raw)))[4:]
-        # array response
-        elif byte == b"*":
-            response = [
-                (await self._read_response(disable_decoding=disable_decoding))
-                for _ in range(_parse_int(response, raw))
-            ]
-        # set response
-        elif byte == b"~":
-            # redis can return unhashable types (like dict) in a set,
-            # so we always convert to a list, to have predictable return types
-            response = [
-                (await self._read_response(disable_decoding=disable_decoding))
-                for _ in range(_parse_int(response, raw))
-            ]
-        # map response
-        elif byte == b"%":
-            # We cannot use a dict-comprehension to parse stream.
-            # Evaluation order of key:val expression in dict comprehension only
-            # became defined to be left-right in version 3.8
-            resp_dict = {}
-            for _ in range(_parse_int(response, raw)):
-                key = await self._read_response(disable_decoding=disable_decoding)
-                resp_dict[key] = await self._read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
-                )
-            response = resp_dict
-        # push response
-        elif byte == b">":
-            response = [
-                (
-                    await self._read_response(
+            # verbatim string response
+            elif byte == b"=":
+                response = (await self._read(_parse_int(response, raw)))[4:]
+            # array response
+            elif byte == b"*":
+                response = [
+                    (await self._read_response(disable_decoding=disable_decoding))
+                    for _ in range(_parse_int(response, raw))
+                ]
+            # set response
+            elif byte == b"~":
+                # redis can return unhashable types (like dict) in a set,
+                # so we always convert to a list, to have predictable return types
+                response = [
+                    (await self._read_response(disable_decoding=disable_decoding))
+                    for _ in range(_parse_int(response, raw))
+                ]
+            # map response
+            elif byte == b"%":
+                # We cannot use a dict-comprehension to parse stream.
+                # Evaluation order of key:val expression in dict comprehension only
+                # became defined to be left-right in version 3.8
+                resp_dict = {}
+                for _ in range(_parse_int(response, raw)):
+                    key = await self._read_response(disable_decoding=disable_decoding)
+                    resp_dict[key] = await self._read_response(
                         disable_decoding=disable_decoding, push_request=push_request
                     )
-                )
-                for _ in range(_parse_int(response, raw))
-            ]
-            response = await self.handle_push_response(response)
-            if not push_request:
-                return await self._read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
-                )
+                response = resp_dict
+            # push response
+            elif byte == b">":
+                response = [
+                    (
+                        await self._read_response(
+                            disable_decoding=disable_decoding, push_request=push_request
+                        )
+                    )
+                    for _ in range(_parse_int(response, raw))
+                ]
+                response = await self.handle_push_response(response)
+                if push_request:
+                    return response
+                # Otherwise read the reply the push interleaved with. Looping
+                # instead of recursing keeps a burst of consecutive push frames
+                # from growing the stack.
+                # A push handler may have disconnected, so check before reading on.
+                if not self._connected:
+                    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+                continue
             else:
-                return response
-        else:
-            raise InvalidResponse(f"Protocol Error: {raw!r}")
+                raise InvalidResponse(f"Protocol Error: {raw!r}")
 
-        if isinstance(response, bytes) and disable_decoding is False:
-            response = self.encoder.decode(response)
-        return response
+            if isinstance(response, bytes) and disable_decoding is False:
+                response = self.encoder.decode(response)
+            return response

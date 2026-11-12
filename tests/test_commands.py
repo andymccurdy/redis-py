@@ -1717,6 +1717,88 @@ class TestRedisCommands:
                     f"Field '{field}' is missing from HOTKEYS GET response"
                 )
 
+    def _wait_for_backup_state(self, r, state, timeout=10):
+        deadline = time.monotonic() + timeout
+        while r.backup_status()[b"state"] != state:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"backup did not reach the {state!r} state")
+            time.sleep(0.05)
+
+    def _reset_backup(self, r):
+        try:
+            r.backup_abort()
+        except ResponseError:
+            pass
+        r.backup_cleanup()
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_lifecycle(self, r):
+        self._reset_backup(r)
+        status = r.backup_status()
+        assert status[b"state"] == b"idle"
+        assert status[b"start_time"] == 0
+        r.set("a", "1")
+        try:
+            assert r.backup_start() == b"OK"
+            self._wait_for_backup_state(r, b"incrementing")
+            files = r.backup_list()
+            assert len(files) == 1
+            assert files[0].endswith(b".base.rdb")
+
+            assert r.backup_seal() == b"OK"
+            status = r.backup_status()
+            assert status[b"state"] == b"sealed"
+            assert status[b"error"] == b""
+            assert 0 < status[b"start_time"] <= status[b"end_time"]
+            files = r.backup_list()
+            assert len(files) == 3
+            assert files[2].endswith(b"appendonly.aof.manifest")
+
+            assert r.backup_cleanup() == b"OK"
+            assert r.backup_status()[b"state"] == b"idle"
+        finally:
+            self._reset_backup(r)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_abort(self, r):
+        self._reset_backup(r)
+        try:
+            assert r.backup_start() == b"OK"
+            self._wait_for_backup_state(r, b"incrementing")
+            assert r.backup_abort() == b"OK"
+            status = r.backup_status()
+            assert status[b"state"] == b"failed"
+            assert status[b"error"] == b"aborted by user"
+        finally:
+            self._reset_backup(r)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_invalid_state_transitions(self, r):
+        self._reset_backup(r)
+        with pytest.raises(ResponseError, match="No backup in progress"):
+            r.backup_abort()
+        with pytest.raises(ResponseError, match="No backup ready to seal"):
+            r.backup_seal()
+        assert r.backup_list() == []
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    def test_backup_status_decoded(self, decoded_r: redis.Redis):
+        self._reset_backup(decoded_r)
+        assert decoded_r.backup_status() == {
+            "state": "idle",
+            "error": "",
+            "start_time": 0,
+            "end_time": 0,
+        }
+
     @skip_if_redis_enterprise()
     def test_bgsave(self, r):
         self._wait_for_bgsave(r)
@@ -3187,6 +3269,19 @@ class TestRedisCommands:
         r["a"] = "foo"
         assert r.pexpireat("a", expire_at) is True
         assert 0 < r.pttl("a") <= 61000
+
+    def test_pexpireat_datetime_ms_is_exact(self):
+        # Argument level only: constructs its own client, so it needs no
+        # server. int(when.timestamp() * 1000) can land 1 ms low for instants
+        # whose seconds part sits just above a power of two (2**31 seconds
+        # is 2038-01-19T03:14:08Z).
+        r = redis.Redis()
+        when = datetime.datetime(
+            2038, 1, 19, 3, 14, 8, 2000, tzinfo=datetime.timezone.utc
+        )
+        with mock.patch.object(r, "execute_command", return_value=True) as cmd:
+            assert r.pexpireat("a", when) is True
+        assert cmd.call_args.args == ("PEXPIREAT", "a", 2147483648002)
 
     @skip_if_server_version_lt("2.6.0")
     def test_pexpireat_no_key(self, r):
@@ -5085,6 +5180,26 @@ class TestRedisCommands:
             int(exp_time.timestamp() * 1000),
             -1,
         ]
+
+    def test_spexpireat_datetime_ms_is_exact(self):
+        # Argument level only: constructs its own client, so it needs no
+        # server. int(when.timestamp() * 1000) can land 1 ms low for instants
+        # whose seconds part sits just above a power of two (2**31 seconds
+        # is 2038-01-19T03:14:08Z).
+        r = redis.Redis()
+        when = datetime.datetime(
+            2038, 1, 19, 3, 14, 8, 2000, tzinfo=datetime.timezone.utc
+        )
+        with mock.patch.object(r, "execute_command", return_value=[1]) as cmd:
+            assert r.spexpireat("test:set", when, "member1") == [1]
+        assert cmd.call_args.args == (
+            "SPEXPIREAT",
+            "test:set",
+            2147483648002,
+            "MEMBERS",
+            1,
+            "member1",
+        )
 
     @skip_if_server_version_lt("8.11.240")
     def test_sexpireat_multiple_condition_flags_error(self, r):

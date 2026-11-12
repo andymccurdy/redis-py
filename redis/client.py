@@ -15,6 +15,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Self,
     Sequence,
     Set,
     Type,
@@ -806,7 +807,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             raise_on_release_error=raise_on_release_error,
         )
 
-    def pubsub(self, **kwargs):
+    def pubsub(self, **kwargs) -> "PubSub":
         """
         Return a Publish/Subscribe object. With this object, you can
         subscribe to channels and listen for messages that get published to
@@ -1255,7 +1256,7 @@ class PubSub:
             _set_info_logger()
         self.reset()
 
-    def __enter__(self) -> "PubSub":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:

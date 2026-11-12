@@ -516,6 +516,80 @@ def test_hiredis_read_response_preserves_timeout_after_initial_push_notification
     parser.pubsub_push_handler_func.assert_called_once_with(push_response)
 
 
+# A burst of consecutive push frames ahead of a reply, far more than the default
+# recursion limit allows. Client-side cache invalidations arrive one per key, so
+# writes to many cached keys while a command is in flight queue that many frames
+# in front of its reply.
+PUSH_BURST_SIZE = 5000
+PUSH_BURST_FRAME = b">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nx\r\n"
+PUSH_BURST = PUSH_BURST_FRAME * PUSH_BURST_SIZE + b"+OK\r\n"
+
+RESP3_PARSERS = [
+    _RESP3Parser,
+    pytest.param(
+        _HiredisParser,
+        marks=pytest.mark.skipif(
+            not HIREDIS_AVAILABLE, reason="hiredis is not installed"
+        ),
+    ),
+]
+
+
+def _push_burst_connection(parser_class, data):
+    """Keep the returned connection alive: collecting it disconnects its parser."""
+    conn = Connection(protocol=3, parser_class=parser_class)
+    conn._sock = _CannedSocket(data)
+    conn._parser.on_connect(conn)
+    return conn
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", RESP3_PARSERS)
+def test_read_response_reads_past_a_push_burst(parser_class):
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+    handled = []
+
+    def handler(response):
+        handled.append(response)
+        return response
+
+    parser.set_pubsub_push_handler(handler)
+
+    assert parser.read_response() == b"OK"
+    assert len(handled) == PUSH_BURST_SIZE
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", RESP3_PARSERS)
+def test_read_response_push_request_returns_first_push_of_a_burst(parser_class):
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+
+    assert parser.read_response(push_request=True) == [b"message", b"ch", b"x"]
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", RESP3_PARSERS)
+def test_push_handler_disconnect_stops_a_push_burst(parser_class):
+    # The parser re-checks the connection after handling a push frame, so a
+    # push handler that disconnects ends the burst there.
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+    handled = []
+
+    def handler(response):
+        handled.append(response)
+        parser.on_disconnect()
+        return response
+
+    parser.set_pubsub_push_handler(handler)
+
+    with pytest.raises(ConnectionError):
+        parser.read_response()
+    assert len(handled) == 1
+
+
 @pytest.mark.fixed_client
 def test_hiredis_read_response_timeout_zero_maps_would_block_to_timeout():
     parser = make_hiredis_parser()

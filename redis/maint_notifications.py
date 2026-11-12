@@ -1568,7 +1568,15 @@ class OSSMaintNotificationsHandler:
                 for current_node in all_nodes:
                     if current_node.redis_connection is None:
                         continue
-                    with current_node.redis_connection.connection_pool._lock:
+                    pool = current_node.redis_connection.connection_pool
+                    # Nested pool teardown must wait until the outer lock is
+                    # released, so idle drains can restore their timeouts.
+                    with (
+                        pool._defer_cached_disconnects()
+                        if pool.cache is not None
+                        else nullcontext(),
+                        pool._lock,
+                    ):
                         handoff_recorded = False
                         if current_node in affected_nodes:
                             # mark for reconnect all in use connections to the node - this will force them to

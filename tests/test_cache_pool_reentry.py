@@ -11,9 +11,14 @@ import pytest
 from redis import Redis
 from redis._parsers import _HiredisParser, _RESP3Parser
 from redis.cache import CacheConfig
+from redis.cluster import ClusterNode, NodesManager
 from redis.connection import BlockingConnectionPool, ConnectionPool
 from redis.event import AfterConnectionReleasedEvent
-from redis.maint_notifications import MaintNotificationsConfig
+from redis.maint_notifications import (
+    MaintNotificationsConfig,
+    OSSMaintNotificationsHandler,
+    OSSNodeMigratedNotification,
+)
 from redis.sentinel import SentinelConnectionPool
 from redis.utils import HIREDIS_AVAILABLE
 
@@ -244,7 +249,9 @@ def test_finalizer_during_release_listener_reconnect(request, parser_class, auto
     )
 
 
-def _finalizer_during_pool_lock(url, parser_class, automatic, operation):
+def _finalizer_during_pool_lock(
+    url, parser_class, automatic, operation, pool_class=ConnectionPool
+):
     writer = Redis.from_url(url)
     address = writer.connection_pool.connection_kwargs
     host, port = address.get("host", "localhost"), address.get("port", 6379)
@@ -262,7 +269,7 @@ def _finalizer_during_pool_lock(url, parser_class, automatic, operation):
         manager.discover_master.return_value = host, port
         pool = SentinelConnectionPool("cache-reentry", manager, **kwargs)
     else:
-        pool = ConnectionPool(host=host, port=port, **kwargs)
+        pool = pool_class(host=host, port=port, **kwargs)
     owner, released = (pool.get_connection() for _ in range(2))
     peers = ConnectionPool(host=host, port=port, cache=pool.cache, **kwargs)
     borrower = peers.get_connection()
@@ -271,6 +278,8 @@ def _finalizer_during_pool_lock(url, parser_class, automatic, operation):
     owner.send_command("GET", key, keys=[key])
     assert owner.read_response() == b"old"
     pool.release(owner)
+    if operation in ("topology_cleanup", "smigrated"):
+        pool.release(released)
     draining, finalizing = threading.Event(), threading.Event()
     errors = []
     original_poll = owner._conn.can_read
@@ -312,7 +321,7 @@ def _finalizer_during_pool_lock(url, parser_class, automatic, operation):
         assert abandoned() is None, "pool-owning client was not finalized"
 
     def disconnect(*args, **kwargs):
-        if operation == "rejected_release":
+        if operation in ("rejected_release", "topology_cleanup", "smigrated"):
             collect()
         return original_disconnect(*args, **kwargs)
 
@@ -338,6 +347,25 @@ def _finalizer_during_pool_lock(url, parser_class, automatic, operation):
                 assert released not in pool._available_connections
                 assert not released._in_use
                 assert pool._created_connections == 1
+            elif operation == "topology_cleanup":
+                NodesManager._free_pool_connections(pool)
+            elif operation == "smigrated":
+                node = ClusterNode(
+                    host, port, redis_connection=Redis(connection_pool=pool)
+                )
+                cluster = Mock()
+                cluster.nodes_manager._initialization_lock = threading.RLock()
+                cluster.nodes_manager.get_node.return_value = node
+                cluster.nodes_manager.nodes_cache = {}
+                handler = OSSMaintNotificationsHandler(
+                    cluster, MaintNotificationsConfig(enabled=True)
+                )
+                notification = OSSNodeMigratedNotification(
+                    1, {f"{host}:{port}": [{f"{host}:{port + 1}": "0-16383"}]}
+                )
+                handler.handle_notification(notification)
+                assert notification in handler._processed_notifications
+                assert not handler._in_progress
             else:
                 pool.disconnect()
                 pool.release(released)
@@ -373,6 +401,25 @@ def test_finalizer_during_pool_lock(request, parser_class, automatic, operation)
     _run_bounded(
         _finalizer_during_pool_lock,
         (request.config.getoption("--redis-url"), parser_class, automatic, operation),
+    )
+
+
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("operation", ["topology_cleanup", "smigrated"])
+def test_finalizer_during_topology_cleanup(
+    request, pool_class, parser_class, automatic, operation
+):
+    _run_bounded(
+        _finalizer_during_pool_lock,
+        (
+            request.config.getoption("--redis-url"),
+            parser_class,
+            automatic,
+            operation,
+            pool_class,
+        ),
     )
 
 

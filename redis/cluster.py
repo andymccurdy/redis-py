@@ -3484,7 +3484,15 @@ class NodesManager:
         closed once their current command completes, and disconnect its free
         connections.
         """
-        with _defer_maintenance_events(), pool._lock:
+        # A finalizer may close the pool while a peer is draining an idle owner.
+        # Join that drain only after releasing this outer pool lock.
+        with (
+            _defer_maintenance_events(),
+            pool._defer_cached_disconnects()
+            if pool.cache is not None
+            else nullcontext(),
+            pool._lock,
+        ):
             pool.update_active_connections_for_reconnect()
             pool.disconnect_free_connections()
 

@@ -1896,7 +1896,13 @@ class RedisCluster(
             )
         return target_node.redis_connection.monitor()
 
-    def pubsub(self, node=None, host=None, port=None, **kwargs):
+    def pubsub(
+        self,
+        node: "ClusterNode | None" = None,
+        host: str | None = None,
+        port: int | None = None,
+        **kwargs: Any,
+    ) -> "ClusterPubSub":
         """
         Allows passing a ClusterNode, or host&port, to get a pubsub instance
         connected to the specified node

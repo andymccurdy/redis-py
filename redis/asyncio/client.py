@@ -21,6 +21,7 @@ from typing import (
     MutableMapping,
     Optional,
     Protocol,
+    Self,
     Sequence,
     Set,
     Tuple,
@@ -1274,17 +1275,17 @@ class PubSub:
         self.pending_unsubscribe_shard_channels = set()
         self._lock = asyncio.Lock()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         await self.aclose()
 
-    def __del__(self):
+    def __del__(self) -> None:
         if self.connection:
             self.connection.deregister_connect_callback(self.on_connect)
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         # In case a connection property does not yet exist
         # (due to a crash earlier in the Redis() constructor), return
         # immediately as there is nothing to clean-up.

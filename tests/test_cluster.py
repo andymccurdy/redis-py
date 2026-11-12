@@ -3636,6 +3636,14 @@ class TestStaticMetadataRouting:
         assert "Command: CONFIG SET <REDACTED>" in str(ex.value)
         assert "s3cret" not in str(ex.value)
 
+        with patch.object(rc, "get_default_node", return_value=None):
+            with pytest.raises(RedisClusterException, match="no default node") as ex:
+                rc._get_command_keys(
+                    "MIGRATE", "host", 6379, "", 0, 5000, "AUTH", "s3cret"
+                )
+        assert "Command: MIGRATE <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
     @pytest.mark.fixed_client
     def test_pipeline_determine_nodes_honors_resolved_metadata_policy(self):
         resolver = DynamicMetadataResolver(

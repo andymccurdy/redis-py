@@ -2222,7 +2222,7 @@ class RedisCluster(
             raise RedisClusterException(
                 "The cluster has no default node to resolve the keys of this "
                 "command against. The client may be closed, or not initialized "
-                f"yet.\nCommand: {args}"
+                f"yet.\nCommand: {truncate_text(command_text(args))}"
             )
 
         return self.commands_parser.get_keys(default_node.redis_connection, *args)

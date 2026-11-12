@@ -262,6 +262,7 @@ _RedisCallbacksRESP2 = {
     "ACL LIST": lambda r: list(map(str_if_bytes, r)),
     "ACL USERS": lambda r: list(map(str_if_bytes, r)),
     "ACL WHOAMI": str_if_bytes,
+    "BACKUP STATUS": pairs_to_dict,
     "CLIENT GETNAME": str_if_bytes,
     "CLIENT TRACKINGINFO": lambda r: list(map(str_if_bytes, r)),
     "CLUSTER GETKEYSINSLOT": lambda r: list(map(str_if_bytes, r)),

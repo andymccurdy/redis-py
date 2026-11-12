@@ -152,6 +152,12 @@ class TestRedisCommands:
         with pytest.raises(redis.ResponseError):
             await r.get("a")
 
+    async def test_unmapped_error_keeps_its_status_code(self, r: redis.Redis):
+        await r.lpush("a", "1")
+        with pytest.raises(redis.ResponseError) as e:
+            await r.get("a")
+        assert e.value.status_code == "WRONGTYPE"
+
     # SERVER INFORMATION
     @skip_if_server_version_lt(REDIS_6_VERSION)
     async def test_acl_cat_no_category(self, r: redis.Redis):

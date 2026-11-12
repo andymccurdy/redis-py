@@ -104,6 +104,8 @@ the parser does not otherwise normalize structural keys or values.
 | RediSearch | `FT.PROFILE` | Parsed tuple with legacy profile data | Parsed tuple with unified profile data |
 | RediSearch | `FT.HYBRID` | `HybridResult`; bytes by default | `HybridResult`; bytes preserved by default |
 | Probabilistic | `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.LIST` | Numeric-looking item names can be coerced | Item names are preserved |
+| Probabilistic | `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`, `TDIGEST.CDF`, `TDIGEST.QUANTILE` | Integers for whole values and the string `"nan"` | Floats, including `nan` |
+| Probabilistic | `TOPK.INFO` | The decay is a string | The decay is a float |
 
 ## RESP3 Legacy to Unified
 

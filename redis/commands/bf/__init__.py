@@ -12,6 +12,18 @@ from .commands import *  # noqa
 from .info import BFInfo, CFInfo, CMSInfo, TDigestInfo, TopKInfo
 
 
+def _parse_to_float_list(response):
+    """Parse a list of doubles, which RESP2 sends as bulk strings."""
+    return [float(item) for item in response]
+
+
+def _parse_topk_info_resp2_unified(response):
+    """Parse TOPK.INFO, whose decay is a double RESP2 sends as a bulk string."""
+    info = TopKInfo(response)
+    info.decay = float(info.decay)
+    return info
+
+
 class AbstractBloom:
     """
     The client allows to interact with RedisBloom and use all of
@@ -161,7 +173,7 @@ class _TOPKBloomBase(TOPKCommands, AbstractBloom):
         }
         _RESP3_MODULE_CALLBACKS = {}
         _RESP2_UNIFIED_MODULE_CALLBACKS = {
-            TOPK_INFO: TopKInfo,
+            TOPK_INFO: _parse_topk_info_resp2_unified,
         }
         _RESP3_UNIFIED_MODULE_CALLBACKS = {
             TOPK_INFO: TopKInfo,
@@ -262,7 +274,15 @@ class _TDigestBloomBase(TDigestCommands, AbstractBloom):
             TDIGEST_QUANTILE: parse_to_list,
         }
         _RESP3_MODULE_CALLBACKS = {}
-        _RESP2_UNIFIED_MODULE_CALLBACKS = dict(_RESP2_MODULE_CALLBACKS)
+        # RESP3 answers these with doubles; RESP2 sends them as bulk strings,
+        # which parse_to_list turns into ints and the string "nan"
+        _RESP2_UNIFIED_MODULE_CALLBACKS = {
+            **_RESP2_MODULE_CALLBACKS,
+            TDIGEST_BYRANK: _parse_to_float_list,
+            TDIGEST_BYREVRANK: _parse_to_float_list,
+            TDIGEST_CDF: _parse_to_float_list,
+            TDIGEST_QUANTILE: _parse_to_float_list,
+        }
         _RESP3_UNIFIED_MODULE_CALLBACKS = {
             TDIGEST_BYRANK: parse_to_list,
             TDIGEST_BYREVRANK: parse_to_list,

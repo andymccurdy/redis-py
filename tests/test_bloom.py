@@ -1,4 +1,4 @@
-from math import inf
+from math import inf, isnan
 from unittest.mock import Mock
 
 import pytest
@@ -674,3 +674,63 @@ def test_tdigest_byrevrank(client):
 #
 #     for i in range(100):
 #         assert client.bf().exists("pipeline", i)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.experimental
+@pytest.mark.redismod
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_tdigest_unified_responses_are_floats(request, stack_url, protocol):
+    with _get_client(
+        redis.Redis,
+        request,
+        protocol=protocol,
+        legacy_responses=False,
+        decode_responses=True,
+        from_url=stack_url,
+    ) as client:
+        client.flushdb()
+        tdigest = client.tdigest()
+        assert tdigest.create("t-digest", 100)
+        assert tdigest.add("t-digest", [1, 2, 3, 4, 5])
+        assert tdigest.create("empty", 100)
+        # Redis replies with doubles, which RESP2 sends as bulk strings.
+        results = [
+            (tdigest.quantile("t-digest", 0.5, 0.9), [3.0, 5.0]),
+            (tdigest.cdf("t-digest", 1, 5), [0.1, 0.9]),
+            (tdigest.byrank("t-digest", 0, 2, 100), [1.0, 3.0, inf]),
+            (tdigest.byrevrank("t-digest", 0, 100), [5.0, -inf]),
+        ]
+        for result, expected in results:
+            assert result == expected
+            assert all(type(value) is float for value in result)
+        # An empty sketch answers nan, as a float as well
+        for result in (
+            tdigest.quantile("empty", 0.5),
+            tdigest.cdf("empty", 1),
+            tdigest.byrank("empty", 0),
+            tdigest.byrevrank("empty", 0),
+        ):
+            assert len(result) == 1
+            assert type(result[0]) is float and isnan(result[0])
+
+
+@pytest.mark.fixed_client
+@pytest.mark.redismod
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_topk_info_unified_responses(request, stack_url, protocol):
+    with _get_client(
+        redis.Redis,
+        request,
+        protocol=protocol,
+        legacy_responses=False,
+        decode_responses=True,
+        from_url=stack_url,
+    ) as client:
+        client.flushdb()
+        assert client.topk().reserve("topk", 3, 50, 4, 0.9)
+        info = client.topk().info("topk")
+        assert (info["k"], info["width"], info["depth"]) == (3, 50, 4)
+        # The decay is a double, which RESP2 sends as a bulk string.
+        assert info["decay"] == 0.9
+        assert type(info["decay"]) is float

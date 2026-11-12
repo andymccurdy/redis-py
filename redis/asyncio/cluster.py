@@ -1476,9 +1476,10 @@ class RedisCluster(
 
     async def _resolve_command_policies(
         self, *args: Any, target_nodes_specified: bool = False
-    ) -> Tuple[str, Union[CommandPolicies, CommandMetadata]]:
+    ) -> Tuple[str, CommandPolicies | CommandMetadata, int | None]:
         """
-        Resolves the policies a command routes and aggregates by.
+        Resolves the policies a command routes and aggregates by, and the slot of its
+        keys when finding the policies took computing it.
 
         Returns the name the policies were decided by along with the record, because the
         name a command is known by is not always ``args[0]``: a container command is
@@ -1497,6 +1498,10 @@ class RedisCluster(
         targets, the command's ``COMMAND_FLAGS`` entry, and finally whether the command
         carries a key. ``target_nodes_specified`` says the caller picked the targets, as
         named nodes or as a nodes flag.
+
+        That last fallback computes the command's slot, which is returned so the caller
+        can pass it to ``_determine_nodes`` instead of computing it again. Every other
+        branch returns ``None`` for the slot.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
@@ -1510,43 +1515,49 @@ class RedisCluster(
             # the loop over the nodes the caller picked, or fold their replies into one.
             # Answer with the record that aggregates nothing, and skip the resolver: with
             # the targets given, neither of its answers is used.
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         policies = await self._policy_resolver.resolve(args[0].lower())
         if policies:
-            return command, policies
+            return command, policies, None
 
         command_flag = self.command_flags.get(command)
         if command_flag:
             if command_flag in self._command_flags_mapping:
-                return command, _METADATA_BY_REQUEST_POLICY[
-                    self._command_flags_mapping[command_flag]
-                ]
-            return command, _DEFAULT_KEYLESS_METADATA
+                return (
+                    command,
+                    _METADATA_BY_REQUEST_POLICY[
+                        self._command_flags_mapping[command_flag]
+                    ],
+                    None,
+                )
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         # Unflagged and unresolved, so the command routes by its key. Without a default
         # node the topology is not known yet and there is no slot to route by.
         if not self.get_default_node():
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         slot = await self._determine_slot(*args)
         if slot is None:
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
-        return command, _DEFAULT_KEYED_METADATA
+        return command, _DEFAULT_KEYED_METADATA, slot
 
     async def _determine_nodes(
         self,
         command: str,
         *args: Any,
-        request_policy: Optional[RequestPolicy] = None,
-        node_flag: Optional[str] = None,
+        request_policy: RequestPolicy | None = None,
+        node_flag: str | None = None,
+        slot: int | None = None,
     ) -> List["ClusterNode"]:
         # Determine which nodes should be executed the command on.
         # Returns a list of target nodes.
         # The caller resolves the command's own policy - see
         # ``_resolve_command_policies`` - so the only decision left here is an explicit
-        # node flag, which overrides it.
+        # node flag, which overrides it. ``slot`` is the slot that resolution already
+        # computed, if it did, so a keyed command is not hashed twice.
         if node_flag and self._is_node_flag(node_flag):
             if node_flag in self._command_flags_mapping:
                 request_policy = self._command_flags_mapping[node_flag]
@@ -1556,14 +1567,18 @@ class RedisCluster(
                 f"No targets were found to execute {command} command on"
             )
 
-        policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
-        if policy_callback is None:
-            # A keyed policy. A MULTI_SHARD command routed here was not split - its keys
-            # share a slot, or are not at fixed positions - so it is routed by its keys as
-            # a whole.
-            nodes = await self.get_nodes_from_slot(command, *args)
+        if slot is not None:
+            # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
+            nodes = [await self._get_node_from_slot(command, slot)]
         else:
-            nodes = await policy_callback(self, command, *args)
+            policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
+            if policy_callback is None:
+                # A keyed policy. A MULTI_SHARD command routed here was not split - its
+                # keys share a slot, or are not at fixed positions - so it is routed by
+                # its keys as a whole.
+                nodes = await self.get_nodes_from_slot(command, *args)
+            else:
+                nodes = await policy_callback(self, command, *args)
 
         if command.lower() == "ft.aggregate":
             self._aggregate_nodes = nodes
@@ -1725,7 +1740,7 @@ class RedisCluster(
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
-        command, command_policies = await self._resolve_command_policies(
+        command, command_policies, slot = await self._resolve_command_policies(
             *args, target_nodes_specified=target_nodes_specified or node_flag
         )
 
@@ -1784,11 +1799,16 @@ class RedisCluster(
             try:
                 if not target_nodes_specified:
                     if splits is None:
+                        # Only the first attempt reuses the slot. A retry computes it
+                        # again, as a command without keys gets a new random slot on
+                        # each attempt - also after an attempt that found no node for it
+                        attempt_slot, slot = slot, None
                         # Determine the nodes to execute the command on
                         target_nodes = await self._determine_nodes(
                             *args,
                             request_policy=command_policies.request_policy,
                             node_flag=passed_targets,
+                            slot=attempt_slot,
                         )
                     else:
                         # One slot: sent as it is, to the node of the slot the split
@@ -4075,7 +4095,7 @@ class PipelineStrategy(AbstractStrategy):
             )
             # A nodes flag picks the targets too, in ``_determine_nodes`` below, and the
             # command's own aggregation must not apply to the replies either
-            command, command_policies = await client._resolve_command_policies(
+            command, command_policies, slot = await client._resolve_command_policies(
                 *cmd.args, target_nodes_specified=bool(passed_targets)
             )
 
@@ -4099,6 +4119,7 @@ class PipelineStrategy(AbstractStrategy):
                         *cmd.args,
                         request_policy=request_policy,
                         node_flag=passed_targets,
+                        slot=slot,
                     )
                     if not target_nodes:
                         raise RedisClusterException(

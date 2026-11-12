@@ -71,12 +71,16 @@ class CMSInfo:
     width = None
     depth = None
     count = None
+    cell_size = None
 
     def __init__(self, args):
         response = _parse_info_args(args)
         self.width = response["width"]
         self.depth = response["depth"]
         self.count = response["count"]
+        # Reported by RedisBloom versions that support CELL_SIZE; older servers
+        # omit the field.
+        self.cell_size = response.get("cell_size")
 
     def __getitem__(self, item):
         return getattr(self, item)

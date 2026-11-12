@@ -24,7 +24,7 @@ protocol-specific overlay. Callers wrap the returned dict in
 ``CaseInsensitiveDict``.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from redis.himport import (
     HIMPORT_DISCARD,
@@ -66,11 +66,14 @@ from .helpers import (
     parse_debug_object,
     parse_function_list_resp3_to_resp2_legacy,
     parse_function_list_unified,
+    parse_function_stats_resp3_to_resp2_legacy,
+    parse_function_stats_unified,
     parse_geopos_resp3_to_resp2_legacy,
     parse_geopos_unified,
     parse_geosearch_generic,
     parse_geosearch_generic_unified,
     parse_hscan,
+    parse_increx_unified,
     parse_info,
     parse_lcs_idx_resp3_to_resp2_legacy,
     parse_lcs_idx_unified,
@@ -158,6 +161,7 @@ _RedisCallbacks = {
     "ACL LOG": parse_acl_log,
     "ACL SETUSER": bool_ok,
     "ACL SAVE": bool_ok,
+    "BLESS SCAN": parse_scan,
     "CLIENT INFO": parse_client_info,
     "CLIENT KILL": parse_client_kill,
     "CLIENT LIST": parse_client_list,
@@ -258,6 +262,7 @@ _RedisCallbacksRESP2 = {
     "ACL LIST": lambda r: list(map(str_if_bytes, r)),
     "ACL USERS": lambda r: list(map(str_if_bytes, r)),
     "ACL WHOAMI": str_if_bytes,
+    "BACKUP STATUS": pairs_to_dict,
     "CLIENT GETNAME": str_if_bytes,
     "CLIENT TRACKINGINFO": lambda r: list(map(str_if_bytes, r)),
     "CLUSTER GETKEYSINSLOT": lambda r: list(map(str_if_bytes, r)),
@@ -269,7 +274,7 @@ _RedisCallbacksRESP2 = {
         map(lambda ll: (float(ll[0]), float(ll[1])) if ll is not None else None, r)
     ),
     "HGETALL": lambda r: r and pairs_to_dict(r) or {},
-    "HOTKEYS GET": lambda r: [pairs_to_dict(m) for m in r],
+    "HOTKEYS GET": lambda r: None if r is None else [pairs_to_dict(m) for m in r],
     "MEMORY STATS": parse_memory_stats,
     "MODULE LIST": lambda r: [pairs_to_dict(m) for m in r],
     "RESET": str_if_bytes,
@@ -363,7 +368,9 @@ _RedisCallbacksRESP2Unified: dict[str, Callable[..., Any]] = {
     "COMMAND": parse_command_unified,
     "COMMAND GETKEYS": lambda r, **kwargs: r,
     "FUNCTION LIST": parse_function_list_unified,
+    "FUNCTION STATS": parse_function_stats_unified,
     "GEOPOS": parse_geopos_unified,
+    "INCREX": parse_increx_unified,
     "LCS": parse_lcs_idx_unified,
     "MEMORY STATS": parse_memory_stats_unified,
     "SENTINEL MASTER": parse_sentinel_master_unified,
@@ -394,6 +401,7 @@ _RedisCallbacksRESP3Unified: dict[str, Callable[..., Any]] = {
         "GEORADIUS GEORADIUSBYMEMBER GEOSEARCH",
         parse_geosearch_generic_unified,
     ),
+    **string_keys_to_dict("BGREWRITEAOF BGSAVE", lambda r: True),
     "ZSCAN": parse_zscan_unified,
     "ZRANDMEMBER": zset_score_pairs_resp3,
     "ACL CAT": lambda r: list(map(str_if_bytes, r)),
@@ -407,7 +415,9 @@ _RedisCallbacksRESP3Unified: dict[str, Callable[..., Any]] = {
     "CLIENT TRACKINGINFO": parse_client_trackinginfo_unified,
     "CLUSTER LINKS": parse_cluster_links_unified,
     "COMMAND": parse_command_unified,
+    "DEBUG OBJECT": parse_debug_object,
     "FUNCTION LIST": parse_function_list_unified,
+    "FUNCTION STATS": parse_function_stats_unified,
     "GEOHASH": lambda r: list(map(str_if_bytes, r)),
     "LCS": parse_lcs_idx_unified,
     "RESET": str_if_bytes,
@@ -422,8 +432,9 @@ _RedisCallbacksRESP3Unified: dict[str, Callable[..., Any]] = {
 # RESP3 wire converted back to the legacy RESP2 Python shapes. Only the
 # entries needed to undo RESP3-side differences are listed; everything
 # else falls through to ``_RedisCallbacks``. Scores are re-encoded to bytes
-# before being passed to ``score_cast_func`` so the callable observes the
-# same input type it would on a RESP2 connection.
+# (``str`` when the client decodes responses) before being passed to
+# ``score_cast_func`` so the callable observes the same input type it would
+# on a RESP2 connection.
 _RedisCallbacksRESP3toRESP2Legacy: dict[str, Callable[..., Any]] = {
     **string_keys_to_dict(
         "SDIFF SINTER SMEMBERS SUNION", lambda r: r and set(r) or set()
@@ -467,6 +478,7 @@ _RedisCallbacksRESP3toRESP2Legacy: dict[str, Callable[..., Any]] = {
     "CONFIG GET": parse_config_get_resp3_to_resp2_legacy,
     "DEBUG OBJECT": parse_debug_object,
     "FUNCTION LIST": parse_function_list_resp3_to_resp2_legacy,
+    "FUNCTION STATS": parse_function_stats_resp3_to_resp2_legacy,
     "GEOHASH": lambda r: list(map(str_if_bytes, r)),
     "GEOPOS": parse_geopos_resp3_to_resp2_legacy,
     "LCS": parse_lcs_idx_resp3_to_resp2_legacy,
@@ -509,3 +521,36 @@ def get_response_callbacks(
         else:
             callbacks.update(_RedisCallbacksRESP2Unified)
     return callbacks
+
+
+def _get_response_callback(
+    callbacks: Mapping, command: str | bytes, connection: Any
+) -> Callable | None:
+    """Select a default callback for the negotiated wire protocol.
+
+    A default-RESP3 connection may fall back independently of the other
+    connections using this mapping. Select its RESP2 callback without mutating
+    the shared mapping or replacing callbacks installed by the caller.
+    """
+    if not getattr(connection, "_resp2_fallback", False):
+        return callbacks.get(command)
+
+    normalized_command = str_if_bytes(command).upper()
+    callback = callbacks.get(normalized_command)
+    if command != normalized_command:
+        # Preserve callbacks registered under the caller's original spelling.
+        callback = callbacks.get(command, callback)
+    if connection.legacy_responses:
+        resp3_callbacks = _RedisCallbacksRESP3toRESP2Legacy
+        resp2_callbacks = _RedisCallbacksRESP2
+    else:
+        resp3_callbacks = _RedisCallbacksRESP3Unified
+        resp2_callbacks = _RedisCallbacksRESP2Unified
+    default_callback = resp3_callbacks.get(
+        normalized_command, _RedisCallbacks.get(normalized_command)
+    )
+    if callback is default_callback:
+        return resp2_callbacks.get(
+            normalized_command, _RedisCallbacks.get(normalized_command)
+        )
+    return callback

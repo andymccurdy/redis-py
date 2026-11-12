@@ -1,3 +1,5 @@
+from unittest import mock
+
 import pytest
 
 from redis.driver_info import DriverInfo, resolve_driver_info
@@ -10,6 +12,16 @@ def test_driver_info_default_name_no_upstream():
     assert info.formatted_name == "redis-py"
     assert info.upstream_drivers == []
     assert info.lib_version == get_lib_version()
+
+
+@pytest.mark.fixed_client
+def test_driver_info_default_lib_version_is_resolved_once():
+    get_lib_version.cache_clear()
+    with mock.patch("redis.utils.metadata.version", return_value="1.2.3") as version:
+        assert DriverInfo().lib_version == "1.2.3"
+        assert DriverInfo().lib_version == "1.2.3"
+    get_lib_version.cache_clear()
+    assert version.call_count == 1
 
 
 @pytest.mark.fixed_client

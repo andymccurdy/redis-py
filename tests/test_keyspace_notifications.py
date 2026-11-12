@@ -28,6 +28,7 @@ from redis.keyspace_notifications import (
 )
 
 
+@pytest.mark.fixed_client
 class TestEventType:
     """Tests for EventType constants."""
 
@@ -40,6 +41,7 @@ class TestEventType:
         assert EventType.LPUSH == "lpush"
 
 
+@pytest.mark.fixed_client
 class TestPatternDetection:
     """Tests for pattern detection function."""
 
@@ -77,6 +79,7 @@ class TestPatternDetection:
         assert _is_pattern(b"user:123") is False
 
 
+@pytest.mark.fixed_client
 class TestKeyspaceChannelClass:
     """Tests for KeyspaceChannel class."""
 
@@ -114,6 +117,7 @@ class TestKeyspaceChannelClass:
         assert channel1 != channel3
 
 
+@pytest.mark.fixed_client
 class TestKeyeventChannelClass:
     """Tests for KeyeventChannel class."""
 
@@ -178,6 +182,7 @@ class TestKeyeventChannelClass:
         assert channel1 != channel3
 
 
+@pytest.mark.fixed_client
 class TestChannelDetection:
     """Tests for channel type detection using get_channel_type()."""
 
@@ -208,6 +213,7 @@ class TestChannelDetection:
         assert get_channel_type(b"regular_channel") is None
 
 
+@pytest.mark.fixed_client
 class TestKeyNotification:
     """Tests for KeyNotification class."""
 
@@ -343,6 +349,43 @@ class TestKeyNotification:
         assert notification.key_starts_with("cache:") is False
         assert notification.key_starts_with(b"user:") is True
 
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize("key", ["user:alice\n", "user:al\nice", "\n"])
+    def test_keyspace_key_with_newline(self, key, as_bytes):
+        """A newline in the key is part of the key, not the end of the channel."""
+        channel = f"__keyspace@0__:{key}"
+        notification = KeyNotification.try_parse(
+            channel.encode() if as_bytes else channel,
+            b"set" if as_bytes else "set",
+        )
+        assert notification is not None
+        assert notification.key == key
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize(
+        ("channel", "data", "subkeys"),
+        [
+            ("__keyspace@0__:", "set", []),
+            ("__subkeyspace@0__:", "hset|5:field", ["field"]),
+        ],
+    )
+    def test_empty_keyspace_key(self, channel, data, subkeys, as_bytes):
+        notification = KeyNotification.try_parse(
+            channel.encode() if as_bytes else channel,
+            data.encode() if as_bytes else data,
+        )
+        assert notification is not None
+        assert notification.key == ""
+        assert notification.subkeys == subkeys
+        assert notification.is_keyspace is True
+
+    def test_keyspace_key_with_trailing_newline_and_prefix(self):
+        notification = KeyNotification.try_parse(
+            "__keyspace@0__:user:alice\n", "set", key_prefix="user:"
+        )
+        assert notification is not None
+        assert notification.key == "alice\n"
+
     def test_database_wildcard(self):
         """Test parsing channel with wildcard database."""
         notification = KeyNotification.try_parse("__keyspace@*__:mykey", "set")
@@ -360,6 +403,7 @@ class TestKeyNotification:
         assert isinstance(notification.event_type, str)
 
 
+@pytest.mark.fixed_client
 class TestClusterKeyspaceNotificationsMocked:
     """
     Mock-based unit tests for ClusterKeyspaceNotifications.
@@ -829,7 +873,9 @@ class TestClusterKeyspaceNotifications:
         r.delete("test:key2")
 
         # Wait for handlers to be called
-        time.sleep(1.0)
+        deadline = time.monotonic() + 5.0
+        while len(received) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
 
         thread.stop()
         thread.join(timeout=1.0)  # Wait for thread to actually stop
@@ -859,7 +905,7 @@ class TestClusterKeyspaceNotifications:
         notifications.close()
 
 
-@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
 class TestStandaloneClientKeyspaceNotificationsMocked:
     """
     Mock-based unit tests for KeyspaceNotifications (standalone Redis).
@@ -1117,6 +1163,7 @@ class TestStandaloneClientKeyspaceNotificationsMocked:
         notifications.close()
 
 
+@pytest.mark.fixed_client
 class TestParseLengthPrefixedSubkeys:
     """Tests for _parse_length_prefixed_subkeys helper."""
 
@@ -1145,7 +1192,19 @@ class TestParseLengthPrefixedSubkeys:
             "ccc",
         ]
 
+    def test_multibyte_subkeys_use_byte_lengths(self):
+        # the server prefixes each subkey with its size in bytes (sdslen):
+        # each 键 is 3 bytes in UTF-8, so "键键" is prefixed with 6
+        assert _parse_length_prefixed_subkeys("6:键键,3:abc") == ["键键", "abc"]
 
+    def test_multibyte_subkeys_from_bytes(self):
+        assert _parse_length_prefixed_subkeys("6:键键,3:abc".encode("utf-8")) == [
+            "键键",
+            "abc",
+        ]
+
+
+@pytest.mark.fixed_client
 class TestSubkeyspaceChannelClass:
     """Tests for SubkeyspaceChannel class."""
 
@@ -1195,6 +1254,7 @@ class TestSubkeyspaceChannelClass:
         assert str(channel) == "__subkeyspace@5__:myhash"
 
 
+@pytest.mark.fixed_client
 class TestSubkeyeventChannelClass:
     """Tests for SubkeyeventChannel class."""
 
@@ -1242,6 +1302,7 @@ class TestSubkeyeventChannelClass:
         assert repr(channel) == "SubkeyeventChannel('hset', db=1)"
 
 
+@pytest.mark.fixed_client
 class TestSubkeyspaceitemChannelClass:
     """Tests for SubkeyspaceitemChannel class."""
 
@@ -1284,6 +1345,7 @@ class TestSubkeyspaceitemChannelClass:
         assert repr(channel) == "SubkeyspaceitemChannel('myhash', 'myfield', db=2)"
 
 
+@pytest.mark.fixed_client
 class TestSubkeyspaceeventChannelClass:
     """Tests for SubkeyspaceeventChannel class."""
 
@@ -1326,6 +1388,7 @@ class TestSubkeyspaceeventChannelClass:
         assert repr(channel) == "SubkeyspaceeventChannel('hset', 'myhash', db=1)"
 
 
+@pytest.mark.fixed_client
 class TestSubkeyChannelDetection:
     """Tests for get_channel_type() with subkey channel types."""
 
@@ -1362,8 +1425,33 @@ class TestSubkeyChannelDetection:
         assert get_channel_type("__keyevent@0__:set") == ChannelType.KEYEVENT
 
 
+@pytest.mark.fixed_client
 class TestSubkeyNotificationParsing:
     """Tests for KeyNotification parsing of subkey channels."""
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize(
+        ("channel", "data"),
+        [
+            ("__subkeyspace@0__:myhash", "hset"),
+            ("__subkeyspace@0__:myhash", "hset|4:abc"),
+            ("__subkeyspace@0__:myhash", "hset|3:abc;3:def"),
+            ("__subkeyspace@0__:myhash", "hset|x:abc"),
+            ("__subkeyevent@0__:hset", "1:k"),
+            ("__subkeyevent@0__:hset", "4:abc|3:foo"),
+            ("__subkeyspaceitem@0__:myhash", "hset"),
+            ("__subkeyspaceevent@0__:hset", "3:foo"),
+        ],
+    )
+    def test_malformed_payload_returns_none(self, channel, data, as_bytes):
+        payload = data.encode() if as_bytes else data
+        assert KeyNotification.try_parse(channel, payload) is None
+        assert (
+            KeyNotification.from_message(
+                {"type": "pmessage", "channel": channel, "data": payload}
+            )
+            is None
+        )
 
     # --- subkeyspace ---
 
@@ -1377,6 +1465,22 @@ class TestSubkeyNotificationParsing:
         assert n.database == 0
         assert n.is_keyspace is True
         assert n.subkeys == ["field", "field2"]
+
+    def test_subkeyspace_multibyte_subkeys_bytes_payload(self):
+        # payload lengths are byte counts: "键键" is 6 bytes in UTF-8
+        n = KeyNotification.try_parse(
+            "__subkeyspace@0__:myhash", "hset|6:键键,3:abc".encode("utf-8")
+        )
+        assert n is not None
+        assert n.event_type == "hset"
+        assert n.subkeys == ["键键", "abc"]
+
+    def test_subkeyspace_multibyte_subkeys_str_payload(self):
+        # decode_responses=True delivers the payload as str; the byte lengths
+        # must still be honored after re-encoding
+        n = KeyNotification.try_parse("__subkeyspace@0__:myhash", "hset|6:键键,3:abc")
+        assert n is not None
+        assert n.subkeys == ["键键", "abc"]
 
     def test_subkeyspace_single_subkey(self):
         n = KeyNotification.try_parse("__subkeyspace@0__:myhash", "hdel|3:foo")
@@ -1418,6 +1522,16 @@ class TestSubkeyNotificationParsing:
         assert n.database == 0
         assert n.is_keyspace is False
         assert n.subkeys == ["field", "field2"]
+
+    def test_subkeyevent_multibyte_key_bytes_payload(self):
+        # key length prefix is a byte count: "键键" is 6 bytes in UTF-8
+        n = KeyNotification.try_parse(
+            "__subkeyevent@0__:hset", "6:键键|3:abc".encode("utf-8")
+        )
+        assert n is not None
+        assert n.key == "键键"
+        assert n.event_type == "hset"
+        assert n.subkeys == ["abc"]
 
     def test_subkeyevent_single_subkey(self):
         n = KeyNotification.try_parse("__subkeyevent@0__:hdel", "6:myhash|3:foo")
@@ -1511,6 +1625,19 @@ class TestSubkeyNotificationParsing:
         )
         assert n is None
 
+    @pytest.mark.parametrize("key", ["myhash\n", "my\nhash"])
+    def test_subkey_channels_key_with_newline(self, key):
+        n = KeyNotification.try_parse(f"__subkeyspace@0__:{key}", "hset|5:field")
+        assert n is not None
+        assert n.key == key
+        assert n.subkeys == ["field"]
+
+        n = KeyNotification.try_parse(f"__subkeyspaceevent@0__:hset|{key}", "5:field")
+        assert n is not None
+        assert n.key == key
+        assert n.event_type == "hset"
+        assert n.subkeys == ["field"]
+
     # --- from_message integration ---
 
     def test_from_message_subkeyspace(self):
@@ -1566,12 +1693,13 @@ class TestSubkeyNotifications:
             else [notifications._pubsub]
         )
         for pubsub in pubsubs:
-            while True:
-                msg = pubsub.get_message(timeout=0.01)
-                if msg is None:
-                    break
-                if msg["type"] not in ("subscribe", "psubscribe"):
-                    break
+            # One ack per subscribed channel or pattern. Reading exactly that
+            # many, each with a generous timeout, cannot stop early on a slow
+            # runner and leave an ack for the test to read.
+            for _ in range(len(pubsub.channels) + len(pubsub.patterns)):
+                msg = pubsub.get_message(timeout=2.0)
+                assert msg is not None, "subscribe ack not received"
+                assert msg["type"] in ("subscribe", "psubscribe"), msg
 
     def test_create_hash_field_subkeyspace_notification(
         self, r_with_subkey_notifications
@@ -1767,12 +1895,9 @@ class TestSubkeyNotifications:
         notifications.subscribe_subkeyspaceitem("test:hash8", "watched_field")
         self._drain_subscribe_messages(notifications)
 
-        # Modify a different field — should NOT trigger a notification
+        # Modify a different field, then the watched one. Notifications arrive
+        # in order, so if the first write had notified, it would be read first.
         r.hset("test:hash8", "other_field", "value")
-        msg = notifications.get_message(timeout=1.0)
-        assert msg is None
-
-        # Modify the watched field — should trigger a notification
         r.hset("test:hash8", "watched_field", "updated")
         msg = notifications.get_message(timeout=2.0)
         assert msg is not None
@@ -1842,10 +1967,13 @@ class TestSubkeyNotifications:
             assert msg.key == "test:hash10"
             assert msg.event_type == "hset"
 
-        # A non-matching field should NOT produce a notification
+        # A non-matching field should NOT produce a notification. Write it
+        # before a matching one: if it notified, it would be read first.
         r.hset("test:hash10", "other", "value")
-        msg = notifications.get_message(timeout=1.0)
-        assert msg is None
+        r.hset("test:hash10", "field4", "value4")
+        msg = notifications.get_message(timeout=2.0)
+        assert msg is not None
+        assert msg.subkeys == ["field4"]
 
         notifications.close()
         r.delete("test:hash10")

@@ -307,6 +307,34 @@ def test_strlen(client):
 
 
 @pytest.mark.redismod
+def test_none_path_is_root_path(client):
+    # path=None must address the root, not a member named "None".
+    client.json().set("arr", Path.root_path(), [0, 1])
+    assert 3 == client.json().arrappend("arr", None, 2)
+    assert 3 == client.json().arrlen("arr", None)
+    assert 2 == client.json().arrpop("arr", None)
+    assert_resp_response(client, client.json().type("arr", None), "array", ["array"])
+    assert isinstance(client.json().resp("arr", None), list)
+    assert 1 == client.json().clear("arr", None)
+    assert [] == client.json().get("arr")
+
+    client.json().set("obj", Path.root_path(), {"a": 1, "b": 2})
+    assert 2 == client.json().objlen("obj", None)
+    assert ["a", "b"] == sorted(client.json().objkeys("obj", None))
+    assert client.json().debug("MEMORY", "obj", None) > 0
+
+    client.json().set("str", Path.root_path(), "foo")
+    assert 6 == client.json().strappend("str", "bar", None)
+
+    client.json().set("bool", Path.root_path(), False)
+    assert client.json().toggle("bool", None)
+    assert client.json().get("bool") is True
+
+    assert 1 == client.json().delete("str", None)
+    assert client.exists("str") == 0
+
+
+@pytest.mark.redismod
 def test_arrappend(client):
     client.json().set("arr", Path.root_path(), [1])
     assert 2 == client.json().arrappend("arr", Path.root_path(), 2)
@@ -324,6 +352,13 @@ def test_arrindex(client):
     assert 4 == client.json().arrindex("arr", Path.root_path(), 4, start=0, stop=5000)
     assert -1 == client.json().arrindex("arr", Path.root_path(), 4, start=0, stop=-1)
     assert -1 == client.json().arrindex("arr", Path.root_path(), 4, start=1, stop=3)
+
+
+@pytest.mark.redismod
+def test_arrindex_stop_without_start(client):
+    client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
+    assert -1 == client.json().arrindex("arr", Path.root_path(), 4, stop=3)
+    assert 2 == client.json().arrindex("arr", Path.root_path(), 2, stop=3)
 
 
 @pytest.mark.redismod
@@ -358,6 +393,11 @@ def test_arrpop(client):
     # test out of bounds
     client.json().set("arr", Path.root_path(), [0, 1, 2, 3, 4])
     assert 4 == client.json().arrpop("arr", Path.root_path(), 99)
+
+    # index=None pops the last element, like omitting it
+    client.json().set("arr", Path.root_path(), [0, 1, 2])
+    assert 2 == client.json().arrpop("arr", Path.root_path(), None)
+    assert [0, 1] == client.json().get("arr")
 
     # none test
     client.json().set("arr", Path.root_path(), [])
@@ -1573,6 +1613,7 @@ def test_arrindex_dollar(client):
     assert client.json().arrindex("test_None", "..nested2_not_found.arr", "None") == 0
 
 
+@pytest.mark.fixed_client
 @pytest.mark.redismod
 def test_decoders_and_unstring():
     assert unstring("4") == 4
@@ -1582,6 +1623,29 @@ def test_decoders_and_unstring():
     assert decode_list(b"45.55") == 45.55
     assert decode_list("45.55") == 45.55
     assert decode_list(["hello", b"world"]) == ["hello", "world"]
+
+
+@pytest.mark.fixed_client
+def test_unstring_decimal_point_must_be_a_literal_dot():
+    """The float pattern must only match a *literal* decimal point.
+
+    ``.`` is a regex metacharacter, so the unescaped pattern used to match
+    any character between two runs of digits (e.g. ``"1a5"``, ``"1 5"``).
+    The whole match was then fed to ``float()``, which raised ``ValueError``
+    instead of the "best effort" return-the-value contract of this helper.
+    """
+    # Still parses genuine numbers.
+    assert unstring("45.55") == 45.55
+    assert unstring("0.0") == 0.0
+    # Non-decimal separators are not numbers: return the value untouched.
+    assert unstring("1a5") == "1a5"
+    assert unstring("1 5") == "1 5"
+    assert unstring("1.2.3") == "1.2.3"
+    assert unstring(".") == "."
+
+    # decode_list() must not raise for the same inputs.
+    assert decode_list("1a5") == "1a5"
+    assert decode_list("1 5") == "1 5"
 
 
 @pytest.mark.redismod

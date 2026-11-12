@@ -25,7 +25,9 @@ from ..exceptions import (
     ConnectionError,
     ExecAbortError,
     ExternalAuthProviderError,
+    InvalidResponse,
     MasterDownError,
+    MaxClientsReachedError,
     ModuleError,
     MovedError,
     NoPermissionError,
@@ -39,6 +41,44 @@ from ..exceptions import (
 from ..typing import EncodableT
 from .encoders import Encoder
 from .socket import SERVER_CLOSED_CONNECTION_ERROR, SocketBuffer
+
+# Errors a parser can raise from the middle of a reply, after the read cursor
+# has already advanced past bytes the parser cannot re-interpret. The resume
+# machinery from #2510/#2695 rewinds so an *interrupted* read can be re-parsed
+# from the start; it cannot help here, because re-parsing the same bytes just
+# reproduces the same failure. Connection.read_response drops the connection on
+# these regardless of disconnect_on_error, or the caller loops forever (#4291).
+#
+# - InvalidResponse: unknown reply type byte, or hiredis' own nesting limit.
+# - UnicodeDecodeError: Encoder.decode at the tail of _read_response, reached
+#   only after the payload has been consumed (decode_responses=True subscriber
+#   receiving a binary PUBLISH payload).
+# - RecursionError: deeply nested aggregate replies exhaust the stack in the
+#   pure-Python parsers. #4144 turns this into InvalidResponse at a bounded
+#   depth; until then, catching it here is what stops the loop.
+#
+# Malformed numeric frames (`:abc\r\n`, `$xyz\r\n`, `*abc\r\n`) are converted to
+# InvalidResponse by the pure-Python parsers (_parse_int/_parse_float below), so
+# they land here too. Plain ValueError is deliberately NOT in this tuple: a
+# user push handler may raise it after the frame was fully consumed, and that
+# must not tear down a healthy connection.
+UNRECOVERABLE_PARSE_ERRORS = (InvalidResponse, UnicodeDecodeError, RecursionError)
+
+
+def _parse_int(value: bytes, raw: bytes) -> int:
+    """int() for a RESP numeric field; a non-numeric field is a protocol error."""
+    try:
+        return int(value)
+    except ValueError:
+        raise InvalidResponse(f"Protocol Error: {raw!r}") from None
+
+
+def _parse_float(value: bytes, raw: bytes) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        raise InvalidResponse(f"Protocol Error: {raw!r}") from None
+
 
 MODULE_LOAD_ERROR = "Error loading the extension. Please check the server logs."
 NO_SUCH_MODULE_ERROR = "Error unloading module: no such module with that name"
@@ -75,7 +115,7 @@ logger = logging.getLogger(__name__)
 class BaseParser(ABC):
     EXCEPTION_CLASSES = {
         "ERR": {
-            "max number of clients reached": ConnectionError,
+            "max number of clients reached": MaxClientsReachedError,
             "invalid password": AuthenticationError,
             # some Redis server versions report invalid command syntax
             # in lowercase
@@ -172,11 +212,17 @@ class _RESPBase(BaseParser):
 class AsyncBaseParser(BaseParser):
     """Base parsing class for the python-backed async parser"""
 
-    __slots__ = "_stream", "_read_size"
+    __slots__ = "_stream", "_read_size", "_connected"
 
     def __init__(self, socket_read_size: int):
         self._stream: Optional[StreamReader] = None
         self._read_size = socket_read_size
+        # Initialized here, not only in on_connect() / on_disconnect(): the
+        # read guards in can_read() and the subclasses' read_response() consult
+        # this flag to turn a read on a dead connection into a retryable
+        # ConnectionError. A parser that has never connected would otherwise
+        # raise AttributeError from those guards, which no retry layer acts on.
+        self._connected: bool = False
 
     @deprecated_function(
         version="8.0.0", reason="Use can_read() instead", name="can_read_destructive"
@@ -547,12 +593,21 @@ class _AsyncRESPBase(AsyncBaseParser):
         # connection state, not only whether application data can be read.
         if not self._connected:
             raise OSError("Buffer is closed.")
+        # buffered data wins over EOF, like the sync SocketBuffer: a pending
+        # response or push notification must stay readable even if the server
+        # has since closed the connection.
         if self._buffer:
             return True
+        if self._stream.at_eof() or self._stream.exception() is not None:
+            # Raise like the sync SocketBuffer does on a server-closed
+            # connection, so callers that tolerate pending data (push
+            # notifications) can't mistake EOF for a readable connection.
+            # A reset (RST) leaves no EOF but an exception on the stream.
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
         # asyncio.StreamReader has no public non-destructive API for checking
         # buffered bytes. Preserve dirty-connection detection for the Python
         # parser and fail loudly if the private buffer API changes.
-        return bool(self._stream._buffer) or self._stream.at_eof()
+        return bool(self._stream._buffer)
 
     async def _read(self, length: int) -> bytes:
         """

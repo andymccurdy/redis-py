@@ -1,6 +1,7 @@
 import inspect
 import socket
 
+import pytest
 from redis._defaults import (
     DEFAULT_SOCKET_CONNECT_TIMEOUT,
     DEFAULT_SOCKET_READ_SIZE,
@@ -25,6 +26,7 @@ from redis.retry import Retry
 from redis.utils import SENTINEL
 
 
+@pytest.mark.fixed_client
 def test_socket_keepalive_signature_defaults_are_true():
     classes = (Redis, Connection, AsyncRedis, AsyncConnection, AsyncRedisCluster)
 
@@ -33,11 +35,13 @@ def test_socket_keepalive_signature_defaults_are_true():
         assert default is True
 
 
+@pytest.mark.fixed_client
 def test_connection_socket_keepalive_defaults_to_true():
     assert Connection().socket_keepalive is True
     assert AsyncConnection().socket_keepalive is True
 
 
+@pytest.mark.fixed_client
 def test_connection_socket_read_size_defaults_to_32kb():
     classes = (
         Redis,
@@ -56,6 +60,7 @@ def test_connection_socket_read_size_defaults_to_32kb():
     assert "socket_read_size" in REDIS_ALLOWED_KEYS
 
 
+@pytest.mark.fixed_client
 def test_socket_read_size_can_be_configured_from_clients_and_pools():
     socket_read_size = 65536
 
@@ -97,6 +102,7 @@ def test_socket_read_size_can_be_configured_from_clients_and_pools():
     )
 
 
+@pytest.mark.fixed_client
 def test_socket_timeout_default():
     classes = (Redis, AbstractConnection, AsyncRedis, AsyncAbstractConnection)
 
@@ -122,6 +128,7 @@ def test_socket_timeout_default():
     assert UnixDomainSocketConnection().socket_timeout == DEFAULT_SOCKET_TIMEOUT
 
 
+@pytest.mark.fixed_client
 def test_default_max_connections():
     assert ConnectionPool().max_connections == 100
     assert AsyncConnectionPool().max_connections == 100
@@ -136,6 +143,7 @@ def test_default_max_connections():
     assert async_cluster_node_parameters["max_connections"].default == 100
 
 
+@pytest.mark.fixed_client
 def test_default_retry_config():
     sync_retry = inspect.signature(Redis.__init__).parameters["retry"].default
     assert isinstance(sync_retry, Retry)
@@ -160,6 +168,7 @@ def test_default_retry_config():
         assert default == 10
 
 
+@pytest.mark.fixed_client
 def test_default_socket_keepalive_options():
     options = get_default_socket_keepalive_options()
 
@@ -178,6 +187,7 @@ def test_default_socket_keepalive_options():
         assert options[tcp_keepcnt] == 3
 
 
+@pytest.mark.fixed_client
 def test_socket_keepalive_options_signature_defaults_use_sentinel():
     sync_classes = (Redis, Connection)
 
@@ -200,6 +210,7 @@ def test_socket_keepalive_options_signature_defaults_use_sentinel():
         assert default is SENTINEL
 
 
+@pytest.mark.fixed_client
 def test_connection_socket_keepalive_options_resolve_sentinel_default():
     assert (
         Connection().socket_keepalive_options == get_default_socket_keepalive_options()
@@ -210,6 +221,7 @@ def test_connection_socket_keepalive_options_resolve_sentinel_default():
     )
 
 
+@pytest.mark.fixed_client
 def test_connection_socket_keepalive_options_default_is_not_shared():
     assert (
         Connection().socket_keepalive_options
@@ -221,6 +233,7 @@ def test_connection_socket_keepalive_options_default_is_not_shared():
     )
 
 
+@pytest.mark.fixed_client
 def test_connection_socket_keepalive_options_none_stays_empty():
     assert Connection(socket_keepalive_options=None).socket_keepalive_options == {}
     assert AsyncConnection(socket_keepalive_options=None).socket_keepalive_options == {}

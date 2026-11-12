@@ -62,6 +62,9 @@ class Lock:
         if ARGV[3] == "0" then
             newttl = ARGV[2] + expiration
         end
+        if tonumber(newttl) <= 0 then
+            return 1
+        end
         redis.call('pexpire', KEYS[1], newttl)
         return 1
     """
@@ -75,7 +78,9 @@ class Lock:
         if not token or token ~= ARGV[1] then
             return 0
         end
-        redis.call('pexpire', KEYS[1], ARGV[2])
+        if tonumber(ARGV[2]) > 0 then
+            redis.call('pexpire', KEYS[1], ARGV[2])
+        end
         return 1
     """
 
@@ -170,7 +175,10 @@ class Lock:
     async def __aenter__(self):
         if await self.acquire():
             return self
-        raise LockError("Unable to acquire lock within the time specified")
+        raise LockError(
+            "Unable to acquire lock within the time specified",
+            lock_name=self.name,
+        )
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         try:
@@ -187,10 +195,16 @@ class Lock:
         blocking: Optional[bool] = None,
         blocking_timeout: Optional[Number] = None,
         token: Optional[Union[str, bytes]] = None,
+        *,
+        sleep: Optional[Number] = None,
     ):
         """
         Use Redis to hold a shared, distributed lock named ``name``.
         Returns True once the lock is acquired.
+
+        ``sleep`` specifies the amount of time to sleep per attempt. If
+        not specified, the ``sleep`` value passed to the constructor
+        will be used.
 
         If ``blocking`` is False, always return immediately. If the lock
         was acquired, return True, otherwise return False.
@@ -203,9 +217,10 @@ class Lock:
         object with the default encoding. If a token isn't specified, a UUID
         will be generated.
         """
-        sleep = self.sleep
+        if sleep is None:
+            sleep = self.sleep
         if token is None:
-            token = uuid.uuid1().hex.encode()
+            token = uuid.uuid4().hex.encode()
         else:
             try:
                 encoder = self.redis.connection_pool.get_encoder()
@@ -279,11 +294,16 @@ class Lock:
         try:
             await self.do_release(expected_token)
         except LockNotOwnedError:
-            # Lock doesn't exist in Redis, safe to clear token
-            self.local.token = None
+            # Lock doesn't exist in Redis, so clear the token, but only if it is still
+            # ours. threading.local() is shared by every task on one event loop, so a
+            # Lock shared between tasks may already hold another acquirer's token;
+            # overwriting it would leave the new owner unable to release.
+            if self.local.token == expected_token:
+                self.local.token = None
             raise
-        # Only clear token after successful release
-        self.local.token = None
+        # Only clear token after successful release, and only if it is still ours.
+        if self.local.token == expected_token:
+            self.local.token = None
 
     async def do_release(self, expected_token: bytes) -> None:
         if not bool(
@@ -291,7 +311,10 @@ class Lock:
                 keys=[self.name], args=[expected_token], client=self.redis
             )
         ):
-            raise LockNotOwnedError("Cannot release a lock that's no longer owned")
+            raise LockNotOwnedError(
+                "Cannot release a lock that's no longer owned",
+                lock_name=self.name,
+            )
 
     def extend(
         self, additional_time: Number, replace_ttl: bool = False
@@ -305,11 +328,14 @@ class Lock:
         ``replace_ttl`` if False (the default), add `additional_time` to
         the lock's existing ttl. If True, replace the lock's ttl with
         `additional_time`.
+
+        When the resulting TTL is non-positive for a lock with an expiry, the
+        current expiry is left unchanged and ``True`` is returned.
         """
         if self.local.token is None:
-            raise LockError("Cannot extend an unlocked lock")
+            raise LockError("Cannot extend an unlocked lock", lock_name=self.name)
         if self.timeout is None:
-            raise LockError("Cannot extend a lock with no timeout")
+            raise LockError("Cannot extend a lock with no timeout", lock_name=self.name)
         return self.do_extend(additional_time, replace_ttl)
 
     async def do_extend(self, additional_time, replace_ttl) -> Literal[True]:
@@ -321,17 +347,25 @@ class Lock:
                 client=self.redis,
             )
         ):
-            raise LockNotOwnedError("Cannot extend a lock that's no longer owned")
+            raise LockNotOwnedError(
+                "Cannot extend a lock that's no longer owned",
+                lock_name=self.name,
+            )
         return True
 
     def reacquire(self) -> Awaitable[Literal[True]]:
         """
         Resets a TTL of an already acquired lock back to a timeout value.
+
+        When the resulting TTL is non-positive, the current expiry is left
+        unchanged and ``True`` is returned.
         """
         if self.local.token is None:
-            raise LockError("Cannot reacquire an unlocked lock")
+            raise LockError("Cannot reacquire an unlocked lock", lock_name=self.name)
         if self.timeout is None:
-            raise LockError("Cannot reacquire a lock with no timeout")
+            raise LockError(
+                "Cannot reacquire a lock with no timeout", lock_name=self.name
+            )
         return self.do_reacquire()
 
     async def do_reacquire(self) -> Literal[True]:
@@ -341,5 +375,8 @@ class Lock:
                 keys=[self.name], args=[self.local.token, timeout], client=self.redis
             )
         ):
-            raise LockNotOwnedError("Cannot reacquire a lock that's no longer owned")
+            raise LockNotOwnedError(
+                "Cannot reacquire a lock that's no longer owned",
+                lock_name=self.name,
+            )
         return True

@@ -1,3 +1,4 @@
+import math
 import random
 from abc import ABC, abstractmethod
 
@@ -5,6 +6,20 @@ from abc import ABC, abstractmethod
 DEFAULT_CAP = 0.512
 # Minimum backoff between each retry in seconds
 DEFAULT_BASE = 0.008
+
+
+def _exponential(base: float, failures: int) -> float:
+    """Return ``base * 2**failures``, or infinity once that overflows a float.
+
+    ``2**failures`` is an arbitrary precision int, and multiplying a float by one
+    beyond the float range raises OverflowError even when the product would fit.
+    ``ldexp`` scales the base directly, so it only overflows when the result
+    itself does, and every strategy below caps an infinite delay.
+    """
+    try:
+        return math.ldexp(base, failures)
+    except OverflowError:
+        return math.inf
 
 
 class AbstractBackoff(ABC):
@@ -72,7 +87,7 @@ class ExponentialBackoff(AbstractBackoff):
         return self._base == other._base and self._cap == other._cap
 
     def compute(self, failures: int) -> float:
-        return min(self._cap, self._base * 2**failures)
+        return min(self._cap, _exponential(self._base, failures))
 
 
 class FullJitterBackoff(AbstractBackoff):
@@ -96,7 +111,7 @@ class FullJitterBackoff(AbstractBackoff):
         return self._base == other._base and self._cap == other._cap
 
     def compute(self, failures: int) -> float:
-        return random.uniform(0, min(self._cap, self._base * 2**failures))
+        return random.uniform(0, min(self._cap, _exponential(self._base, failures)))
 
 
 class EqualJitterBackoff(AbstractBackoff):
@@ -120,7 +135,7 @@ class EqualJitterBackoff(AbstractBackoff):
         return self._base == other._base and self._cap == other._cap
 
     def compute(self, failures: int) -> float:
-        temp = min(self._cap, self._base * 2**failures) / 2
+        temp = min(self._cap, _exponential(self._base, failures)) / 2
         return temp + random.uniform(0, temp)
 
 
@@ -176,7 +191,7 @@ class ExponentialWithJitterBackoff(AbstractBackoff):
         return self._base == other._base and self._cap == other._cap
 
     def compute(self, failures: int) -> float:
-        return min(self._cap, random.random() * self._base * 2**failures)
+        return min(self._cap, _exponential(random.random() * self._base, failures))
 
 
 def default_backoff():

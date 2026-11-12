@@ -1,0 +1,177 @@
+name: Benchmarks
+
+# Compares the read path of a tree under test with a base tree and fails a
+# job when a benchmark regresses by more than the allowed percentage (see
+# benchmarks/measure_read_path/gate.py). The workflow is informational: keep it
+# out of the required status checks, so a regression shows as a failed check
+# without blocking the merge.
+#
+# It runs in two ways:
+# - by hand (Actions > Benchmarks > Run workflow), with any base ref (default
+#   master) and any ref under test;
+# - on a pull request that carries the `with-benchmarks` or `run-benchmark`
+#   label, alongside the regular PR checks: when it is opened or reopened and
+#   on every push. Adding the label starts nothing; the next push does. The
+#   tree under test is GitHub's merge of the PR onto its target branch, and
+#   the base is the commit it was merged onto, so only the PR's own effect is
+#   measured.
+#
+# The tools run from the workflow's own commit, checked out apart from the
+# two measured trees, so a ref under test does not need the benchmarks. Both
+# trees run in the same job, interleaved round by round, because numbers
+# from different runners are not comparable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Base: branch, tag or SHA'
+        default: 'master'
+        required: true
+      test_ref:
+        description: 'Under test: branch, tag, SHA or refs/pull/<number>/head'
+        required: true
+      allowed_regression:
+        description: 'Accepted slowdown or growth in percent'
+        default: '3'
+        required: true
+  pull_request:
+    # No `labeled`: label changes would start runs in the PR's concurrency
+    # group and cancel a benchmark run in progress.
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}..{1}', inputs.base_ref, inputs.test_ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read  #  to fetch code (actions/checkout)
+
+env:
+  # Keep in step with CURRENT_REDIS_VERSION in integration.yaml.
+  REDIS_VERSION: '8.10.2'
+  BASE_REF: ${{ inputs.base_ref || github.base_ref }}
+  TEST_REF: ${{ inputs.test_ref || github.sha }}
+  # Accepted slowdown or growth in percent, on top of the uncertainty rule.
+  ALLOWED_REGRESSION: ${{ inputs.allowed_regression || '3' }}
+  # get_small_seq and set_small_seq send one small command per round trip, so
+  # they time the runner's network more than the client; concurrent_get keeps
+  # many commands in flight and stays. get_1mb and get_10mb swing by 10-35%
+  # between rounds of the same code on a shared runner; get_200kb covers the
+  # multi-read bulk path instead.
+  SCENARIOS: 'pipeline_1k_get,lrange_10k,hgetall_1k,get_200kb,concurrent_get,pool_checkout'
+
+jobs:
+  plan:
+    name: Plan
+    # A PR event runs only while the PR carries one of the labels.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'with-benchmarks') ||
+      contains(github.event.pull_request.labels.*.name, 'run-benchmark')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: benchmarks/measure_read_path
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - id: matrix
+        run: echo "matrix=$(python benchmarks/measure_read_path/ci_matrix.py)" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tools
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TEST_REF }}
+          path: test
+          # a PR's merge commit needs its first parent, the base
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+
+      - name: Check out the commit the PR was merged onto
+        if: github.event_name == 'pull_request'
+        run: git -C test worktree add --detach ../base HEAD^1
+
+      - uses: actions/checkout@v7
+        if: github.event_name != 'pull_request'
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # redis-py itself is not installed: each tool imports it from the
+        # tree it measures and checks where it came from.
+        run: pip install "hiredis>=3.2.0"
+
+      - name: Start Redis
+        # Only the two servers the tools use, standalone on 6379 and the
+        # cluster on 16379: other containers would compete with the
+        # measurement for the runner's CPU.
+        working-directory: tools
+        env:
+          CLIENT_LIBS_TEST_IMAGE_TAG: ${{ env.REDIS_VERSION }}
+          CLIENT_LIBS_TEST_STACK_IMAGE_TAG: ${{ env.REDIS_VERSION }}
+        run: |
+          docker compose up -d redis cluster
+          for i in $(seq 60); do
+            docker exec redis-standalone redis-cli ping | grep -q PONG &&
+              docker exec redis-cluster redis-cli -p 16379 cluster info |
+                grep -q cluster_state:ok &&
+              exit 0
+            sleep 1
+          done
+          docker compose logs --no-color --tail 100
+          exit 1
+
+      - name: Run ${{ matrix.tool }}
+        working-directory: tools
+        run: |
+          {
+            echo "## ${{ matrix.name }}"
+            echo
+            echo "- base: \`$BASE_REF\` at $(git -C ../base rev-parse --short HEAD)"
+            echo "- test: \`$TEST_REF\` at $(git -C ../test rev-parse --short HEAD)"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          extra="${{ matrix.args }}"
+          if [ "${{ matrix.tool }}" = "run_bench" ]; then
+            # even counts, so each of the two trees runs first equally often
+            extra="$extra --scenarios $SCENARIOS --rounds 8 --recheck-rounds 4 --recheck-passes 3"
+          fi
+          python -m benchmarks.measure_read_path.${{ matrix.tool }} \
+            --trees base=../base test=../test \
+            --compare test:base \
+            --allowed-regression "$ALLOWED_REGRESSION" \
+            --fail-on-regression \
+            --warn-inconclusive \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --output-dir "$RUNNER_TEMP/results" \
+            $extra
+
+      - name: Upload results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/results
+          if-no-files-found: ignore

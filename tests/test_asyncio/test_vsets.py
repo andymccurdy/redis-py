@@ -1,9 +1,11 @@
 import json
 import random
+from unittest.mock import patch
 import numpy as np
 import pytest
 import pytest_asyncio
 import redis
+import redis.asyncio as async_redis
 from redis.commands.vectorset.commands import QuantizationOptions
 
 from tests.conftest import (
@@ -35,6 +37,26 @@ async def test_add_elem_with_values(d_client):
 
     with pytest.raises(redis.DataError):
         await d_client.vset().vadd("myset_invalid_data", [12, 45], None, reduce_dim=3)
+
+
+@skip_if_server_version_lt("7.9.0")
+@pytest.mark.parametrize("element", ["", b""])
+async def test_add_elem_with_empty_name(d_client, r, element):
+    assert await d_client.vset().vadd("myset", [1.0, 0.0], element) == 1
+    assert await d_client.vset().vcard("myset") == 1
+    assert await d_client.vset().vemb("myset", element) == [1.0, 0.0]
+
+    name = await r.vset().vrandmember("myset")
+    assert name == b""
+    assert await r.vset().vadd("myset_copy", [1.0, 0.0], name) == 1
+    assert await r.vset().vemb("myset_copy", name) == [1.0, 0.0]
+
+
+@skip_if_server_version_lt("7.9.0")
+async def test_vsim_with_empty_element_name(d_client):
+    await d_client.execute_command("VADD", "myset", "VALUES", 2, 1.0, 0.0, "")
+
+    assert await d_client.vset().vsim("myset", "") == [""]
 
 
 @skip_if_server_version_lt("7.9.0")
@@ -184,17 +206,39 @@ async def test_add_elem_with_attr(d_client):
 
 
 @skip_if_server_version_lt("7.9.0")
+@pytest.mark.parametrize(
+    "attributes, expected",
+    [
+        ({}, None),
+        ("{}", None),
+        ("", None),
+        (None, {"source": "old"}),
+        ({"source": "new"}, {"source": "new"}),
+    ],
+)
+async def test_add_elem_updates_attributes(d_client, attributes, expected):
+    vset = d_client.vset()
+    await vset.vadd("myset", [1, 0], "elem", attributes={"source": "old"})
+
+    await vset.vadd("myset", [0, 1], "elem", attributes=attributes)
+
+    assert await vset.vgetattr("myset", "elem") == expected
+
+
+@skip_if_server_version_lt("7.9.0")
 async def test_add_elem_with_numlinks(d_client):
     elements_count = 100
     vector_dim = 10
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.randint(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=8,
         )
+    await pipe.execute()
 
     float_array = [1, 4.32, 0.11, 0.5, 0.9, 0.1, 0.2, 0.3, 0.4, 0.5]
     resp = await d_client.vset().vadd("myset", float_array, "elem_numlinks", numlinks=8)
@@ -212,14 +256,16 @@ async def test_add_elem_with_numlinks(d_client):
 async def test_vsim_count(d_client):
     elements_count = 30
     vector_dim = 800
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=64,
         )
+    await pipe.execute()
 
     vsim = await d_client.vset().vsim("myset", input="elem1")
     assert len(vsim) == 10
@@ -246,14 +292,16 @@ async def test_vsim_count(d_client):
 async def test_vsim_with_scores(d_client):
     elements_count = 20
     vector_dim = 50
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=64,
         )
+    await pipe.execute()
 
     vsim = await d_client.vset().vsim("myset", input="elem1", with_scores=True)
     assert len(vsim) == 10
@@ -267,15 +315,17 @@ async def test_vsim_with_attribs_attribs_set(d_client):
     elements_count = 5
     vector_dim = 10
     attrs_dict = {"key1": "value1", "key2": "value2"}
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 5) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=64,
             attributes=attrs_dict if i % 2 == 0 else None,
         )
+    await pipe.execute()
 
     vsim = await d_client.vset().vsim("myset", input="elem1", with_attribs=True)
     assert len(vsim) == 5
@@ -289,15 +339,17 @@ async def test_vsim_with_scores_and_attribs_attribs_set(d_client):
     elements_count = 5
     vector_dim = 10
     attrs_dict = {"key1": "value1", "key2": "value2"}
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 5) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=64,
             attributes=attrs_dict if i % 2 == 0 else None,
         )
+    await pipe.execute()
 
     vsim = await d_client.vset().vsim(
         "myset", input="elem1", with_scores=True, with_attribs=True
@@ -321,14 +373,16 @@ async def test_vsim_with_scores_and_attribs_attribs_set(d_client):
 async def test_vsim_with_attribs_attribs_not_set(d_client):
     elements_count = 20
     vector_dim = 50
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=64,
         )
+    await pipe.execute()
 
     vsim = await d_client.vset().vsim("myset", input="elem1", with_attribs=True)
     assert len(vsim) == 10
@@ -340,16 +394,18 @@ async def test_vsim_with_attribs_attribs_not_set(d_client):
 async def test_vsim_with_different_vector_input_types(d_client):
     elements_count = 10
     vector_dim = 5
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
         attributes = {"index": i, "elem_name": f"elem_{i}"}
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem_{i}",
             numlinks=4,
             attributes=attributes,
         )
+    await pipe.execute()
     sim = await d_client.vset().vsim("myset", input="elem_1")
     assert len(sim) == 10
     assert isinstance(sim, list)
@@ -365,8 +421,9 @@ async def test_vsim_with_different_vector_input_types(d_client):
     assert isinstance(sim_to_fp32_vector, list)
     assert sim_to_float_array == sim_to_fp32_vector
 
-    with pytest.raises(redis.DataError):
-        await d_client.vset().vsim("myset", input=None)
+    for invalid_input in (None, [], b""):
+        with pytest.raises(redis.DataError):
+            await d_client.vset().vsim("myset", input=invalid_input)
 
 
 @skip_if_server_version_lt("7.9.0")
@@ -380,21 +437,38 @@ async def test_vsim_unexisting(d_client):
     sim = await d_client.vset().vsim("myset_not_existing", input="elem1")
     assert sim == []
 
+    sim = await d_client.vset().vsim(
+        "myset_not_existing", input="elem1", with_scores=True
+    )
+    assert sim == {}
+
+    sim = await d_client.vset().vsim(
+        "myset_not_existing", input="elem1", with_attribs=True
+    )
+    assert sim == {}
+
+    sim = await d_client.vset().vsim(
+        "myset_not_existing", input="elem1", with_scores=True, with_attribs=True
+    )
+    assert sim == {}
+
 
 @skip_if_server_version_lt("7.9.0")
 async def test_vsim_with_filter(d_client):
     elements_count = 50
     vector_dim = 800
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
         attributes = {"index": i, "elem_name": f"elem_{i}"}
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem_{i}",
             numlinks=4,
             attributes=attributes,
         )
+    await pipe.execute()
     float_array = [-random.uniform(10, 20) for x in range(vector_dim)]
     attributes = {"index": elements_count, "elem_name": "elem_special"}
     await d_client.vset().vadd(
@@ -453,9 +527,11 @@ async def test_vsim_with_filter(d_client):
 async def test_vsim_truth_no_thread_enabled(d_client):
     elements_count = 100
     vector_dim = 50
+    pipe = d_client.pipeline(transaction=False)
     for i in range(1, elements_count + 1):
         float_array = [i * vector_dim for _ in range(vector_dim)]
-        await d_client.vset().vadd("myset", float_array, f"elem_{i}")
+        pipe.vset().vadd("myset", float_array, f"elem_{i}")
+    await pipe.execute()
 
     await d_client.vset().vadd("myset", [-22 for _ in range(vector_dim)], "elem_man_2")
 
@@ -514,9 +590,11 @@ async def test_vdim(d_client):
 @skip_if_server_version_lt("7.9.0")
 async def test_vcard(d_client):
     n = 20
+    pipe = d_client.pipeline(transaction=False)
     for i in range(n):
         float_array = [random.uniform(0, 10) for x in range(1, 8)]
-        await d_client.vset().vadd("myset", float_array, f"elem{i}")
+        pipe.vset().vadd("myset", float_array, f"elem{i}")
+    await pipe.execute()
 
     card = await d_client.vset().vcard("myset")
     assert card == n
@@ -528,9 +606,11 @@ async def test_vcard(d_client):
 @skip_if_server_version_lt("7.9.0")
 async def test_vrem(d_client):
     n = 3
+    pipe = d_client.pipeline(transaction=False)
     for i in range(n):
         float_array = [random.uniform(0, 10) for x in range(1, 8)]
-        await d_client.vset().vadd("myset", float_array, f"elem{i}")
+        pipe.vset().vadd("myset", float_array, f"elem{i}")
+    await pipe.execute()
 
     resp = await d_client.vset().vrem("myset", "elem2")
     assert resp == 1
@@ -546,6 +626,29 @@ async def test_vrem(d_client):
 
     resp = await d_client.vset().vrem("myset_unexisting", "elem1")
     assert resp == 0
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("client_factory", ["direct", "from_url", "pool"])
+async def test_vemb_raw_default_decode_responses(client_factory):
+    if client_factory == "direct":
+        r = async_redis.Redis()
+    elif client_factory == "from_url":
+        r = async_redis.Redis.from_url("redis://localhost:6379")
+    else:
+        r = async_redis.Redis(connection_pool=async_redis.ConnectionPool())
+
+    response = [b"embedding"]
+    try:
+        with patch.object(
+            r, "execute_command", return_value=response
+        ) as execute_command:
+            assert await r.vset().vemb("vectors", "item", raw=True) is response
+        execute_command.assert_awaited_once_with(
+            "VEMB", "vectors", "item", "RAW", RESP3=True, NEVER_DECODE=True, RAW=True
+        )
+    finally:
+        await r.aclose()
 
 
 @skip_if_server_version_lt("7.9.0")
@@ -643,17 +746,42 @@ async def test_vemb_unexisting(d_client):
 
 
 @skip_if_server_version_lt("7.9.0")
+async def test_vemb_unified_responses_return_floats_on_both_protocols(
+    create_redis, redis_url
+):
+    vector = [1, 0.5, 0]
+    embs = {}
+    for protocol in (2, 3):
+        r = await create_redis(
+            url=redis_url,
+            decode_responses=True,
+            protocol=protocol,
+            legacy_responses=False,
+        )
+        await r.delete("myset")
+        await r.vset().vadd(
+            "myset", vector, "elem", quantization=QuantizationOptions.NOQUANT
+        )
+        embs[protocol] = await r.vset().vemb("myset", "elem")
+
+    assert all(isinstance(value, float) for value in embs[2] + embs[3])
+    assert embs[2] == embs[3] == [1.0, 0.5, 0.0]
+
+
+@skip_if_server_version_lt("7.9.0")
 async def test_vlinks(d_client):
     elements_count = 100
     vector_dim = 800
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=8,
         )
+    await pipe.execute()
 
     element_links_all_layers = await d_client.vset().vlinks("myset", "elem1")
     assert len(element_links_all_layers) >= 1
@@ -711,15 +839,17 @@ async def test_vlinks(d_client):
 async def test_vinfo(d_client):
     elements_count = 100
     vector_dim = 800
+    pipe = d_client.pipeline(transaction=False)
     for i in range(elements_count):
         float_array = [random.uniform(0, 10) for x in range(vector_dim)]
-        await d_client.vset().vadd(
+        pipe.vset().vadd(
             "myset",
             float_array,
             f"elem{i}",
             numlinks=8,
             quantization=QuantizationOptions.BIN,
         )
+    await pipe.execute()
 
     vset_info = await d_client.vset().vinfo("myset")
     assert vset_info["quant-type"] == "bin"
@@ -793,9 +923,11 @@ async def test_vset_vget_attributes(d_client):
 @skip_if_server_version_lt("7.9.0")
 async def test_vrandmember(d_client):
     elements = ["elem1", "elem2", "elem3"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
         float_array = [random.uniform(0, 10) for x in range(1, 8)]
-        await d_client.vset().vadd("myset", float_array, element=elem)
+        pipe.vset().vadd("myset", float_array, element=elem)
+    await pipe.execute()
 
     random_member = await d_client.vset().vrandmember("myset")
     assert random_member in elements
@@ -984,8 +1116,10 @@ async def test_vrange_basic(d_client):
     """Test basic VRANGE functionality with lexicographical ordering."""
     # Add elements with different names
     elements = ["apple", "banana", "cherry", "date", "elderberry"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0, 3.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0, 3.0], elem)
+    await pipe.execute()
 
     # Test full range
     result = await d_client.vset().vrange("myset", "-", "+")
@@ -1006,8 +1140,10 @@ async def test_vrange_with_count(d_client):
     """Test VRANGE with count parameter."""
     # Add elements
     elements = ["a", "b", "c", "d", "e", "f", "g"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0], elem)
+    await pipe.execute()
 
     # Test with positive count
     result = await d_client.vset().vrange("myset", "-", "+", count=3)
@@ -1034,8 +1170,10 @@ async def test_vrange_iteration(d_client):
     """Test VRANGE for stateless iteration."""
     # Add elements
     elements = [f"elem{i:03d}" for i in range(20)]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0], elem)
+    await pipe.execute()
 
     # Iterate through all elements, 5 at a time
     all_results = []
@@ -1067,8 +1205,10 @@ async def test_vrange_special_characters(d_client):
     """Test VRANGE with elements containing special characters."""
     # Add elements with special characters
     elements = ["a:1", "a:2", "b:1", "b:2", "c:1"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0], elem)
+    await pipe.execute()
 
     # Test range with prefix
     result = await d_client.vset().vrange("myset", "[a:", "[a:9")
@@ -1098,8 +1238,10 @@ async def test_vrange_lexicographical_order(d_client):
     """Test that VRANGE returns elements in correct lexicographical order."""
     # Add elements in random order
     elements = ["zebra", "apple", "mango", "banana", "cherry"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0], elem)
+    await pipe.execute()
 
     # Should return in sorted order
     result = await d_client.vset().vrange("myset", "-", "+")
@@ -1112,8 +1254,10 @@ async def test_vrange_numeric_strings(d_client):
     """Test VRANGE with numeric string elements."""
     # Add numeric strings (lexicographical order, not numeric)
     elements = ["1", "10", "2", "20", "3"]
+    pipe = d_client.pipeline(transaction=False)
     for elem in elements:
-        await d_client.vset().vadd("myset", [1.0, 2.0], elem)
+        pipe.vset().vadd("myset", [1.0, 2.0], elem)
+    await pipe.execute()
 
     # Lexicographical order: "1", "10", "2", "20", "3"
     result = await d_client.vset().vrange("myset", "-", "+")

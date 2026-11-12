@@ -1,24 +1,47 @@
 from datetime import datetime, timedelta, timezone
+import functools
+import inspect
+import time
 import warnings
 import pytest
 from redis.exceptions import DataError
+import redis.utils
 from redis.utils import (
     check_protocol_version,
+    command_text,
     compare_versions,
     decode_field_value,
     DEFAULT_RESP_VERSION,
     deprecated_args,
     deprecated_function,
+    dict_merge,
     ensure_string,
     experimental_args,
     experimental_method,
     extract_expire_flags,
     format_error_message,
+    list_keys_to_dict,
+    merge_result,
+    pipeline,
     safe_str,
     SENTINEL,
     str_if_bytes,
     truncate_text,
 )
+
+
+@pytest.fixture
+def filterable_args_calls(monkeypatch):
+    """Count calls to the slow path the args decorators skip on clean calls."""
+    calls = []
+    orig_get = redis.utils._get_filterable_args
+
+    def counting_get(*args, **kwargs):
+        calls.append(args)
+        return orig_get(*args, **kwargs)
+
+    monkeypatch.setattr(redis.utils, "_get_filterable_args", counting_get)
+    return calls
 
 
 @pytest.mark.fixed_client
@@ -131,6 +154,19 @@ class TestDeprecatedArgs:
             assert issubclass(w[0].category, DeprecationWarning)
             assert "old_param" in str(w[0].message)
 
+    def test_positional_deprecated_arg_warns(self):
+        @deprecated_args(args_to_warn=["old_param"])
+        def func_with_args(new_param=None, old_param=None):
+            return (new_param, old_param)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = func_with_args("new_val", "old_val")
+            assert result == ("new_val", "old_val")
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "old_param" in str(w[0].message)
+
     def test_sync_function_no_warning_on_allowed_arg(self):
         @deprecated_args(args_to_warn=["*"], allowed_args=["allowed_param"])
         def func_with_allowed(allowed_param=None):
@@ -140,6 +176,30 @@ class TestDeprecatedArgs:
             warnings.simplefilter("always")
             result = func_with_allowed(allowed_param="value")
             assert result == "value"
+            assert len(w) == 0
+
+    def test_positional_allowed_arg_no_warning(self):
+        @deprecated_args(args_to_warn=["*"], allowed_args=["allowed_param"])
+        def func_with_allowed(allowed_param=None):
+            return allowed_param
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = func_with_allowed("value")
+            assert result == "value"
+            assert len(w) == 0
+
+    def test_method_self_with_wildcard_no_warning(self):
+        class Dummy:
+            @deprecated_args(args_to_warn=["*"])
+            def method(self, bad_param=None):
+                return "ok"
+
+        dummy = Dummy()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = dummy.method()
+            assert result == "ok"
             assert len(w) == 0
 
     def test_wildcard_warns_all_args(self):
@@ -153,6 +213,275 @@ class TestDeprecatedArgs:
             assert result == ("a", "b")
             assert len(w) == 1
             assert "param1" in str(w[0].message) or "param2" in str(w[0].message)
+
+    async def test_async_function_warns_on_deprecated_arg(self):
+        @deprecated_args(args_to_warn=["old_param"])
+        async def async_func(new_param=None, old_param=None):
+            return (new_param, old_param)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = await async_func("new_val", old_param="old_val")
+            assert result == ("new_val", "old_val")
+            assert len(w) == 1
+            assert "old_param" in str(w[0].message)
+
+    async def test_async_function_no_warning_on_normal_call(self):
+        @deprecated_args(args_to_warn=["old_param"])
+        async def async_func(new_param=None, old_param=None):
+            return new_param
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = await async_func("new_val")
+            assert result == "new_val"
+            assert len(w) == 0
+
+    def test_fast_path_bypasses_filterable_args_construction(
+        self, filterable_args_calls
+    ):
+        @deprecated_args(args_to_warn=["batch_size"])
+        def record_metric(cmd, dur, host=None, port=None, batch_size=None):
+            return (cmd, dur)
+
+        assert record_metric("GET", 0.001, "localhost", 6379) == ("GET", 0.001)
+        assert not filterable_args_calls, (
+            "_get_filterable_args should not be called on clean hot path"
+        )
+
+    def test_mutable_args_input_snapshotting(self):
+        # Mutating the list passed to args_to_warn or allowed_args after decorator
+        # definition should not desynchronize the decorator configuration.
+        warn_list = ["old_param"]
+        allowed_list = ["allowed_param"]
+
+        @deprecated_args(args_to_warn=warn_list, allowed_args=allowed_list)
+        def func(allowed_param=None, old_param=None, new_param=None):
+            return (allowed_param, old_param, new_param)
+
+        warn_list.append("new_param")
+        allowed_list.clear()
+
+        # allowed_param remains allowed because allowed_list was snapshotted
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            res = func(allowed_param="val")
+            assert res == ("val", None, None)
+            assert len(w) == 0
+
+        # old_param still triggers deprecation warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            res = func(old_param="val")
+            assert res == (None, "val", None)
+            assert len(w) == 1
+            assert "old_param" in str(w[0].message)
+
+    def test_wildcard_pool_get_connection_signature(self, filterable_args_calls):
+        class Pool:
+            @deprecated_args(args_to_warn=["*"])
+            def get_connection(self, command_name=None, *keys, **options):
+                return "conn"
+
+        pool = Pool()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection() == "conn"
+            assert len(w) == 0
+            assert not filterable_args_calls
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection("GET", "key") == "conn"
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "command_name" in str(w[0].message)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection(option="value") == "conn"
+            assert len(w) == 1
+            assert "option" in str(w[0].message)
+
+    def test_wildcard_allowed_kwarg_skips_filterable_args(self, filterable_args_calls):
+        @deprecated_args(args_to_warn=["*"], allowed_args=["allowed_param"])
+        def func(allowed_param=None, old_param=None):
+            return allowed_param
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func(allowed_param="value") == "value"
+            assert len(w) == 0
+        assert not filterable_args_calls, (
+            "_get_filterable_args should not be called for allowed args"
+        )
+
+    def test_keyword_only_and_positional_only_args(self, filterable_args_calls):
+        @deprecated_args(args_to_warn=["old_pos", "old_kw"])
+        def func(old_pos=None, /, new_param=None, *, old_kw=None, **options):
+            return (old_pos, new_param, old_kw)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func(new_param=1, other=2) == (None, 1, None)
+            assert len(w) == 0
+        assert not filterable_args_calls
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func("val") == ("val", None, None)
+            assert len(w) == 1
+            assert "old_pos" in str(w[0].message)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func(old_kw="val") == (None, None, "val")
+            assert len(w) == 1
+            assert "old_kw" in str(w[0].message)
+
+    def test_wildcard_and_named_arg_warn_together(self):
+        @deprecated_args(args_to_warn=["*", "old_param"])
+        def func(new_param=None, old_param=None):
+            return (new_param, old_param)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func() == (None, None)
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert func(old_param="val") == (None, "val")
+            assert len(w) == 2
+            assert all("old_param" in str(x.message) for x in w)
+
+    def test_decorator_that_cannot_warn_keeps_wrapper(self, filterable_args_calls):
+        def func(old_param=None, new_param=None):
+            return (old_param, new_param)
+
+        never_warns = deprecated_args(
+            args_to_warn=["old_param"], allowed_args=["old_param"]
+        )(func)
+        assert never_warns is not func
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert never_warns("a", new_param="b") == ("a", "b")
+            assert len(w) == 0
+        assert not filterable_args_calls
+
+        # Stacking merges into one wrapper over func, so the outer layer sees
+        # func's own signature and warns for positional usage too.
+        stacked = deprecated_args(args_to_warn=["new_param"])(never_warns)
+        assert stacked.__wrapped__ is func
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert stacked("a") == ("a", None)
+            assert stacked(old_param="a") == ("a", None)
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert stacked(new_param="b") == (None, "b")
+            assert stacked("a", "b") == ("a", "b")
+            assert len(w) == 2
+            assert all("new_param" in str(x.message) for x in w)
+
+    def test_stacked_layers_merge_into_one_wrapper(self):
+        def func(a=None, b=None, c=None):
+            return (a, b, c)
+
+        inner = deprecated_args(args_to_warn=["c"], reason="inner")(func)
+        outer = deprecated_args(args_to_warn=["b"], reason="outer")(inner)
+        assert outer.__wrapped__ is func
+        assert outer.__name__ == "func"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(1) == (1, None, None)
+            assert outer(a=1) == (1, None, None)
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(1, 2, 3) == (1, 2, 3)
+            assert outer(c=3, b=2) == (None, 2, 3)
+            # Each layer keeps its own message, outermost first.
+            assert [str(x.message) for x in w] == [
+                "Call to 'func' function with deprecated usage of input "
+                f"argument/s '{arg}'. ({reason})"
+                for arg, reason in (("b", "outer"), ("c", "inner")) * 2
+            ]
+
+    def test_deprecated_args_warn_at_call_site(self):
+        def func(a=None, b=None):
+            return (a, b)
+
+        single = deprecated_args(args_to_warn=["b"])(func)
+        merged = deprecated_args(args_to_warn=["a"])(
+            deprecated_args(args_to_warn=["b"])(func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            single_line = inspect.currentframe().f_lineno + 1
+            single(b=2)
+            merged_line = inspect.currentframe().f_lineno + 1
+            merged(a=1, b=2)
+        # Every layer points at the line that called the decorated function.
+        assert [(x.filename, x.lineno) for x in w] == [
+            (__file__, single_line),
+            (__file__, merged_line),
+            (__file__, merged_line),
+        ]
+
+    def test_stacked_wildcard_and_named_layers(self, filterable_args_calls):
+        def func(self=None, a=None, b=None, c=None):
+            return (a, b, c)
+
+        merged = deprecated_args(args_to_warn=["c"])(
+            deprecated_args(args_to_warn=["*"], allowed_args=["a", "c"])(func)
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert merged(None, 1) == (1, None, None)
+            assert merged(a=1) == (1, None, None)
+            assert len(w) == 0
+        assert not filterable_args_calls
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            merged(c=3)  # allowed by the wildcard layer, warned by the named one
+            assert len(w) == 1
+            assert "'c'" in str(w[0].message)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            merged(None, 1, 2)  # positional b reaches the wildcard layer
+            assert len(w) == 1
+            assert "['b']" in str(w[0].message)
+
+    def test_foreign_decorator_between_layers_is_kept(self):
+        calls = []
+
+        def func(a=None, b=None):
+            return (a, b)
+
+        inner = deprecated_args(args_to_warn=["b"])(func)
+
+        @functools.wraps(inner)
+        def foreign(*args, **kwargs):
+            calls.append(args)
+            return inner(*args, **kwargs)
+
+        outer = deprecated_args(args_to_warn=["a"])(foreign)
+        assert outer.__wrapped__ is foreign
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert outer(b=2) == (None, 2)
+            assert len(w) == 1
+            assert "'b'" in str(w[0].message)
+        assert calls == [()]
 
 
 # Tests for experimental_method decorator
@@ -188,6 +517,18 @@ class TestExperimentalArgs:
             assert issubclass(w[0].category, UserWarning)
             assert "beta_param" in str(w[0].message)
 
+    def test_positional_experimental_arg_warns(self):
+        @experimental_args(args_to_warn=["beta_param"])
+        def func_with_experimental(stable_param=None, beta_param=None):
+            return (stable_param, beta_param)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = func_with_experimental("stable_val", "beta_val")
+            assert result == ("stable_val", "beta_val")
+            assert len(w) == 1
+            assert "beta_param" in str(w[0].message)
+
     def test_no_warning_when_no_args_provided(self):
         @experimental_args(args_to_warn=["beta_param"])
         def func_no_args():
@@ -198,6 +539,55 @@ class TestExperimentalArgs:
             result = func_no_args()
             assert result == "no_args"
             assert len(w) == 0
+
+    async def test_async_experimental_args(self):
+        @experimental_args(args_to_warn=["beta_param"])
+        async def async_func(stable=None, beta_param=None):
+            return (stable, beta_param)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = await async_func("s", beta_param="b")
+            assert result == ("s", "b")
+            assert len(w) == 1
+            assert "beta_param" in str(w[0].message)
+
+    def test_experimental_fast_path_bypasses_filterable_args(
+        self, filterable_args_calls
+    ):
+        @experimental_args(args_to_warn=["beta_param"])
+        def stable_func(a, b, c=1, beta_param=None):
+            return a + b + c
+
+        assert stable_func(1, 2) == 4
+        assert not filterable_args_calls, (
+            "_get_filterable_args should not be called on clean hot path"
+        )
+
+    def test_wildcard_pool_get_connection_signature(self):
+        class Pool:
+            @experimental_args(args_to_warn=["*"])
+            def get_connection(self, command_name=None, *keys, **options):
+                return "conn"
+
+        pool = Pool()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection() == "conn"
+            assert len(w) == 0
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection("GET", "key") == "conn"
+            assert len(w) == 1
+            assert issubclass(w[0].category, UserWarning)
+            assert "command_name" in str(w[0].message)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert pool.get_connection(option="value") == "conn"
+            assert len(w) == 1
+            assert "option" in str(w[0].message)
 
 
 @pytest.mark.fixed_client
@@ -269,14 +659,49 @@ class TestExtractExpireFlags:
         assert extract_expire_flags(ex="60") == ["EX", 60]
 
     def test_ex_invalid_raises(self):
-        with pytest.raises(DataError):
+        with pytest.raises(
+            DataError, match="ex must be datetime.timedelta, int, or a digit string"
+        ):
             extract_expire_flags(ex="not-a-number")
+
+    def test_ex_float_raises_lists_accepted_types(self):
+        with pytest.raises(
+            DataError, match="ex must be datetime.timedelta, int, or a digit string"
+        ):
+            extract_expire_flags(ex=1.5)
 
     def test_px_as_int(self):
         assert extract_expire_flags(px=500) == ["PX", 500]
 
     def test_px_as_timedelta_uses_milliseconds(self):
         assert extract_expire_flags(px=timedelta(seconds=2)) == ["PX", 2000]
+
+    def test_px_as_timedelta_is_exact(self):
+        # 1.001 * 1000 is 1000.9999999999999 in floating point
+        assert extract_expire_flags(px=timedelta(milliseconds=1001)) == ["PX", 1001]
+
+    def test_px_as_negative_timedelta_truncates_toward_zero(self):
+        assert extract_expire_flags(px=timedelta(milliseconds=-1001)) == ["PX", -1001]
+        assert extract_expire_flags(px=timedelta(milliseconds=-1500.3)) == [
+            "PX",
+            -1500,
+        ]
+        assert extract_expire_flags(px=timedelta(microseconds=-500)) == ["PX", 0]
+
+    def test_px_as_digit_string(self):
+        assert extract_expire_flags(px="500") == ["PX", 500]
+
+    def test_px_invalid_raises(self):
+        with pytest.raises(
+            DataError, match="px must be datetime.timedelta, int, or a digit string"
+        ):
+            extract_expire_flags(px="not-a-number")
+
+    @pytest.mark.parametrize("option", ["ex", "px"])
+    def test_non_decimal_digit_string_raises_data_error(self, option):
+        # Superscript two passes isdigit() but cannot be parsed by int().
+        with pytest.raises(DataError):
+            extract_expire_flags(**{option: "\u00b2"})
 
     def test_exat_as_int(self):
         assert extract_expire_flags(exat=1700000000) == ["EXAT", 1700000000]
@@ -287,6 +712,51 @@ class TestExtractExpireFlags:
 
     def test_pxat_as_int(self):
         assert extract_expire_flags(pxat=1700000000000) == ["PXAT", 1700000000000]
+
+    def test_pxat_as_datetime_is_exact(self):
+        # int(when.timestamp() * 1000) lands 1 ms low when the seconds part of
+        # the instant sits just above a power of two: the double rounding of
+        # timestamp() survives the *1000 and int() truncates across the
+        # integer boundary (2**31 seconds is 2038-01-19T03:14:08Z).
+        when = datetime(2038, 1, 19, 3, 14, 8, 2000, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 2147483648002]
+        when = datetime(2004, 1, 10, 13, 37, 4, 1000, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 1073741824001]
+        # Sub-millisecond parts still truncate toward zero.
+        when = datetime(2038, 1, 19, 3, 14, 8, 500, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", 2147483648000]
+        # Pre-epoch instants truncate toward zero, as int() did (-1000.5 ms).
+        when = datetime(1969, 12, 31, 23, 59, 58, 999500, tzinfo=timezone.utc)
+        assert extract_expire_flags(pxat=when) == ["PXAT", -1000]
+
+    @pytest.mark.parametrize(
+        ("when", "expected"),
+        [
+            (
+                datetime.min.replace(tzinfo=timezone(timedelta(hours=1))),
+                -62135600400000,
+            ),
+            (
+                datetime.max.replace(tzinfo=timezone(timedelta(hours=-1))),
+                253402304399999,
+            ),
+        ],
+    )
+    def test_pxat_as_aware_datetime_outside_utc_range(self, when, expected):
+        assert extract_expire_flags(pxat=when) == ["PXAT", expected]
+
+    @pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+    def test_pxat_as_naive_datetime_at_upper_boundary(self, monkeypatch):
+        try:
+            with monkeypatch.context() as local_env:
+                local_env.setenv("TZ", "UTC0")
+                time.tzset()
+                assert extract_expire_flags(pxat=datetime.max) == [
+                    "PXAT",
+                    253402300799999,
+                ]
+        finally:
+            time.tzset()
 
     def test_ex_takes_precedence_over_px(self):
         # The flags are checked in order; ex wins when several are given.
@@ -320,6 +790,46 @@ class TestTruncateText:
 
 
 @pytest.mark.fixed_client
+class TestCommandText:
+    def test_regular_command_shows_arguments(self):
+        assert command_text(("SET", b"key", 1)) == "SET key 1"
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            (("AUTH", "user", "secret"), "AUTH <REDACTED>"),
+            (("auth", b"secret"), "auth <REDACTED>"),
+            (("HELLO", 3, "AUTH", "user", "secret"), "HELLO <REDACTED>"),
+            (
+                ("MIGRATE", "host", 6379, "", 0, 10, "AUTH", "secret", "KEYS", "k"),
+                "MIGRATE <REDACTED>",
+            ),
+            (("ACL SETUSER", "user", ">secret"), "ACL SETUSER <REDACTED>"),
+            (("ACL", "SETUSER", "user", ">secret"), "ACL SETUSER <REDACTED>"),
+            (("CONFIG SET", "requirepass", "secret"), "CONFIG SET <REDACTED>"),
+            (("config", "set", "masterauth", "secret"), "config set <REDACTED>"),
+            (
+                ("SENTINEL SET", "mymaster", "auth-pass", "secret"),
+                "SENTINEL SET <REDACTED>",
+            ),
+        ],
+    )
+    def test_credential_command_arguments_redacted(self, command, expected):
+        assert command_text(command) == expected
+
+    def test_credential_command_without_arguments(self):
+        assert command_text(("AUTH",)) == "AUTH"
+        assert command_text(("ACL", "SETUSER")) == "ACL SETUSER"
+
+    def test_other_acl_and_config_subcommands_show_arguments(self):
+        assert command_text(("ACL", "GETUSER", "user")) == "ACL GETUSER user"
+        assert command_text(("CONFIG GET", "maxmemory")) == "CONFIG GET maxmemory"
+
+    def test_empty_command(self):
+        assert command_text(()) == ""
+
+
+@pytest.mark.fixed_client
 class TestDecodeFieldValue:
     def test_non_bytes_value_returned_unchanged(self):
         assert decode_field_value("already-str") == "already-str"
@@ -346,3 +856,90 @@ class TestDecodeFieldValue:
     def test_undecodable_bytes_use_replacement_character(self):
         result = decode_field_value(b"\xff", key="k", field_encodings={"k": "utf-8"})
         assert result == "�"
+
+
+@pytest.mark.fixed_client
+class TestDictMerge:
+    def test_merges_multiple_dicts(self):
+        assert dict_merge({"a": 1, "b": 2}, {"c": 3}) == {"a": 1, "b": 2, "c": 3}
+
+    def test_later_dicts_take_precedence(self):
+        assert dict_merge({"a": 1, "b": 2}, {"b": 3, "c": 4}) == {
+            "a": 1,
+            "b": 3,
+            "c": 4,
+        }
+
+    def test_no_args_returns_empty_dict(self):
+        assert dict_merge() == {}
+
+    def test_does_not_mutate_inputs(self):
+        first = {"a": 1}
+        dict_merge(first, {"a": 2})
+        assert first == {"a": 1}
+
+
+@pytest.mark.fixed_client
+class TestMergeResult:
+    def test_flattens_and_deduplicates_across_nodes(self):
+        merged = merge_result("CMD", {"node1": [1, 2, 3], "node2": [3, 4]})
+        assert sorted(merged) == [1, 2, 3, 4]
+
+    def test_empty_values(self):
+        assert merge_result("CMD", {"node1": []}) == []
+
+    def test_returns_a_list(self):
+        assert isinstance(merge_result("CMD", {"node1": [1], "node2": [2]}), list)
+
+
+@pytest.mark.fixed_client
+class TestListKeysToDict:
+    def test_maps_every_key_to_the_callback(self):
+        def callback():
+            pass
+
+        assert list_keys_to_dict(["GET", "SET"], callback) == {
+            "GET": callback,
+            "SET": callback,
+        }
+
+
+@pytest.mark.fixed_client
+class TestPipelineContextManager:
+    class _FakePipeline:
+        def __init__(self):
+            self.executed = False
+            self.reset_calls = 0
+
+        def execute(self):
+            self.executed = True
+
+        def reset(self):
+            self.reset_calls += 1
+
+    class _FakeRedis:
+        def __init__(self, fake_pipeline):
+            self._fake_pipeline = fake_pipeline
+
+        def pipeline(self):
+            return self._fake_pipeline
+
+    def test_executes_and_resets_on_success(self):
+        fake_pipeline = self._FakePipeline()
+        with pipeline(self._FakeRedis(fake_pipeline)) as p:
+            assert p is fake_pipeline
+        assert fake_pipeline.executed is True
+        assert fake_pipeline.reset_calls == 1
+
+    def test_resets_but_does_not_execute_on_exception(self):
+        # A pipeline using WATCH holds a real connection checked out from
+        # the pool as soon as watch() is called - reset() is what returns
+        # it. Without a guaranteed reset() on this path, that connection
+        # stayed checked out until the pipeline object happened to be
+        # garbage collected.
+        fake_pipeline = self._FakePipeline()
+        with pytest.raises(ValueError):
+            with pipeline(self._FakeRedis(fake_pipeline)):
+                raise ValueError("boom")
+        assert fake_pipeline.executed is False
+        assert fake_pipeline.reset_calls == 1

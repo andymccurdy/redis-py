@@ -112,4 +112,50 @@ The following commands are not supported:
 - ``EVAL_RO``
 - ``EVALSHA_RO``
 
-Using scripting within pipelines in cluster mode is **not supported**.
+``EVALSHA`` can be used inside a ``ClusterPipeline``. Keys must map to the
+same hash slot (or ``numkeys`` may be ``0``, in which case the command is
+routed to a random primary, exactly as in the non-pipelined case above). In a
+transactional pipeline (``pipeline(transaction=True)``), zero-key ``EVALSHA``
+reuses the transaction's existing slot when one is already chosen, so multiple
+zero-key scripts (or a mix with keyed commands) stay single-slot.
+
+``load_scripts`` and ``script_load_for_pipeline`` remain **not supported**
+on cluster pipelines. On the sync client, ``ClusterPipeline.eval()`` is also
+blocked; the async cluster pipeline has no ``eval`` override.
+
+Important caveats when using ``EVALSHA`` in a cluster pipeline:
+
+- The Lua script cache in Redis is **per-node and is not replicated**.
+  ``SCRIPT LOAD`` loads the script onto the *current* primaries only, at the
+  moment it is called.
+- Any topology change -- a failover that promotes a replica, a rolling
+  upgrade that replaces nodes, resharding, or adding a new shard -- can route
+  an ``EVALSHA`` to a node whose cache does not contain the script, which
+  fails with ``NOSCRIPT`` (``redis.exceptions.NoScriptError``).
+- Unlike the non-pipelined ``Script`` object, **a cluster pipeline performs no
+  automatic reload or retry** on ``NOSCRIPT``. Recovery is the caller's
+  responsibility: catch ``NoScriptError``, re-run ``SCRIPT LOAD``, then retry
+  only when replay is safe (for example an idempotent or single-command
+  pipeline). Blindly re-executing a multi-command pipeline can duplicate
+  side effects: Redis still runs the rest of a non-transactional batch when
+  one ``EVALSHA`` returns ``NOSCRIPT``, and the client raises only after
+  reading every response. Because zero-key ``EVALSHA`` is routed to a random
+  primary, the script must be present on **all** primaries.
+- In a **transactional** pipeline, a ``NOSCRIPT`` from ``EVALSHA`` is raised at
+  ``EXEC`` time and does **not** roll back the other commands (this follows
+  Redis ``MULTI``/``EXEC`` semantics), so partial application is possible.
+
+.. code:: python
+
+   >>> from redis.exceptions import NoScriptError
+   >>> sha = rc.script_load(lua)  # loads on all current primaries
+   >>> def run():
+   ...     with rc.pipeline() as pipe:
+   ...         pipe.evalsha(sha, 1, "{user}:1")
+   ...         return pipe.execute()
+   >>> try:
+   ...     result = run()
+   ... except NoScriptError:
+   ...     # single-command pipeline: safe to reload and retry
+   ...     sha = rc.script_load(lua)  # reload on current primaries
+   ...     result = run()

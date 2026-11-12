@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Python client for Redis database and key-value store"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Redis Inc.", email = "oss@redis.com" }]
 keywords = ["Redis", "database", "key-value-store"]
 classifiers = [
@@ -20,11 +20,11 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
@@ -42,12 +42,12 @@ xxhash = [
 ]
 
 ocsp = [
-    "cryptography>=36.0.1",
-    "pyopenssl>=20.0.1",
+    "cryptography>=41.0.0",
+    "pyopenssl>=23.2.0",
     "requests>=2.31.0",
 ]
 jwt = [
-    "PyJWT>=2.13.0",
+    "PyJWT>=2.15.1",
 ]
 circuit_breaker = [
     "pybreaker>=1.4.0"
@@ -99,14 +99,24 @@ filterwarnings = [
     "ignore:sys.monitoring isn't available:coverage.exceptions.CoverageWarning",
 ]
 log_cli_level = "INFO"
-log_cli_date_format = "%H:%M:%S:%f"
+# `%f` is not a strftime directive, so it renders literally. Sub-second
+# resolution has to come from `%(msecs)03d` in the format string instead - and it
+# is not optional: maintenance notifications arrive on all of a pool's
+# connections within a few milliseconds of each other.
+log_cli_date_format = "%H:%M:%S"
 log_cli = false
-log_cli_format = "%(asctime)s %(levelname)s %(threadName)s: %(message)s"
+log_cli_format = "%(asctime)s.%(msecs)03d %(levelname)s %(threadName)s: %(message)s"
+# `log_format`/`log_date_format` are what the "Captured log" sections of a
+# failure report use. Without them pytest falls back to a default format with no
+# timestamp at all, which makes it impossible to order a command failure against
+# the push notification that was supposed to precede it.
+log_format = "%(asctime)s.%(msecs)03d %(levelname)-8s %(threadName)s %(name)s:%(filename)s:%(lineno)s %(message)s"
+log_date_format = "%H:%M:%S"
 log_level = "INFO"
 capture = "yes"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 exclude = [
     "*.egg-info",

@@ -51,7 +51,7 @@ class AbstractBloom:
     @staticmethod
     def append_no_scale(params, noScale):
         """Append NONSCALING tag to params."""
-        if noScale is not None:
+        if noScale:
             params.extend(["NONSCALING"])
 
     @staticmethod
@@ -64,7 +64,7 @@ class AbstractBloom:
     @staticmethod
     def append_no_create(params, noCreate):
         """Append NOCREATE tag to params."""
-        if noCreate is not None:
+        if noCreate:
             params.extend(["NOCREATE"])
 
     @staticmethod
@@ -92,6 +92,12 @@ class AbstractBloom:
         """Append BUCKETSIZE to params."""
         if bucket_size is not None:
             params.extend(["BUCKETSIZE", bucket_size])
+
+    @staticmethod
+    def append_cell_size(params, cell_size):
+        """Append CELL_SIZE to params."""
+        if cell_size is not None:
+            params.extend(["CELL_SIZE", cell_size])
 
 
 class _CMSBloomBase(CMSCommands, AbstractBloom):

@@ -7,6 +7,8 @@ from redis.asyncio.client import StrictRedis
 
 import redis.asyncio.sentinel
 from redis import exceptions
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
 from redis.asyncio.sentinel import (
     MasterNotFoundError,
     ReplicaNotFoundError,
@@ -29,6 +31,7 @@ class SentinelTestClient:
     async def sentinel_masters(self):
         self.cluster.connection_error_if_down(self)
         self.cluster.timeout_if_down(self)
+        self.cluster.response_error_if_down(self)
         return {self.cluster.service_name: self.cluster.master}
 
     async def sentinel_slaves(self, master_name):
@@ -60,6 +63,7 @@ class SentinelTestCluster:
         self.slaves = []
         self.nodes_down = set()
         self.nodes_timeout = set()
+        self.nodes_response_error = set()
 
     def connection_error_if_down(self, node):
         if node.id in self.nodes_down:
@@ -68,6 +72,12 @@ class SentinelTestCluster:
     def timeout_if_down(self, node):
         if node.id in self.nodes_timeout:
             raise exceptions.TimeoutError
+
+    def response_error_if_down(self, node):
+        if node.id in self.nodes_response_error:
+            raise exceptions.ResponseError(
+                "unknown command 'SENTINEL', with args beginning with: 'masters'"
+            )
 
     def client(self, host, port, **kwargs):
         return SentinelTestClient(self, (host, port))
@@ -147,6 +157,26 @@ async def test_discover_master_sentinel_timeout(cluster, sentinel, master_ip):
     assert address == (master_ip, 6379)
     # 'bar' is now first sentinel
     assert sentinel.sentinels[0].id == ("bar", 26379)
+
+
+@pytest.mark.onlynoncluster
+async def test_discover_master_sentinel_response_error(cluster, sentinel, master_ip):
+    # 'foo' answers SENTINEL MASTERS with an error reply (a node that is not a
+    # sentinel, or an ACL that denies the command): try 'bar' instead
+    cluster.nodes_response_error.add(("foo", 26379))
+    address = await sentinel.discover_master("mymaster")
+    assert address == (master_ip, 6379)
+    # 'bar' is now first sentinel
+    assert sentinel.sentinels[0].id == ("bar", 26379)
+
+
+@pytest.mark.onlynoncluster
+async def test_discover_master_error_names_response_error(cluster, sentinel):
+    cluster.nodes_response_error.update({("foo", 26379), ("bar", 26379)})
+    with pytest.raises(
+        MasterNotFoundError, match="ResponseError: unknown command 'SENTINEL'"
+    ):
+        await sentinel.discover_master("mymaster")
 
 
 @pytest.mark.onlynoncluster
@@ -538,3 +568,36 @@ async def test_himport_prepare_set_survives_reconnect(deployed_sentinel):
     await master.delete("himport:sentinel:async:2")
     await master.himport_set("himport:sentinel:async:2", "users", ["bob", "b@x.com"])
     assert await master.hget("himport:sentinel:async:2", "email") == "b@x.com"
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_do_not_retry_by_default():
+    # Master discovery moves on to the next sentinel by itself; retrying an
+    # unreachable sentinel with the client default policy multiplies its timeout.
+    sentinel = Sentinel([("localhost", 26379), ("localhost", 26380)])
+    assert [s.get_retry().get_retries() for s in sentinel.sentinels] == [0, 0]
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_retry_once_on_error_when_asked():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry_on_error": [exceptions.ConnectionError]},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 1
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_use_the_given_retry():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry": Retry(ExponentialBackoff(), 2)},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 2
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_kwargs_are_not_modified():
+    sentinel_kwargs = {"socket_timeout": 1}
+    Sentinel([("localhost", 26379)], sentinel_kwargs=sentinel_kwargs)
+    assert sentinel_kwargs == {"socket_timeout": 1}

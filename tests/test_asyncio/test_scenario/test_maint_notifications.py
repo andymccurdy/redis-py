@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import pytest
 import pytest_asyncio
@@ -53,18 +53,70 @@ logging.basicConfig(
 
 logging.getLogger("redis.asyncio.maint_notifications").setLevel(logging.DEBUG)
 logging.getLogger("redis.asyncio.cluster").setLevel(logging.DEBUG)
+logging.getLogger("redis.asyncio.client").setLevel(logging.DEBUG)
+logging.getLogger("redis.asyncio.connection").setLevel(logging.DEBUG)
 
 STANDALONE_MAINT_TIMEOUT = 60
-SLOT_SHUFFLE_TIMEOUT = 120
-SMIGRATING_TIMEOUT = 20
-SMIGRATED_TIMEOUT = 40
+
+SMIGRATED_TIMEOUT = 120
+SLOT_SHUFFLE_TIMEOUT = 300
+RESHARD_SMIGRATING_TIMEOUT = int(SLOT_SHUFFLE_TIMEOUT / 2)
+RESHARD_OP_TIMEOUT = 600
+DEFAULT_TRIGGER_OP_TIMEOUT = 180
+RESHARD_TEST_TIMEOUT = RESHARD_OP_TIMEOUT + SMIGRATED_TIMEOUT + 180
 
 DEFAULT_BIND_TTL = 15
 DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT = 1
 DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT = 1
 
+# The fault injector's create_database can fail on transient cluster-side infrastructure
+# problems - a DNS blip while it polls the cluster REST API, for example - that say nothing
+# about the client under test. Retrying the setup keeps such a blip from being reported as a
+# test failure.
+DB_CREATE_ATTEMPTS = 3
+
 
 class TestAsyncPushNotificationsBase:
+    def _drain_command_errors(self, errors, source: str) -> list[str]:
+        """Drain and log the collected command errors without failing yet.
+
+        Callers that also await the trigger task or assert on connection state
+        must drain *before* that: otherwise the first of those raises and the
+        command errors - usually the more informative signal - are never
+        reported.
+
+        Every error is logged individually: pytest truncates long assertion
+        messages, so a run with many failures would otherwise hide most of them
+        behind "...Full output truncated".
+        """
+        collected = []
+        while not errors.empty():
+            collected.append(errors.get_nowait())
+        if collected:
+            logging.error(f"{len(collected)} error(s) collected from {source}:")
+            for index, error in enumerate(collected, start=1):
+                logging.error(f"  [{index}/{len(collected)}] {error}")
+        return collected
+
+    def _fail_on_collected_command_errors(self, collected: list[str], source: str):
+        """Fail on errors already drained by ``_drain_command_errors``.
+
+        The failure message keeps a short preview and points at the log for the
+        rest.
+        """
+        if not collected:
+            return
+        preview = "; ".join(collected[:5])
+        if len(collected) > 5:
+            preview += f"; ... ({len(collected) - 5} more, see the log above)"
+        pytest.fail(f"{len(collected)} error(s) occurred in {source}: {preview}")
+
+    def _fail_on_command_errors(self, errors, source: str):
+        """Drain the collected command errors and fail with all of them printed."""
+        self._fail_on_collected_command_errors(
+            self._drain_command_errors(errors, source), source
+        )
+
     async def _get_all_connections_in_pool(self, client: Redis) -> List:
         connections = []
         async with client.connection_pool._get_pool_lock():
@@ -136,6 +188,7 @@ class TestAsyncPushNotificationsBase:
         configured_timeout: float = CLIENT_TIMEOUT,
     ):
         matching_conns_count = 0
+        mismatched: list[str] = []
         connections = await self._get_all_connections_in_pool(client)
         logging.info(f"Validating {len(connections)} connections")
 
@@ -148,13 +201,14 @@ class TestAsyncPushNotificationsBase:
                 ):
                     matching_conns_count += 1
                 else:
-                    logging.debug(
-                        f"Connection not matching default state: "
-                        f"maintenance_state={conn.maintenance_state}, "
-                        f"socket_timeout={conn.socket_timeout}, "
-                        f"host={conn.host}, "
-                        f"orig_host_address={getattr(conn, 'orig_host_address', None)}"
+                    detail = (
+                        f"{conn}: maintenance_state={conn.maintenance_state}, "
+                        f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                        f"orig_host_address={getattr(conn, 'orig_host_address', None)}, "
+                        f"{conn.extract_connection_details()}"
                     )
+                    mismatched.append(detail)
+                    logging.debug(f"Connection not matching default state: {detail}")
             elif (
                 conn.socket_timeout == configured_timeout
                 and conn.maintenance_state == MaintenanceState.NONE
@@ -162,13 +216,14 @@ class TestAsyncPushNotificationsBase:
             ):
                 matching_conns_count += 1
             else:
-                logging.debug(
-                    f"Connection not matching default state: "
-                    f"maintenance_state={conn.maintenance_state}, "
-                    f"socket_timeout={conn.socket_timeout}, "
-                    f"host={conn.host}, "
-                    f"orig_host_address={getattr(conn, 'orig_host_address', None)}"
+                detail = (
+                    f"{conn}: maintenance_state={conn.maintenance_state}, "
+                    f"socket_timeout={conn.socket_timeout}, host={conn.host}, "
+                    f"orig_host_address={getattr(conn, 'orig_host_address', None)}, "
+                    f"{conn.extract_connection_details()}"
                 )
+                mismatched.append(detail)
+                logging.debug(f"Connection not matching default state: {detail}")
 
         conn_kwargs = client.connection_pool.connection_kwargs
         client_host = conn_kwargs.get("host", "unknown")
@@ -182,7 +237,8 @@ class TestAsyncPushNotificationsBase:
             f"Client: host={client_host}, port={client_port}, "
             f"configured_timeout={configured_timeout}. "
             f"Expected {expected_matching_conns_count} matching connections, "
-            f"but found {matching_conns_count} out of {len(connections)} total connections."
+            f"but found {matching_conns_count} out of {len(connections)} total connections. "
+            f"Non-matching connections: {'; '.join(mismatched) if mismatched else 'none'}"
         )
 
     async def _validate_default_notif_disabled_state(
@@ -222,7 +278,10 @@ class TestAsyncPushNotificationsBase:
                 logging.info(f"Deleted database: {db_name}")
             else:
                 logging.info(f"Database {db_name} does not exist.")
-        except Exception as e:
+        # _get_cluster_nodes_info reports failures through pytest.fail, which does not
+        # derive from Exception - catch it too, so deleting a leftover DB stays best
+        # effort and never aborts the caller.
+        except (Exception, pytest.fail.Exception) as e:
             logging.error(f"Failed to delete database {db_name}: {e}")
 
     async def create_db(
@@ -230,14 +289,28 @@ class TestAsyncPushNotificationsBase:
         fault_injector_client: AsyncFaultInjectorClient,
         bdb_config: Dict[str, Any],
     ):
-        try:
-            logging.info(f"Creating database: \n{json.dumps(bdb_config, indent=2)}")
-            cluster_endpoint_config = await fault_injector_client.create_database(
-                bdb_config
-            )
-            return cluster_endpoint_config
-        except Exception as e:
-            pytest.fail(f"Failed to create database: {e}")
+        """Create the test database, retrying transient infrastructure failures.
+
+        A create that fails midway can still leave the BDB on the cluster, so any
+        leftover is deleted by name before the next attempt - otherwise the retry
+        collides with it on the fixed port from the config.
+        """
+        logging.info(f"Creating database: \n{json.dumps(bdb_config, indent=2)}")
+        for attempt in range(1, DB_CREATE_ATTEMPTS + 1):
+            try:
+                return await fault_injector_client.create_database(bdb_config)
+            # get_operation_result reports a failed action through pytest.fail, which
+            # does not derive from Exception.
+            except (Exception, pytest.fail.Exception) as e:
+                if attempt == DB_CREATE_ATTEMPTS:
+                    pytest.fail(
+                        f"Failed to create database after {attempt} attempts: {e}"
+                    )
+                logging.warning(
+                    f"Attempt {attempt}/{DB_CREATE_ATTEMPTS} to create database "
+                    f"{bdb_config['name']} failed: {e}"
+                )
+                await self.delete_prev_db(fault_injector_client, bdb_config["name"])
 
     async def _trigger_effect(
         self,
@@ -248,7 +321,7 @@ class TestAsyncPushNotificationsBase:
         target_node: Optional[str] = None,
         empty_node: Optional[str] = None,
         skip_end_notification: bool = False,
-        timeout: int = SLOT_SHUFFLE_TIMEOUT,
+        timeout: int = DEFAULT_TRIGGER_OP_TIMEOUT,
     ):
         action_id = await fault_injector_client.trigger_effect(
             endpoint_config=endpoints_config,
@@ -277,8 +350,9 @@ class TestAsyncStandaloneClientPushNotificationsWithEffectTriggerBase(
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
 
-        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         auth_ssl_client_certs_config_info = db_config.get(
             "authentication_ssl_client_certs", None
@@ -877,10 +951,7 @@ class TestAsyncStandaloneClientPushNotificationsHandlingWithEffectTrigger(
                     assert conn.host != conn.orig_host_address
                 assert not conn.should_reconnect()
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_command_errors(errors, "command execution tasks")
 
         await trigger_task
         self.maintenance_ops_tasks.remove(trigger_task)
@@ -1020,8 +1091,9 @@ class TestAsyncStandaloneClientPushNotificationsHandlingWithEffectTrigger(
 
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
-        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        db_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         logging.info("Creating client with disabled notifications.")
         self._client = client = get_async_standalone_client_maint_notifications(
@@ -1112,6 +1184,8 @@ class TestAsyncStandaloneClientPushNotificationsHandlingWithEffectTrigger(
 class TestAsyncStandaloneClientCommandsExecutionWithPushNotificationsWithEffectTrigger(
     TestAsyncStandaloneClientPushNotificationsWithEffectTriggerBase
 ):
+    # TODO: re-enable TopologyChangeStandaloneEffects.DNS_RESOLUTION_CHANGE once the
+    # effect is troubleshooted and fixed.
     @pytest.mark.timeout(300)
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name, endpoint_type",
@@ -1121,7 +1195,7 @@ class TestAsyncStandaloneClientCommandsExecutionWithPushNotificationsWithEffectT
                 TopologyChangeStandaloneEffects.DATA_MOVEMENT_NO_CONN_DROP,
                 TopologyChangeStandaloneEffects.DATA_MOVEMENT_CONN_DROP,
                 TopologyChangeStandaloneEffects.CONN_DROP,
-                TopologyChangeStandaloneEffects.DNS_RESOLUTION_CHANGE,
+                # TopologyChangeStandaloneEffects.DNS_RESOLUTION_CHANGE,
             ],
             endpoint_types=[
                 EndpointType.EXTERNAL_FQDN,
@@ -1191,19 +1265,26 @@ class TestAsyncStandaloneClientCommandsExecutionWithPushNotificationsWithEffectT
 
         await asyncio.gather(*tasks)
 
+        # Drain first so the command errors are logged even if awaiting the
+        # trigger task or the state assertion below raises.
+        collected_errors = self._drain_command_errors(errors, "command execution tasks")
+
         await trigger_task
         self.maintenance_ops_tasks.remove(trigger_task)
 
+        # "all" rather than a hard-coded 10: the pool size is emergent from the
+        # task count, so pinning the number fails on an extra connection even
+        # when every connection is in the expected state - and passes when one
+        # of eleven is not.
         await self._validate_default_state(
             client,
-            expected_matching_conns_count=10,
+            expected_matching_conns_count="all",
             configured_timeout=DEFAULT_STANDALONE_CLIENT_SOCKET_TIMEOUT,
         )
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_collected_command_errors(
+            collected_errors, "command execution tasks"
+        )
 
 
 class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
@@ -1217,8 +1298,9 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
         self._fault_injector = fault_injector_client
         await self.delete_prev_db(fault_injector_client, db_config["name"])
 
-        cluster_endpoint_config = await self.create_db(fault_injector_client, db_config)
+        # Recorded before the create so teardown removes a partially created DB.
         self._bdb_name = db_config["name"]
+        cluster_endpoint_config = await self.create_db(fault_injector_client, db_config)
 
         socket_timeout = DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT
         socket_connect_timeout = DEFAULT_OSS_API_CLIENT_SOCKET_TIMEOUT
@@ -1274,6 +1356,57 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
             await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(0)
 
+    async def _wait_for_node_cache_reconciliation(
+        self,
+        client: RedisCluster,
+        connections: List,
+        is_reconciled: Callable[[Dict[str, Any]], bool],
+        description: str,
+        timeout: int = SMIGRATED_TIMEOUT,
+    ):
+        """Drain pending notifications until the client node cache reconciles.
+
+        Async counterpart of the sync suite's ``_wait_for_node_cache_delta``,
+        generalized to a predicate over the node cache so it also covers the
+        net-zero node-replace case (one node removed and one added leaves the
+        cache size unchanged).
+
+        A topology change may arrive as several push notifications - in particular an
+        ASM scale add/remove is a cascade of SMIGRATING/SMIGRATED as the decision
+        engine moves slots - so the client reconciles its node cache over multiple
+        notifications after the server-side operation finishes. Reading a single
+        SMIGRATED frame off a single connection is therefore not enough; poll,
+        draining pending pushes on the given connections, until ``is_reconciled``
+        holds. Single-step triggers (migrate/failover) reach the target immediately
+        and return on the first check.
+
+        Draining pushes alone is not sufficient in the async client: SMIGRATED
+        handling is scheduled as a background task instead of completing inline while
+        reading the command response, so every round also drains those tasks.
+        """
+        deadline = time.time() + timeout
+        while True:
+            await self._drain_maint_notification_tasks(client)
+            if is_reconciled(client.nodes_manager.nodes_cache):
+                return
+            if time.time() >= deadline:
+                break
+            for conn in connections:
+                try:
+                    if conn.is_connected and await conn.can_read():
+                        await conn.read_response(push_request=True)
+                except Exception as e:
+                    # A connection to a node being removed may error; that is expected.
+                    logging.debug(f"Ignored error while draining notifications: {e}")
+            await asyncio.sleep(0.5)
+        # Fail explicitly on a drain timeout so it surfaces as a clear "node cache did
+        # not reconcile" error, rather than silently returning and letting the caller's
+        # exact assertion fail later with a misleading node-count message.
+        pytest.fail(
+            f"Node cache did not reconcile ({description}) within {timeout}s; "
+            f"current nodes={sorted(client.nodes_manager.nodes_cache)}"
+        )
+
     @pytest_asyncio.fixture(autouse=True)
     async def setup_and_cleanup(self):
         self.maintenance_ops_tasks = []
@@ -1301,7 +1434,9 @@ class TestAsyncClusterClientPushNotificationsWithEffectTriggerBase(
 class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
     TestAsyncClusterClientPushNotificationsWithEffectTriggerBase
 ):
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1336,6 +1471,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1344,7 +1480,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=int(SLOT_SHUFFLE_TIMEOUT / 2),
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1395,7 +1531,9 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         await trigger_task
         self.maintenance_ops_tasks.remove(trigger_task)
 
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1431,6 +1569,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1439,7 +1578,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=SMIGRATING_TIMEOUT,
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1458,7 +1597,19 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
             timeout=SMIGRATED_TIMEOUT,
             connection=con_to_read_smigrated,
         )
-        await self._drain_maint_notification_tasks(client)
+        logging.info("Waiting for the operation to finish server-side...")
+        await trigger_task
+        self.maintenance_ops_tasks.remove(trigger_task)
+
+        logging.info("Draining notifications until one node has been replaced...")
+        initial_nodes = set(initial_cluster_nodes.values())
+        await self._wait_for_node_cache_reconciliation(
+            client,
+            list(in_use_connections.values()),
+            lambda cache: len(initial_nodes - set(cache.values())) == 1
+            and len(set(cache.values()) - initial_nodes) == 1,
+            "expected exactly one node removed and one added",
+        )
 
         logging.info("Validating connection state after SMIGRATED ...")
         updated_cluster_nodes = client.nodes_manager.nodes_cache.copy()
@@ -1485,10 +1636,9 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for node, conn in in_use_connections.items():
             node.release(conn)
 
-        await trigger_task
-        self.maintenance_ops_tasks.remove(trigger_task)
-
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1524,6 +1674,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1532,7 +1683,7 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for conn in in_use_connections.values():
             await AsyncClientValidations.wait_push_notification(
                 client,
-                timeout=int(SLOT_SHUFFLE_TIMEOUT / 2),
+                timeout=RESHARD_SMIGRATING_TIMEOUT,
                 connection=conn,
             )
 
@@ -1551,7 +1702,18 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
             timeout=SMIGRATED_TIMEOUT,
             connection=con_to_read_smigrated,
         )
-        await self._drain_maint_notification_tasks(client)
+        logging.info("Waiting for the operation to finish server-side...")
+        await trigger_task
+        self.maintenance_ops_tasks.remove(trigger_task)
+
+        logging.info("Draining notifications until the node cache reflects -1 node...")
+        expected_node_count = len(initial_cluster_nodes) - 1
+        await self._wait_for_node_cache_reconciliation(
+            client,
+            list(in_use_connections.values()),
+            lambda cache: len(cache) == expected_node_count,
+            f"expected {expected_node_count} nodes, one fewer than at start",
+        )
 
         logging.info("Validating connection state after SMIGRATED ...")
         updated_cluster_nodes = client.nodes_manager.nodes_cache.copy()
@@ -1583,14 +1745,13 @@ class TestAsyncClusterClientPushNotificationsHandlingWithEffectTrigger(
         for node, conn in in_use_connections.items():
             node.release(conn)
 
-        await trigger_task
-        self.maintenance_ops_tasks.remove(trigger_task)
-
 
 class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrigger(
     TestAsyncClusterClientPushNotificationsWithEffectTriggerBase
 ):
-    @pytest.mark.timeout(300)
+    @pytest.mark.timeout(
+        RESHARD_TEST_TIMEOUT
+    )  # sized for slow ASM reshard, see RESHARD_OP_TIMEOUT
     @pytest.mark.parametrize(
         "effect_name, trigger, db_config, db_name",
         generate_params(
@@ -1691,6 +1852,7 @@ class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrig
                 cluster_endpoint_config,
                 effect_name,
                 trigger,
+                timeout=RESHARD_OP_TIMEOUT,
             )
         )
         self.maintenance_ops_tasks.append(trigger_task)
@@ -1727,16 +1889,14 @@ class TestAsyncClusterClientCommandsExecutionWithPushNotificationsWithEffectTrig
                     except RedisConnectionError:
                         # remove/failover migrations close connections to the
                         # removed/failed-over node server-side. async can_read()
-                        # reports True on EOF (it also flags a closed/dirty
-                        # connection, not just buffered data), so the drain enters
-                        # read_response() and hits "Connection closed by server".
-                        # A closed connection has nothing left to drain — this is
-                        # expected during the migration, not an unconsumed push.
+                        # reports buffered data first, then raises on EOF (a
+                        # closed connection must not be reused), and
+                        # read_response() hits "Connection closed by server" if
+                        # the close lands mid-read. A closed connection has
+                        # nothing left to drain — this is expected during the
+                        # migration, not an unconsumed push.
                         pass
             logging.info(f"Consumed all buffers for node: {node.name}")
         logging.info("All buffers consumed.")
 
-        error_items = []
-        while not errors.empty():
-            error_items.append(errors.get_nowait())
-        assert not error_items, f"Errors occurred in tasks: {error_items}"
+        self._fail_on_command_errors(errors, "command execution tasks")

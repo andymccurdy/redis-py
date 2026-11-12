@@ -8,6 +8,11 @@ from redis.asyncio.observability.recorder import (
     record_connection_relaxed_timeout,
     record_maint_notification_count,
 )
+from redis.event import (
+    MaintenanceCompletedEvent,
+    MaintenanceEvent,
+    MaintenanceStartedEvent,
+)
 from redis.maint_notifications import (
     MaintenanceNotification,
     MaintenanceState,
@@ -15,6 +20,7 @@ from redis.maint_notifications import (
     NodeMovingNotification,
     OSSNodeMigratedNotification,
     OSSNodeMigratingNotification,
+    _dispatch_maintenance_event,
     _get_maintenance_notification_name,
     _get_maintenance_notification_type,
     _should_skip_connection_timeout_update,
@@ -56,28 +62,17 @@ def add_debug_log_for_notification(
     if not logger.isEnabledFor(logging.DEBUG):
         return
 
-    socket_address = None
+    details = "no connection"
     try:
-        writer = getattr(connection, "_writer", None)
-        socket_name = writer.get_extra_info("sockname") if writer else None
-        socket_address = (
-            socket_name[1] if socket_name and len(socket_name) > 1 else None
-        )
+        extract = getattr(connection, "extract_connection_details", None)
+        if callable(extract):
+            details = extract()
     except (AttributeError, OSError, TypeError):
-        pass
-
-    resolved_ip = None
-    try:
-        get_resolved_ip = getattr(connection, "get_resolved_ip", None)
-        if callable(get_resolved_ip):
-            resolved_ip = get_resolved_ip()
-    except (AttributeError, OSError):
         pass
 
     logger.debug(
         f"Handling maintenance notification: {notification}, "
-        f"with connection: {connection}, connected to ip {resolved_ip}, "
-        f"local socket port: {socket_address}",
+        f"with connection: {connection}, {details}",
     )
 
 
@@ -91,6 +86,8 @@ class AsyncMaintNotificationsPoolHandler:
         self.config = config
         self._processed_notifications: set[MaintenanceNotification] = set()
         self._scheduled_tasks: set[asyncio.Task[None]] = set()
+        # The handoffs whose scheduled cleanup has not finished yet
+        self._pending_handoffs: set[NodeMovingNotification] = set()
         self._lock = asyncio.Lock()
         self.connection: Any | None = None
 
@@ -105,6 +102,7 @@ class AsyncMaintNotificationsPoolHandler:
         copy = AsyncMaintNotificationsPoolHandler(self.pool, self.config)
         copy._processed_notifications = self._processed_notifications
         copy._scheduled_tasks = self._scheduled_tasks
+        copy._pending_handoffs = self._pending_handoffs
         copy._lock = self._lock
         copy.connection = None
         return copy
@@ -152,38 +150,76 @@ class AsyncMaintNotificationsPoolHandler:
                 self.connection.getpeername() if self.connection else None
             )
 
-            # The async pool owns the active/free connection collections and
-            # asyncio.Lock is not reentrant, so the whole MOVING pool mutation
-            # has to be one pool-owned atomic operation. The handler still owns
-            # the notification policy and passes the already-decided inputs.
-            await self.pool.apply_moving_notification(
-                notification=notification,
-                config=self.config,
-                moving_address_src=moving_address_src,
-                run_proactive_reconnect=(
-                    self.config.proactive_reconnect
-                    and notification.new_node_host is not None
-                ),
-            )
+            # Reported before the pool is relaxed: taking over a connection
+            # under maintenance completes that connection's pair, and a
+            # listener must see the handoff's pair open by then rather than
+            # no relaxation at all.
+            self._dispatch_handoff_event(MaintenanceStartedEvent, notification)
 
-            if self.config.proactive_reconnect and notification.new_node_host is None:
-                self._schedule(
-                    notification.ttl / 2,
-                    self.run_proactive_reconnect,
-                    moving_address_src,
+            try:
+                # The async pool owns the active/free connection collections
+                # and asyncio.Lock is not reentrant, so the whole MOVING pool
+                # mutation has to be one pool-owned atomic operation. The
+                # handler still owns the notification policy and passes the
+                # already-decided inputs.
+                await self.pool.apply_moving_notification(
+                    notification=notification,
+                    config=self.config,
+                    moving_address_src=moving_address_src,
+                    run_proactive_reconnect=(
+                        self.config.proactive_reconnect
+                        and notification.new_node_host is not None
+                    ),
                 )
 
-            self._schedule(
-                notification.ttl,
-                self.handle_node_moved_notification,
-                notification,
-            )
+                if (
+                    self.config.proactive_reconnect
+                    and notification.new_node_host is None
+                ):
+                    self._schedule(
+                        notification.ttl / 2,
+                        self.run_proactive_reconnect,
+                        moving_address_src,
+                    )
+
+                self._schedule(
+                    notification.ttl,
+                    self.handle_node_moved_notification,
+                    notification,
+                )
+                self._pending_handoffs.add(notification)
+            except BaseException:
+                # The relaxation reported above was not applied, or has no
+                # cleanup to end it: close its pair
+                self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+                raise
 
             await record_connection_handoff(
                 pool_name=get_pool_name(self.pool),
             )
 
             self._processed_notifications.add(notification)
+
+    def _dispatch_handoff_event(
+        self,
+        event_type: type[MaintenanceEvent],
+        notification: NodeMovingNotification,
+    ) -> None:
+        """
+        Report a handoff's relaxation. The events report relaxed timeouts; a
+        handoff handled only for the proactive reconnect relaxes nothing.
+        """
+        if self.config.is_relaxed_timeouts_enabled():
+            _dispatch_maintenance_event(
+                self.config,
+                event_type(
+                    connection_pool=self.pool,
+                    connection=self.connection,
+                    state=MaintenanceState.MOVING,
+                    notification=notification,
+                    config=self.config,
+                ),
+            )
 
     async def run_proactive_reconnect(
         self, moving_address_src: str | None = None
@@ -203,30 +239,48 @@ class AsyncMaintNotificationsPoolHandler:
 
     async def handle_node_moved_notification(
         self, notification: NodeMovingNotification
-    ) -> None:
+    ) -> bool:
         """
         Handle the cleanup after a node moving notification expires.
+
+        Returns whether the cleanup reverted the connection kwargs; it does not
+        when a newer MOVING notification has superseded this one.
         """
+        async with self._lock:
+            return await self._revert_node_moved_notification(notification)
+
+    async def _revert_node_moved_notification(
+        self, notification: NodeMovingNotification
+    ) -> bool:
+        # Runs under self._lock
         notification_hash = hash(notification)
 
-        async with self._lock:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"Reverting temporary changes related to notification: {notification}, "
-                    f"with connection: {self.connection}, connected to ip "
-                    f"{self.connection.get_resolved_ip() if self.connection else None}"
-                )
-            reset_relaxed_timeout = self.config.is_relaxed_timeouts_enabled()
-            reset_host_address = self.config.proactive_reconnect
-
-            # Cleanup has to reset future connection kwargs and existing
-            # matching connections together under the pool lock. Splitting it
-            # lets an acquire/release interleave and leaves stale MOVING state.
-            await self.pool.cleanup_moving_notification(
-                notification_hash=notification_hash,
-                reset_relaxed_timeout=reset_relaxed_timeout,
-                reset_host_address=reset_host_address,
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Reverting temporary changes related to notification: {notification}, "
+                f"with connection: {self.connection}, connected to ip "
+                f"{self.connection.get_resolved_ip() if self.connection else None}"
             )
+        reset_relaxed_timeout = self.config.is_relaxed_timeouts_enabled()
+        reset_host_address = self.config.proactive_reconnect
+
+        # Cleanup has to reset future connection kwargs and existing
+        # matching connections together under the pool lock. Splitting it
+        # lets an acquire/release interleave and leaves stale MOVING state.
+        reverted = await self.pool.cleanup_moving_notification(
+            notification_hash=notification_hash,
+            reset_relaxed_timeout=reset_relaxed_timeout,
+            reset_host_address=reset_host_address,
+        )
+
+        # Discarded once the cleanup is done, so one cancelled halfway is
+        # still run by cancel_scheduled_tasks(), and before the listeners run
+        self._pending_handoffs.discard(notification)
+        # A newer MOVING notification has superseded this one when the
+        # kwargs were not reverted: the pool stays relaxed until it expires.
+        if reverted:
+            self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+        return reverted
 
     def _schedule(
         self,
@@ -259,12 +313,33 @@ class AsyncMaintNotificationsPoolHandler:
         await callback(*args)
 
     async def cancel_scheduled_tasks(self) -> None:
-        if not self._scheduled_tasks:
-            return
-        tasks = tuple(self._scheduled_tasks)
-        for task in tasks:
-            task.cancel()
+        # Taken under the lock so a MOVING still being handled finishes, and
+        # schedules its cleanup, before the snapshot. The cleanups take the
+        # lock themselves, so they are awaited after it is released.
+        async with self._lock:
+            # A cancelled aclose() can leave handoffs whose tasks are already
+            # gone: a retry still has to run their cleanups
+            if not self._scheduled_tasks and not self._pending_handoffs:
+                return
+            pending_handoffs = tuple(self._pending_handoffs)
+            tasks = tuple(self._scheduled_tasks)
+            for task in tasks:
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # The pool can be reused after aclose(): run the cancelled MOVING
+        # cleanups now so the temporary host and relaxed timeouts do not stay
+        # in its connection kwargs, and forget the handoffs so the server can
+        # redeliver a still-active MOVING to the reused pool.
+        for notification in pending_handoffs:
+            async with self._lock:
+                # A concurrent aclose() may have run this cleanup already
+                if notification not in self._pending_handoffs:
+                    continue
+                reverted = await self._revert_node_moved_notification(notification)
+            if not reverted:
+                # Closing ends the relaxation of a superseded handoff too
+                self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
+            self._processed_notifications.discard(notification)
 
 
 class AsyncMaintNotificationsConnectionHandler:
@@ -276,16 +351,26 @@ class AsyncMaintNotificationsConnectionHandler:
         self.connection = connection
         self.config = config
 
+    def _get_pool(self) -> Any | None:
+        """
+        Get the pool from the connection's pool handler, or None for
+        standalone connections without a pool.
+        """
+        pool_handler = getattr(
+            self.connection, "_maint_notifications_pool_handler", None
+        )
+        if pool_handler:
+            return getattr(pool_handler, "pool", None)
+        return None
+
     def _get_pool_name(self) -> str:
         """
         Get the pool name from the connection's pool handler.
         Falls back to connection representation if pool is not available.
         """
-        pool_handler = getattr(
-            self.connection, "_maint_notifications_pool_handler", None
-        )
-        if pool_handler and getattr(pool_handler, "pool", None):
-            return get_pool_name(pool_handler.pool)
+        pool = self._get_pool()
+        if pool:
+            return get_pool_name(pool)
         # Fallback for standalone connections without a pool
         return repr(self.connection)
 
@@ -335,7 +420,7 @@ class AsyncMaintNotificationsConnectionHandler:
         if isinstance(notification, OSSNodeMigratingNotification):
             # add the notification id to the set of processed start maint notifications
             # this is used to skip the unrelaxing of the timeouts if we have received more than
-            # one start notification before the the final end notification
+            # one start notification before the final end notification
             self.connection.add_maint_start_notification(notification.id)
 
         maint_notification = _get_maintenance_notification_name(notification)
@@ -345,12 +430,28 @@ class AsyncMaintNotificationsConnectionHandler:
             relaxed=True,
         )
 
+        _dispatch_maintenance_event(
+            self.config,
+            MaintenanceStartedEvent(
+                connection_pool=self._get_pool(),
+                connection=self.connection,
+                state=maintenance_state,
+                notification=notification,
+                config=self.config,
+            ),
+        )
+
     async def handle_maintenance_completed_notification(self, **kwargs: Any) -> None:
         # Only reset timeouts if state is not MOVING and relaxed timeouts are enabled
         if _should_skip_connection_timeout_update(
             self.connection.maintenance_state, self.config
         ):
             return
+
+        # A completion can reach a connection whose start went to another one,
+        # or none at all; only a connection that was relaxed has a start event
+        # to pair the completion with
+        was_relaxed = self.connection.maintenance_state == MaintenanceState.MAINTENANCE
 
         notification = None
         if kwargs.get("notification"):
@@ -375,6 +476,18 @@ class AsyncMaintNotificationsConnectionHandler:
                 relaxed=False,
             )
 
+        if was_relaxed:
+            _dispatch_maintenance_event(
+                self.config,
+                MaintenanceCompletedEvent(
+                    connection_pool=self._get_pool(),
+                    connection=self.connection,
+                    state=MaintenanceState.MAINTENANCE,
+                    notification=notification,
+                    config=self.config,
+                ),
+            )
+
 
 class AsyncOSSMaintNotificationsHandler:
     """
@@ -395,6 +508,13 @@ class AsyncOSSMaintNotificationsHandler:
     re-entrant arrival never tries to re-acquire the lock on this call stack.
     The cheap _in_progress/_processed dedup that gates that scheduling runs
     without the lock — those sets are only mutated from the single event loop.
+
+    For the same reason the sync handler's lock-ordering rule (acquire
+    NodesManager._initialization_lock before the handler's _lock) does not apply
+    here: because the handling never runs inline on the call stack that is inside
+    initialize(), no task ever holds NodesManager._initialize_lock while waiting
+    for this _lock, so the two can be acquired in this order safely. The
+    divergence from the sync handler is deliberate, not drift.
     """
 
     def __init__(

@@ -1,4 +1,5 @@
 from .base import (
+    UNRECOVERABLE_PARSE_ERRORS,
     AsyncPushNotificationsParser,
     BaseParser,
     PushNotificationsParser,
@@ -24,4 +25,5 @@ __all__ = [
     "_RESP2Parser",
     "_RESP3Parser",
     "PushNotificationsParser",
+    "UNRECOVERABLE_PARSE_ERRORS",
 ]

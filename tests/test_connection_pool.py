@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 import redis
 from redis.cache import CacheConfig
+from redis.commands.metadata import StaticMetadataResolver
 from redis.connection import CacheProxyConnection, Connection, to_bool
 from redis.event import (
     AfterConnectionReleasedEvent,
@@ -19,6 +20,8 @@ from redis.maint_notifications import (
     MaintNotificationsConfig,
     MaintNotificationsPoolHandler,
 )
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from redis.utils import SSL_AVAILABLE
 
 from .conftest import (
@@ -69,6 +72,24 @@ class DummyConnection:
 
     def re_auth(self):
         pass
+
+
+class ConstructionFailure(Exception):
+    """Raised by ``failing_connection_class`` instead of building a connection."""
+
+
+def failing_connection_class(failures):
+    """A ``DummyConnection`` whose constructor raises the first ``failures`` times."""
+    remaining = [failures]
+
+    class FailingConnection(DummyConnection):
+        def __init__(self, **kwargs):
+            if remaining[0] > 0:
+                remaining[0] -= 1
+                raise ConstructionFailure("could not build a connection")
+            super().__init__(**kwargs)
+
+    return FailingConnection
 
 
 class TestConnectionPool:
@@ -146,6 +167,59 @@ class TestConnectionPool:
         pool.get_connection()
         with pytest.raises(redis.MaxConnectionsError):
             pool.get_connection()
+
+    def test_capacity_survives_failed_connection_creation(self):
+        pool = self.get_pool(
+            max_connections=2, connection_class=failing_connection_class(2)
+        )
+        for _ in range(2):
+            with pytest.raises(ConstructionFailure):
+                pool.get_connection()
+
+        c1 = pool.get_connection()
+        c2 = pool.get_connection()
+        assert c1 != c2
+        with pytest.raises(redis.MaxConnectionsError):
+            pool.get_connection()
+
+    @pytest.mark.fixed_client
+    def test_failed_re_auth_does_not_stop_the_other_connections(self):
+        pool = self.get_pool(connection_class=DummyConnection)
+        failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        failing.send_command.side_effect = redis.ConnectionError("broken")
+        other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        in_use = mock.Mock(spec=Connection)
+        pool._available_connections.extend([failing, other])
+        pool._in_use_connections.add(in_use)
+        token = mock.Mock()
+        token.try_get.return_value = "oid"
+        token.get_value.return_value = "value"
+
+        with pytest.raises(redis.ConnectionError, match="broken"):
+            pool.re_auth_callback(token)
+
+        other.send_command.assert_called_once_with("AUTH", "oid", "value")
+        in_use.set_re_auth_token.assert_called_once_with(token)
+
+    @pytest.mark.fixed_client
+    def test_re_auth_stops_at_authentication_error(self):
+        pool = self.get_pool(connection_class=DummyConnection)
+        failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 3))
+        failing.read_response.side_effect = redis.AuthenticationError("expired")
+        other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+        in_use = mock.Mock(spec=Connection)
+        pool._available_connections.extend([failing, other])
+        pool._in_use_connections.add(in_use)
+        token = mock.Mock()
+        token.try_get.return_value = "oid"
+        token.get_value.return_value = "value"
+
+        with pytest.raises(redis.AuthenticationError, match="expired"):
+            pool.re_auth_callback(token)
+
+        failing.read_response.assert_called_once()
+        other.send_command.assert_not_called()
+        in_use.set_re_auth_token.assert_not_called()
 
     def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}
@@ -253,6 +327,35 @@ class TestBlockingConnectionPool:
         c2 = pool.get_connection()
         assert c1 != c2
 
+    def test_capacity_survives_failed_connection_creation(self):
+        pool = redis.BlockingConnectionPool(
+            connection_class=failing_connection_class(2),
+            max_connections=2,
+            timeout=0.1,
+        )
+        for _ in range(2):
+            with pytest.raises(ConstructionFailure):
+                pool.get_connection()
+
+        c1 = pool.get_connection()
+        c2 = pool.get_connection()
+        assert c1 != c2
+        with pytest.raises(redis.ConnectionError):
+            pool.get_connection()
+
+    def test_lock_released_after_checkout_in_maintenance(self):
+        pool = self.get_pool()
+        pool.set_in_maintenance(True)
+        # get_connection() and the nested make_connection() both take the
+        # lock; they used to share one flag deciding whether to release it.
+        pool.release(pool.get_connection())
+
+        acquired = []
+        t = Thread(target=lambda: acquired.append(pool._lock.acquire(timeout=1)))
+        t.start()
+        t.join()
+        assert acquired == [True]
+
     def test_connection_pool_blocks_until_timeout(self, master_host):
         "When out of connections, block for timeout seconds, then raise"
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}
@@ -262,10 +365,12 @@ class TestBlockingConnectionPool:
         pool.get_connection()
 
         start = time.monotonic()
-        with pytest.raises(redis.ConnectionError):
-            pool.get_connection()
+        with mock.patch("redis.connection.record_connection_timeout") as record:
+            with pytest.raises(redis.ConnectionError):
+                pool.get_connection()
         # we should have waited at least 0.1 seconds
         assert time.monotonic() - start >= 0.1
+        record.assert_called_once()
 
     def test_connection_pool_blocks_until_conn_available(self, master_host):
         """
@@ -285,7 +390,9 @@ class TestBlockingConnectionPool:
         start = time.monotonic()
         Thread(target=target).start()
         pool.get_connection()
-        assert time.monotonic() - start >= 0.1
+        elapsed = time.monotonic() - start
+        # block until the release and wake on it, well before the 2 s pool timeout
+        assert 0.1 <= elapsed < 1.0
 
     def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}
@@ -503,6 +610,9 @@ class TestConnectionPoolURLParsing:
             (False, "n"),
             (False, "N"),
             (False, "No"),
+            (False, "off"),
+            (False, "OFF"),
+            (False, "Off"),
             (True, 1),
             (True, "1"),
             (True, "y"),
@@ -535,6 +645,48 @@ class TestConnectionPoolURLParsing:
             redis.ConnectionPool.from_url(
                 "redis://localhost/2?socket_timeout=_&socket_connect_timeout=abc"
             )
+
+    def test_retry_on_error_querystring(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=ConnectionError"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [redis.ConnectionError]
+
+    def test_retry_on_error_querystring_multiple(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=ConnectionError,TimeoutError"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError,
+            redis.TimeoutError,
+        ]
+
+    def test_retry_on_error_querystring_brackets(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=[ConnectionError,TimeoutError]"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError,
+            redis.TimeoutError,
+        ]
+
+    def test_retry_on_error_querystring_blank(self):
+        with pytest.raises(ValueError, match="Invalid value for 'retry_on_error'"):
+            redis.ConnectionPool.from_url("redis://localhost?retry_on_error=,")
+
+    def test_retry_on_error_querystring_invalid(self):
+        with pytest.raises(ValueError, match="Invalid value for 'retry_on_error'"):
+            redis.ConnectionPool.from_url(
+                "redis://localhost?retry_on_error=NotARealError"
+            )
+
+    def test_from_url_retry_on_error(self):
+        client = redis.Redis.from_url(
+            "redis://localhost?retry_on_error=ConnectionError"
+        )
+        assert client.connection_pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError
+        ]
 
     def test_extra_querystring_options(self):
         pool = redis.ConnectionPool.from_url("redis://localhost?a=1&b=2")
@@ -611,6 +763,20 @@ class TestConnectionPoolURLParsing:
             "(redis://, rediss://, unix://)"
         )
 
+    def test_uppercase_scheme_is_accepted(self):
+        # URL schemes are case-insensitive (RFC 3986)
+        pool = redis.ConnectionPool.from_url("REDIS://my.host")
+        assert pool.connection_class == redis.Connection
+        assert_kwargs_subset(pool.connection_kwargs, {"host": "my.host"})
+
+        ssl_pool = redis.ConnectionPool.from_url("REDISS://my.host")
+        assert ssl_pool.connection_class == redis.SSLConnection
+        assert_kwargs_subset(ssl_pool.connection_kwargs, {"host": "my.host"})
+
+        unix_pool = redis.ConnectionPool.from_url("UNIX:///tmp/redis.sock")
+        assert unix_pool.connection_class == redis.UnixDomainSocketConnection
+        assert_kwargs_subset(unix_pool.connection_kwargs, {"path": "/tmp/redis.sock"})
+
 
 @pytest.mark.fixed_client
 class TestBlockingConnectionPoolURLParsing:
@@ -657,6 +823,30 @@ class TestConnectionPoolUnixSocketURLParsing:
         assert pool.maint_notifications_enabled() is None
         assert "maint_notifications_config" not in pool.connection_kwargs
         assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_client_enables_client_side_caching(self):
+        resolver = StaticMetadataResolver()
+        client = redis.Redis(
+            unix_socket_path="/socket",
+            protocol=3,
+            cache_config=CacheConfig(),
+            metadata_resolver=resolver,
+        )
+        pool = client.connection_pool
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert client.get_cache() is not None
+        assert pool.metadata_resolver is resolver
+        assert isinstance(pool.make_connection(), CacheProxyConnection)
+
+    def test_from_url_enables_client_side_caching(self):
+        pool = redis.ConnectionPool.from_url(
+            "unix:///socket?protocol=3", cache_config=CacheConfig()
+        )
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert pool.cache is not None
+        assert isinstance(pool.make_connection(), CacheProxyConnection)
 
     def test_client_respects_disabled_maint_notifications_config(self):
         client = redis.Redis(
@@ -893,6 +1083,15 @@ class TestSSLConnectionURLParsing:
         pool = DummyConnectionPool.from_url("rediss://?ssl_check_hostname=True")
         assert pool.get_connection().check_hostname is True
 
+    def test_ocsp_options(self):
+        pool = redis.ConnectionPool.from_url(
+            "rediss://my.host?ssl_validate_ocsp=True&ssl_validate_ocsp_stapled=False"
+        )
+        assert_kwargs_subset(
+            pool.connection_kwargs,
+            {"ssl_validate_ocsp": True, "ssl_validate_ocsp_stapled": False},
+        )
+
     def test_ssl_flags_config_parsing(self):
         class DummyConnectionPool(redis.ConnectionPool):
             def get_connection(self):
@@ -1115,26 +1314,32 @@ class TestHealthCheck:
     def r(self, request):
         return _get_client(redis.Redis, request, health_check_interval=self.interval)
 
-    def assert_interval_advanced(self, connection):
-        diff = connection.next_health_check - time.monotonic()
-        assert self.interval > diff > (self.interval - 1)
+    def assert_interval_advanced(self, connection, start):
+        # next_health_check is set from the clock when a reply is read,
+        # which happens between `start` and now
+        now = time.monotonic()
+        assert (
+            start + self.interval <= connection.next_health_check <= now + self.interval
+        )
 
     def test_health_check_runs(self, r):
         r.connection.next_health_check = time.monotonic() - 1
+        start = time.monotonic()
         r.connection.check_health()
-        self.assert_interval_advanced(r.connection)
+        self.assert_interval_advanced(r.connection, start)
 
     def test_arbitrary_command_invokes_health_check(self, r):
         # invoke a command to make sure the connection is entirely setup
         r.get("foo")
-        r.connection.next_health_check = time.monotonic()
+        r.connection.next_health_check = time.monotonic() - 1
+        start = time.monotonic()
         with mock.patch.object(
             r.connection, "send_command", wraps=r.connection.send_command
         ) as m:
             r.get("foo")
             m.assert_called_with("PING", check_health=False)
 
-        self.assert_interval_advanced(r.connection)
+        self.assert_interval_advanced(r.connection, start)
 
     def test_arbitrary_command_advances_next_health_check(self, r):
         r.get("foo")
@@ -1181,10 +1386,11 @@ class TestHealthCheck:
             with mock.patch.object(
                 pipe.connection, "send_command", wraps=pipe.connection.send_command
             ) as m:
+                start = time.monotonic()
                 pipe.watch("foo")
                 # the health check should be called when watching
                 m.assert_called_with("PING", check_health=False)
-                self.assert_interval_advanced(pipe.connection)
+                self.assert_interval_advanced(pipe.connection, start)
                 assert pipe.get("foo") == b"bar"
 
                 # reset the mock to clear the call list and schedule another
@@ -1206,12 +1412,13 @@ class TestHealthCheck:
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
             assert not p.subscribed
+            start = time.monotonic()
             p.subscribe("foo")
             # the connection is not yet in pubsub mode, so the normal
             # ping/pong within connection.send_command should check
             # the health of the connection
             m.assert_any_call("PING", check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
             subscribe_message = wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
@@ -1227,10 +1434,11 @@ class TestHealthCheck:
         with mock.patch.object(
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
+            start = time.monotonic()
             p.subscribe("foo")
             subscribe_message = wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
             # because we weren't subscribed when sending the subscribe
             # message to 'foo', the connection's standard check_health ran
             # prior to subscribing.
@@ -1239,6 +1447,7 @@ class TestHealthCheck:
             p.connection.next_health_check = 0
             m.reset_mock()
 
+            start = time.monotonic()
             p.subscribe("bar")
             # the second subscribe issues exactly only command (the subscribe)
             # and the health check is not invoked
@@ -1250,11 +1459,11 @@ class TestHealthCheck:
 
             subscribe_message = wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            assert wait_for_message(p) is None
+            assert p.get_message(timeout=1) is None
             # now that the connection is subscribed, the pubsub health
             # check should have taken over and include the HEALTH_CHECK_MESSAGE
             m.assert_any_call("PING", p.HEALTH_CHECK_MESSAGE, check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
     def test_health_check_in_pubsub_poll(self, r):
         """
@@ -1266,16 +1475,18 @@ class TestHealthCheck:
         with mock.patch.object(
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
+            start = time.monotonic()
             p.subscribe("foo")
             subscribe_message = wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
             # polling the connection before the health check interval
             # doesn't result in another health check
             m.reset_mock()
             next_health_check = p.connection.next_health_check
-            assert wait_for_message(p) is None
+            # one poll is enough: every get_message runs check_health first
+            assert p.get_message(timeout=0) is None
             assert p.connection.next_health_check == next_health_check
             m.assert_not_called()
 
@@ -1283,9 +1494,10 @@ class TestHealthCheck:
             # we should not receive a pong message, but the next_health_check
             # should be advanced
             p.connection.next_health_check = 0
-            assert wait_for_message(p) is None
+            start = time.monotonic()
+            assert p.get_message(timeout=1) is None
             m.assert_called_with("PING", p.HEALTH_CHECK_MESSAGE, check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
 
 @pytest.mark.fixed_client

@@ -5,6 +5,8 @@ These tests verify that the async cluster error handling correctly records metri
 when exceptions occur, even when using ClusterNode objects instead of Connection objects.
 """
 
+import asyncio
+
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from redis.asyncio.cluster import RedisCluster, ClusterNode
@@ -296,6 +298,10 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
             cluster._policy_resolver = MagicMock()
             cluster._policy_resolver.resolve = AsyncMock(return_value=None)
             cluster.command_flags = {}
+            cluster._refresh_topology = AsyncMock()
+            # The refresh runs under the lock of an initialized client
+            cluster._lock = asyncio.Lock()
+            cluster._topology_ready = True
 
             with patch.object(
                 ClusterNode,
@@ -312,6 +318,8 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
                             await cluster.execute_command(
                                 "GET", "key", target_nodes=target_node
                             )
+
+                    cluster._refresh_topology.assert_awaited_once_with()
 
                     mock_record.assert_called_once()
                     call_kwargs = mock_record.call_args.kwargs
@@ -338,6 +346,10 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
             cluster._policy_resolver = MagicMock()
             cluster._policy_resolver.resolve = AsyncMock(return_value=None)
             cluster.command_flags = {}
+            cluster._refresh_topology = AsyncMock()
+            # The refresh runs under the lock of an initialized client
+            cluster._lock = asyncio.Lock()
+            cluster._topology_ready = True
 
             with patch.object(
                 ClusterNode,
@@ -355,6 +367,8 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
                                 "GET", "key", target_nodes=target_node
                             )
 
+                    cluster._refresh_topology.assert_awaited_once_with()
+
                     mock_record.assert_called_once()
                     call_kwargs = mock_record.call_args.kwargs
                     assert call_kwargs["server_address"] == "172.20.0.20"
@@ -369,8 +383,6 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
         In async cluster, the execute_command is called on target_node directly,
         so we use target_node's connection_kwargs for db lookup.
         """
-        from redis._parsers.commands import ResponsePolicy
-
         target_node = ClusterNode(
             host="192.168.50.10", port=7008, server_type="primary", db=3
         )
@@ -387,10 +399,6 @@ class TestAsyncClusterMetricsRecordingDuringErrorHandling:
             cluster._policy_resolver.resolve = AsyncMock(return_value=None)
             cluster.command_flags = {}
             cluster.result_callbacks = {}
-            cluster._policies_callback_mapping = {
-                ResponsePolicy.DEFAULT_KEYLESS: lambda x: x,
-                ResponsePolicy.DEFAULT_KEYED: lambda x: x,
-            }
 
             with patch.object(
                 ClusterNode,

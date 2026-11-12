@@ -2,8 +2,10 @@ import socket
 from unittest.mock import patch
 
 import pytest
+from redis.backoff import NoBackoff
 from redis.client import Redis
 from redis.exceptions import ExternalAuthProviderError
+from redis.retry import Retry
 
 
 class MockSocket:
@@ -157,8 +159,10 @@ class TestErrorParsing:
 
     @pytest.mark.parametrize("protocol_version", [2, 3])
     def test_external_auth_provider_error(self, protocol_version):
+        # ExternalAuthProviderError subclasses ConnectionError, so skip the retries
         client = Redis(
             protocol=protocol_version,
+            retry=Retry(NoBackoff(), 0),
         )
         client.set("hello", "world")
 

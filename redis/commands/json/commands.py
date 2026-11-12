@@ -12,6 +12,11 @@ from .decoders import decode_dict_keys
 from .path import Path
 
 
+def _path_arg(path: str | None) -> str:
+    """Return ``path`` as a command argument, using the root path for ``None``."""
+    return Path.root_path() if path is None else str(path)
+
+
 class FPHAType(str, Enum):
     """Floating-point type options for homogeneous array storage in JSON.SET.
 
@@ -76,7 +81,7 @@ class JSONCommands:
 
         For more information see `JSON.ARRAPPEND <https://redis.io/commands/json.arrappend>`_..
         """  # noqa
-        pieces = [name, str(path)]
+        pieces = [name, _path_arg(path)]
         for o in args:
             pieces.append(self._encode(o))
         return self.execute_command("JSON.ARRAPPEND", *pieces)
@@ -119,8 +124,10 @@ class JSONCommands:
         For more information see `JSON.ARRINDEX <https://redis.io/commands/json.arrindex>`_.
         """  # noqa
         pieces = [name, str(path), self._encode(scalar)]
-        if start is not None:
-            pieces.append(start)
+        if start is not None or stop is not None:
+            # ``stop`` is positional, so a ``stop`` without ``start`` needs the
+            # server's default start (0) in front of it.
+            pieces.append(0 if start is None else start)
             if stop is not None:
                 pieces.append(stop)
 
@@ -171,7 +178,7 @@ class JSONCommands:
 
         For more information see `JSON.ARRLEN <https://redis.io/commands/json.arrlen>`_.
         """  # noqa
-        return self.execute_command("JSON.ARRLEN", name, str(path), keys=[name])
+        return self.execute_command("JSON.ARRLEN", name, _path_arg(path), keys=[name])
 
     @overload
     def arrpop(
@@ -200,9 +207,15 @@ class JSONCommands:
         """Pop the element at ``index`` in the array JSON value under
         ``path`` at key ``name``.
 
+        ``index`` defaults to -1 (the last element). ``None`` omits it, which
+        the server also treats as the last element.
+
         For more information see `JSON.ARRPOP <https://redis.io/commands/json.arrpop>`_.
         """  # noqa
-        return self.execute_command("JSON.ARRPOP", name, str(path), index)
+        pieces = [name, _path_arg(path)]
+        if index is not None:
+            pieces.append(index)
+        return self.execute_command("JSON.ARRPOP", *pieces)
 
     @overload
     def arrtrim(
@@ -241,7 +254,7 @@ class JSONCommands:
 
         For more information see `JSON.TYPE <https://redis.io/commands/json.type>`_.
         """  # noqa
-        return self.execute_command("JSON.TYPE", name, str(path), keys=[name])
+        return self.execute_command("JSON.TYPE", name, _path_arg(path), keys=[name])
 
     @overload
     def resp(
@@ -260,7 +273,7 @@ class JSONCommands:
 
         For more information see `JSON.RESP <https://redis.io/commands/json.resp>`_.
         """  # noqa
-        return self.execute_command("JSON.RESP", name, str(path), keys=[name])
+        return self.execute_command("JSON.RESP", name, _path_arg(path), keys=[name])
 
     @overload
     def objkeys(
@@ -280,7 +293,7 @@ class JSONCommands:
 
         For more information see `JSON.OBJKEYS <https://redis.io/commands/json.objkeys>`_.
         """  # noqa
-        return self.execute_command("JSON.OBJKEYS", name, str(path), keys=[name])
+        return self.execute_command("JSON.OBJKEYS", name, _path_arg(path), keys=[name])
 
     @overload
     def objlen(
@@ -300,7 +313,7 @@ class JSONCommands:
 
         For more information see `JSON.OBJLEN <https://redis.io/commands/json.objlen>`_.
         """  # noqa
-        return self.execute_command("JSON.OBJLEN", name, str(path), keys=[name])
+        return self.execute_command("JSON.OBJLEN", name, _path_arg(path), keys=[name])
 
     @overload
     def numincrby(
@@ -370,7 +383,7 @@ class JSONCommands:
 
         For more information see `JSON.CLEAR <https://redis.io/commands/json.clear>`_.
         """  # noqa
-        return self.execute_command("JSON.CLEAR", name, str(path))
+        return self.execute_command("JSON.CLEAR", name, _path_arg(path))
 
     @overload
     def delete(
@@ -389,7 +402,7 @@ class JSONCommands:
 
         For more information see `JSON.DEL <https://redis.io/commands/json.del>`_.
         """
-        return self.execute_command("JSON.DEL", key, str(path))
+        return self.execute_command("JSON.DEL", key, _path_arg(path))
 
     # forget is an alias for delete
     forget = delete
@@ -762,7 +775,7 @@ class JSONCommands:
 
         For more information see `JSON.TOGGLE <https://redis.io/commands/json.toggle>`_.
         """  # noqa
-        return self.execute_command("JSON.TOGGLE", name, str(path))
+        return self.execute_command("JSON.TOGGLE", name, _path_arg(path))
 
     @overload
     def strappend(
@@ -789,7 +802,7 @@ class JSONCommands:
 
         For more information see `JSON.STRAPPEND <https://redis.io/commands/json.strappend>`_.
         """  # noqa
-        pieces = [name, str(path), self._encode(value)]
+        pieces = [name, _path_arg(path), self._encode(value)]
         return self.execute_command("JSON.STRAPPEND", *pieces)
 
     @overload
@@ -827,7 +840,7 @@ class JSONCommands:
             if key is None:
                 raise DataError("No key specified")
             pieces.append(key)
-            pieces.append(str(path))
+            pieces.append(_path_arg(path))
         return self.execute_command("JSON.DEBUG", *pieces)
 
     @overload

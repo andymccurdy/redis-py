@@ -17,6 +17,7 @@ class DelayProxy:
         self.task = None
         self.cond = asyncio.Condition()
         self.running = 0
+        self.sleeping = set()
 
     async def __aenter__(self):
         await self.start()
@@ -58,6 +59,11 @@ class DelayProxy:
         await asyncio.gather(pipe1, pipe2)
 
     async def stop(self):
+        # A pipe may still be sleeping out the delay of a request the test has
+        # already cancelled. Cancel that sleep instead of waiting it out; the
+        # pipe's finally block still closes its sockets.
+        for pipe in list(self.sleeping):
+            pipe.cancel()
         # shutdown the server
         self.task.cancel()
         try:
@@ -86,7 +92,12 @@ class DelayProxy:
                 # print(f"{name} read {len(data)} delay {self.delay}")
                 if event:
                     event.set()
-                await asyncio.sleep(self.delay)
+                task = asyncio.current_task()
+                self.sleeping.add(task)
+                try:
+                    await asyncio.sleep(self.delay)
+                finally:
+                    self.sleeping.discard(task)
                 writer.write(data)
                 await writer.drain()
         finally:

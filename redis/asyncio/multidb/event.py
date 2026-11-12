@@ -53,6 +53,7 @@ class ResubscribeOnActiveDatabaseChanged(AsyncEventListenerInterface):
             new_pubsub = event.new_database.client.pubsub(**event.kwargs)
             new_pubsub.channels = old_pubsub.channels
             new_pubsub.patterns = old_pubsub.patterns
+            new_pubsub.shard_channels = old_pubsub.shard_channels
             await new_pubsub.on_connect(None)
             event.command_executor.active_pubsub = new_pubsub
             await old_pubsub.aclose()
@@ -60,15 +61,37 @@ class ResubscribeOnActiveDatabaseChanged(AsyncEventListenerInterface):
 
 class CloseConnectionOnActiveDatabaseChanged(AsyncEventListenerInterface):
     """
-    Close connection to the old active database.
+    Drop the free connections to the old active database and mark the in-use
+    ones for reconnect, so they are not torn down mid-command.
     """
 
     async def listen(self, event: AsyncActiveDatabaseChanged):
-        await event.old_database.client.aclose()
+        client = event.old_database.client
 
-        if isinstance(event.old_database.client, Redis):
-            await event.old_database.client.connection_pool.update_active_connections_for_reconnect()
-            await event.old_database.client.connection_pool.disconnect()
+        if isinstance(client, Redis):
+            pool = client.connection_pool
+            # Mark and disconnect under one lock, so a connection acquired
+            # meanwhile is either marked for reconnect or disconnected while
+            # still free.
+            async with pool._get_pool_lock():
+                pool._set_in_maintenance(True)
+                try:
+                    await pool._run_proactive_reconnect_without_locking()
+                finally:
+                    pool._set_in_maintenance(False)
+        else:
+            # Snapshot the nodes: a topology refresh can change the caches
+            # while this loop awaits. The seed nodes are separate instances
+            # with their own connections, so they are visited too, once each.
+            nodes_manager = client.nodes_manager
+            nodes = {
+                id(node): node
+                for cache in (nodes_manager.nodes_cache, nodes_manager.startup_nodes)
+                for node in cache.values()
+            }
+            for node in nodes.values():
+                node.update_active_connections_for_reconnect()
+                await node.disconnect_free_connections()
 
 
 class RegisterCommandFailure(AsyncEventListenerInterface):

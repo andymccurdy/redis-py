@@ -145,7 +145,7 @@ class GeoField(Field):
 class TagField(Field):
     """
     TagField is a tag-indexing field with simpler compression and tokenization.
-    See http://redisearch.io/Tags/
+    See https://redis.io/docs/latest/develop/ai/search-and-query/advanced-concepts/tags/
     """
 
     SEPARATOR = "SEPARATOR"
@@ -171,7 +171,7 @@ class TagField(Field):
 class VectorField(Field):
     """
     Allows vector similarity queries against the value in this attribute.
-    See https://oss.redis.com/redisearch/Vectors/#vector_fields.
+    See https://redis.io/docs/latest/develop/ai/search-and-query/vectors/.
     """
 
     def __init__(self, name: str, algorithm: str, attributes: dict, **kwargs):
@@ -185,7 +185,7 @@ class VectorField(Field):
 
         ``attributes`` each algorithm can have specific attributes. Some of them
         are mandatory and some of them are optional. See
-        https://oss.redis.com/redisearch/master/Vectors/#specific_creation_attributes_per_algorithm
+        https://redis.io/docs/latest/develop/ai/search-and-query/vectors/
         for more information.
         """
         sort = kwargs.get("sortable", False)

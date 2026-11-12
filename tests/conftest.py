@@ -91,16 +91,29 @@ class BooleanOptionalAction(argparse.Action):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def enable_tracemalloc():
+def enable_tracemalloc(request):
     """
-    Enable tracemalloc while tests are being executed.
+    Enable tracemalloc while tests are being executed, if ``--tracemalloc``
+    is given.
+
+    Tracing every allocation makes allocation-heavy code, such as parsing the
+    ``COMMAND`` reply during cluster client setup, several times slower, so it
+    is off by default. Turn it on to get allocation tracebacks in
+    ``ResourceWarning`` messages.
     """
+    if not request.config.getoption("--tracemalloc"):
+        yield
+        return
     try:
         import tracemalloc
 
-        tracemalloc.start()
+        # Leave tracing started by PYTHONTRACEMALLOC or -X tracemalloc running.
+        started = not tracemalloc.is_tracing()
+        if started:
+            tracemalloc.start()
         yield
-        tracemalloc.stop()
+        if started:
+            tracemalloc.stop()
     except ImportError:
         yield
 
@@ -154,6 +167,13 @@ def pytest_addoption(parser):
 
     parser.addoption(
         "--uvloop", action=BooleanOptionalAction, help="Run tests with uvloop"
+    )
+
+    parser.addoption(
+        "--tracemalloc",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Trace memory allocations with tracemalloc while tests run",
     )
 
     parser.addoption(
@@ -490,6 +510,39 @@ def cluster_teardown(client, flushdb):
     client.disconnect_connection_pools()
 
 
+def patch_monotonic(module: str, value: float):
+    """
+    Freeze ``time.monotonic`` as :module: sees it, without patching the
+    ``time`` module that every other thread and library also uses.
+    """
+    frozen_time = Mock(wraps=time)
+    frozen_time.monotonic.return_value = value
+    return mock.patch(f"{module}.time", frozen_time)
+
+
+@pytest.fixture()
+def no_topology_refresh_interval():
+    """
+    Let every error-triggered cluster topology refresh run at once, for tests
+    of the refresh logic itself rather than of its minimum interval.
+    """
+    with mock.patch("redis.cluster._TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS", 0):
+        yield
+
+
+@pytest.fixture()
+def no_cluster_retry_delay():
+    """
+    Skip the backoff sleep between cluster retries, for tests that count
+    retries rather than time them.
+    """
+    # The async clients inherit it from the same class
+    with mock.patch.object(
+        redis.cluster.AbstractRedisCluster, "_retry_backoff_delay", return_value=0
+    ):
+        yield
+
+
 @pytest.fixture()
 def r(request):
     with _get_client(redis.Redis, request) as client:
@@ -672,6 +725,7 @@ def master(request, sentinel_setup):
 
 def _gen_cluster_mock_resp(r, response):
     connection = Mock(spec=Connection)
+    connection._resp2_fallback = False
     connection.retry = Retry(NoBackoff(), 0)
     connection.read_response.return_value = response
     connection.host = "localhost"

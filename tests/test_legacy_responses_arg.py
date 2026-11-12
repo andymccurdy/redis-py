@@ -123,3 +123,31 @@ async def test_async_cluster_client_cluster_shards_callback(protocol, legacy_res
         )
     finally:
         await client.aclose()
+
+
+_DEBUG_OBJECT_REPLY = (
+    b"Value at:0x7f0000000000 refcount:1 encoding:embstr serializedlength:4 "
+    b"lru:0 lru_seconds_idle:0"
+)
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("protocol", _PROTOCOL_VARIANTS)
+def test_unified_status_replies_have_the_resp2_shape(protocol):
+    """BGSAVE, BGREWRITEAOF and DEBUG OBJECT give the RESP2 shape when unified."""
+    client = redis.Redis(**_make_client_kwargs(protocol, False))
+    callbacks = client.response_callbacks
+    assert callbacks["BGSAVE"](b"Background saving started") is True
+    assert (
+        callbacks["BGREWRITEAOF"](b"Background append only file rewriting started")
+        is True
+    )
+    assert callbacks["DEBUG OBJECT"](_DEBUG_OBJECT_REPLY) == {
+        "type": "Value",
+        "at": "0x7f0000000000",
+        "refcount": 1,
+        "encoding": "embstr",
+        "serializedlength": 4,
+        "lru": 0,
+        "lru_seconds_idle": 0,
+    }

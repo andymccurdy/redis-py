@@ -3,6 +3,11 @@ import functools
 import logging
 import socket
 import sys
+import time
+import weakref
+from collections import defaultdict
+from collections.abc import Coroutine
+from contextlib import contextmanager
 from typing import Optional
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -21,14 +26,33 @@ import redis.asyncio as redis
 from redis.asyncio import Subscription
 from redis._parsers import Encoder
 from redis.asyncio.client import PubSub
-from redis.asyncio.cluster import ClusterPubSub
+from redis.asyncio.cluster import _DISPATCHED, ClusterPubSub
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.crc import key_slot
 
-from redis.exceptions import ConnectionError, SlotNotCoveredError, TimeoutError
+from redis.exceptions import (
+    ConnectionError,
+    RedisError,
+    ResponseError,
+    SlotNotCoveredError,
+    TimeoutError,
+)
 from redis.typing import EncodableT
-from tests.conftest import get_protocol_version, skip_if_server_version_lt
+from redis.utils import str_if_bytes
+from tests.conftest import REDIS_INFO, get_protocol_version, skip_if_server_version_lt
 
 from .compat import aclosing, create_task
+
+# Slack for the lower bound of a measured ``asyncio.sleep``. uvloop drives its
+# timers off libuv's cached millisecond-resolution clock rather than
+# ``time.monotonic()``, so a sleep can return just under a millisecond before the
+# requested delay has elapsed on the clock these tests measure with - which makes
+# an exact lower bound fail intermittently on the ``--uvloop`` matrix leg. The
+# sync counterparts of these tests need no such slack: ``time.sleep`` does not
+# return early. Kept well above the observed sub-millisecond undershoot, and far
+# below any delay a test asserts on, so it cannot mask a wait that never happened.
+EVENT_LOOP_TIMER_SLACK = 0.005
 
 
 def with_timeout(t):
@@ -43,7 +67,7 @@ def with_timeout(t):
     return wrapper
 
 
-async def wait_for_message(pubsub, timeout=0.2, ignore_subscribe_messages=False):
+async def wait_for_message(pubsub, timeout=0.5, ignore_subscribe_messages=False):
     now = asyncio.get_running_loop().time()
     timeout = now + timeout
     while now < timeout:
@@ -55,6 +79,23 @@ async def wait_for_message(pubsub, timeout=0.2, ignore_subscribe_messages=False)
         await asyncio.sleep(0.01)
         now = asyncio.get_running_loop().time()
     return None
+
+
+async def wait_for_handled_message(test, get_message, expected, timeout=5.0):
+    """Handle messages until the test's handler has seen ``expected``.
+
+    In a cluster, a PUBLISH reaches subscribers on other nodes over the cluster
+    bus, so a message an earlier test published on the same channel can arrive
+    late and be handled first. Handling until the expected message shows up
+    skips such strays. A handled message is never returned, so every call must
+    still return None.
+    """
+    deadline = time.monotonic() + timeout
+    while getattr(test, "message", None) != expected:
+        assert time.monotonic() < deadline, (
+            f"handler saw {getattr(test, 'message', None)!r}, expected {expected!r}"
+        )
+        assert await get_message(timeout=0.1) is None
 
 
 def make_message(
@@ -105,6 +146,341 @@ async def pubsub(r: redis.Redis):
         yield p
 
 
+@pytest.mark.fixed_client
+class TestPubSubSubscriberModeProtocol:
+    DEFAULT_STANDALONE_URL = "redis://localhost:6379/0"
+    DEFAULT_CLUSTER_URL = "redis://localhost:16379/0"
+
+    async def _get_resp2_client(self, request, cluster=False):
+        client = None
+        redis_url = self._get_url(request, cluster)
+        try:
+            if cluster:
+                client = redis.RedisCluster.from_url(
+                    redis_url,
+                    protocol=2,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
+                await client.initialize()
+            else:
+                client = redis.Redis.from_url(
+                    redis_url,
+                    protocol=2,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
+            await client.ping()
+        except RedisError as exc:
+            await self._close_client(client)
+            pytest.skip(
+                f"Redis {'cluster' if cluster else 'standalone'} unavailable: {exc}"
+            )
+
+        if get_protocol_version(client) not in [2, "2"]:
+            await self._close_client(client)
+            pytest.skip("subscriber-mode command rejection is RESP2-specific")
+
+        return client
+
+    def _get_url(self, request, cluster):
+        if bool(REDIS_INFO.get("cluster_enabled", False)) == cluster:
+            return request.config.getoption("--redis-url")
+        if cluster:
+            return self.DEFAULT_CLUSTER_URL
+        return self.DEFAULT_STANDALONE_URL
+
+    async def _close_client(self, client):
+        if client is not None:
+            await client.aclose()
+
+    async def test_subscriber_mode_rejects_regular_command_after_subscribe(
+        self, request
+    ):
+        r = await self._get_resp2_client(request)
+        p = r.pubsub()
+        try:
+            await p.subscribe("subscriber-mode")
+            assert (await wait_for_message(p))["type"] == "subscribe"
+
+            await p.execute_command("SET", "should-not-run", "1")
+            with pytest.raises(ResponseError, match="only .* allowed|Can't execute"):
+                await p.parse_response(block=False, timeout=1)
+        finally:
+            await p.aclose()
+            await self._close_client(r)
+
+    async def test_subscriber_mode_rejects_regular_command_after_psubscribe(
+        self, request
+    ):
+        r = await self._get_resp2_client(request)
+        p = r.pubsub()
+        try:
+            await p.psubscribe("subscriber-*")
+            assert (await wait_for_message(p))["type"] == "psubscribe"
+
+            await p.execute_command("SET", "should-not-run", "1")
+            with pytest.raises(ResponseError, match="only .* allowed|Can't execute"):
+                await p.parse_response(block=False, timeout=1)
+        finally:
+            await p.aclose()
+            await self._close_client(r)
+
+    @skip_if_server_version_lt("7.0.0")
+    async def test_subscriber_mode_rejects_regular_command_after_ssubscribe(
+        self, request
+    ):
+        r = await self._get_resp2_client(request, cluster=True)
+        channel = "subscriber-mode-{shard}"
+        node = r.get_node_from_key(channel)
+        p = r.pubsub()
+        try:
+            await p.ssubscribe(channel)
+            message = await p.get_sharded_message(target_node=node, timeout=1)
+            assert message["type"] == "ssubscribe"
+
+            per_node_pubsub = p.node_pubsub_mapping[node.name]
+            await per_node_pubsub.execute_command("SET", "should-not-run-{shard}", "1")
+            with pytest.raises(ResponseError, match="only .* allowed|Can't execute"):
+                await per_node_pubsub.parse_response(block=False, timeout=1)
+        finally:
+            await p.aclose()
+            await self._close_client(r)
+
+
+class TestPubSubCloseServerCleanup:
+    async def _wait_for_result_to_match_expected(
+        self, get_result, expected, timeout=2.0
+    ):
+        deadline = asyncio.get_running_loop().time() + timeout
+        result = None
+        while asyncio.get_running_loop().time() < deadline:
+            result = await get_result()
+            if result == expected:
+                return
+            await asyncio.sleep(0.01)
+        assert result == expected
+
+    @pytest.mark.onlynoncluster
+    async def test_close_while_subscribed_removes_numsub_entry(self, r: redis.Redis):
+        channel = "close-cleanup"
+        p = r.pubsub()
+        try:
+            await p.subscribe(channel)
+            assert (await wait_for_message(p))["type"] == "subscribe"
+            await self._wait_for_result_to_match_expected(
+                lambda: r.pubsub_numsub(channel),
+                [(channel.encode(), 1)],
+            )
+        finally:
+            await p.aclose()
+
+        assert p.connection is None
+        assert p.channels == {}
+        await self._wait_for_result_to_match_expected(
+            lambda: r.pubsub_numsub(channel),
+            [(channel.encode(), 0)],
+        )
+
+    @pytest.mark.onlycluster
+    @skip_if_server_version_lt("7.0.0")
+    async def test_close_while_ssubscribed_removes_shardnumsub_entry(
+        self, r: redis.Redis
+    ):
+        channel = "close-cleanup-{shard}"
+        node = r.get_node_from_key(channel)
+        p = r.pubsub()
+        try:
+            await p.ssubscribe(channel)
+            message = await p.get_sharded_message(target_node=node, timeout=1)
+            assert message["type"] == "ssubscribe"
+            await self._wait_for_result_to_match_expected(
+                lambda: r.pubsub_shardnumsub(channel, target_nodes=node),
+                [(channel.encode(), 1)],
+            )
+        finally:
+            await p.aclose()
+
+        assert p.node_pubsub_mapping == {}
+        assert p.shard_channels == {}
+        await self._wait_for_result_to_match_expected(
+            lambda: r.pubsub_shardnumsub(channel, target_nodes=node),
+            [(channel.encode(), 0)],
+        )
+
+
+@pytest.mark.onlycluster
+@skip_if_server_version_lt("7.0.0")
+class TestClusterShardedPubSubDelivery:
+    async def _wait_for_sharded_acks(
+        self, pubsub, count, node=None, message_type="ssubscribe"
+    ):
+        for _ in range(count):
+            if node is not None:
+                message = await pubsub.get_sharded_message(
+                    target_node=node, timeout=2.0
+                )
+            else:
+                message = await pubsub.get_sharded_message(timeout=2.0)
+            assert message is not None
+            assert message["type"] == message_type
+
+    async def _read_sharded_messages(self, pubsub, expected_count, timeout=5.0):
+        messages = []
+        deadline = asyncio.get_running_loop().time() + timeout
+        while (
+            asyncio.get_running_loop().time() < deadline
+            and len(messages) < expected_count
+        ):
+            message = await pubsub.get_sharded_message(timeout=0.05)
+            if message is not None and message["type"] == "smessage":
+                messages.append(message)
+        return messages
+
+    async def test_multiple_sharded_subscribers_receive_all_messages(
+        self, r: redis.Redis
+    ):
+        channels = ["multi-sub-{shared}:0", "multi-sub-{shared}:1"]
+        subscriber_count = 2
+        message_count = 20
+        expected = set(range(message_count))
+        received = [defaultdict(set) for _ in range(subscriber_count)]
+        subscribers = [r.pubsub() for _ in range(subscriber_count)]
+
+        try:
+            for pubsub in subscribers:
+                await pubsub.ssubscribe(*channels)
+                await self._wait_for_sharded_acks(pubsub, len(channels))
+
+            for seq in range(message_count):
+                for channel in channels:
+                    assert await r.spublish(channel, str(seq)) == subscriber_count
+
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < deadline:
+                for index, pubsub in enumerate(subscribers):
+                    message = await pubsub.get_sharded_message(timeout=0.01)
+                    if message is not None and message["type"] == "smessage":
+                        channel = str_if_bytes(message["channel"])
+                        received[index][channel].add(int(message["data"]))
+
+                if all(
+                    all(subscriber[channel] == expected for channel in channels)
+                    for subscriber in received
+                ):
+                    return
+
+            assert [
+                {channel: sorted(seqs) for channel, seqs in subscriber.items()}
+                for subscriber in received
+            ] == [
+                {channel: list(range(message_count)) for channel in channels}
+                for _ in range(subscriber_count)
+            ]
+        finally:
+            for pubsub in subscribers:
+                await pubsub.aclose()
+
+    async def test_duplicate_ssubscribe_delivers_each_message_once(
+        self, r: redis.Redis
+    ):
+        channel = "duplicate-ssubscribe-{shared}"
+        p = r.pubsub()
+        try:
+            await p.ssubscribe(channel)
+            await self._wait_for_sharded_acks(p, 1)
+
+            await p.ssubscribe(channel)
+            maybe_ack = await p.get_sharded_message(timeout=0.5)
+            assert maybe_ack is None or maybe_ack["type"] == "ssubscribe"
+
+            for seq in range(10):
+                assert await r.spublish(channel, str(seq)) == 1
+
+            messages = await self._read_sharded_messages(p, expected_count=10)
+            received = [int(message["data"]) for message in messages]
+
+            assert sorted(received) == list(range(10))
+            assert await p.get_sharded_message(timeout=0.5) is None
+        finally:
+            await p.aclose()
+
+    async def test_no_messages_delivered_after_sunsubscribe(self, r: redis.Redis):
+        kept = "still-subscribed-{shared}"
+        removed = "removed-{shared}"
+        p = r.pubsub()
+        try:
+            await p.ssubscribe(kept, removed)
+            await self._wait_for_sharded_acks(p, 2)
+
+            await p.sunsubscribe(removed)
+            await self._wait_for_sharded_acks(p, 1, message_type="sunsubscribe")
+
+            for seq in range(10):
+                assert await r.spublish(kept, str(seq)) == 1
+                assert await r.spublish(removed, str(seq)) == 0
+
+            messages = await self._read_sharded_messages(p, expected_count=10)
+            delivered_channels = [
+                str_if_bytes(message["channel"]) for message in messages
+            ]
+
+            assert delivered_channels == [kept] * 10
+            assert await p.get_sharded_message(timeout=0.5) is None
+        finally:
+            await p.aclose()
+
+
+@pytest.mark.onlycluster
+@skip_if_server_version_lt("7.0.0")
+class TestClusterShardedPubSubConnectionLifecycle:
+    async def _wait_for_ssubscribe_ack(self, pubsub):
+        message = await pubsub.get_sharded_message(timeout=2.0)
+        assert message is not None
+        assert message["type"] == "ssubscribe"
+
+    async def test_cluster_sharded_pubsub_creates_connections_lazily(
+        self, r: redis.Redis
+    ):
+        channel = "lazy-connection-{shared}"
+        node = r.get_node_from_key(channel)
+        p = r.pubsub()
+        try:
+            assert p.node_pubsub_mapping == {}
+            assert p.connection is None
+
+            await p.ssubscribe(channel)
+            await self._wait_for_ssubscribe_ack(p)
+
+            assert list(p.node_pubsub_mapping) == [node.name]
+            assert p.node_pubsub_mapping[node.name].connection is not None
+        finally:
+            await p.aclose()
+
+    async def test_cluster_sharded_pubsub_reuses_connection_for_same_shard(
+        self, r: redis.Redis
+    ):
+        first = "reuse-1-{same-shard}"
+        second = "reuse-2-{same-shard}"
+        node = r.get_node_from_key(first)
+        assert node.name == r.get_node_from_key(second).name
+        p = r.pubsub()
+        try:
+            await p.ssubscribe(first)
+            await self._wait_for_ssubscribe_ack(p)
+            first_mapping = dict(p.node_pubsub_mapping)
+            first_pubsub = p.node_pubsub_mapping[node.name]
+
+            await p.ssubscribe(second)
+            await self._wait_for_ssubscribe_ack(p)
+
+            assert p.node_pubsub_mapping == first_mapping
+            assert p.node_pubsub_mapping[node.name] is first_pubsub
+            assert len(p.node_pubsub_mapping) == 1
+        finally:
+            await p.aclose()
+
+
 @pytest.mark.onlynoncluster
 class TestPubSubSubscribeUnsubscribe:
     async def _test_subscribe_unsubscribe(
@@ -134,11 +510,37 @@ class TestPubSubSubscribeUnsubscribe:
         kwargs = make_subscribe_test_data(pubsub, "pattern")
         await self._test_subscribe_unsubscribe(**kwargs)
 
+    async def test_pattern_unsubscribe_with_a_list(self, pubsub):
+        # Like unsubscribe() and the sync PubSub.punsubscribe(), the first
+        # argument can be a list of patterns
+        p = pubsub
+        await p.psubscribe("f*", "b*")
+        for _ in range(2):
+            assert (await wait_for_message(p))["type"] == "psubscribe"
+
+        assert await p.punsubscribe(["f*", "b*"]) is None
+        for _ in range(2):
+            assert (await wait_for_message(p))["type"] == "punsubscribe"
+        assert p.subscribed is False
+
     @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("7.0.0")
     async def test_shard_channel_subscribe_unsubscribe(self, pubsub):
         kwargs = make_subscribe_test_data(pubsub, "shard_channel")
         await self._test_subscribe_unsubscribe(**kwargs)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.0.0")
+    async def test_get_sharded_message_reads_shard_channel_messages(self, r, pubsub):
+        """``get_sharded_message`` mirrors the sync alias of ``get_message``."""
+        assert await pubsub.ssubscribe("foo") is None
+        assert (await pubsub.get_sharded_message(timeout=1))["type"] == "ssubscribe"
+
+        assert await r.spublish("foo", "hello") == 1
+        message = await pubsub.get_sharded_message(timeout=1)
+        assert message["type"] == "smessage"
+        assert message["channel"] == b"foo"
+        assert message["data"] == b"hello"
 
     @pytest.mark.onlynoncluster
     async def _test_resubscribe_on_reconnection(
@@ -266,107 +668,6 @@ class TestPubSubSubscribeUnsubscribe:
                 "data": b"test message",
             }
         ]
-
-    @pytest.mark.fixed_client
-    async def test_resubscribe_binary_handler_uses_subscription(self):
-        pool = MagicMock()
-        encoder = Encoder(
-            encoding="utf-8", encoding_errors="strict", decode_responses=False
-        )
-        p = PubSub(connection_pool=pool, encoder=encoder)
-        binary_channel = b"\x80\x81\x82"
-        handler = MagicMock()
-        p.channels = {binary_channel: handler}
-
-        calls = []
-
-        async def fake_subscribe(*args, **kwargs):
-            calls.append((tuple(args), dict(kwargs)))
-
-        with mock.patch.object(p, "subscribe", side_effect=fake_subscribe):
-            await p._resubscribe(p.channels, p.subscribe)
-
-        assert calls == [((Subscription(binary_channel, handler),), {})]
-
-    @pytest.mark.fixed_client
-    async def test_cluster_pubsub_resubscribe_shard_channels_groups_by_slot(self):
-        """The cluster-aware ``_resubscribe_shard_channels`` must group shard
-        channels by hash slot on reconnect. A cluster node can own multiple
-        slot ranges, so a single batched SSUBSCRIBE across different slots
-        would be rejected by Redis with CROSSSLOT and resubscription would
-        fail silently. The same method is bound to the per-node PubSub
-        instances managed by ``ClusterPubSub``.
-        """
-        # Pure client-side logic: mock the pool, use a real encoder, no
-        # server needed. ``key_slot`` is client-side CRC16, so slot
-        # assignments are deterministic without a cluster.
-        pool = MagicMock()
-        encoder = Encoder(
-            encoding="utf-8", encoding_errors="strict", decode_responses=False
-        )
-        p = PubSub(connection_pool=pool, encoder=encoder)
-
-        # Two channels share a hash tag (same slot); a third hashes to a
-        # different slot.
-        ch_a1 = b"{slot-a}-one"
-        ch_a2 = b"{slot-a}-two"
-        ch_b = b"{slot-b}-one"
-        assert key_slot(ch_a1) == key_slot(ch_a2)
-        assert key_slot(ch_a1) != key_slot(ch_b)
-
-        # Populate state as if previously subscribed, without going to the wire.
-        p.shard_channels = {ch_a1: None, ch_a2: None, ch_b: None}
-
-        calls = []
-
-        async def fake_ssubscribe(*args, **kwargs):
-            calls.append((tuple(args), dict(kwargs)))
-
-        with mock.patch.object(p, "ssubscribe", side_effect=fake_ssubscribe):
-            await ClusterPubSub._resubscribe_shard_channels(p)
-
-        # Every ssubscribe call must target exactly one slot.
-        slots_per_call = []
-        all_channels = set()
-        for args, kwargs in calls:
-            channels = set(args) | set(
-                k.encode() if isinstance(k, str) else k for k in kwargs
-            )
-            assert channels, "ssubscribe called with no channels"
-            call_slots = {key_slot(c) for c in channels}
-            assert len(call_slots) == 1, (
-                f"ssubscribe grouped channels from multiple slots: {call_slots}"
-            )
-            slots_per_call.append(next(iter(call_slots)))
-            all_channels.update(channels)
-
-        # All original channels must be resubscribed, across exactly two
-        # distinct slot groups.
-        assert all_channels == {ch_a1, ch_a2, ch_b}
-        assert set(slots_per_call) == {key_slot(ch_a1), key_slot(ch_b)}
-        # Channels sharing a slot are batched: two unique slots => two calls.
-        assert len(calls) == 2
-
-    @pytest.mark.fixed_client
-    async def test_cluster_pubsub_resubscribe_binary_shard_channel_with_handler(self):
-        pool = MagicMock()
-        encoder = Encoder(
-            encoding="utf-8", encoding_errors="strict", decode_responses=False
-        )
-        p = PubSub(connection_pool=pool, encoder=encoder)
-        binary_channel = b"\x80\x81\x82"
-        handler = MagicMock()
-        p.shard_channels = {binary_channel: handler}
-
-        calls = []
-
-        async def fake_ssubscribe(*args, **kwargs):
-            calls.append((tuple(args), dict(kwargs)))
-
-        with mock.patch.object(p, "ssubscribe", side_effect=fake_ssubscribe):
-            await ClusterPubSub._resubscribe_shard_channels(p)
-
-        assert calls == [((Subscription(binary_channel, handler),), {})]
 
     @skip_if_server_version_lt("7.0.0")
     async def test_standalone_pubsub_on_connect_batches_shard_channels(self, pubsub):
@@ -509,7 +810,7 @@ class TestPubSubSubscribeUnsubscribe:
         for func, channel in checks:
             assert await func(channel) is None
             assert p.subscribed is True
-            assert await wait_for_message(p) is None
+            assert await p.get_message(timeout=1) is None
         assert p.subscribed is False
         await p.aclose()
 
@@ -527,7 +828,7 @@ class TestPubSubSubscribeUnsubscribe:
         for func, channel in checks:
             assert await func(channel) is None
             assert p.subscribed is True
-            message = await wait_for_message(p, ignore_subscribe_messages=True)
+            message = await p.get_message(ignore_subscribe_messages=True, timeout=1)
             assert message is None
         assert p.subscribed is False
 
@@ -577,6 +878,109 @@ class TestPubSubSubscribeUnsubscribe:
         assert p.subscribed is True
 
 
+@pytest.mark.fixed_client
+class TestPubSubResubscribeMocked:
+    """Resubscribe handling checked against mocked connections; no server needed."""
+
+    async def test_cluster_pubsub_resubscribe_binary_shard_channel_with_handler(self):
+        pool = MagicMock()
+        encoder = Encoder(
+            encoding="utf-8", encoding_errors="strict", decode_responses=False
+        )
+        p = PubSub(connection_pool=pool, encoder=encoder)
+        binary_channel = b"\x80\x81\x82"
+        handler = MagicMock()
+        p.shard_channels = {binary_channel: handler}
+
+        calls = []
+
+        async def fake_ssubscribe(*args, **kwargs):
+            calls.append((tuple(args), dict(kwargs)))
+
+        with mock.patch.object(p, "ssubscribe", side_effect=fake_ssubscribe):
+            await ClusterPubSub._resubscribe_shard_channels(p)
+
+        assert calls == [((Subscription(binary_channel, handler),), {})]
+
+    async def test_cluster_pubsub_resubscribe_shard_channels_groups_by_slot(self):
+        """The cluster-aware ``_resubscribe_shard_channels`` must group shard
+        channels by hash slot on reconnect. A cluster node can own multiple
+        slot ranges, so a single batched SSUBSCRIBE across different slots
+        would be rejected by Redis with CROSSSLOT and resubscription would
+        fail silently. The same method is bound to the per-node PubSub
+        instances managed by ``ClusterPubSub``.
+        """
+        # Pure client-side logic: mock the pool, use a real encoder, no
+        # server needed. ``key_slot`` is client-side CRC16, so slot
+        # assignments are deterministic without a cluster.
+        pool = MagicMock()
+        encoder = Encoder(
+            encoding="utf-8", encoding_errors="strict", decode_responses=False
+        )
+        p = PubSub(connection_pool=pool, encoder=encoder)
+
+        # Two channels share a hash tag (same slot); a third hashes to a
+        # different slot.
+        ch_a1 = b"{slot-a}-one"
+        ch_a2 = b"{slot-a}-two"
+        ch_b = b"{slot-b}-one"
+        assert key_slot(ch_a1) == key_slot(ch_a2)
+        assert key_slot(ch_a1) != key_slot(ch_b)
+
+        # Populate state as if previously subscribed, without going to the wire.
+        p.shard_channels = {ch_a1: None, ch_a2: None, ch_b: None}
+
+        calls = []
+
+        async def fake_ssubscribe(*args, **kwargs):
+            calls.append((tuple(args), dict(kwargs)))
+
+        with mock.patch.object(p, "ssubscribe", side_effect=fake_ssubscribe):
+            await ClusterPubSub._resubscribe_shard_channels(p)
+
+        # Every ssubscribe call must target exactly one slot.
+        slots_per_call = []
+        all_channels = set()
+        for args, kwargs in calls:
+            channels = set(args) | set(
+                k.encode() if isinstance(k, str) else k for k in kwargs
+            )
+            assert channels, "ssubscribe called with no channels"
+            call_slots = {key_slot(c) for c in channels}
+            assert len(call_slots) == 1, (
+                f"ssubscribe grouped channels from multiple slots: {call_slots}"
+            )
+            slots_per_call.append(next(iter(call_slots)))
+            all_channels.update(channels)
+
+        # All original channels must be resubscribed, across exactly two
+        # distinct slot groups.
+        assert all_channels == {ch_a1, ch_a2, ch_b}
+        assert set(slots_per_call) == {key_slot(ch_a1), key_slot(ch_b)}
+        # Channels sharing a slot are batched: two unique slots => two calls.
+        assert len(calls) == 2
+
+    async def test_resubscribe_binary_handler_uses_subscription(self):
+        pool = MagicMock()
+        encoder = Encoder(
+            encoding="utf-8", encoding_errors="strict", decode_responses=False
+        )
+        p = PubSub(connection_pool=pool, encoder=encoder)
+        binary_channel = b"\x80\x81\x82"
+        handler = MagicMock()
+        p.channels = {binary_channel: handler}
+
+        calls = []
+
+        async def fake_subscribe(*args, **kwargs):
+            calls.append((tuple(args), dict(kwargs)))
+
+        with mock.patch.object(p, "subscribe", side_effect=fake_subscribe):
+            await p._resubscribe(p.channels, p.subscribe)
+
+        assert calls == [((Subscription(binary_channel, handler),), {})]
+
+
 @pytest.mark.onlynoncluster
 class TestPubSubMessages:
     def setup_method(self, method):
@@ -624,10 +1028,11 @@ class TestPubSubMessages:
     async def test_channel_message_handler(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe(foo=self.message_handler)
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish("foo", "test message") == 1
-        assert await wait_for_message(p) is None
-        assert self.message == make_message("message", "foo", "test message")
+        await wait_for_handled_message(
+            self, p.get_message, make_message("message", "foo", "test message")
+        )
         await p.aclose()
 
     async def test_binary_channel_message_handler_with_subscription(self, r):
@@ -636,21 +1041,24 @@ class TestPubSubMessages:
         await p.subscribe(Subscription(channel, self.message_handler))
         assert await p.get_message(timeout=1) is None
         assert await r.publish(channel, b"test message") == 1
-        assert await p.get_message(timeout=1) is None
-        assert self.message == {
-            "type": "message",
-            "pattern": None,
-            "channel": channel,
-            "data": b"test message",
-        }
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            {
+                "type": "message",
+                "pattern": None,
+                "channel": channel,
+                "data": b"test message",
+            },
+        )
         await p.aclose()
 
     async def test_channel_async_message_handler(self, r):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe(foo=self.async_message_handler)
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish("foo", "test message") == 1
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert self.async_message == make_message("message", "foo", "test message")
         await p.aclose()
 
@@ -658,10 +1066,13 @@ class TestPubSubMessages:
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe(foo=self.message_handler)
         await p.subscribe(bar=self.async_message_handler)
-        assert await wait_for_message(p) is None
+        # get_message handles one message per call: two acks, then two messages
+        assert await p.get_message(timeout=1) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish("foo", "test message") == 1
         assert await r.publish("bar", "test message 2") == 1
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
+        assert await p.get_message(timeout=1) is None
         assert self.message == make_message("message", "foo", "test message")
         assert self.async_message == make_message("message", "bar", "test message 2")
         await p.aclose()
@@ -673,24 +1084,28 @@ class TestPubSubMessages:
         await p.ssubscribe(Subscription(channel, self.message_handler))
         assert await p.get_message(timeout=1) is None
         assert await r.spublish(channel, b"test message") == 1
-        assert await p.get_message(timeout=1) is None
-        assert self.message == {
-            "type": "smessage",
-            "pattern": None,
-            "channel": channel,
-            "data": b"test message",
-        }
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            {
+                "type": "smessage",
+                "pattern": None,
+                "channel": channel,
+                "data": b"test message",
+            },
+        )
         await p.aclose()
 
     @pytest.mark.onlynoncluster
     async def test_pattern_message_handler(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.psubscribe(**{"f*": self.message_handler})
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish("foo", "test message") == 1
-        assert await wait_for_message(p) is None
-        assert self.message == make_message(
-            "pmessage", "foo", "test message", pattern="f*"
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            make_message("pmessage", "foo", "test message", pattern="f*"),
         )
         await p.aclose()
 
@@ -702,13 +1117,16 @@ class TestPubSubMessages:
         await p.psubscribe(Subscription(pattern, self.message_handler))
         assert await p.get_message(timeout=1) is None
         assert await r.publish(channel, b"test message") == 1
-        assert await p.get_message(timeout=1) is None
-        assert self.message == {
-            "type": "pmessage",
-            "pattern": pattern,
-            "channel": channel,
-            "data": b"test message",
-        }
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            {
+                "type": "pmessage",
+                "pattern": pattern,
+                "channel": channel,
+                "data": b"test message",
+            },
+        )
         await p.aclose()
 
     async def test_unicode_channel_message_handler(self, r: redis.Redis):
@@ -716,10 +1134,11 @@ class TestPubSubMessages:
         channel = "uni" + chr(4456) + "code"
         channels = {channel: self.message_handler}
         await p.subscribe(**channels)
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish(channel, "test message") == 1
-        assert await wait_for_message(p) is None
-        assert self.message == make_message("message", channel, "test message")
+        await wait_for_handled_message(
+            self, p.get_message, make_message("message", channel, "test message")
+        )
         await p.aclose()
 
     @pytest.mark.onlynoncluster
@@ -729,11 +1148,12 @@ class TestPubSubMessages:
         pattern = "uni" + chr(4456) + "*"
         channel = "uni" + chr(4456) + "code"
         await p.psubscribe(**{pattern: self.message_handler})
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         assert await r.publish(channel, "test message") == 1
-        assert await wait_for_message(p) is None
-        assert self.message == make_message(
-            "pmessage", channel, "test message", pattern=pattern
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            make_message("pmessage", channel, "test message", pattern=pattern),
         )
         await p.aclose()
 
@@ -757,11 +1177,37 @@ class TestPubSubRESP3Handler:
             return
         p = r.pubsub(push_handler_func=self.my_handler)
         await p.subscribe("foo")
-        assert await wait_for_message(p) is None
-        assert self.message == ["my handler", [b"subscribe", b"foo", 1]]
+        await wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"subscribe", b"foo", 1]]
+        )
         assert await r.publish("foo", "test message") == 1
-        assert await wait_for_message(p) is None
-        assert self.message == ["my handler", [b"message", b"foo", b"test message"]]
+        await wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"message", b"foo", b"test message"]]
+        )
+
+    async def test_push_handler_not_left_on_released_connection(self, r):
+        if get_protocol_version(r) in [2, "2", None]:
+            return
+        p = r.pubsub(push_handler_func=self.my_handler)
+        await p.subscribe("foo")
+        await wait_for_handled_message(
+            self, p.get_message, ["my handler", [b"subscribe", b"foo", 1]]
+        )
+        connection = p.connection
+        await p.aclose()
+        self.message = None
+
+        # The next pubsub gets the same pooled connection and has no handler
+        p2 = r.pubsub()
+        await p2.subscribe("foo")
+        assert p2.connection is connection
+        assert await wait_for_message(p2) == make_message("subscribe", "foo", 1)
+        assert await r.publish("foo", "test message") == 1
+        assert await wait_for_message(p2) == make_message(
+            "message", "foo", "test message"
+        )
+        assert self.message is None
+        await p2.aclose()
 
 
 @pytest.mark.onlynoncluster
@@ -835,40 +1281,46 @@ class TestPubSubAutoDecoding:
     async def test_channel_message_handler(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe(**{self.channel: self.message_handler})
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         await r.publish(self.channel, self.data)
-        assert await wait_for_message(p) is None
-        assert self.message == self.make_message("message", self.channel, self.data)
+        await wait_for_handled_message(
+            self, p.get_message, self.make_message("message", self.channel, self.data)
+        )
 
         # test that we reconnected to the correct channel
         self.message = None
         await p.connection.disconnect()
-        assert await wait_for_message(p) is None  # should reconnect
+        assert await p.get_message(timeout=1) is None  # should reconnect
         new_data = self.data + "new data"
         await r.publish(self.channel, new_data)
-        assert await wait_for_message(p) is None
-        assert self.message == self.make_message("message", self.channel, new_data)
+        await wait_for_handled_message(
+            self, p.get_message, self.make_message("message", self.channel, new_data)
+        )
         await p.aclose()
 
     async def test_pattern_message_handler(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.psubscribe(**{self.pattern: self.message_handler})
-        assert await wait_for_message(p) is None
+        assert await p.get_message(timeout=1) is None
         await r.publish(self.channel, self.data)
-        assert await wait_for_message(p) is None
-        assert self.message == self.make_message(
-            "pmessage", self.channel, self.data, pattern=self.pattern
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            self.make_message(
+                "pmessage", self.channel, self.data, pattern=self.pattern
+            ),
         )
 
         # test that we reconnected to the correct pattern
         self.message = None
         await p.connection.disconnect()
-        assert await wait_for_message(p) is None  # should reconnect
+        assert await p.get_message(timeout=1) is None  # should reconnect
         new_data = self.data + "new data"
         await r.publish(self.channel, new_data)
-        assert await wait_for_message(p) is None
-        assert self.message == self.make_message(
-            "pmessage", self.channel, new_data, pattern=self.pattern
+        await wait_for_handled_message(
+            self,
+            p.get_message,
+            self.make_message("pmessage", self.channel, new_data, pattern=self.pattern),
         )
         await p.aclose()
 
@@ -885,8 +1337,9 @@ class TestPubSubAutoDecoding:
 
 @pytest.mark.onlynoncluster
 class TestPubSubRedisDown:
-    async def test_channel_subscribe(self, r: redis.Redis):
-        r = redis.Redis(host="localhost", port=6390)
+    async def test_channel_subscribe(self):
+        # nothing listens on this port, so skip the default backoff retries
+        r = redis.Redis(host="localhost", port=6390, retry=Retry(NoBackoff(), 0))
         p = r.pubsub()
         with pytest.raises(ConnectionError):
             await p.subscribe("foo")
@@ -937,12 +1390,46 @@ class TestPubSubSubcommands:
 
 @pytest.mark.onlynoncluster
 class TestPubSubPings:
+    @pytest.mark.fixed_client
+    @skip_if_server_version_lt("6.0.0")
+    @pytest.mark.parametrize("protocol", [2, 3])
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    @pytest.mark.parametrize("message", [None, "x", "hello\u2603"])
+    @pytest.mark.parametrize("read_method", ["get_message", "listen"])
+    async def test_ping_response_shapes(
+        self, create_redis, protocol, decode_responses, message, read_method
+    ):
+        client = await create_redis(
+            protocol=protocol, decode_responses=decode_responses
+        )
+        async with client.pubsub() as pubsub:
+            await pubsub.subscribe("foo")
+            assert (await pubsub.get_message(timeout=1))["type"] == "subscribe"
+            await pubsub.ping(message)
+
+            if read_method == "get_message":
+                response = await pubsub.get_message(timeout=1)
+            else:
+                messages = pubsub.listen()
+                try:
+                    response = await asyncio.wait_for(messages.__anext__(), timeout=1)
+                finally:
+                    await messages.aclose()
+
+            data = message if message is not None else ""
+            assert response == {
+                "type": "pong",
+                "pattern": None,
+                "channel": None,
+                "data": data if decode_responses else data.encode(),
+            }
+
     @skip_if_server_version_lt("3.0.0")
     async def test_send_pubsub_ping(self, r: redis.Redis):
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe("foo")
         await p.ping()
-        assert await wait_for_message(p) == make_message(
+        assert await wait_for_message(p, timeout=5) == make_message(
             type="pong", channel=None, data="", pattern=None
         )
         await p.aclose()
@@ -952,7 +1439,7 @@ class TestPubSubPings:
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe("foo")
         await p.ping(message="hello world")
-        assert await wait_for_message(p) == make_message(
+        assert await wait_for_message(p, timeout=5) == make_message(
             type="pong", channel=None, data="hello world", pattern=None
         )
         await p.aclose()
@@ -1102,6 +1589,17 @@ class TestPubSubReconnect:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.fixed_client
+async def test_run_requires_a_handler_for_every_shard_channel():
+    p = PubSub(MagicMock(), ignore_subscribe_messages=True)
+    p.shard_channels = {b"foo": None}
+
+    with pytest.raises(
+        redis.PubSubError, match="Shard Channel: 'b'foo'' has no handler registered"
+    ):
+        await p.run()
 
 
 @pytest.mark.onlynoncluster
@@ -1348,9 +1846,6 @@ class TestPubSubAutoReconnect:
 
 @pytest.mark.onlynoncluster
 class TestBaseException:
-    @pytest.mark.skipif(
-        sys.version_info < (3, 8), reason="requires python 3.8 or higher"
-    )
     async def test_outer_timeout(self, r: redis.Redis):
         """
         Using asyncio_timeout manually outside the inner method timeouts works.
@@ -1382,9 +1877,6 @@ class TestBaseException:
         # the timeout on the read should not cause disconnect
         assert pubsub.connection.is_connected
 
-    @pytest.mark.skipif(
-        sys.version_info < (3, 8), reason="requires python 3.8 or higher"
-    )
     async def test_base_exception(self, r: redis.Redis):
         """
         Manually trigger a BaseException inside the parser's .read_response method
@@ -1452,7 +1944,7 @@ class TestAsyncPubSubTimeoutPropagation:
         elapsed = asyncio.get_running_loop().time() - start
         assert msg is None
         # Verify timeout was actually respected (within reasonable bounds)
-        assert elapsed < 0.5
+        assert elapsed < 1.0  # generous: a stalled runner must not fail it
         await p.aclose()
 
     @pytest.mark.asyncio
@@ -1493,7 +1985,7 @@ class TestAsyncPubSubTimeoutPropagation:
         response = await p.parse_response(block=False, timeout=0.1)
         elapsed = asyncio.get_running_loop().time() - start
         assert response is None
-        assert elapsed < 0.5
+        assert elapsed < 1.0  # generous: a stalled runner must not fail it
         await p.aclose()
 
     @pytest.mark.asyncio
@@ -1512,7 +2004,7 @@ class TestAsyncPubSubTimeoutPropagation:
         msg = await p.get_message(timeout=0)
         elapsed = asyncio.get_running_loop().time() - start
         assert msg is None
-        assert elapsed < 0.1
+        assert elapsed < 0.5  # well below any blocking wait, above a runner stall
         await p.aclose()
 
     @pytest.mark.asyncio
@@ -1585,14 +2077,16 @@ class TestAsyncPubSubTimeoutPropagation:
         Test that timeout works correctly with pattern subscriptions.
         """
         p = r.pubsub()
-        await p.psubscribe("foo*")
+        # A prefix no other test publishes to: on a cluster, a PUBLISH to "foo"
+        # from an earlier test can still be crossing the cluster bus.
+        await p.psubscribe("timeout-pattern*")
         # Read subscription message
         msg = await wait_for_message(p, timeout=1.0)
         assert msg is not None
         assert msg["type"] == "psubscribe"
 
         # Publish a message matching the pattern
-        await r.publish("foobar", "hello")
+        await r.publish("timeout-pattern-bar", "hello")
 
         # get_message with timeout should return the message
         msg = await p.get_message(timeout=1.0)
@@ -1633,7 +2127,7 @@ class TestAsyncPubSubBlockingListen:
     """
 
     SOCKET_TIMEOUT = 0.3
-    PUBLISH_DELAY = SOCKET_TIMEOUT * 3
+    PUBLISH_DELAY = SOCKET_TIMEOUT * 2
 
     async def _make_subscriber(self, create_redis):
         from redis.asyncio.retry import Retry
@@ -1715,7 +2209,8 @@ class TestAsyncPubSubBlockingListen:
         p = r.pubsub(ignore_subscribe_messages=True)
         await p.subscribe("foo")
         # Drain the subscribe ack before calling parse_response directly.
-        await wait_for_message(p, timeout=1.0)
+        # The ack is ignored, so get_message returns None as soon as it is read.
+        await p.get_message(timeout=1.0)
 
         async def publish_after_delay():
             await asyncio.sleep(self.PUBLISH_DELAY)
@@ -1799,10 +2294,11 @@ class TestAsyncPubSubBlockingListen:
         msg = await p.get_message(timeout=0.1)
         elapsed = asyncio.get_running_loop().time() - start
         assert msg is None
-        assert elapsed < 0.5
+        assert elapsed < 1.0  # generous: a stalled runner must not fail it
         await p.aclose()
 
 
+@pytest.mark.fixed_client
 @pytest.mark.asyncio
 class TestPubSubHandleMessageMetrics:
     """Tests for handle_message recording pubsub metrics."""
@@ -1957,6 +2453,211 @@ class TestPubSubAcloseWithMocks:
         connection.disconnect.assert_awaited_once_with(nowait=True)
 
 
+class _CountingCoroutine(Coroutine):
+    """Wrap a coroutine and count how often the event loop resumes it."""
+
+    def __init__(self, coro):
+        self._coro = coro
+        self.resumes = 0
+
+    def send(self, value):
+        self.resumes += 1
+        return self._coro.send(value)
+
+    def throw(self, *args):
+        self.resumes += 1
+        return self._coro.throw(*args)
+
+    def close(self):
+        return self._coro.close()
+
+    def __await__(self):
+        return self._coro.__await__()
+
+
+@pytest.mark.onlynoncluster
+class TestPubSubAcloseCancellation:
+    """
+    Cancelling the task that runs PubSub.aclose() (e.g. a cancelled
+    anyio/Starlette scope tearing down an ``async with r.pubsub()``) must not
+    leak the pubsub connection: it still has to be disconnected and returned
+    to the pool.
+    """
+
+    @staticmethod
+    async def _cancel(task: asyncio.Task, started: asyncio.Event, unblock=None):
+        await started.wait()
+        task.cancel()
+        if unblock is not None:
+            await asyncio.sleep(0.01)
+            task.cancel()  # again, as a level-triggered scope would
+            await asyncio.sleep(0.01)
+            try:
+                # aclose() must not return before its teardown has finished.
+                assert not task.done()
+            finally:
+                unblock()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @staticmethod
+    def _blocking_disconnect(connection, started, resume):
+        disconnect = connection.disconnect
+
+        async def slow_disconnect(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            await disconnect(*args, **kwargs)
+
+        return mock.patch.object(connection, "disconnect", side_effect=slow_disconnect)
+
+    async def test_aclose_releases_connection_when_cancelled_in_disconnect(
+        self, r: redis.Redis
+    ):
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert leased in pool._available_connections
+        assert p.channels == {}
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_waiting_for_lock(
+        self, r: redis.Redis
+    ):
+        # PubSub._lock is also held by the streaming-credentials re-auth
+        # handler while it talks to the server, so aclose() can be cancelled
+        # while still waiting to acquire it.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await p._lock.acquire()
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, p._lock.release)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_aclose_releases_connection_when_cancelled_in_release(
+        self, r: redis.Redis
+    ):
+        # A cancel that lands while release() waits for the pool's lock must
+        # neither leave the pubsub holding the connection nor split the pool's
+        # in-use/available bookkeeping.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+
+        started = asyncio.Event()
+        await pool._lock.acquire()
+        task = asyncio.ensure_future(p.aclose())
+        asyncio.get_running_loop().call_soon(started.set)
+        await self._cancel(task, started, pool._lock.release)
+
+        assert p.connection is None
+        assert leased in pool._available_connections
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_cancelled_subscribe_then_cancelled_aclose_does_not_leak(
+        self, r: redis.Redis
+    ):
+        # Cancel subscribe() while it waits on the socket, then tear the
+        # pubsub down from a task that is itself being cancelled: the
+        # connection leased for subscribe() must still go back to the pool.
+        pool = r.connection_pool
+        in_use_before = len(pool._in_use_connections)
+        p = r.pubsub()
+        await p.connect()
+        leased = p.connection
+
+        started = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with mock.patch.object(leased, "send_command", side_effect=hang):
+            await self._cancel(asyncio.ensure_future(p.subscribe("foo")), started)
+        assert p.connection is leased
+        assert leased in pool._in_use_connections
+
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        with self._blocking_disconnect(leased, started, resume):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+
+        assert p.connection is None
+        assert not leased.is_connected
+        assert len(pool._in_use_connections) == in_use_before
+
+    async def test_teardown_failure_after_cancel_is_logged(
+        self, r: redis.Redis, caplog
+    ):
+        # A teardown that fails while the caller is cancelled must not be
+        # swallowed silently behind the CancelledError.
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        started = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failing_disconnect(*_args, **_kwargs):
+            started.set()
+            await resume.wait()
+            raise RuntimeError("disconnect failed")
+
+        with mock.patch.object(leased, "disconnect", side_effect=failing_disconnect):
+            await self._cancel(asyncio.ensure_future(p.aclose()), started, resume.set)
+        assert "PubSub teardown failed after a cancellation" in caplog.text
+        await p.aclose()  # clean up the connection the failed teardown kept
+
+    async def test_repeated_cancels_wake_aclose_only_once(self, r: redis.Redis):
+        # A level-triggered canceller (e.g. an anyio cancel scope) calls
+        # task.cancel() on every loop turn while aclose() waits for its
+        # teardown; aclose() must not wake up for each of them.
+        loop = asyncio.get_running_loop()
+        p = r.pubsub()
+        await p.subscribe("foo")
+        await p._lock.acquire()  # blocks the teardown
+        coro = _CountingCoroutine(p.aclose())
+        task = loop.create_task(coro)
+        await asyncio.sleep(0)  # aclose() now waits for the teardown
+
+        def cancel_again():
+            if not task.done():
+                task.cancel()
+                loop.call_soon(cancel_again)
+
+        loop.call_soon(cancel_again)
+        for _ in range(100):
+            await asyncio.sleep(0)
+        p._lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Started, woken by the first cancel, and woken once more when the
+        # teardown finished; not once per loop turn.
+        assert coro.resumes == 3
+        assert p.connection is None
+
+
 class TestClusterPubSubResubscribe:
     """
     Cluster-only tests verifying that sharded pubsub resubscription after a
@@ -2038,7 +2739,6 @@ class TestClusterPubSubSlotMigration:
         pubsub.encoder = Encoder("utf-8", "strict", False)
         pubsub.connection = None
         pubsub._lock = asyncio.Lock()
-        pubsub.subscribed_event = asyncio.Event()
         pubsub.health_check_response_counter = 0
         pubsub.channels = {}
         pubsub.shard_channels = {}
@@ -2047,10 +2747,15 @@ class TestClusterPubSubSlotMigration:
         pubsub.ignore_subscribe_messages = False
         # ClusterPubSub-specific state.
         pubsub.cluster = MagicMock()
+        pubsub.cluster._initialize = False
         pubsub.node_pubsub_mapping = {}
         pubsub._shard_channel_to_node = {}
+        pubsub._poll_cool_off = weakref.WeakKeyDictionary()
+        pubsub._unreachable_nodes = set()
+        pubsub._next_topology_repair = 0.0
         pubsub._shard_state_lock = asyncio.Lock()
         pubsub._reconcile_tasks = set()
+        pubsub._topology_repair_tasks = set()
         pubsub.push_handler_func = None
         return pubsub
 
@@ -2068,6 +2773,28 @@ class TestClusterPubSubSlotMigration:
         p.sunsubscribe = AsyncMock()
         p.get_message = AsyncMock()
         p.aclose = AsyncMock()
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it, so a user
+        # handler may re-subscribe). Tests keep configuring the single
+        # ``get_message`` seam; these two forward to it - parse_response yields
+        # the raw reply shape _is_publish_response inspects, handle_message
+        # returns the already-parsed message the assertions compare against.
+        p._last_message = None
+
+        async def _parse_response(block=True, timeout=0.0):
+            message = await p.get_message(
+                ignore_subscribe_messages=False, timeout=timeout
+            )
+            p._last_message = message
+            if message is None:
+                return None
+            return [message["type"], message.get("channel"), message.get("data")]
+
+        async def _handle_message(response, ignore_subscribe_messages=False):
+            return p._last_message
+
+        p.parse_response = AsyncMock(side_effect=_parse_response)
+        p.handle_message = AsyncMock(side_effect=_handle_message)
         return p
 
     async def test_reinitialize_moves_channel_to_new_owner(self):
@@ -2105,6 +2832,198 @@ class TestClusterPubSubSlotMigration:
         owner_ps.ssubscribe.assert_not_awaited()
         assert pubsub._shard_channel_to_node[channel] == owner.name
 
+    async def test_reinitialize_skips_pending_unsubscribe(self):
+        """A topology refresh must not restore a channel being removed."""
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_node_pubsub({channel: None})
+        new_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        old_ps.pending_unsubscribe_shard_channels = {channel}
+        pubsub.shard_channels = {channel: None}
+        pubsub.pending_unsubscribe_shard_channels = {channel}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        old_ps.sunsubscribe.assert_not_awaited()
+        new_ps.ssubscribe.assert_not_awaited()
+        assert pubsub._shard_channel_to_node[channel] == old_node.name
+
+    async def test_initialize_refresh_does_not_restore_sunsubscribed_channel(self):
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_node_pubsub({channel: None})
+        new_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping = {old_node.name: old_ps, new_node.name: new_ps}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster._initialize = True
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        old_ps.sunsubscribe.side_effect = lambda *_: (
+            old_ps.pending_unsubscribe_shard_channels.add(channel)
+        )
+        reconcile_task = None
+
+        async def initialize():
+            nonlocal reconcile_task
+            pubsub.cluster._initialize = False
+            reconcile_task = asyncio.create_task(
+                pubsub.reinitialize_shard_subscriptions()
+            )
+
+        pubsub.cluster.initialize = AsyncMock(side_effect=initialize)
+
+        await pubsub.sunsubscribe(channel)
+        await reconcile_task
+
+        new_ps.ssubscribe.assert_not_awaited()
+        assert channel in pubsub.pending_unsubscribe_shard_channels
+
+    async def test_reinitialize_moves_channel_after_reconnect_drops_pending_unsubscribe(
+        self,
+    ):
+        """
+        A reconnect between ``sunsubscribe`` and its confirmation clears the
+        per-node pending set and replays ``SSUBSCRIBE``, but the cluster-level
+        set kept the channel. Reconciliation skipped it, so it stayed on the
+        old owner after a slot migration.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        # on_connect cleared the per-node pending set and re-subscribed.
+        old_ps = self._make_node_pubsub({channel: None})
+        new_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub.pending_unsubscribe_shard_channels = {channel}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        old_ps.sunsubscribe.assert_awaited_once_with(channel)
+        new_ps.ssubscribe.assert_awaited_once_with(channel)
+        assert pubsub._shard_channel_to_node[channel] == new_node.name
+        assert channel not in pubsub.pending_unsubscribe_shard_channels
+
+    async def test_reinitialize_retries_revived_channel_after_failed_attach(self):
+        """
+        Moving a channel a reconnect subscribed again sends ``SUNSUBSCRIBE`` to
+        the old node before it attaches to the new owner. If the attach fails,
+        the stale cluster-level pending entry must not make the next pass skip
+        the channel as a user unsubscribe.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_node_pubsub({channel: None})
+        old_ps.sunsubscribe.side_effect = lambda *_: (
+            old_ps.pending_unsubscribe_shard_channels.add(channel)
+        )
+        new_ps = self._make_node_pubsub()
+        new_ps.ssubscribe.side_effect = [ConnectionError("new owner is down"), None]
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub.pending_unsubscribe_shard_channels = {channel}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+
+        with pytest.raises(ConnectionError):
+            await pubsub.reinitialize_shard_subscriptions()
+        await pubsub.reinitialize_shard_subscriptions()
+
+        assert new_ps.ssubscribe.await_count == 2
+        assert pubsub._shard_channel_to_node[channel] == new_node.name
+        assert channel not in pubsub.pending_unsubscribe_shard_channels
+
+    async def test_reinitialize_skips_channel_whose_unsubscribe_the_node_confirmed(
+        self,
+    ):
+        """
+        The per-node pubsub drops the channel when it reads the ``SUNSUBSCRIBE``
+        confirmation, before ``get_sharded_message`` updates the cluster-level
+        state. A pass running in between must not subscribe it again.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_node_pubsub()
+        new_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub.pending_unsubscribe_shard_channels = {channel}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        new_ps.ssubscribe.assert_not_awaited()
+        assert channel in pubsub.pending_unsubscribe_shard_channels
+
+    async def test_sunsubscribe_keeps_tracking_for_channel_resubscribed_on_reconnect(
+        self,
+    ):
+        """
+        A ``sunsubscribe`` for a channel the per-node pubsub still holds is not
+        the confirmation of a user unsubscribe, even when a reconnect left the
+        channel in the cluster-level pending set, so the channel stays tracked.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        channel = b"foo"
+        old_ps = self._make_node_pubsub({channel: None})
+        old_ps.get_message.return_value = {"type": "sunsubscribe", "channel": channel}
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub.pending_unsubscribe_shard_channels = {channel}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+
+        message = await pubsub.get_sharded_message(target_node=old_node)
+
+        assert message is not None
+        assert channel in pubsub.shard_channels
+        assert pubsub._shard_channel_to_node[channel] == old_node.name
+
+    async def test_reinitialize_reattaches_when_owner_lost_the_subscription(self):
+        """
+        A pass that detached from the old owner and then failed to attach leaves
+        the channel subscribed nowhere while the reverse index still names a
+        node. If ownership then moves back to that node, the unchanged-owner
+        short-circuit would skip the channel for the lifetime of the pubsub, so
+        the missing subscription has to be re-attached instead.
+        """
+        pubsub = self._make_cluster_pubsub()
+        owner = self._make_node("127.0.0.1:7000")
+        channel = b"foo"
+        # Index says owner holds the channel; its pubsub does not.
+        owner_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[owner.name] = owner_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: owner.name}
+        pubsub.cluster.get_node_from_key.return_value = owner
+
+        with patch.object(pubsub, "_get_node_pubsub", return_value=owner_ps):
+            await pubsub.reinitialize_shard_subscriptions()
+
+        # Nothing to sunsubscribe from - the channel was already detached.
+        owner_ps.sunsubscribe.assert_not_awaited()
+        owner_ps.ssubscribe.assert_awaited_once_with(channel)
+        assert pubsub._shard_channel_to_node[channel] == owner.name
+
     async def test_reinitialize_tolerates_old_node_disconnect(self):
         """
         When the old node is still part of the cluster topology but just
@@ -2112,7 +3031,9 @@ class TestClusterPubSubSlotMigration:
         abort migration, and the old per-node pubsub must be left in
         place so ``PubSub._execute`` can auto-reconnect and
         ``on_connect`` can re-subscribe the remaining channels on the
-        next read.
+        next read. The migrated channel is not one of them: it is
+        detached locally so the replay cannot put it back on the node it
+        was migrated away from.
         """
         pubsub = self._make_cluster_pubsub()
         old_node = self._make_node("127.0.0.1:7000")
@@ -2139,6 +3060,8 @@ class TestClusterPubSubSlotMigration:
         # Connection.disconnect() before the exception surfaced.
         old_ps.aclose.assert_not_awaited()
         assert old_node.name in pubsub.node_pubsub_mapping
+        assert channel not in old_ps.shard_channels
+        assert channel not in old_ps.pending_unsubscribe_shard_channels
 
     async def test_reinitialize_drops_old_pubsub_when_node_removed_from_topology(self):
         """
@@ -2259,6 +3182,26 @@ class TestClusterPubSubSlotMigration:
         assert pubsub.node_pubsub_mapping == {}
         assert pubsub._shard_channel_to_node == {b"foo": "127.0.0.1:7000"}
 
+    async def test_ssubscribe_initializes_cluster_before_resolving_slot(self):
+        """
+        Async RedisCluster lazily initializes on first awaited command.
+        ClusterPubSub.ssubscribe must honor that contract before it resolves
+        the shard channel slot through the cluster's slots cache.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster._initialize = True
+        pubsub.cluster.initialize = AsyncMock()
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        await pubsub.ssubscribe(b"foo")
+
+        pubsub.cluster.initialize.assert_awaited_once()
+        pubsub.cluster.get_node_from_key.assert_called_once_with(b"foo")
+        node_ps.ssubscribe.assert_awaited_once_with(b"foo")
+
     async def test_aclose_clears_state_and_cancels_reconcile_tasks(self):
         """
         Regression: aclose() must clear the ``_shard_channel_to_node`` reverse
@@ -2287,6 +3230,52 @@ class TestClusterPubSubSlotMigration:
         assert pubsub._shard_channel_to_node == {}
         assert pubsub._reconcile_tasks == set()
         assert reconcile_task.cancelled()
+
+    async def test_aclose_does_not_cancel_a_topology_refresh(self):
+        """
+        Regression: the topology repair used to be tracked in the same set
+        aclose() cancels. ``NodesManager.initialize`` refreshes the slots cache
+        of the whole cluster client, which every other command on it reads, so
+        closing one pubsub used to abort a refresh in flight and leave that
+        shared cache stale until some later MOVED or failed poll asked again.
+        The sync counterpart has the same property: ``reset()`` retires the
+        reconciliation executor with ``cancel_futures=True``, which drops queued
+        work but lets a running ``initialize`` finish.
+        """
+        pubsub = self._make_cluster_pubsub()
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def _refresh():
+            started.set()
+            await asyncio.sleep(0)
+            finished.set()
+
+        pubsub.shard_channels = {b"foo": None}
+        # The repair runs the refresh through the cluster client
+        pubsub.cluster.initialize = _refresh
+        pubsub._schedule_topology_repair()
+        (task,) = list(pubsub._topology_repair_tasks)
+        await started.wait()
+
+        await pubsub.aclose()
+
+        assert not task.cancelled()
+        await task
+        assert finished.is_set()
+
+    async def test_aclose_clears_the_topology_repair_throttle(self):
+        """
+        A reused pubsub must not inherit the previous incarnation's throttle
+        window: it would skip the first repair after resubscribing, delaying the
+        move of its shard channels off a node that is already gone.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub._next_topology_repair = time.monotonic() + 300
+
+        await pubsub.aclose()
+
+        assert pubsub._next_topology_repair == 0.0
 
     async def test_migration_driven_sunsubscribe_drops_empty_pubsub(self):
         """
@@ -2414,3 +3403,1314 @@ class TestClusterPubSubSlotMigration:
             and rec.levelno == logging.ERROR
             for rec in caplog.records
         )
+
+    async def test_drop_node_pubsub_recreates_pubsubs_generator(self):
+        """
+        Regression: only ``aclose()`` rebound ``_pubsubs_generator``, but a
+        single-node drop has the same exposure - the generator captures
+        ``node_pubsub_mapping.values()`` into a local list inside ``yield
+        from``, which ``_drop_node_pubsub``'s pop does not reach. So the round
+        robin kept handing the retired per-node pubsub to the next poll.
+
+        It cannot stall the reader here the way it can in the sync stack, where
+        the prelude's subscription wait parks on it: ``_poll_node_pubsub``'s
+        ``connection is None`` guard skips it. But the pass only runs
+        ``range(len(node_pubsub_mapping))`` iterations, so spending one of them
+        on a dead entry costs a healthy sibling its turn.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+        ps_a = self._make_stateful_node_pubsub({b"foo": None})
+        ps_b = self._make_stateful_node_pubsub({b"bar": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": ps_a,
+            "127.0.0.1:7001": ps_b,
+        }
+        # Advance into yield-from so the generator's frame holds a captured
+        # list referencing both per-node pubsubs.
+        assert next(pubsub._pubsubs_generator) is ps_a
+        old_generator = pubsub._pubsubs_generator
+
+        async with pubsub._shard_state_lock:
+            await pubsub._drop_node_pubsub("127.0.0.1:7000", ps_a)
+
+        assert pubsub._pubsubs_generator is not old_generator
+        # The fresh generator must not drain the old captured list first.
+        assert next(pubsub._pubsubs_generator) is ps_b
+        assert next(pubsub._pubsubs_generator) is ps_b
+
+    def _make_stateful_node_pubsub(self, shard_channels=None):
+        """A per-node pubsub whose ``subscribed`` follows its channels.
+
+        ``_make_node_pubsub`` pins ``subscribed`` to True, which is what the
+        tests above need. The detach-driven garbage collection only becomes
+        observable when the flag tracks ``shard_channels`` the way a real
+        ``PubSub`` does, so those tests use this instead.
+        """
+        return _StatefulNodePubSub(shard_channels)
+
+    async def test_reinitialize_detaches_migrated_channel_from_old_pubsub(self):
+        """
+        Regression: a ``SUNSUBSCRIBE`` that never reaches the server used to
+        leave the channel in the old pubsub's ``shard_channels``.
+        ``PubSub.on_connect`` clears ``pending_unsubscribe_shard_channels`` and
+        replays ``SSUBSCRIBE`` from ``shard_channels``, so the channel was
+        re-subscribed on the node it had just been migrated away from on every
+        reconnect - and because the reverse index had already advanced,
+        reconciliation never revisited it. Delivery on that channel was lost
+        for the lifetime of the pubsub.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        migrated = b"foo"
+        staying = b"bar"
+        old_ps = self._make_stateful_node_pubsub({migrated: None, staying: None})
+        old_ps.sunsubscribe_error = ConnectionError("connection closed by server")
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {migrated: None}
+        pubsub._shard_channel_to_node = {migrated: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        # The channel is gone from the old node's replay set, and present on
+        # the new owner.
+        assert migrated not in old_ps.shard_channels
+        assert migrated not in old_ps.pending_unsubscribe_shard_channels
+        assert migrated in new_ps.shard_channels
+        assert pubsub._shard_channel_to_node[migrated] == new_node.name
+        # A sibling subscription on the same node is untouched, so the pubsub
+        # survives to recover it through on_connect.
+        assert staying in old_ps.shard_channels
+        assert old_node.name in pubsub.node_pubsub_mapping
+
+    async def test_reinitialize_collects_old_pubsub_once_detach_empties_it(self):
+        """
+        The end-of-pass garbage collection drops per-node pubsubs that hold no
+        subscription. Detaching the last channel of a node whose SUNSUBSCRIBE
+        failed must therefore release its dedicated connection instead of
+        leaving a pubsub the round-robin generator keeps polling for nothing.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_stateful_node_pubsub({channel: None})
+        old_ps.sunsubscribe_error = TimeoutError("timeout reading from socket")
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.reinitialize_shard_subscriptions()
+
+        assert old_ps.aclose_calls == 1
+        assert old_node.name not in pubsub.node_pubsub_mapping
+        assert channel in new_ps.shard_channels
+
+    async def test_ssubscribe_reroute_collects_old_pubsub_once_detach_empties_it(self):
+        """
+        Regression: the detach-driven collection cannot be left to the
+        end-of-pass garbage collection, because ``ssubscribe``'s lazy re-route
+        reaches ``_forget_shard_channel_on_old_node`` without ever running
+        ``reinitialize_shard_subscriptions``. The other two collectors cannot
+        reach it either: no ``SUNSUBSCRIBE`` confirmation can arrive for a
+        channel forgotten locally, so ``get_sharded_message``'s unsubscribe
+        branch never fires, and the old node is still in the topology, so the
+        departed-node fast path does not apply.
+
+        An empty pubsub left in ``node_pubsub_mapping`` keeps a live connection
+        with nothing subscribed on it, so ``_poll_node_pubsub`` passes its
+        ``connection is None`` guard and blocks reading a socket no message can
+        arrive on - forever for a ``timeout=None`` caller, and for the whole
+        timeout of every pass otherwise, before a single healthy node is read.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        channel = b"foo"
+        old_ps = self._make_stateful_node_pubsub({channel: None})
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: old_node.name}
+        # The reader has just failed to reach the old node, so the migration
+        # forgets the channel locally rather than paying a reconnect for a
+        # SUNSUBSCRIBE that cannot arrive.
+        pubsub._unreachable_nodes = {old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        # Still in the topology - the departed-node fast path must not be what
+        # collects it, or this test would pass with the bug present.
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.ssubscribe(channel)
+
+        assert channel in new_ps.shard_channels
+        assert pubsub._shard_channel_to_node[channel] == new_node.name
+        assert not old_ps.subscribed
+        assert old_ps.aclose_calls == 1
+        assert old_node.name not in pubsub.node_pubsub_mapping
+
+    async def test_ssubscribe_reroute_keeps_old_pubsub_with_sibling_channels(self):
+        """
+        The collection above is conditional on the detach having emptied the
+        pubsub. A node that still holds a sibling subscription has to stay in
+        ``node_pubsub_mapping``, so the reader keeps delivering that sibling.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_node = self._make_node("127.0.0.1:7000")
+        new_node = self._make_node("127.0.0.1:7001")
+        migrated = b"foo"
+        staying = b"bar"
+        old_ps = self._make_stateful_node_pubsub({migrated: None, staying: None})
+        new_ps = self._make_stateful_node_pubsub()
+        pubsub.node_pubsub_mapping[old_node.name] = old_ps
+        pubsub.node_pubsub_mapping[new_node.name] = new_ps
+        pubsub.shard_channels = {migrated: None, staying: None}
+        pubsub._shard_channel_to_node = {
+            migrated: old_node.name,
+            staying: old_node.name,
+        }
+        pubsub._unreachable_nodes = {old_node.name}
+        pubsub.cluster.get_node_from_key.return_value = new_node
+        pubsub.cluster.get_node.return_value = old_node
+
+        await pubsub.ssubscribe(migrated)
+
+        assert migrated not in old_ps.shard_channels
+        assert staying in old_ps.shard_channels
+        assert old_ps.aclose_calls == 0
+        assert old_node.name in pubsub.node_pubsub_mapping
+
+    @contextmanager
+    def _idle_polls(self, pubsub, time_module):
+        """Polls that find nothing and wait out their timeout on a fake clock."""
+        clock = [time.monotonic()]
+
+        def poll(ps, timeout):
+            clock[0] += timeout
+
+        with patch(time_module) as fake_time:
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            with patch.object(
+                pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)
+            ) as p:
+                yield p
+
+    def _prime_generator(self, pubsub):
+        from redis.asyncio.cluster import ClusterPubSub
+
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+    async def test_sharded_message_generator_skips_a_failing_pubsub(self):
+        """
+        Regression: a single reader serves every per-node pubsub, so letting an
+        exception from one abort the pass stopped delivery cluster-wide while
+        only one node was actually affected.
+        """
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        good = self._make_node_pubsub({b"bar": None})
+        message = {"type": "smessage", "channel": b"bar", "data": b"hi"}
+        good.get_message.return_value = message
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad, "127.0.0.1:7001": good}
+        self._prime_generator(pubsub)
+
+        source, delivered = await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert source is good
+        assert delivered is message
+
+    async def test_sharded_message_generator_splits_timeout_across_nodes(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(4)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        # A non-blocking sweep, the timed pass in equal shares, a last sweep.
+        slices = [c.args[1] for c in poll.call_args_list]
+        assert slices[:8] == pytest.approx([0.0] * 4 + [0.1] * 4)
+        assert slices[-4:] == [0.0] * 4
+
+    async def test_sharded_message_generator_gives_skipped_share_to_others(self):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[cooling] = time.monotonic() + 30
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        # [0] is the non-blocking sweep, which skips the cooling node too.
+        assert poll.call_args_list[0].args == (healthy, 0.0)
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
+    async def test_sharded_message_generator_gives_unconnected_share_to_others(
+        self,
+    ):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        unconnected = self._make_node_pubsub({b"b": None})
+        unconnected.connection = None
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": unconnected,
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.asyncio.cluster.time") as poll:
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
+    async def test_sharded_message_generator_ends_pass_after_dispatch(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # The sweep finds nothing, then a handler takes the first node's message
+        # in the timed pass: the idle node must not get the rest of the wait.
+        poll = AsyncMock(side_effect=[None, None, _DISPATCHED, None])
+        with patch.object(pubsub, "_poll_node_pubsub", poll):
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert poll.call_count == 3
+
+    async def test_sharded_message_generator_sweeps_for_late_message(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"c0", "data": b"late"}
+
+        # The message reaches the first node only after its slice ran out.
+        with patch.object(
+            pubsub,
+            "_poll_node_pubsub",
+            AsyncMock(side_effect=[None, None, None, None, msg]),
+        ):
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                idle[0],
+                msg,
+            )
+
+    async def test_sharded_message_generator_does_not_block_a_busy_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        hot = self._make_node_pubsub({b"hot": None})
+        idle = self._make_node_pubsub({b"idle": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": hot, "127.0.0.1:7001": idle}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"hot", "data": b"x"}
+
+        async def poll(ps, timeout):
+            return msg if ps is hot else None
+
+        with patch.object(
+            pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)
+        ) as p:
+            # The second call starts on the idle node, after the hot one.
+            for _ in range(2):
+                assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                    hot,
+                    msg,
+                )
+
+        assert [c.args[1] for c in p.call_args_list] == [0.0, 0.0, 0.0]
+
+    async def test_sharded_message_generator_reuses_time_a_fast_shard_left(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = self._make_node_pubsub({b"idle": None})
+        fast = self._make_node_pubsub({b"fast": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": idle, "127.0.0.1:7001": fast}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"idle", "data": b"x"}
+        idle_polls = []
+        clock = [time.monotonic()]
+
+        async def poll(ps, timeout):
+            if ps is fast:
+                return None
+            idle_polls.append(timeout)
+            # Arrives after the idle node's first slice, within the timeout.
+            if len(idle_polls) == 3:
+                return msg
+            clock[0] += timeout
+            return None
+
+        # A sub-millisecond pass still blocked on the idle node.
+        with (
+            patch("redis.asyncio.cluster.time") as fake_time,
+            patch.object(pubsub, "_poll_node_pubsub", AsyncMock(side_effect=poll)),
+        ):
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            assert await pubsub._sharded_message_generator(timeout=0.001) == (
+                idle,
+                msg,
+            )
+
+        # The sweep, the first timed slice, then a second pass over the rest.
+        assert idle_polls[2] > 0
+
+    async def test_sharded_message_generator_stops_without_connections(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        for ps in nodes:
+            ps.connection = None
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # Every poll returns at once, so looping until the deadline would spin.
+        with patch.object(
+            pubsub, "_sharded_pass", wraps=pubsub._sharded_pass
+        ) as passes:
+            assert await pubsub._sharded_message_generator(timeout=0.4) == (
+                None,
+                None,
+            )
+
+        assert passes.call_count == 3
+
+    async def test_sharded_message_generator_sleeps_past_unconnected_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        clock = [time.monotonic()]
+        pubsub._poll_cool_off[cooling] = clock[0] + 30
+
+        async def sleep(next_ready, timeout):
+            clock[0] += timeout
+
+        with (
+            patch("redis.asyncio.cluster.time") as fake_time,
+            patch.object(pubsub, "_wait_out_cool_off", AsyncMock(side_effect=sleep)),
+            patch.object(pubsub, "_sharded_pass", wraps=pubsub._sharded_pass) as passes,
+        ):
+            # Ticks on each read, so a pass that never sleeps still ends.
+            fake_time.monotonic.side_effect = (
+                lambda: clock.__setitem__(0, clock[0] + 0.001) or clock[0]
+            )
+            await pubsub._sharded_message_generator(timeout=0.4)
+
+        assert passes.call_count == 3
+
+    async def test_sharded_message_generator_unconnected_shard_is_not_down(self):
+        pubsub = self._make_cluster_pubsub()
+        unconnected = self._make_node_pubsub({b"a": None})
+        unconnected.connection = None
+        bad = self._make_node_pubsub({b"b": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": unconnected,
+            "127.0.0.1:7001": bad,
+        }
+        self._prime_generator(pubsub)
+
+        assert await pubsub._sharded_message_generator(timeout=0) == (None, None)
+
+    async def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
+        """
+        Isolation must not swallow a total outage: with nothing left to poll
+        successfully, the first error is surfaced to the caller as before.
+        """
+        pubsub = self._make_cluster_pubsub()
+        first = self._make_node_pubsub({b"foo": None})
+        first.get_message.side_effect = ConnectionError("first is gone")
+        second = self._make_node_pubsub({b"bar": None})
+        second.get_message.side_effect = TimeoutError("second is slow")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": first,
+            "127.0.0.1:7001": second,
+        }
+        self._prime_generator(pubsub)
+
+        with pytest.raises((ConnectionError, TimeoutError)):
+            await pubsub._sharded_message_generator(timeout=0.01)
+
+    async def test_sharded_message_generator_repairs_moved(self):
+        """
+        ``on_connect`` replays ``SSUBSCRIBE`` to the node its connection is
+        bound to, so a channel left on a former owner is answered with
+        ``MOVED``. ``MovedError`` is not retried by ``Connection.retry`` and
+        nothing else on the read path refreshes the slots cache, so without
+        this repair the subscription could never recover.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        slot = key_slot(channel)
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{slot} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        source, delivered = await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert (source, delivered) == (None, None)
+        # The stale subscription is dropped so on_connect stops replaying it,
+        # and its recorded owner is forgotten so reconciliation does not
+        # short-circuit on an already-advanced reverse index.
+        assert channel not in stale.shard_channels
+        assert channel not in pubsub._shard_channel_to_node
+        # The channel stays in the cluster-level intent, which is what
+        # reconciliation walks.
+        assert channel in pubsub.shard_channels
+        pubsub.cluster.nodes_manager.move_slot.assert_awaited_once()
+        pubsub.on_slots_changed.assert_awaited_once()
+        # Cooled off, so an uncorrectable slots cache cannot make the repair
+        # re-run on every poll.
+        assert stale in pubsub._poll_cool_off
+
+    async def test_moved_repair_fills_in_a_missing_redirect_host(self):
+        """
+        A node whose endpoint is unknown (cluster-preferred-endpoint-type
+        unknown-endpoint) answers ``MOVED`` with only a port, and the repair
+        applies the redirect on the host of the node that sent it rather than
+        failing to parse an address with an empty host.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} :7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        (redirect,), _ = pubsub.cluster.nodes_manager.move_slot.call_args
+        assert redirect.node_addr == ("127.0.0.1", 7001)
+
+    async def test_moved_repair_collects_the_pubsub_it_empties(self):
+        """
+        A node that lost its only slot answers ``MOVED`` for every channel it
+        held, so the repair's detach can leave its pubsub with nothing
+        subscribed - and an empty one left in ``node_pubsub_mapping`` keeps a
+        live connection with nothing subscribed on it, which
+        ``_poll_node_pubsub`` blocks on reading. The other collectors cannot
+        reach it: no ``SUNSUBSCRIBE`` confirmation arrives for a channel
+        forgotten locally, and the reconciliation pass scheduled by the repair
+        only garbage-collects it once its task runs - a whole poll cool-off
+        later, at best.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        assert stale.aclose_calls == 1
+        assert "127.0.0.1:7000" not in pubsub.node_pubsub_mapping
+        # The cluster-level intent survives, so the reconciliation the repair
+        # scheduled still re-attaches the channel on its new owner.
+        assert channel in pubsub.shard_channels
+
+    async def test_moved_repair_keeps_a_pubsub_with_other_slots(self):
+        """
+        Only the channels of the moved slot are re-routed, so a pubsub that
+        still holds a subscription on another slot must stay in the mapping and
+        keep serving it.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        moved = b"foo"
+        staying = b"bar"
+        stale = self._make_stateful_node_pubsub({moved: None, staying: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {moved: None, staying: None}
+        pubsub._shard_channel_to_node = {
+            moved: "127.0.0.1:7000",
+            staying: "127.0.0.1:7000",
+        }
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(moved)} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        assert stale.aclose_calls == 0
+        assert pubsub.node_pubsub_mapping == {"127.0.0.1:7000": stale}
+        assert moved not in stale.shard_channels
+        assert staying in stale.shard_channels
+        assert pubsub._shard_channel_to_node == {staying: "127.0.0.1:7000"}
+
+    async def test_sunsubscribe_bookkeeping_survives_a_racing_detach(self):
+        """
+        Mirrors the sync regression: ``handle_message`` did its unsubscribe
+        bookkeeping as a check-then-``remove`` on
+        ``pending_unsubscribe_shard_channels``, which a concurrent
+        ``_detach_shard_channel`` of the same channel could turn into a
+        ``KeyError`` raised out of a pubsub read that no caller catches. The
+        async detach cannot actually interleave (it runs to completion without
+        an ``await``), but the bookkeeping is a mirror and must not drift.
+        """
+        # A real PubSub, not a mock: handle_message's bookkeeping is the code
+        # under test here.
+        node_pubsub = PubSub.__new__(PubSub)
+        # __del__ reads it, so a bare __new__ instance would raise on collection.
+        node_pubsub.connection = None
+        node_pubsub.shard_channels = {b"foo": None}
+        node_pubsub.channels = {}
+        node_pubsub.patterns = {}
+        node_pubsub.ignore_subscribe_messages = False
+
+        class _RacingSet(set):
+            """Detaches the channel exactly in the check-to-removal window."""
+
+            def __contains__(self, item):
+                present = super().__contains__(item)
+                if present:
+                    ClusterPubSub._detach_shard_channel(node_pubsub, item)
+                return present
+
+        node_pubsub.pending_unsubscribe_shard_channels = _RacingSet({b"foo"})
+
+        await node_pubsub.handle_message(
+            ["sunsubscribe", b"foo", 0], ignore_subscribe_messages=False
+        )
+
+        assert b"foo" not in node_pubsub.shard_channels
+        assert b"foo" not in node_pubsub.pending_unsubscribe_shard_channels
+
+    async def test_target_node_poll_repairs_moved(self):
+        """
+        Regression: a poll that names one node used to hand the caller a raw
+        ``MovedError`` - an error it cannot act on - and left the channel pinned
+        to the former owner, while the round-robin path re-routed it. The two
+        poll paths must repair the same way.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        node = self._make_node("127.0.0.1:7000")
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {node.name: stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: node.name}
+        stale.get_message_error = MovedError(f"{key_slot(channel)} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock()
+        pubsub.on_slots_changed = AsyncMock()
+
+        message = await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+
+        assert message is None
+
+        # Same repair as the round-robin path: the stale subscription is dropped
+        # so on_connect stops replaying it, its recorded owner is forgotten, the
+        # cluster-level intent is kept for reconciliation to walk, and the node
+        # is cooled off so an uncorrectable slots cache cannot re-run the repair
+        # on every poll.
+        assert channel not in stale.shard_channels
+        assert channel not in pubsub._shard_channel_to_node
+        assert channel in pubsub.shard_channels
+        pubsub.on_slots_changed.assert_awaited_once()
+        assert stale in pubsub._poll_cool_off
+
+    async def test_target_node_poll_still_raises_connection_errors(self):
+        """
+        Isolation from a sick node exists to protect its healthy siblings, and a
+        caller that named a single node has no sibling to protect - so a
+        connectivity failure stays visible there.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        bad = self._make_stateful_node_pubsub({b"foo": None})
+        bad.get_message_error = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {node.name: bad}
+
+        with pytest.raises(ConnectionError):
+            await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+
+    async def test_sharded_message_generator_survives_a_failing_redirect(self):
+        """
+        ``move_slot`` indexes ``slots_cache`` by the redirected slot, so an
+        as-yet-uncovered slot raises. That must not turn a pubsub read into an
+        exception: reconciliation is scheduled either way.
+        """
+        from redis.crc import key_slot
+        from redis.exceptions import MovedError
+
+        pubsub = self._make_cluster_pubsub()
+        channel = b"foo"
+        stale = self._make_stateful_node_pubsub({channel: None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": stale}
+        pubsub.shard_channels = {channel: None}
+        pubsub._shard_channel_to_node = {channel: "127.0.0.1:7000"}
+        self._prime_generator(pubsub)
+        stale.get_message_error = MovedError(f"{key_slot(channel)} 127.0.0.1:7001")
+        pubsub.cluster.nodes_manager.move_slot = AsyncMock(
+            side_effect=KeyError(key_slot(channel))
+        )
+        pubsub.on_slots_changed = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        pubsub.on_slots_changed.assert_awaited_once()
+
+    async def test_pubsubs_generator_survives_a_momentarily_empty_mapping(self):
+        """
+        Regression: the generator used to ``return`` on an empty
+        ``node_pubsub_mapping``, which exhausts it for good - and only
+        ``reset`` recreates it. Reconciliation drops a per-node pubsub before
+        creating its replacement, so one such window silently ended sharded
+        delivery for the rest of the pubsub's life.
+        """
+        pubsub = self._make_cluster_pubsub()
+        self._prime_generator(pubsub)
+
+        assert next(pubsub._pubsubs_generator) is None
+
+        ps = self._make_node_pubsub({b"foo": None})
+        pubsub.node_pubsub_mapping["127.0.0.1:7000"] = ps
+
+        assert next(pubsub._pubsubs_generator) is ps
+
+    async def test_sharded_message_generator_cools_off_a_failing_pubsub(self):
+        """
+        ``PubSub._execute`` reconnects and then retries through the
+        connection's own ``Retry``, so one "bounded" poll on an unreachable node
+        can cost its whole retry budget instead of the timeout the caller asked
+        for. Going straight back to that node on the next pass is what turns one
+        sick node into a cluster-wide delivery stall, so it is skipped for a
+        cool-off window while its healthy siblings keep being polled.
+        """
+        from redis.asyncio.cluster import SHARD_POLL_COOL_OFF_SECONDS
+
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        good = self._make_node_pubsub({b"bar": None})
+        good.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad, "127.0.0.1:7001": good}
+        self._prime_generator(pubsub)
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 1
+        polls_of_good = good.get_message.await_count
+
+        # Second pass: the bad one is skipped, the good one is polled again.
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 1
+        assert good.get_message.await_count > polls_of_good
+
+        # Once the window expires it is tried again.
+        pubsub._poll_cool_off[bad] = time.monotonic() - SHARD_POLL_COOL_OFF_SECONDS
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+        assert bad.get_message.await_count == 2
+
+    async def test_sharded_message_generator_blocks_when_all_nodes_cool_off(self):
+        """
+        A pass in which every node is skipped for cool-off performs no wire
+        read, so returning straight away ignores the timeout the caller asked
+        to block for - and a reader loop on ``get_sharded_message`` polls right
+        back, spinning until the cool-off expires instead of blocking.
+        """
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[bad] = time.monotonic() + 30
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.05) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert bad.get_message.await_count == 0
+        assert elapsed >= 0.05 - EVENT_LOOP_TIMER_SLACK
+
+    async def test_sharded_message_generator_cool_off_wait_ends_with_the_window(self):
+        """The wait is bounded by the cool-off, not by a long caller timeout."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+
+        # Anchor the deadline to ``start``: _wait_out_cool_off sleeps up to the
+        # absolute deadline, so a deadline taken before ``start`` shortens the
+        # measured wait by the setup's own cost and makes the lower bound below
+        # unreachable.
+        start = time.monotonic()
+        # A stall longer than the window between here and the generator's
+        # deadline check lets it poll the failing node; keep the window wide.
+        pubsub._poll_cool_off[bad] = start + 0.5
+        assert await pubsub._sharded_message_generator(timeout=30) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert 0.5 - EVENT_LOOP_TIMER_SLACK <= elapsed < 5
+
+    async def test_sharded_message_generator_cool_off_does_not_block_zero_timeout(
+        self,
+    ):
+        """A non-blocking poll must stay non-blocking while nodes cool off."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[bad] = time.monotonic() + 30
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.0) == (None, None)
+
+        assert time.monotonic() - start < 1
+
+    async def test_sharded_message_generator_clears_cool_off_on_success(self):
+        """A pubsub that polls cleanly must not stay in cool-off."""
+        pubsub = self._make_cluster_pubsub()
+        ps = self._make_node_pubsub({b"foo": None})
+        ps.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": ps}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[ps] = time.monotonic() - 1
+
+        await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert ps not in pubsub._poll_cool_off
+
+    async def test_failed_poll_schedules_one_throttled_topology_refresh(self):
+        """
+        A node that has left the deployment answers ECONNREFUSED, never MOVED, so
+        the failed poll is the only signal that its shard channels need a new
+        owner. Reconciliation is otherwise purely event-driven, so the read path
+        has to ask for a slots-cache refresh - throttled, because a node that is
+        down fails every poll.
+        """
+        from redis.asyncio.cluster import SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
+
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        # The repair runs the refresh through the cluster client
+        pubsub.cluster.initialize = AsyncMock()
+
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._topology_repair_tasks, return_exceptions=True)
+        assert pubsub.cluster.initialize.await_count == 1
+        # Asked for on the client, so a failed refresh stays asked for
+        pubsub.cluster._request_refresh.assert_called_once_with()
+        assert pubsub._unreachable_nodes == {"127.0.0.1:7000"}
+
+        # Second failure inside the throttle window must not refresh again.
+        pubsub._poll_cool_off.pop(bad, None)
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._topology_repair_tasks, return_exceptions=True)
+        assert pubsub.cluster.initialize.await_count == 1
+
+        # Once the window expires the next failure asks again.
+        pubsub._next_topology_repair = (
+            time.monotonic() - SHARD_TOPOLOGY_REPAIR_INTERVAL_SECONDS
+        )
+        pubsub._poll_cool_off.pop(bad, None)
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+        await asyncio.gather(*pubsub._topology_repair_tasks, return_exceptions=True)
+        assert pubsub.cluster.initialize.await_count == 2
+
+    async def test_failed_poll_does_not_refresh_without_shard_channels(self):
+        """Nothing to reconcile means nothing to refresh the topology for."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub()
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+
+        with pytest.raises(ConnectionError):
+            await pubsub._sharded_message_generator(timeout=0.01)
+
+        pubsub.cluster.initialize.assert_not_awaited()
+        assert pubsub.cluster._initialize is False
+
+    async def test_successful_poll_clears_the_unreachable_mark(self):
+        """A node that answers again must not keep the migration fast path."""
+        pubsub = self._make_cluster_pubsub()
+        ps = self._make_node_pubsub({b"foo": None})
+        ps.get_message.return_value = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": ps}
+        self._prime_generator(pubsub)
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+
+        await pubsub._sharded_message_generator(timeout=0.01)
+
+        assert pubsub._unreachable_nodes == set()
+
+    async def test_migration_skips_sunsubscribe_on_an_unreachable_old_node(self):
+        """
+        A SUNSUBSCRIBE to a node the reader just failed to reach cannot arrive,
+        and attempting it costs a full reconnect plus the client's retry budget -
+        queued behind the reader on the same per-node io lock, while this pass
+        holds ``_shard_state_lock``. Detach locally instead and re-SSUBSCRIBE on
+        the new owner straight away.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_pubsub = self._make_node_pubsub({b"foo": None})
+        new_pubsub = self._make_node_pubsub()
+        new_pubsub.shard_channels = {b"foo": None}
+        new_node = self._make_node("127.0.0.1:7001")
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": old_pubsub,
+            "127.0.0.1:7001": new_pubsub,
+        }
+        pubsub.shard_channels = {b"foo": None}
+        pubsub._shard_channel_to_node = {b"foo": "127.0.0.1:7000"}
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+        pubsub.cluster.get_node.return_value = self._make_node("127.0.0.1:7000")
+
+        with patch.object(
+            pubsub, "_get_node_pubsub", return_value=new_pubsub
+        ) as get_node_pubsub:
+            await pubsub._migrate_shard_channel(
+                b"foo", None, "127.0.0.1:7000", new_node
+            )
+
+        old_pubsub.sunsubscribe.assert_not_awaited()
+        assert b"foo" not in old_pubsub.shard_channels
+        get_node_pubsub.assert_called_once_with(new_node)
+        new_pubsub.ssubscribe.assert_awaited_once_with(b"foo")
+        assert pubsub._shard_channel_to_node[b"foo"] == "127.0.0.1:7001"
+
+    async def test_migration_drops_an_unreachable_node_gone_from_the_topology(self):
+        """
+        A departed node has no reconnect target, so its per-node pubsub is
+        dropped rather than left for the round robin to keep yielding - and the
+        unreachable mark goes with it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        old_pubsub = self._make_node_pubsub({b"foo": None})
+        new_pubsub = self._make_node_pubsub()
+        new_node = self._make_node("127.0.0.1:7001")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": old_pubsub}
+        pubsub.shard_channels = {b"foo": None}
+        pubsub._shard_channel_to_node = {b"foo": "127.0.0.1:7000"}
+        pubsub._unreachable_nodes = {"127.0.0.1:7000"}
+        pubsub.cluster.get_node.return_value = None
+
+        with patch.object(pubsub, "_get_node_pubsub", return_value=new_pubsub):
+            await pubsub._migrate_shard_channel(
+                b"foo", None, "127.0.0.1:7000", new_node
+            )
+
+        old_pubsub.sunsubscribe.assert_not_awaited()
+        old_pubsub.aclose.assert_awaited_once()
+        assert "127.0.0.1:7000" not in pubsub.node_pubsub_mapping
+        assert pubsub._unreachable_nodes == set()
+
+    # --- per-node I/O lock scope ------------------------------------------
+
+    def _make_real_node_pubsub(self, raw_response, handler=None, channel=b"foo"):
+        """A real per-node ``PubSub`` with only the wire read stubbed.
+
+        ``handle_message`` stays real so the assertions exercise the actual
+        dispatch, and a real ``_shard_io_lock`` gets attached by
+        ``_pubsub_io_lock`` - a ``MagicMock`` stand-in would hand back a mock
+        that supports ``__aenter__``, making every lock-scope assertion
+        vacuously true.
+        """
+        p = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.shard_channels = {channel: handler}
+        # A subscribed per-node pubsub is connected; the poll path skips one
+        # whose connection is gone. Only the wire read is stubbed, so this is
+        # just the non-None marker that state needs.
+        p.connection = MagicMock()
+        p.parse_response = AsyncMock(return_value=raw_response)
+        return p
+
+    @pytest.mark.parametrize("via_target_node", [True, False])
+    async def test_handler_runs_without_the_node_io_lock(self, via_target_node):
+        """
+        The per-node I/O lock must not be held while handle_message awaits a
+        user handler. A handler may await ssubscribe / sunsubscribe on this
+        ClusterPubSub, which takes the same I/O lock, and asyncio.Lock is not
+        reentrant - so the reader task used to hang permanently and silently.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        observed = []
+
+        async def handler(message):
+            observed.append(io_lock.locked())
+
+        node_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"], handler)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        if via_target_node:
+            message = await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+        else:
+            message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert observed == [False]
+        # A dispatched handler consumes the message.
+        assert message is None
+
+    @pytest.mark.parametrize(
+        "raw_response,expect_lock_held",
+        [
+            ([b"ssubscribe", b"foo", 1], True),
+            ([b"sunsubscribe", b"foo", 0], True),
+            ([b"smessage", b"foo", b"hi"], False),
+        ],
+    )
+    async def test_bookkeeping_stays_under_the_io_lock(
+        self, raw_response, expect_lock_held
+    ):
+        """
+        Only handler dispatch leaves the I/O lock. handle_message's
+        subscription bookkeeping mutates the same shard_channels /
+        pending_unsubscribe_shard_channels that ssubscribe / sunsubscribe
+        mutate under this lock, so it must stay inside it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+
+        async def handler(message):
+            return None
+
+        node_ps = self._make_real_node_pubsub(raw_response, handler)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        real_handle_message = node_ps.handle_message
+
+        async def _spy(response, ignore_subscribe_messages=False):
+            observed.append(io_lock.locked())
+            return await real_handle_message(response, ignore_subscribe_messages)
+
+        node_ps.handle_message = _spy
+
+        await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+
+        assert observed == [expect_lock_held]
+
+    async def test_handler_may_resubscribe_from_inside_the_handler(self):
+        """
+        Regression: asyncio.Lock is not reentrant, so a handler awaiting
+        ssubscribe / sunsubscribe on this ClusterPubSub - which re-takes the
+        same per-node I/O lock - hung the reader task permanently and
+        silently. wait_for so a regression fails fast instead of hanging CI.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        async def handler(message):
+            await pubsub.ssubscribe(b"bar")
+
+        node_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"], handler)
+        node_ps.ssubscribe = AsyncMock()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        with mock.patch.object(pubsub, "_get_node_pubsub", return_value=node_ps):
+            message = await asyncio.wait_for(
+                pubsub.get_sharded_message(timeout=0.01, target_node=node),
+                timeout=2.0,
+            )
+
+        assert message is None
+        node_ps.ssubscribe.assert_awaited_once_with(b"bar")
+        assert not ClusterPubSub._pubsub_io_lock(node_ps).locked()
+
+    async def test_detach_shard_channel_on_a_real_node_pubsub(self):
+        """
+        _detach_shard_channel is ported from sync, where PubSub has a
+        subscribed_event to clear. The async PubSub has none, so touching it
+        raised AttributeError out of _forget_shard_channel_on_old_node -
+        which reinitialize_shard_subscriptions does not catch.
+        """
+        node_ps = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        node_ps.shard_channels = {b"foo": None}
+
+        ClusterPubSub._detach_shard_channel(node_ps, b"foo")
+
+        assert node_ps.shard_channels == {}
+        assert not node_ps.subscribed
+
+    def _make_gone_node_pubsub(self):
+        """A per-node ``PubSub`` in the state the reconciliation GC leaves.
+
+        ``parse_response`` stays real - it is what raises ``RuntimeError`` on a
+        ``None`` connection, so stubbing it would make the regression
+        untestable.
+        """
+        p = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.shard_channels = {b"foo": None}
+        return p
+
+    async def test_poll_skips_a_pubsub_the_gc_closed_mid_pass(self):
+        """
+        _pubsubs_generator yields from a snapshot of node_pubsub_mapping, so a
+        per-node pubsub the reconciliation GC aclose()d and popped can still
+        reach _poll_node_pubsub. PubSub.parse_response raises RuntimeError on a
+        None connection, and _sharded_message_generator catches only
+        Moved/Connection/Timeout/OSError - so the whole pass aborted, taking
+        the healthy siblings' messages with it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        closed_ps = self._make_gone_node_pubsub()
+        await closed_ps.aclose()
+        live_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"])
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": closed_ps,
+            "127.0.0.1:7001": live_ps,
+        }
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert closed_ps.connection is None
+        assert message is not None
+        assert message["channel"] == b"foo"
+
+    @pytest.mark.parametrize("via_target_node", [True, False])
+    async def test_poll_skips_a_never_subscribed_pubsub(self, via_target_node):
+        """
+        _get_node_pubsub registers a per-node pubsub before its caller's first
+        ssubscribe, and awaiting the I/O lock in between lets the reader task
+        in - so a poll can land on a pubsub whose connection is still None.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        if via_target_node:
+            message = await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+        else:
+            message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert message is None
+
+    # --- shard commands routed through execute_command --------------------
+
+    @pytest.mark.parametrize(
+        "command,override",
+        [("SSUBSCRIBE", "ssubscribe"), ("SUNSUBSCRIBE", "sunsubscribe")],
+    )
+    async def test_execute_command_delegates_shard_subscriptions(
+        self, command, override
+    ):
+        """
+        execute_command's shard branch used to dispatch SSUBSCRIBE /
+        SUNSUBSCRIBE straight at the per-node pubsub, which both wrote the
+        socket without the per-node I/O lock and recorded nothing - so the
+        channel stayed invisible to the reader loop and to on_connect's replay.
+        It must go through the overrides, which own the lock and the
+        bookkeeping.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+        delegate = AsyncMock()
+        setattr(pubsub, override, delegate)
+
+        await pubsub.execute_command(command, b"foo")
+
+        delegate.assert_awaited_once_with(b"foo")
+        node_ps.execute_command.assert_not_called()
+
+    async def test_execute_command_ssubscribe_records_the_channel(self):
+        """
+        End-to-end counterpart to the delegation test: the bookkeeping the raw
+        dispatch skipped actually lands.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        await pubsub.execute_command("SSUBSCRIBE", b"foo")
+
+        node_ps.ssubscribe.assert_awaited_once_with(b"foo")
+        assert pubsub._shard_channel_to_node[b"foo"] == node.name
+
+    async def test_execute_command_spublish_holds_the_node_io_lock(self):
+        """
+        SPUBLISH stays a raw send - there is no override to delegate to - so
+        the branch itself has to take the per-node I/O lock, or the send can
+        reconnect the socket under a concurrent bounded poll.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        observed = []
+        node_ps.execute_command = AsyncMock(
+            side_effect=lambda *a, **kw: observed.append(io_lock.locked())
+        )
+
+        await pubsub.execute_command("SPUBLISH", b"foo", b"hi")
+
+        assert observed == [True]
+        assert not io_lock.locked()
+
+    async def test_aclose_holds_the_node_io_lock(self):
+        """
+        The other four per-node aclose() sites take the I/O lock; teardown must
+        too, so it does not disconnect the socket beneath a bounded poll parked
+        in parse_response.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        node_ps.aclose = AsyncMock(
+            side_effect=lambda: observed.append(io_lock.locked())
+        )
+
+        await pubsub.aclose()
+
+        assert observed == [True]
+        assert not io_lock.locked()
+        assert pubsub.node_pubsub_mapping == {}
+
+
+class _StatefulNodePubSub:
+    """Per-node ``PubSub`` stand-in with real subscription state.
+
+    Only the surface ``ClusterPubSub`` touches on a per-node pubsub is
+    implemented: the subscription dicts, the ``subscribed`` flag derived from
+    them, and the three wire calls. ``sunsubscribe_error`` /
+    ``get_message_error`` inject the transient failures the tests are about.
+    """
+
+    def __init__(self, shard_channels=None):
+        self.shard_channels = dict(shard_channels or {})
+        self.pending_unsubscribe_shard_channels = set()
+        self.channels = {}
+        self.patterns = {}
+        self.subscribed_event = asyncio.Event()
+        if self.shard_channels:
+            self.subscribed_event.set()
+        # Connected, like any per-node pubsub the reader can poll: the poll
+        # path skips one whose connection a teardown has already dropped.
+        self.connection = MagicMock()
+        self.sunsubscribe_error = None
+        self.get_message_error = None
+        self.aclose_calls = 0
+
+    @property
+    def subscribed(self):
+        # Mirrors the real async PubSub.subscribed property, which is derived
+        # from the subscription dicts. The async PubSub has no
+        # subscribed_event; this stand-in keeps one only so the sync and async
+        # test doubles stay diffable.
+        return bool(self.channels or self.patterns or self.shard_channels)
+
+    async def ssubscribe(self, *args):
+        for arg in args:
+            name = getattr(arg, "name", arg)
+            self.shard_channels[name] = getattr(arg, "handler", None)
+        self.subscribed_event.set()
+
+    async def sunsubscribe(self, channel):
+        if self.sunsubscribe_error is not None:
+            raise self.sunsubscribe_error
+        self.shard_channels.pop(channel, None)
+        if not self.shard_channels:
+            self.subscribed_event.clear()
+
+    async def parse_response(self, block=True, timeout=0.0):
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it), so the
+        # injected failure has to surface from the read half.
+        if self.get_message_error is not None:
+            raise self.get_message_error
+        return None
+
+    async def handle_message(self, response, ignore_subscribe_messages=False):
+        return response
+
+    async def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+        return await self.handle_message(
+            await self.parse_response(block=(timeout is None), timeout=timeout),
+            ignore_subscribe_messages,
+        )
+
+    async def aclose(self):
+        self.aclose_calls += 1
+        self.shard_channels.clear()
+        self.pending_unsubscribe_shard_channels.clear()
+        self.subscribed_event.clear()

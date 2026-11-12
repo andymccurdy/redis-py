@@ -40,7 +40,44 @@ Read specification file: `$ARGUMENTS`
 - Ensure arguments and response types consider bytes representation
 - Ensure response RESP2 and RESP3 compatibility via `response_callbacks`
 
-#### c. Verify as you go
+#### c. Record the command's metadata
+- Obtain the server's metadata for the command: use the `COMMAND INFO` output from the
+  specification's "Command metadata" section, or run `COMMAND INFO <name>` against a server
+  that ships the command. For a container command (`BLESS`, `MEMORY`, ...) the subcommands
+  are nested in the reply as `<container>|<sub>`; each one gets its own record.
+- Add a record for the command to `_STATIC_COMMAND_METADATA` in `redis/commands/metadata.py`,
+  keyed lowercase under its module (`"core"` for non-module commands, the lowercased prefix
+  such as `"json"` or `"ft"` for module commands). Key a container subcommand by its
+  space-joined name (`"bless scan"`), the form `execute_command` receives.
+- Map the reply onto the record fields and reuse an existing shape (`_CACHEABLE_KEYED`,
+  `_WRITE_KEYED`, `_NONDETERMINISTIC_KEYED`, ...) when one matches; otherwise spell out every
+  field of a `CommandMetadata` inline, as the table does for `touch` and `vrandmember`:
+  - `is_readonly` is the `readonly` command flag - not the `RO` key spec flag. A command the
+    server does not flag `readonly` is neither client-side cacheable nor replica-eligible.
+  - `is_blocking` is the `blocking` flag; `is_script_runner` the `script_runner` flag.
+  - `has_key_argument` is true when `first_key_pos > 0 and step_count > 0`, or when a
+    `movablekeys` command reports a key spec not flagged `not_key`.
+  - `has_nondeterministic_output` and `is_dont_cache` are the `nondeterministic_output` and
+    `dont_cache` tips, matched exactly (`nondeterministic_output_order` is a different tip).
+  - `has_complete_metadata` is true: the record was taken from a reply that carries flags and
+    tips.
+  - `request_policy` / `response_policy` are the keyed or keyless defaults unless a
+    `request_policy:` / `response_policy:` tip overrides them. Withhold both (set them to
+    `None`) when the cluster client must keep resolving the target itself: the command is in
+    `RedisCluster.COMMAND_FLAGS` (as `SCAN` and `BLESS SCAN` are), is `movablekeys`, or tips a
+    policy the client does not implement (`multi_shard`). A keyed command must never be
+    recorded `DEFAULT_KEYLESS`.
+- Document in a comment next to the record anything that diverges from the live reply and
+  why, and extend the provenance note above the table if the command needs a newer server
+  than the table was validated against.
+- Update the guards in `tests/test_command_metadata.py` (shared with its async mirror):
+  add a withheld record to `ALL_WITHHELD_ROUTING_COMMANDS`, a deliberate cacheability
+  divergence to `LIVE_CACHEABILITY_DIVERGENCE`, and raise `STATIC_TABLE_SERVER_VERSION` if
+  the command first ships in a newer release. Then run `tests/test_command_metadata.py`,
+  `tests/test_asyncio/test_command_metadata.py` and the static-table routing tests in
+  `tests/test_cluster.py` / `tests/test_asyncio/test_cluster.py`.
+
+#### d. Verify as you go
 - After each file change, check syntax
 - Ensure imports are correct
 - Verify types are properly defined

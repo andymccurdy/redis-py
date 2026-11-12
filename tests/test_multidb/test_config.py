@@ -2,6 +2,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from redis._defaults import DEFAULT_RETRY_COUNT
+from redis.backoff import NoBackoff
 from redis.connection import ConnectionPool
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.multidb.circuit import (
@@ -61,6 +63,28 @@ class TestMultiDbConfig:
         )
         assert config.auto_fallback_interval == DEFAULT_AUTO_FALLBACK_INTERVAL
         assert isinstance(config.command_retry, Retry)
+
+    def test_default_command_retry_is_isolated(self):
+        first = MultiDbConfig(databases_config=[])
+        second = MultiDbConfig(databases_config=[])
+
+        assert first.command_retry is not second.command_retry
+        assert first.command_retry._backoff is not second.command_retry._backoff
+        assert first.command_retry == second.command_retry
+
+        first.command_retry.update_retries(0)
+        first.command_retry.update_supported_errors((ValueError,))
+
+        for config in (second, MultiDbConfig(databases_config=[])):
+            assert config.command_retry.get_retries() == DEFAULT_RETRY_COUNT
+            assert ValueError not in config.command_retry._supported_errors
+
+    def test_explicit_command_retry_is_preserved(self):
+        retry = Retry(backoff=NoBackoff(), retries=2)
+        config = MultiDbConfig(databases_config=[], command_retry=retry)
+
+        assert config.command_retry is retry
+        assert config.command_retry.get_retries() == 2
 
     def test_overridden_config(self):
         grace_period = 2
@@ -194,6 +218,23 @@ class TestMultiDbConfig:
         pool = db.client.connection_pool
         assert pool._maint_notifications_pool_handler is not None
         assert pool._maint_notifications_pool_handler.config.enabled is True
+
+    def test_supplied_pool_keeps_its_own_maint_notifications_config(self):
+        """
+        The disabled default only applies to clients built from client_kwargs; a
+        pool the user supplies is used as it is, and its kwargs are not touched.
+        """
+        pool = ConnectionPool(host="host1", port=6379, protocol=3)
+        db_config = DatabaseConfig(from_pool=pool, weight=1.0)
+
+        config = MultiDbConfig(databases_config=[db_config])
+        databases = config.databases()
+
+        db, weight = databases[0]
+        assert db.client.connection_pool is pool
+        assert "maint_notifications_config" not in db_config.client_kwargs
+        # The pool's own RESP3 default ("auto") is left in place
+        assert pool.maint_notifications_enabled()
 
 
 @pytest.mark.fixed_client

@@ -4,10 +4,12 @@ from unittest import mock
 import pytest
 from redis import RedisClusterException
 import redis
+from redis.backoff import NoBackoff
 from redis.client import Pipeline
 from redis.observability import recorder
 from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
+from redis.retry import Retry
 
 from .conftest import skip_if_server_version_lt, wait_for_command
 
@@ -60,6 +62,21 @@ class TestPipeline:
             assert r["a"] == b"a1"
             assert r["b"] == b"b1"
             assert r["c"] == b"c1"
+
+    @pytest.mark.onlynoncluster
+    def test_info_in_transaction(self, decoded_r):
+        with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = pipe.execute()
+            assert "redis_version" in info
+
+    @pytest.mark.onlynoncluster
+    def test_info_in_transaction_with_custom_callback(self, decoded_r):
+        decoded_r.set_response_callback("INFO", lambda response, **options: response)
+        with decoded_r.pipeline() as pipe:
+            pipe.info("server")
+            (info,) = pipe.execute()
+            assert "redis_version:" in info
 
     @pytest.mark.onlynoncluster
     def test_pipeline_no_transaction_watch(self, r):
@@ -178,6 +195,22 @@ class TestPipeline:
             # make sure the pipe was restored to a working state
             assert pipe.set("z", "zzz").execute() == [True]
             assert r["z"] == b"zzz"
+
+    @pytest.mark.onlynoncluster
+    def test_callback_error_does_not_leave_replies_on_connection(self, r):
+        # The score callback raises on the first reply, while the BLPOP reply is
+        # still in flight. The next command on the pooled connection must not
+        # read it.
+        r.zadd("z", {"a": float("inf")})
+        r.set("b", "b1")
+        with r.pipeline(transaction=False) as pipe:
+            pipe.zrange("z", 0, -1, withscores=True, score_cast_func=int)
+            pipe.blpop("q", 0.5)
+            with pytest.raises(OverflowError):
+                pipe.execute()
+
+        client = redis.Redis(connection_pool=r.connection_pool)
+        assert client.get("b") == b"b1"
 
     @pytest.mark.onlynoncluster
     def test_parse_error_raised_transaction(self, r):
@@ -374,6 +407,26 @@ class TestPipeline:
 
         assert r[key] == b"1"
 
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("6.0.0")
+    def test_exec_error_in_pipeline_redacts_credentials(self, r, request):
+        request.addfinalizer(lambda: r.acl_deluser("redis-py-user"))
+        with r.pipeline(transaction=False) as pipe:
+            pipe.acl_setuser(
+                "redis-py-user",
+                enabled=True,
+                passwords=["+pipeline-secret"],
+                commands=["+nosuchcommand"],
+            )
+
+            with pytest.raises(redis.ResponseError) as ex:
+                pipe.execute()
+
+        assert "pipeline-secret" not in str(ex.value)
+        assert str(ex.value).startswith(
+            "Command # 1 (ACL SETUSER <REDACTED>) of pipeline caused error: "
+        )
+
     def test_exec_error_in_pipeline_truncated(self, r):
         key = "a" * 50
         a_value = "a" * 20
@@ -460,6 +513,7 @@ class TestPipeline:
             )
 
 
+@pytest.mark.fixed_client
 class TestPipelineMetricsRecording:
     """
     Unit tests that verify metrics are properly recorded from Pipeline
@@ -539,9 +593,7 @@ class TestPipelineMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             # Create pipeline with mocked connection pool
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
@@ -610,9 +662,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             # Create pipeline with transaction=False
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
@@ -651,9 +701,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
                 response_callbacks={},
@@ -713,9 +761,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             # First pipeline execution
             pipeline1 = Pipeline(
                 connection_pool=mock_connection_pool,
@@ -758,9 +804,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
                 response_callbacks={},
@@ -823,9 +867,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
                 response_callbacks={},
@@ -913,9 +955,7 @@ class TestPipelineMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             pipeline = Pipeline(
                 connection_pool=mock_connection_pool,
                 response_callbacks={},
@@ -953,3 +993,53 @@ class TestPipelineMetricsRecording:
             assert "error.type" in error_attrs
 
         recorder.reset_collector()
+
+
+@pytest.mark.fixed_client
+class TestPipelineRetryChecker:
+    """A retry-level checker rejection must still run the pipeline's fail hook."""
+
+    class FakeConnection:
+        host = "localhost"
+        port = 6379
+        db = 0
+        _resp2_fallback = False
+
+        def __init__(self, retry):
+            self.retry = retry
+            self.disconnected = False
+
+        def send_command(self, *args, **kwargs):
+            if args[0] == "GET":
+                raise redis.TimeoutError("boom")
+            return None
+
+        def read_response(self):
+            return True
+
+        def disconnect(self, *args, **kwargs):
+            self.disconnected = True
+
+    class FakeConnectionPool:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def get_connection(self):
+            return self.connection
+
+        def release(self, connection):
+            pass
+
+    def test_retry_checker_rejection_resets_watching_pipeline(self):
+        retry = Retry(NoBackoff(), 3, is_retryable=lambda error: False)
+        connection = self.FakeConnection(retry)
+        pipeline = Pipeline(self.FakeConnectionPool(connection), {}, True, None)
+
+        pipeline.watch("foo")
+        assert pipeline.watching
+
+        with pytest.raises(redis.WatchError):
+            pipeline.get("foo")
+
+        assert not pipeline.watching
+        assert connection.disconnected

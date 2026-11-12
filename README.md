@@ -14,7 +14,8 @@ The Python interface to the Redis key-value store.
 ---------------------------------------------
 
 **Note:** redis-py 5.0 is the last version of redis-py that supports Python 3.7, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 5.1 supports Python 3.8+.<br>
-**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.
+**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.<br>
+**Note:** redis-py 8.1.0 is the last version of redis-py that supports Python 3.10, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 8.2.0 supports Python 3.11+.
 
 ---------------------------------------------
 
@@ -92,6 +93,19 @@ The above code connects to localhost on port 6379, sets a value in Redis, and re
 redis-py supports RESP3 starting with version 5.0. Starting with redis-py 8.0,
 clients use RESP3 on the wire by default while preserving legacy
 RESP2-compatible Python response shapes for existing applications.
+
+When *protocol* is left unset, a server or proxy that rejects `HELLO` with
+an unknown-command or `NOPROTO` error triggers a fallback to RESP2 and a warning.
+Authentication and other server errors still propagate. Automatic fallback is
+disabled when *protocol=3* is explicit, client-side caching is configured, or
+maintenance notifications are explicitly enabled.
+
+Automatic fallback adapts core command response callbacks only. Module commands
+(JSON, Search, TimeSeries, Bloom, and vector sets) still select their response
+parsers from the configured protocol and can return incorrect results after a
+fallback, including empty results from `FT.SEARCH`. When using these commands
+with a server or proxy that does not support `HELLO`, set *protocol=2* explicitly
+when creating the client.
 
 Set *protocol=3* explicitly when your application should receive
 RESP3-specific response shapes or when you want the wire protocol choice to be
@@ -219,7 +233,7 @@ This is useful when:
 1. You have more than one Redis deployment. This might include two independent Redis servers or two or more Redis databases replicated across multiple [active-active Redis Enterprise](https://redis.io/docs/latest/operate/rs/databases/active-active/) clusters.
 2. You want your application to connect to one deployment at a time and to fail over to the next available deployment if the first deployment becomes unavailable.
 
-For the complete failover configuration options and examples, see the [Multi-database client docs](https://redis.readthedocs.io/en/latest/multi_database.html).
+For the complete failover configuration options and examples, see the [Multi-database client docs](https://redis.readthedocs.io/en/latest/geographic_failover.html).
 
 ### Bulk hash ingestion (HIMPORT)
 

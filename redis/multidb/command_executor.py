@@ -300,7 +300,7 @@ class DefaultCommandExecutor(SyncCommandExecutor, BaseCommandExecutor):
             self._register_command_execution(args)
             return response
 
-        return self._execute_with_failure_detection(callback, *args)
+        return self._execute_with_failure_detection(callback, args)
 
     def execute_pubsub_run(self, sleep_time, **kwargs) -> "PubSubWorkerThread":
         def callback():

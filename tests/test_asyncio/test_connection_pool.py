@@ -6,6 +6,8 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
+from redis._parsers import _AsyncHiredisParser, _AsyncRESP3Parser
+from redis.utils import HIREDIS_AVAILABLE
 from redis.asyncio.connection import (
     BlockingConnectionPool,
     Connection,
@@ -14,13 +16,16 @@ from redis.asyncio.connection import (
 )
 from unittest.mock import AsyncMock, MagicMock
 
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintenanceState, MaintNotificationsConfig
 from redis.observability.metrics import CloseReason
 from redis.auth.token import TokenInterface
 from tests.conftest import skip_if_redis_enterprise, skip_if_server_version_lt
 
 from .compat import aclosing
 from .conftest import asynccontextmanager
-from .test_pubsub import wait_for_message
+from .test_pubsub import EVENT_LOOP_TIMER_SLACK, wait_for_message
 
 
 def assert_kwargs_subset(actual, expected):
@@ -139,6 +144,9 @@ class DummyConnection(Connection):
     def should_reconnect(self):
         return False
 
+    def _force_disconnect(self):
+        self._connected = False
+
 
 class TestConnectionPool:
     @asynccontextmanager
@@ -196,6 +204,45 @@ class TestConnectionPool:
             await pool.get_connection()
             with pytest.raises(redis.ConnectionError):
                 await pool.get_connection()
+
+    @pytest.mark.fixed_client
+    async def test_failed_re_auth_does_not_stop_the_other_connections(self):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            failing.send_command.side_effect = redis.ConnectionError("broken")
+            other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            in_use = mock.Mock(spec=Connection)
+            pool._available_connections.extend([failing, other])
+            pool._in_use_connections.add(in_use)
+            token = mock.Mock()
+            token.try_get.return_value = "oid"
+            token.get_value.return_value = "value"
+
+            with pytest.raises(redis.ConnectionError, match="broken"):
+                await pool.re_auth_callback(token)
+
+            other.send_command.assert_awaited_once_with("AUTH", "oid", "value")
+            in_use.set_re_auth_token.assert_called_once_with(token)
+
+    @pytest.mark.fixed_client
+    async def test_re_auth_stops_at_authentication_error(self):
+        async with self.get_pool(connection_class=DummyConnection) as pool:
+            failing = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 3))
+            failing.read_response.side_effect = redis.AuthenticationError("expired")
+            other = mock.Mock(spec=Connection, retry=Retry(NoBackoff(), 0))
+            in_use = mock.Mock(spec=Connection)
+            pool._available_connections.extend([failing, other])
+            pool._in_use_connections.add(in_use)
+            token = mock.Mock()
+            token.try_get.return_value = "oid"
+            token.get_value.return_value = "value"
+
+            with pytest.raises(redis.AuthenticationError, match="expired"):
+                await pool.re_auth_callback(token)
+
+            failing.read_response.assert_awaited_once()
+            other.send_command.assert_not_awaited()
+            in_use.set_re_auth_token.assert_not_called()
 
     async def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0]}
@@ -293,44 +340,116 @@ class TestConnectionPool:
         Test that multiple concurrent connection acquisitions don't block
         each other during connection establishment.
         """
-        connection_delay = 0.05
         num_connections = 3
+        started = 0
+        all_started = asyncio.Event()
 
         class SlowConnectConnection(DummyConnection):
-            """Connection that simulates slow connection establishment"""
+            """Connection whose connect() finishes only once every connect started"""
 
             async def connect(self):
-                # Simulate slow connection (e.g., network latency, TLS handshake)
-                await asyncio.sleep(connection_delay)
+                nonlocal started
+                started += 1
+                if started == num_connections:
+                    all_started.set()
+                await all_started.wait()
                 self._connected = True
 
         async with self.get_pool(
             connection_class=SlowConnectConnection, max_connections=10
         ) as pool:
-            # Start acquiring multiple connections concurrently
-            start_time = asyncio.get_running_loop().time()
-
-            # Try to get connections concurrently
-            connections = await asyncio.gather(
-                *[pool.get_connection() for _ in range(num_connections)]
-            )
-
-            elapsed_time = asyncio.get_running_loop().time() - start_time
-
-            # With proper lock handling, these should complete mostly in parallel
-            # If the lock was held during connect(), it would take num_connections * connection_delay
-            # With lock only during pop, it should take ~connection_delay (connections in parallel)
-            # We allow 2.5x overhead for system variance
-            max_allowed_time = connection_delay * 2.5
-            assert elapsed_time < max_allowed_time, (
-                f"Concurrent connections took {elapsed_time:.3f}s, "
-                f"expected < {max_allowed_time:.3f}s. "
-                f"This suggests lock was held during connection establishment."
-            )
+            # If the lock were held during connect(), the second connect() could
+            # not start, the first would wait forever, and wait_for would time out.
+            try:
+                connections = await asyncio.wait_for(
+                    asyncio.gather(
+                        *[pool.get_connection() for _ in range(num_connections)]
+                    ),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                pytest.fail(
+                    f"only {started} of {num_connections} connect() calls started; "
+                    "the lock was held during connection establishment"
+                )
 
             # Clean up
             for conn in connections:
                 await pool.release(conn)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "parser_class",
+        [
+            _AsyncRESP3Parser,
+            pytest.param(
+                _AsyncHiredisParser,
+                marks=pytest.mark.skipif(
+                    not HIREDIS_AVAILABLE, reason="hiredis is not installed"
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("maint_notifications_enabled", [True, False])
+    @pytest.mark.parametrize("reset", [False, True])
+    async def test_get_connection_replaces_closed_idle_connection(
+        self, maint_notifications_enabled, parser_class, reset
+    ):
+        """
+        A pooled connection whose socket the server closed while it sat idle
+        must be reconnected at checkout. Regression test for #4252: with
+        maintenance notifications enabled, the pending-push-data exemption
+        must not swallow the EOF signal and hand out the dead connection.
+        A reset (RST) leaves no EOF but an exception on the stream, and must
+        be detected the same way.
+        """
+        async with self.get_pool(connection_class=redis.Connection) as pool:
+            conn = pool.make_connection()
+            conn.set_parser(parser_class)
+
+            # simulate a connection that was healthy when released to the
+            # pool but whose socket the server has since closed or reset
+            eof_stream = asyncio.StreamReader()
+            if reset:
+                eof_stream.set_exception(ConnectionResetError())
+            else:
+                eof_stream.feed_eof()
+            conn._parser._connected = True
+            conn._parser._stream = eof_stream
+            if parser_class is _AsyncHiredisParser:
+                # on_connect() normally creates the hiredis reader; the test
+                # never dials, so give it one with an empty buffer
+                conn._parser._reader = mock.Mock(has_data=mock.Mock(return_value=False))
+            fake_writer = mock.Mock()
+            fake_writer.wait_closed = AsyncMock(return_value=None)
+            conn._reader = eof_stream
+            conn._writer = fake_writer
+
+            async def fake_connect():
+                # mirror the real connect(): a no-op unless disconnected
+                if conn.is_connected:
+                    return
+                conn._parser._connected = True
+                conn._parser._stream = asyncio.StreamReader()
+                conn._reader = conn._parser._stream
+                conn._writer = fake_writer
+
+            conn.connect = AsyncMock(side_effect=fake_connect)
+            pool._available_connections.append(conn)
+
+            with mock.patch.object(
+                pool,
+                "maint_notifications_enabled",
+                return_value=maint_notifications_enabled,
+            ):
+                checked_out = await pool.get_connection()
+
+            assert checked_out is conn
+            # ensure_connection() detected the EOF and reconnected: once for
+            # the initial ensure, once after discarding the dead socket
+            assert conn.connect.await_count == 2
+            assert conn._parser._stream is not eof_stream
+            await pool.release(conn)
 
 
 class TestBlockingConnectionPool:
@@ -404,11 +523,16 @@ class TestBlockingConnectionPool:
             c1 = await pool.get_connection()
 
             start = asyncio.get_running_loop().time()
-            with pytest.raises(redis.ConnectionError):
-                await pool.get_connection()
+            with patch(
+                "redis.asyncio.connection.record_connection_timeout",
+                new_callable=AsyncMock,
+            ) as record:
+                with pytest.raises(redis.ConnectionError):
+                    await pool.get_connection()
 
             # we should have waited at least some period of time
             assert asyncio.get_running_loop().time() - start >= 0.05
+            record.assert_awaited_once()
             await c1.disconnect()
 
     async def test_connection_pool_blocks_until_conn_available(self, master_host):
@@ -427,9 +551,13 @@ class TestBlockingConnectionPool:
                 await pool.release(c1)
 
             start = asyncio.get_running_loop().time()
-            await asyncio.gather(target(), pool.get_connection())
-            stop = asyncio.get_running_loop().time()
-            assert (stop - start) <= 0.2
+            release = asyncio.create_task(target())
+            # time get_connection alone: it must block until the release
+            await pool.get_connection()
+            elapsed = asyncio.get_running_loop().time() - start
+            # and wake on it, well before the 2 s pool timeout
+            assert 0.1 - EVENT_LOOP_TIMER_SLACK <= elapsed < 1.0
+            await release
 
     async def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0]}
@@ -438,6 +566,77 @@ class TestBlockingConnectionPool:
             await pool.release(c1)
             c2 = await pool.get_connection()
             assert c1 == c2
+
+    @pytest.mark.fixed_client
+    async def test_checkout_waits_for_idle_re_auth(self):
+        async with self.get_pool(max_connections=1) as pool:
+            connection = await pool.get_connection()
+            await pool.release(connection)
+            auth_started = asyncio.Event()
+            finish_auth = asyncio.Event()
+            checkout_started = asyncio.Event()
+
+            async def read_auth_response():
+                auth_started.set()
+                await finish_auth.wait()
+                return b"OK"
+
+            async def checkout():
+                checkout_started.set()
+                return await pool.get_connection()
+
+            connection.retry = Retry(NoBackoff(), 0)
+            connection.send_command = AsyncMock()
+            connection.read_response = AsyncMock(side_effect=read_auth_response)
+            token = mock.Mock()
+            token.try_get.return_value = "default"
+            token.get_value.return_value = "token"
+
+            refresh = asyncio.create_task(pool.re_auth_callback(token))
+            await auth_started.wait()
+            acquire = asyncio.create_task(checkout())
+            try:
+                await checkout_started.wait()
+                assert not acquire.done()
+                assert pool._available_connections == [connection]
+                assert not pool._in_use_connections
+            finally:
+                finish_auth.set()
+                await asyncio.gather(refresh, acquire)
+
+            assert acquire.result() is connection
+            connection.send_command.assert_awaited_once_with("AUTH", "default", "token")
+            await pool.release(connection)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_checkout_interrupted_while_pool_locked(self, cancel):
+        async with self.get_pool(max_connections=1, timeout=0.01) as pool:
+            connection = await pool.get_connection()
+            await pool.release(connection)
+            checkout_started = asyncio.Event()
+
+            async def checkout():
+                checkout_started.set()
+                return await pool.get_connection()
+
+            async with pool._lock:
+                acquire = asyncio.create_task(checkout())
+                await checkout_started.wait()
+                if cancel:
+                    acquire.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await acquire
+                else:
+                    with pytest.raises(
+                        redis.ConnectionError, match="No connection available"
+                    ):
+                        await acquire
+                assert pool._available_connections == [connection]
+                assert not pool._in_use_connections
+
+            assert await pool.get_connection() is connection
+            await pool.release(connection)
 
     @pytest.mark.fixed_client
     def test_repr_contains_db_info_tcp(self):
@@ -483,6 +682,264 @@ class TestBlockingConnectionPool:
         assert "host=localhost" in repr_output
         assert "port=6379" in repr_output
         assert "db=0" in repr_output
+
+
+class TestReleaseWhenCancelled:
+    """
+    A connection must go back to the pool even if the caller is cancelled while
+    release() waits for the pool lock (held e.g. by a streaming-credentials
+    re-auth).
+    """
+
+    @staticmethod
+    async def _wait_until_released(pool, connection) -> None:
+        async with asyncio.timeout(2):
+            while connection in pool._in_use_connections:
+                await asyncio.sleep(0.01)
+        assert connection in pool._available_connections
+
+    @staticmethod
+    def _signal_release(pool):
+        """Patch pool.release to set an event once it has been entered."""
+        entered = asyncio.Event()
+        release = pool.release
+
+        async def signalling_release(connection):
+            entered.set()
+            return await release(connection)
+
+        return entered, patch.object(pool, "release", side_effect=signalling_release)
+
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    async def test_get_connection_releases_when_cancelled(self, pool_class):
+        pool = pool_class(connection_class=DummyConnection)
+        started = asyncio.Event()
+
+        async def hang(connection):
+            started.set()
+            await asyncio.Event().wait()
+
+        entered, signal_release = self._signal_release(pool)
+        with patch.object(pool, "ensure_connection", side_effect=hang), signal_release:
+            task = asyncio.ensure_future(pool.get_connection())
+            await started.wait()
+            (leased,) = pool._in_use_connections
+            await pool._lock.acquire()
+            try:
+                task.cancel()
+                await entered.wait()  # the cleanup release() waits for the lock
+                task.cancel()  # again, as a level-triggered scope would
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                pool._lock.release()
+        await self._wait_until_released(pool, leased)
+
+    async def test_background_release_failure_is_logged(self, caplog):
+        pool = ConnectionPool(connection_class=DummyConnection)
+        connection = await pool.get_connection()
+        await pool._lock.acquire()
+        task = asyncio.ensure_future(pool.release(connection))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with patch.object(
+            pool._event_dispatcher, "dispatch_async", side_effect=RuntimeError("x")
+        ):
+            pool._lock.release()
+            await self._wait_until_released(pool, connection)
+            await asyncio.sleep(0.01)  # let the done callback run
+        assert not pool._background_releases
+        assert "A background connection release failed" in caplog.text
+
+    @staticmethod
+    def _hang_disconnect(connection):
+        """Mark connection for reconnect and make its disconnect() block."""
+        started = asyncio.Event()
+
+        async def hang(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        return started, (
+            patch.object(connection, "should_reconnect", return_value=True),
+            patch.object(connection, "disconnect", side_effect=hang),
+        )
+
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    @pytest.mark.parametrize("failure", ["cancelled", "raised"])
+    async def test_release_keeps_connection_when_disconnect_fails(
+        self, pool_class, failure
+    ):
+        pool = pool_class(connection_class=DummyConnection)
+        connection = await pool.get_connection()
+        assert connection.is_connected
+        if failure == "cancelled":
+            started, (mark, block) = self._hang_disconnect(connection)
+        else:
+            started = None
+            mark = patch.object(connection, "should_reconnect", return_value=True)
+            block = patch.object(
+                connection, "disconnect", side_effect=RuntimeError("x")
+            )
+        dispatch = AsyncMock()
+        record = AsyncMock()
+        with (
+            mark,
+            block,
+            patch.object(pool._event_dispatcher, "dispatch_async", dispatch),
+            patch("redis.asyncio.connection.record_connection_count", record),
+        ):
+            task = asyncio.ensure_future(pool.release(connection))
+            if started is not None:
+                await started.wait()
+                task.cancel()
+            with pytest.raises(asyncio.CancelledError if started else RuntimeError):
+                await task
+            # The release listeners and metrics still run, in the background.
+            async with asyncio.timeout(2):
+                while pool._background_releases:
+                    await asyncio.sleep(0.01)
+        assert connection not in pool._in_use_connections
+        assert connection in pool._available_connections
+        # It was not closed cleanly, so it must not be reused as it is.
+        assert not connection.is_connected
+        dispatch.assert_awaited_once()
+        assert dispatch.await_args.args[0].connection is connection
+        assert [c.kwargs["counter"] for c in record.await_args_list] == [-1, 1]
+
+    async def test_failed_disconnect_resets_the_connection_state(self):
+        # A connection left marked for reconnect would have its next healthy
+        # socket disconnected again on the following release, and one left in
+        # maintenance would keep its relaxed timeouts.
+        pool = ConnectionPool(
+            host="localhost",
+            protocol=3,
+            maint_notifications_config=MaintNotificationsConfig(enabled=True),
+        )
+        connection = pool.make_connection()  # never connected: no I/O
+        pool._in_use_connections.add(connection)
+        connection.mark_for_reconnect()
+        # What a maintenance start applies: relaxed timeouts.
+        socket_timeout = connection.socket_timeout
+        connection.set_tmp_settings(tmp_relaxed_timeout=30)
+        connection.maintenance_state = MaintenanceState.MAINTENANCE
+        started = asyncio.Event()
+
+        async def hang(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(connection, "disconnect", side_effect=hang):
+            task = asyncio.ensure_future(pool.release(connection))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        async with asyncio.timeout(2):
+            while pool._background_releases:
+                await asyncio.sleep(0.01)
+        assert connection in pool._available_connections
+        assert not connection.should_reconnect()
+        assert connection.maintenance_state == MaintenanceState.NONE
+        assert connection.socket_timeout == socket_timeout
+        assert not connection.is_connected
+
+    async def test_release_records_metrics_when_listener_is_cancelled(self):
+        # A release listener may await I/O (e.g. a re-auth AUTH); cancelling
+        # it must not leave the USED -> IDLE counts unrecorded.
+        pool = ConnectionPool(connection_class=DummyConnection)
+        connection = await pool.get_connection()
+        started = asyncio.Event()
+
+        async def hang(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        record = AsyncMock()
+        with (
+            patch.object(pool._event_dispatcher, "dispatch_async", side_effect=hang),
+            patch("redis.asyncio.connection.record_connection_count", record),
+        ):
+            task = asyncio.ensure_future(pool.release(connection))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert connection in pool._available_connections
+        assert [c.kwargs["counter"] for c in record.await_args_list] == [-1, 1]
+
+    async def test_blocking_pool_notifies_when_disconnect_is_cancelled(self):
+        pool = BlockingConnectionPool(
+            connection_class=DummyConnection, max_connections=1
+        )
+        connection = await pool.get_connection()
+        waiter = asyncio.ensure_future(pool.get_connection())
+        await asyncio.sleep(0)  # the waiter now waits for a free connection
+        started, (mark, block) = self._hang_disconnect(connection)
+        with mark, block:
+            task = asyncio.ensure_future(pool.release(connection))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        async with asyncio.timeout(2):
+            assert await waiter is connection
+
+    @pytest.mark.onlynoncluster
+    async def test_pipeline_reset_releases_when_cancelled(self, r):
+        # Pipeline.reset() no longer shields release(); the pool must cope.
+        pool = r.connection_pool
+        pipe = r.pipeline()
+        await pipe.watch("a")
+        leased = pipe.connection
+        entered, signal_release = self._signal_release(pool)
+        await pool._lock.acquire()
+        try:
+            with signal_release:
+                task = asyncio.ensure_future(pipe.reset())
+                await entered.wait()  # release() now waits for the pool lock
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            pool._lock.release()
+        await self._wait_until_released(pool, leased)
+        assert pipe.connection is None
+
+    @pytest.mark.onlynoncluster
+    async def test_execute_command_releases_when_cancelled(self, r):
+        if r.single_connection_client:
+            pytest.skip("single-connection clients do not release per command")
+        pool = r.connection_pool
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        send_and_parse = r._send_command_parse_response
+
+        async def slow(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            return await send_and_parse(*args, **kwargs)
+
+        entered, signal_release = self._signal_release(pool)
+        with (
+            patch.object(r, "_send_command_parse_response", side_effect=slow),
+            signal_release,
+        ):
+            task = asyncio.ensure_future(r.ping())
+            await started.wait()
+            (leased,) = pool._in_use_connections
+            await pool._lock.acquire()
+            try:
+                resume.set()
+                await entered.wait()  # release() now waits for the pool lock
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                pool._lock.release()
+        await self._wait_until_released(pool, leased)
 
 
 @pytest.mark.fixed_client
@@ -605,6 +1062,9 @@ class TestConnectionPoolURLParsing:
             (False, "n"),
             (False, "N"),
             (False, "No"),
+            (False, "off"),
+            (False, "OFF"),
+            (False, "Off"),
             (True, 1),
             (True, "1"),
             (True, "y"),
@@ -638,6 +1098,48 @@ class TestConnectionPoolURLParsing:
                 "redis://localhost/2?socket_timeout=_&socket_connect_timeout=abc"
             )
 
+    def test_retry_on_error_querystring(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=ConnectionError"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [redis.ConnectionError]
+
+    def test_retry_on_error_querystring_multiple(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=ConnectionError,TimeoutError"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError,
+            redis.TimeoutError,
+        ]
+
+    def test_retry_on_error_querystring_brackets(self):
+        pool = redis.ConnectionPool.from_url(
+            "redis://localhost?retry_on_error=[ConnectionError,TimeoutError]"
+        )
+        assert pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError,
+            redis.TimeoutError,
+        ]
+
+    def test_retry_on_error_querystring_blank(self):
+        with pytest.raises(ValueError, match="Invalid value for 'retry_on_error'"):
+            redis.ConnectionPool.from_url("redis://localhost?retry_on_error=,")
+
+    def test_retry_on_error_querystring_invalid(self):
+        with pytest.raises(ValueError, match="Invalid value for 'retry_on_error'"):
+            redis.ConnectionPool.from_url(
+                "redis://localhost?retry_on_error=NotARealError"
+            )
+
+    def test_from_url_retry_on_error(self):
+        client = redis.Redis.from_url(
+            "redis://localhost?retry_on_error=ConnectionError"
+        )
+        assert client.connection_pool.connection_kwargs["retry_on_error"] == [
+            redis.ConnectionError
+        ]
+
     def test_extra_querystring_options(self):
         pool = redis.ConnectionPool.from_url("redis://localhost?a=1&b=2")
         assert pool.connection_class == redis.Connection
@@ -661,6 +1163,28 @@ class TestConnectionPoolURLParsing:
             "Redis URL must specify one of the following schemes "
             "(redis://, rediss://, unix://)"
         )
+
+    def test_invalid_scheme_raises_error_when_double_slash_missing(self):
+        with pytest.raises(ValueError) as cm:
+            redis.ConnectionPool.from_url("redis:foo.bar.com:12345")
+        assert str(cm.value) == (
+            "Redis URL must specify one of the following schemes "
+            "(redis://, rediss://, unix://)"
+        )
+
+    def test_uppercase_scheme_is_accepted(self):
+        # URL schemes are case-insensitive (RFC 3986)
+        pool = redis.ConnectionPool.from_url("REDIS://my.host")
+        assert pool.connection_class == redis.Connection
+        assert_kwargs_subset(pool.connection_kwargs, {"host": "my.host"})
+
+        ssl_pool = redis.ConnectionPool.from_url("REDISS://my.host")
+        assert ssl_pool.connection_class == redis.SSLConnection
+        assert_kwargs_subset(ssl_pool.connection_kwargs, {"host": "my.host"})
+
+        unix_pool = redis.ConnectionPool.from_url("UNIX:///tmp/redis.sock")
+        assert unix_pool.connection_class == redis.UnixDomainSocketConnection
+        assert_kwargs_subset(unix_pool.connection_kwargs, {"path": "/tmp/redis.sock"})
 
 
 @pytest.mark.fixed_client
@@ -775,6 +1299,15 @@ class TestConnectionPoolUnixSocketURLParsing:
             pool.connection_kwargs, {"path": "/socket", "a": "1", "b": "2"}
         )
 
+    def test_connection_class_override(self):
+        class MyConnection(redis.UnixDomainSocketConnection):
+            pass
+
+        pool = redis.ConnectionPool.from_url(
+            "unix:///socket", connection_class=MyConnection
+        )
+        assert pool.connection_class == MyConnection
+
 
 @pytest.mark.fixed_client
 class TestSSLConnectionURLParsing:
@@ -782,6 +1315,15 @@ class TestSSLConnectionURLParsing:
         pool = redis.ConnectionPool.from_url("rediss://my.host")
         assert pool.connection_class == redis.SSLConnection
         assert_kwargs_subset(pool.connection_kwargs, {"host": "my.host"})
+
+    def test_connection_class_override(self):
+        class MyConnection(redis.SSLConnection):
+            pass
+
+        pool = redis.ConnectionPool.from_url(
+            "rediss://my.host", connection_class=MyConnection
+        )
+        assert pool.connection_class == MyConnection
 
     def test_cert_reqs_options(self):
         import ssl
@@ -941,7 +1483,9 @@ class TestMultiConnectionClient:
 
 
 @pytest.mark.onlynoncluster
-@pytest.mark.xfail(strict=False)
+# r.connection is the connection under test, as in the sync tests, so only the
+# single-connection variant of create_redis applies
+@pytest.mark.parametrize("create_redis", [(True,)], ids=["single"], indirect=True)
 class TestHealthCheck:
     interval = 60
 
@@ -951,47 +1495,49 @@ class TestHealthCheck:
         yield redis
         await redis.flushall()
 
-    def assert_interval_advanced(self, connection):
-        diff = connection.next_health_check - asyncio.get_running_loop().time()
-        assert self.interval >= diff > (self.interval - 1)
+    def assert_interval_advanced(self, connection, start):
+        # next_health_check is set from the clock when a reply is read,
+        # which happens between `start` and now
+        now = asyncio.get_running_loop().time()
+        assert (
+            start + self.interval <= connection.next_health_check <= now + self.interval
+        )
 
     async def test_health_check_runs(self, r):
-        if r.connection:
-            r.connection.next_health_check = asyncio.get_running_loop().time() - 1
-            await r.connection.check_health()
-            self.assert_interval_advanced(r.connection)
+        r.connection.next_health_check = asyncio.get_running_loop().time() - 1
+        start = asyncio.get_running_loop().time()
+        await r.connection.check_health()
+        self.assert_interval_advanced(r.connection, start)
 
     async def test_arbitrary_command_invokes_health_check(self, r):
         # invoke a command to make sure the connection is entirely setup
-        if r.connection:
+        await r.get("foo")
+        r.connection.next_health_check = asyncio.get_running_loop().time() - 1
+        start = asyncio.get_running_loop().time()
+        with mock.patch.object(
+            r.connection, "send_command", wraps=r.connection.send_command
+        ) as m:
             await r.get("foo")
-            r.connection.next_health_check = asyncio.get_running_loop().time()
-            with mock.patch.object(
-                r.connection, "send_command", wraps=r.connection.send_command
-            ) as m:
-                await r.get("foo")
-                m.assert_called_with("PING", check_health=False)
+            m.assert_called_with("PING", check_health=False)
 
-            self.assert_interval_advanced(r.connection)
+        self.assert_interval_advanced(r.connection, start)
 
     async def test_arbitrary_command_advances_next_health_check(self, r):
-        if r.connection:
-            await r.get("foo")
-            next_health_check = r.connection.next_health_check
-            # ensure that the event loop's `time()` advances a bit
-            await asyncio.sleep(0.001)
-            await r.get("foo")
-            assert next_health_check < r.connection.next_health_check
+        await r.get("foo")
+        next_health_check = r.connection.next_health_check
+        # ensure that the event loop's `time()` advances a bit
+        await asyncio.sleep(0.001)
+        await r.get("foo")
+        assert next_health_check < r.connection.next_health_check
 
     async def test_health_check_not_invoked_within_interval(self, r):
-        if r.connection:
+        await r.get("foo")
+        with mock.patch.object(
+            r.connection, "send_command", wraps=r.connection.send_command
+        ) as m:
             await r.get("foo")
-            with mock.patch.object(
-                r.connection, "send_command", wraps=r.connection.send_command
-            ) as m:
-                await r.get("foo")
-                ping_call_spec = (("PING",), {"check_health": False})
-                assert ping_call_spec not in m.call_args_list
+            ping_call_spec = (("PING",), {"check_health": False})
+            assert ping_call_spec not in m.call_args_list
 
     async def test_health_check_in_pipeline(self, r):
         async with r.pipeline(transaction=False) as pipe:
@@ -1023,10 +1569,11 @@ class TestHealthCheck:
             with mock.patch.object(
                 pipe.connection, "send_command", wraps=pipe.connection.send_command
             ) as m:
+                start = asyncio.get_running_loop().time()
                 await pipe.watch("foo")
                 # the health check should be called when watching
                 m.assert_called_with("PING", check_health=False)
-                self.assert_interval_advanced(pipe.connection)
+                self.assert_interval_advanced(pipe.connection, start)
                 assert await pipe.get("foo") == b"bar"
 
                 # reset the mock to clear the call list and schedule another
@@ -1048,12 +1595,13 @@ class TestHealthCheck:
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
             assert not p.subscribed
+            start = asyncio.get_running_loop().time()
             await p.subscribe("foo")
             # the connection is not yet in pubsub mode, so the normal
             # ping/pong within connection.send_command should check
             # the health of the connection
             m.assert_any_call("PING", check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
             subscribe_message = await wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
@@ -1069,10 +1617,11 @@ class TestHealthCheck:
         with mock.patch.object(
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
+            start = asyncio.get_running_loop().time()
             await p.subscribe("foo")
             subscribe_message = await wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
             # because we weren't subscribed when sending the subscribe
             # message to 'foo', the connection's standard check_health ran
             # prior to subscribing.
@@ -1081,6 +1630,7 @@ class TestHealthCheck:
             p.connection.next_health_check = 0
             m.reset_mock()
 
+            start = asyncio.get_running_loop().time()
             await p.subscribe("bar")
             # the second subscribe issues exactly only command (the subscribe)
             # and the health check is not invoked
@@ -1092,11 +1642,11 @@ class TestHealthCheck:
 
             subscribe_message = await wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            assert await wait_for_message(p) is None
+            assert await p.get_message(timeout=1) is None
             # now that the connection is subscribed, the pubsub health
             # check should have taken over and include the HEALTH_CHECK_MESSAGE
             m.assert_any_call("PING", p.HEALTH_CHECK_MESSAGE, check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
     async def test_health_check_in_pubsub_poll(self, r):
         """
@@ -1108,16 +1658,18 @@ class TestHealthCheck:
         with mock.patch.object(
             p.connection, "send_command", wraps=p.connection.send_command
         ) as m:
+            start = asyncio.get_running_loop().time()
             await p.subscribe("foo")
             subscribe_message = await wait_for_message(p)
             assert subscribe_message["type"] == "subscribe"
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
             # polling the connection before the health check interval
             # doesn't result in another health check
             m.reset_mock()
             next_health_check = p.connection.next_health_check
-            assert await wait_for_message(p) is None
+            # one poll is enough: every get_message runs check_health first
+            assert await p.get_message(timeout=0) is None
             assert p.connection.next_health_check == next_health_check
             m.assert_not_called()
 
@@ -1125,9 +1677,10 @@ class TestHealthCheck:
             # we should not receive a pong message, but the next_health_check
             # should be advanced
             p.connection.next_health_check = 0
-            assert await wait_for_message(p) is None
+            start = asyncio.get_running_loop().time()
+            assert await p.get_message(timeout=1) is None
             m.assert_called_with("PING", p.HEALTH_CHECK_MESSAGE, check_health=False)
-            self.assert_interval_advanced(p.connection)
+            self.assert_interval_advanced(p.connection, start)
 
 
 @pytest.mark.fixed_client
@@ -1328,3 +1881,140 @@ class TestAsyncConnectionPoolMetricsRecording:
             mock_record.assert_called_once()
             call_kwargs = mock_record.call_args[1]
             assert call_kwargs["close_reason"] == CloseReason.APPLICATION_CLOSE
+
+    @staticmethod
+    def _connect_with_blocking_close(conn):
+        """Give conn a mock socket whose wait_closed() never finishes."""
+        started = asyncio.Event()
+
+        async def hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        conn._writer = MagicMock()
+        conn._writer.wait_closed = AsyncMock(side_effect=hang)
+        conn._reader = MagicMock()
+        return started
+
+    async def test_connection_disconnect_records_connection_closed_on_timeout(self):
+        conn = Connection(socket_connect_timeout=0.01)
+        self._connect_with_blocking_close(conn)
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            error = ConnectionError("Connection lost")
+            with pytest.raises(redis.TimeoutError):
+                await conn.disconnect(error=error)
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.ERROR, error_type=error
+            )
+
+    async def test_connection_disconnect_records_connection_closed_on_cancel(self):
+        conn = Connection()
+        started = self._connect_with_blocking_close(conn)
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            task = asyncio.ensure_future(conn.disconnect())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_concurrent_disconnects_record_connection_closed_once(self):
+        conn = Connection()
+        started = self._connect_with_blocking_close(conn)
+        writer = conn._writer
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            first = asyncio.ensure_future(conn.disconnect())
+            await started.wait()
+            # Starts while the first close is still waiting in wait_closed()
+            await conn.disconnect(nowait=True)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            assert not conn.is_connected
+            writer.close.assert_called_once()
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_connection_disconnect_records_connection_closed_without_task(
+        self,
+    ):
+        conn = Connection()
+        conn._writer = MagicMock()
+        conn._reader = MagicMock()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            # Simulate the no-task context (e.g. GC finalization)
+            with patch("asyncio.current_task", return_value=None):
+                await conn.disconnect()
+
+            assert not conn.is_connected
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )
+
+    async def test_connection_disconnect_skips_connection_closed_when_not_connected(
+        self,
+    ):
+        conn = Connection()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            await conn.disconnect()
+            with patch("asyncio.current_task", return_value=None):
+                await conn.disconnect()
+
+            mock_record.assert_not_called()
+
+    async def test_release_records_connection_closed_once_when_disconnect_cancelled(
+        self,
+    ):
+        pool = ConnectionPool()
+        conn = pool.make_connection()
+        started = self._connect_with_blocking_close(conn)
+        pool._in_use_connections.add(conn)
+        conn.mark_for_reconnect()
+
+        with patch(
+            "redis.asyncio.connection.record_connection_closed",
+            new_callable=AsyncMock,
+        ) as mock_record:
+            task = asyncio.ensure_future(pool.release(conn))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            async with asyncio.timeout(2):
+                while pool._background_releases:
+                    await asyncio.sleep(0.01)
+
+            assert conn in pool._available_connections
+            assert not conn.is_connected
+            # Recorded by disconnect(), not again by the forced close after it
+            mock_record.assert_awaited_once_with(
+                close_reason=CloseReason.APPLICATION_CLOSE
+            )

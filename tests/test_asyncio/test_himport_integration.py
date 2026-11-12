@@ -286,7 +286,9 @@ async def test_discard_runtime(hr):
 
 
 async def test_pool_churn_lazy_prepare(hr):
-    n = 20
+    # The calls run one after another on a reused connection, so a few are
+    # enough; more would not add churn.
+    n = 3
     for i in range(n):
         await hr.himport_set(f"h:{{u}}:c{i}", "shared", [f"n{i}", f"e{i}@x", str(i)])
     for i in range(n):

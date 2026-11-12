@@ -1,7 +1,9 @@
 from math import inf
+from unittest.mock import Mock
 
 import pytest
 import redis.commands.bf
+from redis.client import NEVER_DECODE
 from redis.exceptions import RedisError
 
 from .conftest import (
@@ -121,6 +123,20 @@ def test_bf_insert(client):
 
 
 @pytest.mark.redismod
+def test_bf_false_flags_are_not_sent(client):
+    # noScale=False and noCreate=False must behave like omitting the flag,
+    # not send NONSCALING / NOCREATE.
+    assert client.bf().create("bloom", 0.01, 1, noScale=False)
+    assert [1, 1, 1] == intlist(client.bf().madd("bloom", "a", "b", "c"))
+    assert [1, 1, 1] == intlist(
+        client.bf().insert("bloom_ins", ["a", "b", "c"], capacity=1, noScale=False)
+    )
+    assert [1] == intlist(client.bf().insert("bloom_new", ["a"], noCreate=False))
+    assert [1] == client.cf().insert("cuckoo_new", ["a"], nocreate=False)
+    assert [1] == client.cf().insertnx("cuckoo_nx_new", ["a"], nocreate=False)
+
+
+@pytest.mark.redismod
 # BF.SCANDUMP/LOADCHUNK does not complete against Redis Enterprise's bloom module
 # (the scandump cursor loop times out).
 @skip_if_redis_enterprise()
@@ -131,13 +147,17 @@ def test_bf_scandump_and_loadchunk(client):
     # test is probabilistic and might fail. It is OK to change variables if
     # certain to not break anything
     def do_verify():
-        res = 0
+        pipe = client.pipeline(transaction=False)
+        bf = pipe.bf()
         for x in range(1000):
-            client.bf().add("myBloom", x)
-            rv = client.bf().exists("myBloom", x)
-            assert rv
-            rv = client.bf().exists("myBloom", f"nonexist_{x}")
-            res += rv == x
+            bf.add("myBloom", x)
+            bf.exists("myBloom", x)
+            bf.exists("myBloom", f"nonexist_{x}")
+        replies = pipe.execute()
+        res = 0
+        for exists, false_positive in zip(replies[1::3], replies[2::3]):
+            assert exists
+            res += false_positive
         assert res < 5
 
     do_verify()
@@ -168,7 +188,38 @@ def test_bf_scandump_and_loadchunk(client):
     do_verify()
 
     client.bf().client.delete("myBloom")
-    client.bf().create("myBloom", "0.0001", "10000000")
+
+
+@pytest.mark.redismod
+@skip_if_redis_enterprise()
+def test_cf_scandump_and_loadchunk(client):
+    # The client decodes responses, but the dumped chunks are binary.
+    client.cf().create("myCuckoo", 1000)
+    for x in range(100):
+        client.cf().add("myCuckoo", x)
+
+    chunks = []
+    it = 0
+    while True:
+        it, data = client.cf().scandump("myCuckoo", it)
+        if it == 0:
+            break
+        assert isinstance(data, bytes)
+        chunks.append((it, data))
+
+    client.delete("myCuckoo")
+    for it, data in chunks:
+        client.cf().loadchunk("myCuckoo", it, data)
+
+    assert all(client.cf().mexists("myCuckoo", *range(100)))
+
+
+def test_cf_scandump_does_not_decode_response():
+    mock_client = Mock()
+    redis.commands.bf.CFBloom(mock_client).scandump("myCuckoo", 0)
+    mock_client.execute_command.assert_called_once_with(
+        "CF.SCANDUMP", "myCuckoo", 0, **{NEVER_DECODE: []}
+    )
 
 
 @pytest.mark.redismod
@@ -303,6 +354,34 @@ def test_cms_merge(client):
     assert [9, 9, 11] == client.cms().query("C", "foo", "bar", "baz")
     assert client.cms().merge("C", 2, ["A", "B"], ["2", "3"])
     assert [16, 15, 21] == client.cms().query("C", "foo", "bar", "baz")
+
+
+@pytest.mark.redismod
+@skip_ifmodversion_lt("8.11.0", "bf")
+def test_cms_cell_size(client):
+    for cell_size in (1, 2, 4, 8):
+        assert client.cms().initbydim(
+            f"cell_dim{cell_size}", 1000, 5, cell_size=cell_size
+        )
+        assert cell_size == client.cms().info(f"cell_dim{cell_size}")["cell_size"]
+        assert client.cms().initbyprob(
+            f"cell_prob{cell_size}", 0.01, 0.01, cell_size=cell_size
+        )
+        assert cell_size == client.cms().info(f"cell_prob{cell_size}")["cell_size"]
+
+    # the server uses 4-byte counters when CELL_SIZE is omitted
+    assert client.cms().initbydim("cell_default", 1000, 5)
+    info = client.cms().info("cell_default")
+    assert 1000 == info["width"]
+    assert 5 == info["depth"]
+    assert 0 == info["count"]
+    assert 4 == info["cell_size"]
+
+    # only 1, 2, 4 and 8 are valid cell sizes
+    with pytest.raises(redis.ResponseError):
+        client.cms().initbydim("cell_bad", 1000, 5, cell_size=3)
+    with pytest.raises(redis.ResponseError):
+        client.cms().initbyprob("cell_bad", 0.01, 0.01, cell_size=16)
 
 
 @pytest.mark.redismod

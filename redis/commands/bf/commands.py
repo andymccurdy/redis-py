@@ -470,7 +470,10 @@ class CFCommands:
         (0, NULL) to indicate completion.
         For more information see `CF.SCANDUMP <https://redis.io/commands/cf.scandump>`_.
         """  # noqa
-        return self.execute_command(CF_SCANDUMP, key, iter)
+        params = [key, iter]
+        options = {}
+        options[NEVER_DECODE] = []
+        return self.execute_command(CF_SCANDUMP, *params, **options)
 
     @overload
     def loadchunk(self: SyncClientProtocol, key, iter, data) -> bytes | str: ...
@@ -561,7 +564,7 @@ class TOPKCommands:
 
         Example:
 
-        >>> topkincrby('A', ['foo'], [1])
+        >>> client.topk().incrby('A', ['foo'], [1])
         """  # noqa
         params = [key]
         self.append_items_and_increments(params, items, increments)
@@ -897,32 +900,56 @@ class CMSCommands:
     """Count-Min Sketch Commands"""
 
     @overload
-    def initbydim(self: SyncClientProtocol, key, width, depth) -> bool: ...
+    def initbydim(
+        self: SyncClientProtocol, key, width, depth, cell_size: int | None = None
+    ) -> bool: ...
 
     @overload
-    def initbydim(self: AsyncClientProtocol, key, width, depth) -> Awaitable[bool]: ...
+    def initbydim(
+        self: AsyncClientProtocol, key, width, depth, cell_size: int | None = None
+    ) -> Awaitable[bool]: ...
 
-    def initbydim(self, key, width, depth) -> bool | Awaitable[bool]:
+    def initbydim(
+        self, key, width, depth, cell_size: int | None = None
+    ) -> bool | Awaitable[bool]:
         """
         Initialize a Count-Min Sketch `key` to dimensions (`width`, `depth`) specified by user.
+        `cell_size` sets the size of each counter in bytes: 1, 2, 4 or 8 (server default is 4).
+        Increments that would overflow a counter are rejected by the server.
+        Requires a RedisBloom version newer than the one shipped with Redis 8.10.
         For more information see `CMS.INITBYDIM <https://redis.io/commands/cms.initbydim>`_.
         """  # noqa
-        return self.execute_command(CMS_INITBYDIM, key, width, depth)
-
-    @overload
-    def initbyprob(self: SyncClientProtocol, key, error, probability) -> bool: ...
+        params = [key, width, depth]
+        self.append_cell_size(params, cell_size)
+        return self.execute_command(CMS_INITBYDIM, *params)
 
     @overload
     def initbyprob(
-        self: AsyncClientProtocol, key, error, probability
+        self: SyncClientProtocol, key, error, probability, cell_size: int | None = None
+    ) -> bool: ...
+
+    @overload
+    def initbyprob(
+        self: AsyncClientProtocol,
+        key,
+        error,
+        probability,
+        cell_size: int | None = None,
     ) -> Awaitable[bool]: ...
 
-    def initbyprob(self, key, error, probability) -> bool | Awaitable[bool]:
+    def initbyprob(
+        self, key, error, probability, cell_size: int | None = None
+    ) -> bool | Awaitable[bool]:
         """
         Initialize a Count-Min Sketch `key` to characteristics (`error`, `probability`) specified by user.
+        `cell_size` sets the size of each counter in bytes: 1, 2, 4 or 8 (server default is 4).
+        Increments that would overflow a counter are rejected by the server.
+        Requires a RedisBloom version newer than the one shipped with Redis 8.10.
         For more information see `CMS.INITBYPROB <https://redis.io/commands/cms.initbyprob>`_.
         """  # noqa
-        return self.execute_command(CMS_INITBYPROB, key, error, probability)
+        params = [key, error, probability]
+        self.append_cell_size(params, cell_size)
+        return self.execute_command(CMS_INITBYPROB, *params)
 
     @overload
     def incrby(self: SyncClientProtocol, key, items, increments) -> list[int]: ...
@@ -940,7 +967,7 @@ class CMSCommands:
 
         Example:
 
-        >>> cmsincrby('A', ['foo'], [1])
+        >>> client.cms().incrby('A', ['foo'], [1])
         """  # noqa
         params = [key]
         self.append_items_and_increments(params, items, increments)
@@ -992,7 +1019,8 @@ class CMSCommands:
         CMSInfo | dict[str, Any]
     ]:
         """
-        Return width, depth and total count of the sketch.
+        Return width, depth, total count and, on servers that support it, the
+        counter `cell_size` of the sketch.
         For more information see `CMS.INFO <https://redis.io/commands/cms.info>`_.
         """  # noqa
         return self.execute_command(CMS_INFO, key)

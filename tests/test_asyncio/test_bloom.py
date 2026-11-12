@@ -89,6 +89,24 @@ async def test_bf_insert(decoded_r: redis.Redis):
 
 
 @pytest.mark.redismod
+async def test_bf_false_flags_are_not_sent(decoded_r: redis.Redis):
+    # noScale=False and noCreate=False must behave like omitting the flag,
+    # not send NONSCALING / NOCREATE.
+    assert await decoded_r.bf().create("bloom", 0.01, 1, noScale=False)
+    assert [1, 1, 1] == intlist(await decoded_r.bf().madd("bloom", "a", "b", "c"))
+    assert [1, 1, 1] == intlist(
+        await decoded_r.bf().insert(
+            "bloom_ins", ["a", "b", "c"], capacity=1, noScale=False
+        )
+    )
+    assert [1] == intlist(
+        await decoded_r.bf().insert("bloom_new", ["a"], noCreate=False)
+    )
+    assert [1] == await decoded_r.cf().insert("cuckoo_new", ["a"], nocreate=False)
+    assert [1] == await decoded_r.cf().insertnx("cuckoo_nx_new", ["a"], nocreate=False)
+
+
+@pytest.mark.redismod
 async def test_bf_scandump_and_loadchunk(decoded_r: redis.Redis):
     # Store a filter
     await decoded_r.bf().create("myBloom", "0.0001", "1000")
@@ -96,13 +114,17 @@ async def test_bf_scandump_and_loadchunk(decoded_r: redis.Redis):
     # test is probabilistic and might fail. It is OK to change variables if
     # certain to not break anything
     async def do_verify():
-        res = 0
+        pipe = decoded_r.pipeline(transaction=False)
+        bf = pipe.bf()
         for x in range(1000):
-            await decoded_r.bf().add("myBloom", x)
-            rv = await decoded_r.bf().exists("myBloom", x)
-            assert rv
-            rv = await decoded_r.bf().exists("myBloom", f"nonexist_{x}")
-            res += rv == x
+            bf.add("myBloom", x)
+            bf.exists("myBloom", x)
+            bf.exists("myBloom", f"nonexist_{x}")
+        replies = await pipe.execute()
+        res = 0
+        for exists, false_positive in zip(replies[1::3], replies[2::3]):
+            assert exists
+            res += false_positive
         assert res < 5
 
     await do_verify()
@@ -133,7 +155,29 @@ async def test_bf_scandump_and_loadchunk(decoded_r: redis.Redis):
     await do_verify()
 
     await decoded_r.bf().client.delete("myBloom")
-    await decoded_r.bf().create("myBloom", "0.0001", "10000000")
+
+
+@pytest.mark.redismod
+async def test_cf_scandump_and_loadchunk(decoded_r: redis.Redis):
+    # The client decodes responses, but the dumped chunks are binary.
+    await decoded_r.cf().create("myCuckoo", 1000)
+    for x in range(100):
+        await decoded_r.cf().add("myCuckoo", x)
+
+    chunks = []
+    it = 0
+    while True:
+        it, data = await decoded_r.cf().scandump("myCuckoo", it)
+        if it == 0:
+            break
+        assert isinstance(data, bytes)
+        chunks.append((it, data))
+
+    await decoded_r.delete("myCuckoo")
+    for it, data in chunks:
+        await decoded_r.cf().loadchunk("myCuckoo", it, data)
+
+    assert all(await decoded_r.cf().mexists("myCuckoo", *range(100)))
 
 
 @pytest.mark.redismod
@@ -267,6 +311,40 @@ async def test_cms_merge(decoded_r: redis.Redis):
     assert [9, 9, 11] == await decoded_r.cms().query("C", "foo", "bar", "baz")
     assert await decoded_r.cms().merge("C", 2, ["A", "B"], ["2", "3"])
     assert [16, 15, 21] == await decoded_r.cms().query("C", "foo", "bar", "baz")
+
+
+@pytest.mark.redismod
+@skip_ifmodversion_lt("8.11.0", "bf")
+async def test_cms_cell_size(decoded_r: redis.Redis):
+    for cell_size in (1, 2, 4, 8):
+        assert await decoded_r.cms().initbydim(
+            f"cell_dim{cell_size}", 1000, 5, cell_size=cell_size
+        )
+        assert (
+            cell_size
+            == (await decoded_r.cms().info(f"cell_dim{cell_size}"))["cell_size"]
+        )
+        assert await decoded_r.cms().initbyprob(
+            f"cell_prob{cell_size}", 0.01, 0.01, cell_size=cell_size
+        )
+        assert (
+            cell_size
+            == (await decoded_r.cms().info(f"cell_prob{cell_size}"))["cell_size"]
+        )
+
+    # the server uses 4-byte counters when CELL_SIZE is omitted
+    assert await decoded_r.cms().initbydim("cell_default", 1000, 5)
+    info = await decoded_r.cms().info("cell_default")
+    assert 1000 == info["width"]
+    assert 5 == info["depth"]
+    assert 0 == info["count"]
+    assert 4 == info["cell_size"]
+
+    # only 1, 2, 4 and 8 are valid cell sizes
+    with pytest.raises(redis.ResponseError):
+        await decoded_r.cms().initbydim("cell_bad", 1000, 5, cell_size=3)
+    with pytest.raises(redis.ResponseError):
+        await decoded_r.cms().initbyprob("cell_bad", 0.01, 0.01, cell_size=16)
 
 
 @pytest.mark.redismod

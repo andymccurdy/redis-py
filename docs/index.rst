@@ -66,7 +66,7 @@ Module Documentation
 
    connections
    clustering
-   multi_database
+   geographic_failover
    exceptions
    backoff
    lock

@@ -31,6 +31,7 @@ from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
 from redis.data_structure import WeightedList
 from redis.event import EventDispatcher, EventDispatcherInterface
+from redis.maint_notifications import MaintNotificationsConfig
 from redis.multidb.circuit import (
     DEFAULT_GRACE_PERIOD,
     CircuitBreaker,
@@ -104,6 +105,7 @@ class MultiDbConfig:
         databases_config: A list of database configurations.
         client_class: The client class used to manage database connections.
         command_retry: Retry strategy for executing database commands.
+            Defaults to a separate instance for each configuration.
         failure_detectors: Optional list of additional failure detectors for monitoring database failures.
         min_num_failures: Minimal count of failures required for failover
         failure_rate_threshold: Percentage of failures required for failover
@@ -142,11 +144,13 @@ class MultiDbConfig:
 
     databases_config: List[DatabaseConfig]
     client_class: Type[Union[Redis, RedisCluster]] = Redis
-    command_retry: Retry = Retry(
-        backoff=ExponentialWithJitterBackoff(
-            base=DEFAULT_RETRY_BASE, cap=DEFAULT_RETRY_CAP
-        ),
-        retries=DEFAULT_RETRY_COUNT,
+    command_retry: Retry = field(
+        default_factory=lambda: Retry(
+            backoff=ExponentialWithJitterBackoff(
+                base=DEFAULT_RETRY_BASE, cap=DEFAULT_RETRY_CAP
+            ),
+            retries=DEFAULT_RETRY_COUNT,
+        )
     )
     failure_detectors: Optional[List[AsyncFailureDetector]] = None
     min_num_failures: int = DEFAULT_MIN_NUM_FAILURES
@@ -176,6 +180,17 @@ class MultiDbConfig:
             database_config.client_kwargs.update(
                 {"retry": Retry(retries=0, backoff=NoBackoff())}
             )
+
+            # Maintenance notifications are disabled by default in underlying clients,
+            # but user can override this by providing their own config. A supplied
+            # pool keeps its own configuration.
+            if (
+                not database_config.from_pool
+                and "maint_notifications_config" not in database_config.client_kwargs
+            ):
+                database_config.client_kwargs["maint_notifications_config"] = (
+                    MaintNotificationsConfig(enabled=False)
+                )
 
             if database_config.from_url:
                 client = self.client_class.from_url(

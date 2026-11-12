@@ -16,3 +16,4 @@ Examples
    examples/redis-stream-example
    examples/opentelemetry_api_examples
    examples/hash_examples
+   examples/pubsub_examples

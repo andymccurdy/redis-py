@@ -117,6 +117,13 @@ pygments_style = "tango"
 
 nitpicky = True
 
+# Type hints that Sphinx cannot resolve: AbstractConnection is an internal base
+# class that is not documented, and asyncio.queues.Queue is not in these docs.
+nitpick_ignore = [
+    ("py:class", "redis.asyncio.connection.AbstractConnection"),
+    ("py:class", "asyncio.queues.Queue"),
+]
+
 
 # -- Options for HTML output --------------------------------------------------
 

@@ -346,6 +346,6 @@ Next, you can learn how to configure `uptrace-python <https://uptrace.dev/get/op
 You may also be interested in the following guides:
 
 - `OpenTelemetry Django <https://uptrace.dev/get/instrument/opentelemetry-django.html>`_
-- `OpenTelemetry Flask <https://uptrace.dev/get/instrument/instrument/opentelemetry-flask.html>`_
+- `OpenTelemetry Flask <https://uptrace.dev/get/instrument/opentelemetry-flask.html>`_
 - `OpenTelemetry FastAPI <https://uptrace.dev/get/instrument/opentelemetry-fastapi.html>`_
 - `OpenTelemetry SQLAlchemy <https://uptrace.dev/get/instrument/opentelemetry-sqlalchemy.html>`_

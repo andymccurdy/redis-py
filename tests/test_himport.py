@@ -685,6 +685,7 @@ class TestParseHImportSetArgs:
         assert parse_himport_set_args(args) is None
 
 
+@pytest.mark.fixed_client
 class TestHImportAskRedirectSync:
     """An ASK-redirected ``HIMPORT SET`` must carry the ASKING allowance on the
     same connection, immediately before the SET.

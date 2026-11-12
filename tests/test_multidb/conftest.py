@@ -1,4 +1,4 @@
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -77,7 +77,7 @@ def _create_mock_db(request) -> Database:
     db = Mock(spec=Database)
     db.weight = request.param.get("weight", 1.0)
     db.client = Mock(spec=Redis)
-    db.client.connection_pool = Mock(spec=ConnectionPool)
+    db.client.connection_pool = MagicMock(spec=ConnectionPool)
 
     cb = request.param.get("circuit", {})
     mock_cb = Mock(spec=CircuitBreaker)

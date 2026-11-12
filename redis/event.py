@@ -2,7 +2,7 @@ import asyncio
 import threading
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Type, Union
 
 from redis.auth.token import TokenInterface
 from redis.credentials import CredentialProvider, StreamingCredentialProvider
@@ -11,6 +11,13 @@ from redis.observability.recorder import (
     register_pools_connection_count,
 )
 from redis.utils import check_protocol_version, deprecated_function
+
+if TYPE_CHECKING:
+    from redis.maint_notifications import (
+        MaintenanceNotification,
+        MaintenanceState,
+        MaintNotificationsConfig,
+    )
 
 
 class EventListenerInterface(ABC):
@@ -215,6 +222,89 @@ class AsyncAfterSlotsCacheRefreshEvent(AfterSlotsCacheRefreshEvent):
     pass
 
 
+class MaintenanceEvent:
+    """
+    Base class of the events a maintenance notification pushed by the server
+    produces while it relaxes timeouts: on a connection pool for a node handoff
+    (``MaintenanceState.MOVING``), or on a single connection for a shard
+    migration or failover (``MaintenanceState.MAINTENANCE``).
+
+    Dispatched synchronously, by both the sync and the async client, to the
+    ``event_dispatcher`` of the ``MaintNotificationsConfig`` the handler acted
+    with; listeners implement ``EventListenerInterface``.
+
+    :param connection_pool: The pool whose connections are affected. ``None``
+        when the notification was handled by a connection without a pool
+        handler, such as an OSS cluster node connection.
+    :param connection: The connection that received the notification. ``None``
+        when a pool-level handler had no connection to attribute it to.
+    :param state: The ``MaintenanceState`` the notification puts its source in.
+    :param notification: The ``MaintenanceNotification`` that was handled.
+    :param config: The ``MaintNotificationsConfig`` the handler acted with.
+    """
+
+    def __init__(
+        self,
+        connection_pool: Optional[object],
+        connection: Optional[object],
+        state: "MaintenanceState",
+        notification: Optional["MaintenanceNotification"],
+        config: "MaintNotificationsConfig",
+    ):
+        self._connection_pool = connection_pool
+        self._connection = connection
+        self._state = state
+        self._notification = notification
+        self._config = config
+
+    @property
+    def connection_pool(self) -> Optional[object]:
+        return self._connection_pool
+
+    @property
+    def connection(self) -> Optional[object]:
+        return self._connection
+
+    @property
+    def state(self) -> "MaintenanceState":
+        return self._state
+
+    @property
+    def notification(self) -> Optional["MaintenanceNotification"]:
+        return self._notification
+
+    @property
+    def config(self) -> "MaintNotificationsConfig":
+        return self._config
+
+
+class MaintenanceStartedEvent(MaintenanceEvent):
+    """
+    Event fired when a maintenance notification starts relaxing the timeouts of
+    its source. Paired with a ``MaintenanceCompletedEvent`` carrying the same
+    ``state`` and source.
+    """
+
+    pass
+
+
+class MaintenanceCompletedEvent(MaintenanceEvent):
+    """
+    Event fired when the timeout relaxation announced by a
+    ``MaintenanceStartedEvent`` is reverted: the completion notification
+    arrived, the handoff TTL expired, or the connection was closed while
+    still under maintenance. Also fired, with ``MaintenanceState.MAINTENANCE``,
+    when a handoff takes over a connection under maintenance: the connection
+    stays relaxed, but under the handoff's ``MOVING`` pair from then on. In
+    the last two cases ``notification`` is ``None``.
+
+    Not fired when a newer handoff superseded the one that completed; the
+    source stays relaxed until the newer one completes.
+    """
+
+    pass
+
+
 class ClientType(Enum):
     SYNC = ("sync",)
     ASYNC = ("async",)
@@ -399,12 +489,26 @@ class RegisterReAuthForPooledConnections(EventListenerInterface):
                 event.credential_provider.on_error(self._raise_on_error_async)
 
     def _re_auth(self, token):
+        first_error = None
         for pool in self._event.connection_pools:
-            pool.re_auth_callback(token)
+            try:
+                pool.re_auth_callback(token)
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
 
     async def _re_auth_async(self, token):
+        first_error = None
         for pool in self._event.connection_pools:
-            await pool.re_auth_callback(token)
+            try:
+                await pool.re_auth_callback(token)
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
 
     def _raise_on_error(self, error: Exception):
         raise EventException(error, self._event)
@@ -469,8 +573,22 @@ class RegisterReAuthForAsyncClusterNodes(EventListenerInterface):
             event.credential_provider.on_error(self._raise_on_error)
 
     async def _re_auth(self, token: TokenInterface):
-        for key in self._event.nodes:
-            await self._event.nodes[key].re_auth_callback(token)
+        nodes = self._event.nodes
+        first_error = None
+        # Iterate a snapshot: a topology refresh can add and remove nodes while
+        # a node is being re-authenticated. A node that is no longer the one cached
+        # under its key is skipped: it is being closed, even if a later refresh
+        # re-added its address as a new node. Nodes added in the meantime connect
+        # with the current credentials and need no AUTH.
+        for key, node in tuple(nodes.items()):
+            if nodes.get(key) is node:
+                try:
+                    await node.re_auth_callback(token)
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
+        if first_error is not None:
+            raise first_error
 
     async def _raise_on_error(self, error: Exception):
         raise EventException(error, self._event)

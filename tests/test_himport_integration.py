@@ -365,7 +365,9 @@ class TestHImportIntegration:
 
     def test_pool_churn_lazy_prepare(self, hr):
         # Each connection the pool hands out prepares the fieldset once, lazily.
-        n = 25
+        # The calls run one after another on a reused connection, so a few are
+        # enough; more would not add churn.
+        n = 3
         for i in range(n):
             hr.himport_set(f"h:{{u}}:c{i}", "shared", [f"n{i}", f"e{i}@x", str(i)])
         for i in range(n):

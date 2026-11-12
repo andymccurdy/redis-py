@@ -24,5 +24,9 @@ class pipeline:  # noqa: N801
         return self.p
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        await self.p.execute()
-        del self.p
+        try:
+            if exc_type is None:
+                await self.p.execute()
+        finally:
+            await self.p.reset()
+            del self.p

@@ -35,6 +35,7 @@ class FakeResponse:
         return None
 
 
+@pytest.mark.fixed_client
 class TestHttpClient:
     def test_get_returns_parsed_json_and_uses_timeout(
         self, monkeypatch: pytest.MonkeyPatch

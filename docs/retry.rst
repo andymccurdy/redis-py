@@ -29,9 +29,58 @@ As you can see from the example above, Redis client supports 2 parameters to con
       which can be overridden by passing a tuple with :ref:`exceptions-label` to the ``supported_errors`` parameter.
 * ``retry_on_error``: list of additional :ref:`exceptions-label` to retry on
 
+``retry_on_error`` can also be set in a connection URL as a comma-separated
+list of names from :mod:`redis.exceptions` (for example
+``redis://localhost?retry_on_error=ConnectionError,TimeoutError``).
+
 
 If no ``retry`` is provided, a default one is created with  :class:`~.ExponentialWithJitterBackoff` as backoff strategy
 and 3 retries.
+
+
+Opt-in retryability checker
+***************************
+
+A :class:`~.Retry` object accepts an optional ``is_retryable`` callable. When it
+is set, an error is retried only if its type is one of the ``supported_errors``
+AND the callable returns ``True`` for it. The default (``None``) leaves the
+retry behavior unchanged.
+
+``redis.retry.is_retryable_connect_error`` is a ready-made checker that
+returns ``False`` for definitively unrecoverable connection errors - currently
+a missing Unix socket path (``ENOENT``) - while leaving transient errors such as
+``ECONNREFUSED`` retryable. Use it to fail fast instead of spending the whole
+backoff budget on a socket path that does not exist:
+
+>>> from redis import Redis
+>>> from redis.backoff import ExponentialBackoff
+>>> from redis.retry import Retry, is_retryable_connect_error
+>>> retry = Retry(
+...     ExponentialBackoff(), 3, is_retryable=is_retryable_connect_error
+... )
+>>> r = Redis(unix_socket_path="/tmp/does-not-exist.sock", retry=retry)
+
+The same checker works with ``redis.asyncio.retry.Retry``.
+
+
+Retry with asyncio
+******************
+
+Async clients use ``redis.asyncio.retry.Retry`` so retry callbacks and backoff
+delays can be awaited:
+
+>>> from redis.asyncio import Redis
+>>> from redis.asyncio.retry import Retry
+>>> from redis.backoff import ExponentialBackoff
+>>>
+>>> retry = Retry(ExponentialBackoff(), 3)
+>>> r = Redis(host='localhost', port=6379, retry=retry)
+
+Passing :class:`redis.retry.Retry` to an async client is supported for
+compatibility, but it is converted to ``redis.asyncio.retry.Retry`` and emits a
+warning. Custom synchronous ``call_with_retry`` implementations cannot be
+preserved by that conversion, so async clients should be configured with an
+async retry policy directly.
 
 
 Retry in Redis Cluster
@@ -54,8 +103,9 @@ Retry behaviour in Redis Cluster is a little bit different from Standalone:
       only in the case when the ``retry`` object is not provided.
       When the ``retry`` argument is provided, the ``cluster_error_retry_attempts`` argument is ignored!
 
-* The retry object is not yet fully utilized in the cluster client.
-  The retry object is used only to determine the number of retries for the cluster level calls.
+* The retry object sets both the number of retries and the delay before each one:
+  the cluster client waits as long as its backoff says before it retries a command or a pipeline.
+  See :ref:`cluster-retries-label` for the delays and for how often the topology is refreshed.
 
 Let's consider the following example:
 
@@ -69,5 +119,10 @@ Let's consider the following example:
 #. the client library calculates the hash slot for key 'foo'.
 #. given the hash slot, it then determines which node to connect to, in order to execute the command.
 #. during the connection, a :class:`~.ConnectionError` is raised.
-#. because we set ``retry=Retry(ExponentialBackoff(), 6)``, the cluster client starts a cluster update, removes the failed node from the startup nodes, and re-initializes the cluster.
-#. the cluster client retries the command until it either succeeds or the max number of retries is reached.
+#. because we set ``retry=Retry(ExponentialBackoff(), 6)``, the cluster client asks for
+   a refresh of the cluster topology, which tries the failed node last. The request is
+   shared by the whole client: the first command attempt that starts once the refresh
+   is due runs it, whether that is the retry of this command or another command.
+   Refreshes run at most once per ``topology_refresh_min_interval`` seconds (one second
+   by default), so a retry inside that interval still uses the current topology.
+#. the cluster client waits as long as the backoff says and retries the command, until it either succeeds or the max number of retries is reached.

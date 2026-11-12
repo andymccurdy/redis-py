@@ -128,6 +128,7 @@ class TokenManager:
         self._listener = None
         self._init_timer = None
         self._retries = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def __del__(self):
         logger.info("Token manager are disposed")
@@ -138,34 +139,41 @@ class TokenManager:
         listener: CredentialsListener,
         skip_initial: bool = False,
     ) -> Callable[[], None]:
+        """Start renewal on a background event loop and wait for initialization."""
+        self.stop()
         self._listener = listener
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Run loop in a separate thread to unblock main thread.
-            loop = asyncio.new_event_loop()
+        # Startup waits synchronously, so renewal must run on a separate loop.
+        loop = asyncio.new_event_loop()
+        self._loop = loop
 
-            # Use threading.Event to signal when loop is ready
-            loop_ready = threading.Event()
+        # Use threading.Event to signal when loop is ready
+        loop_ready = threading.Event()
+        init_done = threading.Event()
 
-            def start_loop():
-                # This runs in the background thread. First, bind the event loop to
-                # this thread, then signal that the loop is ready so the calling
-                # thread can safely schedule work (via call_soon_threadsafe) before
-                # we block in run_forever().
-                asyncio.set_event_loop(loop)
-                loop_ready.set()  # Signal that loop is ready for cross-thread use
+        def start_loop():
+            # This runs in the background thread. First, bind the event loop to
+            # this thread, then signal that the loop is ready so the calling
+            # thread can safely schedule work (via call_soon_threadsafe) before
+            # we block in run_forever().
+            asyncio.set_event_loop(loop)
+            loop_ready.set()  # Signal that loop is ready for cross-thread use
+            try:
                 loop.run_forever()
+            finally:
+                loop.close()
+                # Shutdown may cancel the initial callback before it runs.
+                init_done.set()
 
+        try:
             thread = threading.Thread(target=start_loop, daemon=True)
             thread.start()
+        except BaseException:
+            loop.close()
+            raise
 
-            # Wait for the loop to be ready before scheduling
-            loop_ready.wait()
-
-        # Use thread-safe Event for cross-thread synchronization
-        init_done = threading.Event()
+        # Wait for the loop to be ready before scheduling
+        loop_ready.wait()
 
         def renew_with_callback():
             try:
@@ -174,7 +182,12 @@ class TokenManager:
                 init_done.set()
 
         # Schedule using call_soon_threadsafe for thread-safe scheduling
-        self._init_timer = loop.call_soon_threadsafe(renew_with_callback)
+        try:
+            self._init_timer = loop.call_soon_threadsafe(renew_with_callback)
+        except RuntimeError:
+            # Concurrent shutdown may close the loop before initial scheduling.
+            if not loop.is_closed():
+                raise
         logger.info("Token manager started")
 
         # Blocks using thread-safe Event
@@ -210,6 +223,15 @@ class TokenManager:
             self._init_timer.cancel()
         if self._next_timer is not None:
             self._next_timer.cancel()
+
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                # A concurrent stop may have already closed this loop.
+                if not loop.is_closed():
+                    raise
 
     def acquire_token(self, force_refresh=False) -> TokenResponse:
         try:
@@ -289,18 +311,21 @@ class TokenManager:
                 )
                 return
 
+            callback_error = None
             if not skip_initial:
                 try:
                     self._listener.on_next(token_res.get_token())
                 except Exception as e:
-                    raise TokenRenewalErr(e)
+                    callback_error = e
 
-            if delay <= 0:
-                return
+            if delay > 0:
+                loop = asyncio.get_running_loop()
+                self._next_timer = loop.call_later(delay, self._renew_token)
+                logger.info(f"Next token renewal scheduled in {delay} seconds")
 
-            loop = asyncio.get_running_loop()
-            self._next_timer = loop.call_later(delay, self._renew_token)
-            logger.info(f"Next token renewal scheduled in {delay} seconds")
+            if callback_error is not None:
+                raise TokenRenewalErr(callback_error) from callback_error
+
             return token_res
         except Exception as e:
             if self._listener.on_error is None:
@@ -332,19 +357,21 @@ class TokenManager:
                 )
                 return
 
+            callback_error = None
             if not skip_initial:
                 try:
                     await self._listener.on_next(token_res.get_token())
                 except Exception as e:
-                    raise TokenRenewalErr(e)
+                    callback_error = e
 
-            if delay <= 0:
-                return
+            if delay > 0:
+                loop = asyncio.get_running_loop()
+                wrapped = _async_to_sync_wrapper(loop, self._renew_token_async)
+                logger.info(f"Next token renewal scheduled in {delay} seconds")
+                self._next_timer = loop.call_later(delay, wrapped)
 
-            loop = asyncio.get_running_loop()
-            wrapped = _async_to_sync_wrapper(loop, self._renew_token_async)
-            logger.info(f"Next token renewal scheduled in {delay} seconds")
-            loop.call_later(delay, wrapped)
+            if callback_error is not None:
+                raise TokenRenewalErr(callback_error) from callback_error
         except Exception as e:
             if self._listener.on_error is None:
                 raise e

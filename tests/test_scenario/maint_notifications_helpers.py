@@ -172,6 +172,43 @@ class ClusterOperations:
             skip_end_notification=skip_end_notification,
         )
 
+    @staticmethod
+    def migrate(
+        fault_injector: FaultInjectorClient,
+        endpoint_config: Dict[str, Any],
+    ) -> str:
+        """Migrate all master shards of the database to another node.
+
+        Args:
+            fault_injector: The fault injector client to use
+            endpoint_config: Endpoint configuration dictionary
+
+        Returns:
+            str: Action ID for tracking the operation
+        """
+        return fault_injector.migrate(endpoint_config)
+
+    @staticmethod
+    def wait_for_database_active(
+        fault_injector: FaultInjectorClient,
+        endpoint_config: Dict[str, Any],
+        active_timeout: Optional[int] = None,
+    ) -> str:
+        """Wait server-side until the database reports 'active'.
+
+        Args:
+            fault_injector: The fault injector client to use
+            endpoint_config: Endpoint configuration dictionary
+            active_timeout: Optional seconds to wait before the fault injector
+                gives up (its own default applies when omitted)
+
+        Returns:
+            str: Action ID for tracking the operation
+        """
+        return fault_injector.wait_for_database_active(
+            endpoint_config, active_timeout=active_timeout
+        )
+
 
 class KeyGenerationHelpers:
     TOTAL_SLOTS = 16384
@@ -247,9 +284,14 @@ class KeyGenerationHelpers:
                 end_slot = start_slot + slots_per_shard - 1
 
             # Generate keys for this shard's slot range
+            span = end_slot - start_slot + 1
             for i in range(keys_per_shard):
-                # Pick a slot within this shard's range
-                slot_number = start_slot + (i % (end_slot - start_slot + 1))
+                # Spread the keys across the shard's slot range instead of clustering
+                # them at its start. Slots one apart almost always migrate together, so
+                # adjacent keys never produce the partial move that leaves a per-node
+                # PubSub holding some but not all of its channels. Identical to the
+                # previous formula at keys_per_shard=1, which every other caller uses.
+                slot_number = start_slot + (i * span) // keys_per_shard
                 keys.append(KeyGenerationHelpers.generate_key(slot_number, prefix))
 
         return keys
@@ -301,12 +343,16 @@ def generate_params(
     effect_names: list[SlotMigrateEffects | TopologyChangeStandaloneEffects],
     skip_combinations: list[tuple[SlotMigrateEffects, str]] = [],
     endpoint_types: Optional[list[EndpointType]] = None,
+    include_tls: bool = True,
 ):
     """Build parametrize tuples for maint-notification scenario tests.
 
     Returns a list of (effect_name, trigger, dbconfig, db_name) tuples, or
     (effect_name, trigger, dbconfig, db_name, endpoint_type) when endpoint_types
     is provided.
+
+    Set include_tls=False to drop the TLS and mTLS requirement variants, for suites
+    whose client cannot use a rediss:// endpoint.
     """
     params = []
     try:
@@ -331,6 +377,8 @@ def generate_params(
                     continue
                 trigger_requirements = trigger_info["requirements"]
                 for requirement in trigger_requirements:
+                    if not include_tls and requirement.get("tls"):
+                        continue
                     dbconfig = requirement["dbconfig"]
                     if requirement.get("oss_cluster_api"):
                         ip_type = requirement["oss_cluster_api"]["ip_type"]
@@ -352,7 +400,18 @@ def generate_params(
                             )
                     else:
                         params.append((effect_name, trigger, dbconfig, db_name_pattern))
+    except NotImplementedError as e:
+        # Not every backend implements every effect - the mock proxy server
+        # rejects the topology-change triggers outright - so an empty
+        # parametrization is the correct outcome rather than a failure.
+        logging.info(f"No params for test, unsupported by this fault injector: {e}")
     except Exception as e:
         logging.error(f"Failed to extract params for test: {e}")
+        if not params:
+            # Partial results are still worth running, but an *empty*
+            # parametrization makes pytest report success while having executed
+            # nothing at all. A fault injector that is unreachable or rejecting
+            # requests has to surface as a collection error instead.
+            raise
 
     return params

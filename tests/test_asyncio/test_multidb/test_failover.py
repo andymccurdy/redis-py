@@ -132,7 +132,7 @@ class TestDefaultStrategyExecutor:
                     await asyncio.sleep(0.11)
                     pass
 
-            assert mock_fs.database.call_count == 4
+        assert mock_fs.database.call_count == 4
 
     @pytest.mark.asyncio
     async def test_execute_throws_exception_on_attempts_does_not_exceed_delay(
@@ -167,4 +167,4 @@ class TestDefaultStrategyExecutor:
                     if i == failover_attempts:
                         raise e
 
-            assert mock_fs.database.call_count == 4
+        assert mock_fs.database.call_count == 4

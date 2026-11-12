@@ -279,10 +279,34 @@ class SlotNotCoveredError(RedisClusterException):
     pass
 
 
+class RedisClusterUnreachableError(RedisClusterException):
+    """
+    Raised when a topology refresh could not reach any node of the cluster.
+
+    A subclass of :class:`RedisClusterException` so existing handlers keep working,
+    but distinguishable from the many deterministic errors that also use the base
+    type - cross-slot commands, unsupported methods and the like - so that callers
+    which need to react to an unreachable deployment can select just this case by
+    type. The connection error that triggered the refresh is kept as the cause.
+    """
+
+    pass
+
+
 class MaxConnectionsError(ConnectionError):
     """
     Raised when a connection pool has reached its max_connections limit.
     This indicates pool exhaustion rather than an actual connection failure.
+    """
+
+    pass
+
+
+class MaxClientsReachedError(ConnectionError):
+    """
+    Raised when the server refuses a new connection because it has reached its
+    ``maxclients`` limit ("max number of clients reached").
+    This indicates server-side capacity exhaustion rather than a node failure.
     """
 
     pass

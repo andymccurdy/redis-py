@@ -4,6 +4,7 @@ from typing import Literal
 from redis._parsers.helpers import pairs_to_dict
 from redis.commands.vectorset.utils import (
     parse_vemb_result,
+    parse_vemb_result_unified,
     parse_vlinks_result,
     parse_vsim_result,
 )
@@ -40,7 +41,10 @@ class _VectorSetBase(VectorSetCommands):
             VLINKS_CMD: parse_vlinks_result,
         }
         self._RESP3_MODULE_CALLBACKS = {}
-        self._RESP2_UNIFIED_MODULE_CALLBACKS = dict(self._RESP2_MODULE_CALLBACKS)
+        self._RESP2_UNIFIED_MODULE_CALLBACKS = {
+            **self._RESP2_MODULE_CALLBACKS,
+            VEMB_CMD: parse_vemb_result_unified,
+        }
         self._RESP3_UNIFIED_MODULE_CALLBACKS = dict(self._RESP3_MODULE_CALLBACKS)
         self._RESP3_TO_RESP2_LEGACY_MODULE_CALLBACKS = {}
 

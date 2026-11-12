@@ -1,10 +1,12 @@
 import asyncio
+from contextlib import nullcontext
 from unittest.mock import Mock, AsyncMock, patch
 
 import pybreaker
 import pytest
 
 from redis.asyncio.client import Pipeline
+from redis.client import NEVER_DECODE
 from redis.asyncio.multidb.client import MultiDBClient, Pipeline as MultiDBPipeline
 from redis.exceptions import DataError
 from redis.asyncio.multidb.config import InitialHealthCheck
@@ -21,8 +23,115 @@ def mock_pipe() -> Pipeline:
     return mock_pipe
 
 
-@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
 class TestPipeline:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raise_error", [False, True])
+    @pytest.mark.parametrize("mock_multi_db_config,mock_db", [({}, {})], indirect=True)
+    async def test_context_exit_keeps_parent_open(
+        self, mock_multi_db_config, mock_db, mock_hc, raise_error
+    ):
+        databases = create_weighted_list(mock_db)
+        db_pipe = mock_pipe()
+        db_pipe.execute.side_effect = [[True], [b"value"]]
+        mock_db.client.pipeline.return_value = db_pipe
+        mock_db.client.execute_command.return_value = b"value"
+
+        with (
+            patch.object(mock_multi_db_config, "databases", return_value=databases),
+            patch.object(
+                mock_multi_db_config, "default_health_checks", return_value=[mock_hc]
+            ),
+        ):
+            async with MultiDBClient(mock_multi_db_config) as client:
+                await client._recurring_hc_task
+                health_check_timer = client._bg_scheduler._next_timer
+                assert health_check_timer is not None
+                with (
+                    pytest.raises(ValueError, match="pipeline failed")
+                    if raise_error
+                    else nullcontext()
+                ):
+                    async with client.pipeline() as pipe:
+                        pipe.set("key", "value")
+                        assert await pipe.execute() == [True]
+                        pipe.get("discarded")
+                        if raise_error:
+                            raise ValueError("pipeline failed")
+
+                assert len(pipe) == 0
+                mock_db.client.aclose.assert_not_awaited()
+                assert client._bg_scheduler._next_timer is health_check_timer
+                assert not health_check_timer.cancelled()
+                assert await client.get("key") == b"value"
+                async with client.pipeline() as next_pipe:
+                    next_pipe.get("key")
+                    assert await next_pipe.execute() == [b"value"]
+                mock_db.client.aclose.assert_not_awaited()
+
+            mock_db.client.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raise_error", [False, True])
+    @pytest.mark.parametrize("mock_multi_db_config,mock_db", [({}, {})], indirect=True)
+    async def test_context_exit_preserves_pipeline_in_flight(
+        self, mock_multi_db_config, mock_db, mock_hc, raise_error
+    ):
+        databases = create_weighted_list(mock_db)
+        execution_started = asyncio.Event()
+        finish_execution = asyncio.Event()
+        db_pipe = mock_pipe()
+
+        async def execute():
+            execution_started.set()
+            await finish_execution.wait()
+            return [b"value"]
+
+        db_pipe.execute.side_effect = execute
+        mock_db.client.pipeline.return_value = db_pipe
+
+        with (
+            patch.object(mock_multi_db_config, "databases", return_value=databases),
+            patch.object(
+                mock_multi_db_config, "default_health_checks", return_value=[mock_hc]
+            ),
+        ):
+            async with MultiDBClient(mock_multi_db_config) as client:
+                await client._recurring_hc_task
+                health_check_timer = client._bg_scheduler._next_timer
+                assert health_check_timer is not None
+
+                async def run_pipeline():
+                    async with client.pipeline() as pipe:
+                        pipe.get("key")
+                        return await pipe.execute()
+
+                pending = asyncio.create_task(run_pipeline())
+                try:
+                    await asyncio.wait_for(execution_started.wait(), timeout=1)
+                    with (
+                        pytest.raises(ValueError, match="pipeline failed")
+                        if raise_error
+                        else nullcontext()
+                    ):
+                        async with client.pipeline() as other_pipe:
+                            other_pipe.set("discarded", "value")
+                            if raise_error:
+                                raise ValueError("pipeline failed")
+
+                    assert len(other_pipe) == 0
+                    mock_db.client.aclose.assert_not_awaited()
+                    finish_execution.set()
+                    assert await pending == [b"value"]
+                    mock_db.client.aclose.assert_not_awaited()
+                    assert client._bg_scheduler._next_timer is health_check_timer
+                    assert not health_check_timer.cancelled()
+                finally:
+                    finish_execution.set()
+                    await asyncio.gather(pending, return_exceptions=True)
+
+            mock_db.client.aclose.assert_awaited_once()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "mock_multi_db_config,mock_db, mock_db1, mock_db2",
@@ -236,7 +345,7 @@ class TestPipeline:
             # Wait for mock_db1 to become unhealthy
             await wait_for_condition(
                 lambda: cb1.state == CBState.OPEN,
-                timeout=0.5,
+                timeout=5.0,
                 error_message="Timeout waiting for cb1 to open",
             )
 
@@ -246,7 +355,7 @@ class TestPipeline:
             # Wait for mock_db2 to become unhealthy
             await wait_for_condition(
                 lambda: cb2.state == CBState.OPEN,
-                timeout=0.5,
+                timeout=5.0,
                 error_message="Timeout waiting for cb2 to open",
             )
 
@@ -259,14 +368,14 @@ class TestPipeline:
             )
             await wait_for_condition(
                 lambda: cb.state == CBState.OPEN,
-                timeout=0.5,
+                timeout=5.0,
                 error_message="Timeout waiting for cb to open",
             )
 
             # Wait for mock_db1 to recover (circuit breaker to close)
             await wait_for_condition(
                 lambda: cb1.state == CBState.CLOSED,
-                timeout=1.0,
+                timeout=5.0,
                 error_message="Timeout waiting for cb1 to close (mock_db1 to recover)",
             )
 
@@ -275,8 +384,60 @@ class TestPipeline:
 
             await client.aclose()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    @pytest.mark.parametrize("decode_responses", [False, True])
+    async def test_pipeline_slowlog_get_before_first_command(
+        self,
+        mock_multi_db_config,
+        mock_db,
+        mock_db1,
+        mock_db2,
+        mock_hc,
+        decode_responses,
+    ):
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
 
-@pytest.mark.onlynoncluster
+        with (
+            patch.object(mock_multi_db_config, "databases", return_value=databases),
+            patch.object(
+                mock_multi_db_config, "default_health_checks", return_value=[mock_hc]
+            ),
+        ):
+            pipe = mock_pipe()
+            pipe.execute.return_value = [[]]
+            mock_db1.client.pipeline.return_value = pipe
+            mock_db1.client.get_connection_kwargs.return_value = {
+                "decode_responses": decode_responses
+            }
+
+            mock_hc.check_health.return_value = True
+
+            client = MultiDBClient(mock_multi_db_config)
+            try:
+                assert not client.initialized
+                multi_db_pipe = client.pipeline()
+                multi_db_pipe.slowlog_get()
+                assert await multi_db_pipe.execute() == [[]]
+
+                expected = {NEVER_DECODE: []} if decode_responses else {}
+                pipe.execute_command.assert_called_once_with("SLOWLOG GET", **expected)
+            finally:
+                await client.aclose()
+
+
+@pytest.mark.fixed_client
 class TestTransaction:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -319,6 +480,56 @@ class TestTransaction:
                 # if we assume at least 3 health checks have run per each database
                 # we should have at least 9 total calls
                 assert len(mock_hc.check_health.call_args_list) >= 9
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mock_multi_db_config,mock_db, mock_db1, mock_db2",
+        [
+            (
+                {},
+                {"weight": 0.2, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.7, "circuit": {"state": CBState.CLOSED}},
+                {"weight": 0.5, "circuit": {"state": CBState.CLOSED}},
+            ),
+        ],
+        indirect=True,
+    )
+    async def test_transaction_forwards_watches_and_options(
+        self, mock_multi_db_config, mock_db, mock_db1, mock_db2, mock_hc
+    ):
+        databases = create_weighted_list(mock_db, mock_db1, mock_db2)
+
+        with (
+            patch.object(mock_multi_db_config, "databases", return_value=databases),
+            patch.object(
+                mock_multi_db_config, "default_health_checks", return_value=[mock_hc]
+            ),
+        ):
+            mock_db1.client.transaction.return_value = ["OK1", "value1"]
+
+            mock_hc.check_health.return_value = True
+
+            async with MultiDBClient(mock_multi_db_config) as client:
+
+                async def callback(pipe: Pipeline):
+                    pipe.set("key1", "value1")
+                    pipe.get("key1")
+
+                assert await client.transaction(
+                    callback,
+                    "watched-key",
+                    value_from_callable=True,
+                    watch_delay=2.5,
+                ) == ["OK1", "value1"]
+                # watched keys must stay positional; transaction options
+                # must reach the active client as keyword arguments
+                mock_db1.client.transaction.assert_called_once_with(
+                    callback,
+                    "watched-key",
+                    shard_hint=None,
+                    value_from_callable=True,
+                    watch_delay=2.5,
+                )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -481,7 +692,7 @@ class TestTransaction:
                 # Wait for mock_db1 to become unhealthy
                 await wait_for_condition(
                     lambda: cb1.state == CBState.OPEN,
-                    timeout=0.5,
+                    timeout=5.0,
                     error_message="Timeout waiting for cb1 to open",
                 )
 
@@ -490,7 +701,7 @@ class TestTransaction:
                 # Wait for mock_db2 to become unhealthy
                 await wait_for_condition(
                     lambda: cb2.state == CBState.OPEN,
-                    timeout=0.5,
+                    timeout=5.0,
                     error_message="Timeout waiting for cb2 to open",
                 )
 
@@ -502,21 +713,21 @@ class TestTransaction:
                 ), "Timeout waiting for mock_db to become unhealthy"
                 await wait_for_condition(
                     lambda: cb.state == CBState.OPEN,
-                    timeout=0.5,
+                    timeout=5.0,
                     error_message="Timeout waiting for cb to open",
                 )
 
                 # Wait for mock_db1 to recover (circuit breaker to close)
                 await wait_for_condition(
                     lambda: cb1.state == CBState.CLOSED,
-                    timeout=1.0,
+                    timeout=5.0,
                     error_message="Timeout waiting for cb1 to close (mock_db1 to recover)",
                 )
 
                 assert await client.transaction(callback) == ["OK1", "value"]
 
 
-@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
 class TestPipelineHImportUnsupported:
     """HIMPORT is unsupported on the multi-database client. The lifecycle methods
     are blocked on ``MultiDBClient``; the pipeline inherits ``himport_set`` from

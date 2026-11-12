@@ -2,11 +2,16 @@ from unittest.mock import Mock, AsyncMock
 
 import pytest
 
+from redis.credentials import StreamingCredentialProvider
 from redis.event import (
+    AfterPooledConnectionsInstantiationEvent,
+    ClientType,
     EventListenerInterface,
     EventDispatcher,
     AsyncEventListenerInterface,
+    RegisterReAuthForPooledConnections,
 )
+from redis.exceptions import ConnectionError
 
 
 @pytest.mark.fixed_client
@@ -169,3 +174,27 @@ class TestEventDispatcher:
         assert later_calls == 0
         await dispatcher.dispatch_async(_Evt())
         assert later_calls == 1
+
+
+@pytest.mark.fixed_client
+class TestRegisterReAuthForPooledConnections:
+    async def test_failed_re_auth_does_not_stop_the_other_pools_async(self):
+        credential_provider = Mock(spec=StreamingCredentialProvider)
+        pools = [Mock(), Mock(), Mock()]
+        pools[0].re_auth_callback = AsyncMock(side_effect=ConnectionError("first"))
+        pools[1].re_auth_callback = AsyncMock(side_effect=ConnectionError("second"))
+        pools[2].re_auth_callback = AsyncMock()
+        token = Mock()
+
+        RegisterReAuthForPooledConnections().listen(
+            AfterPooledConnectionsInstantiationEvent(
+                pools, ClientType.ASYNC, credential_provider
+            )
+        )
+        re_auth = credential_provider.on_next.call_args.args[0]
+
+        with pytest.raises(ConnectionError, match="first"):
+            await re_auth(token)
+
+        for pool in pools:
+            pool.re_auth_callback.assert_awaited_once_with(token)

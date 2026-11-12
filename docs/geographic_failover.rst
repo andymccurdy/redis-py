@@ -277,6 +277,12 @@ define one of the health check policies to evaluate probes result.
 **HealthCheckPolicies.HEALTHY_MAJORITY** - Majority of probes should be successful.
 **HealthCheckPolicies.HEALTHY_ANY** - Any of probes should be successful.
 
+The whole health check - all of its probes - runs under `health_check_timeout`
+(3 seconds by default), and a single check running out of it marks the database
+unhealthy regardless of the failure detector's threshold. See
+`Planned maintenance (maintenance notifications)`_ for how this budget behaves
+while a database undergoes a planned maintenance.
+
 PingHealthCheck (default)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -409,6 +415,161 @@ To enable periodic fallback to a higher-priority healthy database, set `auto_fal
     )
     client = MultiDBClient(cfg)
 
+
+Planned maintenance (maintenance notifications)
+-----------------------------------------------
+
+A planned maintenance on one of the databases - a shard migration, a shard failover or
+an endpoint rebind during an upgrade or a rebalancing - is not an outage, and should not
+turn into a geo failover: the database stays available, and the operation is resolved
+inside its own cluster within seconds. Redis Enterprise announces such operations to the
+connected clients through push notifications (`MIGRATING` / `MIGRATED`,
+`FAILING_OVER` / `FAILED_OVER`, `MOVING`), and redis-py reacts to them on the
+connections of the cluster they concern. What follows describes what the
+`MultiDBClient` does with them, how to enable them, and what to expect without them.
+
+Enabling the notifications
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+`MultiDbConfig` disables maintenance notifications in the underlying clients unless a
+`MaintNotificationsConfig` is passed through `client_kwargs`; a database configured
+with `from_pool` keeps whatever its pool was built with. The notifications require
+RESP3, and the relaxed timeout they apply only means something when the connections
+have a finite socket timeout to relax:
+
+.. code-block:: python
+
+    from redis.maint_notifications import MaintNotificationsConfig
+    from redis.multidb.config import MultiDbConfig, DatabaseConfig
+
+    maint_config = MaintNotificationsConfig(
+        enabled=True,
+        relaxed_timeout=30,  # seconds; the socket timeout during a maintenance
+    )
+
+    cfg = MultiDbConfig(
+        databases_config=[
+            DatabaseConfig(
+                from_url="redis://db-primary:6379/0",
+                weight=1.0,
+                client_kwargs={
+                    "protocol": 3,
+                    "socket_timeout": 5,
+                    "maint_notifications_config": maint_config,
+                },
+            ),
+            DatabaseConfig(
+                from_url="redis://db-secondary:6379/0",
+                weight=0.5,
+                client_kwargs={
+                    "protocol": 3,
+                    "socket_timeout": 5,
+                    "maint_notifications_config": maint_config,
+                },
+            ),
+        ],
+    )
+
+`enabled=True` makes the client require the server-side support (the cluster setting
+`client_maint_notifications`) and fail the connection otherwise; `enabled="auto"`
+attempts to enable the notifications and continues without them if the server rejects
+the command.
+
+What the client does during a maintenance
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With the notifications enabled, a planned maintenance is handled by the underlying
+client of the affected database, and the `MultiDBClient` keeps that database active:
+
+- **Connections.** A `MIGRATING` or `FAILING_OVER` notification relaxes the socket
+  timeout of the connection it arrives on to `relaxed_timeout`, so a command that the
+  shard switch stalls waits instead of timing out; the matching completion
+  notification restores the timeout. A `MOVING` notification announces the endpoint
+  moving to another node: the pool relaxes all of its connections and reconnects them
+  to the new node, transparently to the commands in flight.
+
+- **Health checks.** The health check client of each database is built from that
+  database's `client_kwargs`, so it receives the same notifications, and the health
+  check budget follows the connection timeout they relax: while the database is under
+  a maintenance, `health_check_timeout` becomes
+  `health_check_probes * (relaxed_timeout + health_check_delay)` - the time every probe
+  needs when each may take as long as the relaxed socket timeout - and it returns to
+  its configured value once the maintenance completes. A stall with no notification
+  behind it, an unplanned failure, keeps the configured budget and fails the database
+  over as before. `relaxed_timeout=-1` disables the relaxation of both the connections
+  and the budget; `relaxed_timeout=None` (blocking sockets) relaxes the budget up to
+  the notification's time-to-live. The notifications reach the health checks through
+  the probe client's Redis connections, which only a check that talks to the
+  database keeps reading - `PingHealthCheck` does, `LagAwareHealthCheck` uses the
+  REST API alone. Combined with a `PingHealthCheck` (the default), the budget of a
+  `LagAwareHealthCheck` is relaxed the same way, with each REST request still bounded
+  by its own `http_timeout`; on its own it keeps the configured budget.
+
+- **Idle connections.** A connection that is idle through the maintenance has the
+  notifications, and possibly the server's close after an endpoint rebind, waiting in
+  its buffer. When the pool hands it out again it reads them first. If the connection
+  is still alive the maintenance is still in progress and the notifications are
+  applied as usual. If the server has closed it, the maintenance is over: the stale
+  notifications are discarded and the connection is reconnected, through the
+  configured address, before the command is sent - so resuming traffic after an idle
+  period does not count as a failure towards a failover.
+
+The failure detector and the circuit breakers are not involved in any of this: a
+maintenance that the notifications cover produces neither the command failures nor
+the failed health checks that would open a circuit.
+
+Without the notifications
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Without the notifications the client learns of a maintenance only through its effects:
+connections closed by an endpoint rebind, and commands or health check probes stalled
+by a shard switch for longer than their timeouts. Whether that turns into a geo
+failover depends on the operation and on the configuration - the size of the shard,
+`socket_timeout`, `health_check_timeout`, `min_num_failures` and the failure rate
+threshold. A failover to a healthy database is the intended fallback when it does, and
+the client falls back to the higher-weighted database once it is healthy again (see
+`Failover and automatic fallback`_), but it costs a reconnect of every command in
+flight and a switch of the database the application talks to, for an operation the
+cluster could have resolved on its own. Enabling the notifications is the way to avoid
+that.
+
+Observing a maintenance
+^^^^^^^^^^^^^^^^^^^^^^^
+
+The phases the underlying clients go through are observable: the handlers dispatch a
+`MaintenanceStartedEvent` when a notification starts relaxing timeouts and a
+`MaintenanceCompletedEvent` when the relaxation is reverted, to the `event_dispatcher`
+of the `MaintNotificationsConfig` passed in `client_kwargs`. Both events carry the
+`state` (`MaintenanceState.MOVING` for a pool-level handoff,
+`MaintenanceState.MAINTENANCE` for a connection-level migration or failover), the
+affected `connection_pool` and `connection`, the `notification` and the `config` acted
+with; `notification` is `None` when the relaxation ended because a connection still
+under maintenance was closed. The events are dispatched synchronously from the
+connection's read path, so listeners must not block.
+
+.. code-block:: python
+
+    from redis.event import (
+        EventDispatcher,
+        EventListenerInterface,
+        MaintenanceCompletedEvent,
+        MaintenanceStartedEvent,
+    )
+    from redis.maint_notifications import MaintNotificationsConfig
+
+    class LogMaintenanceListener(EventListenerInterface):
+        def listen(self, event):
+            print(f"{type(event).__name__}: {event.state} {event.notification}")
+
+    dispatcher = EventDispatcher()
+    listener = LogMaintenanceListener()
+    dispatcher.register_listeners(
+        {MaintenanceStartedEvent: [listener], MaintenanceCompletedEvent: [listener]}
+    )
+    maint_config = MaintNotificationsConfig(enabled=True, event_dispatcher=dispatcher)
+
+A geo failover, should one happen anyway, is reported through the
+`ActiveDatabaseChanged` event described in the next section.
 
 Custom failover callbacks
 -------------------------

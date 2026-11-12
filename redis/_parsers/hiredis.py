@@ -6,7 +6,12 @@ from typing import Callable, List, Optional, TypedDict, Union
 
 from ..exceptions import ConnectionError, InvalidResponse, RedisError, TimeoutError
 from ..typing import EncodableT
-from ..utils import HIREDIS_AVAILABLE, SENTINEL, deprecated_function
+from ..utils import (
+    HIREDIS_AVAILABLE,
+    SENTINEL,
+    deprecated_function,
+    is_os_level_timeout,
+)
 from .base import (
     AsyncBaseParser,
     AsyncPushNotificationsParser,
@@ -159,21 +164,35 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
     def can_read(self, timeout: float = 0) -> bool:
         # TODO: Rename this API; it detects pending data or dirty/closed
         # connection state, not only whether application data can be read.
-        if not self._reader:
+        reader = self._reader
+        sock = self._sock
+        # Another thread may disconnect this connection while we are here (e.g.
+        # the multi-database health check taking a database out of service);
+        # on_disconnect() sets both _sock and _reader to None. Bind them locally
+        # so the checks below cannot disagree about the connection, and fail with
+        # a descriptive, retryable ConnectionError instead of a TypeError from
+        # registering None with poll().
+        if reader is None or sock is None:
             raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
-        if self._reader.has_data():
+        if reader.has_data():
             return True
-        if not _socket_can_read(self._sock, timeout):
-            return False
-        # the socket reports readable but the reader has no buffered data. a
-        # server-closed socket also reads as ready (it yields EOF), so tell the
-        # two apart with a non-destructive poll: a peer-closed socket must not be
-        # reused, while a readable-but-open socket may just hold a pending push.
-        # this mirrors how the pure-Python parser (recv -> b"") and the async
-        # parser (StreamReader.at_eof()) already signal a closed connection.
-        if _socket_is_closed(self._sock):
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        try:
+            if not _socket_can_read(sock, timeout):
+                return False
+            # the socket reports readable but the reader has no buffered data. a
+            # server-closed socket also reads as ready (it yields EOF), so tell the
+            # two apart with a non-destructive poll: a peer-closed socket must not be
+            # reused, while a readable-but-open socket may just hold a pending push.
+            # this mirrors how the pure-Python parser (recv -> b"") and the async
+            # parser (StreamReader.at_eof()) already signal a closed connection.
+            if _socket_is_closed(sock):
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        except ValueError:
+            # Same race as above, one step later: a concurrent disconnect closed
+            # the socket, so its file descriptor is -1 and neither poll() nor a
+            # selector can register it. The connection is gone either way.
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
         return True
 
     def read_from_socket(self, timeout=SENTINEL, raise_on_timeout=True):
@@ -196,7 +215,12 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
             # data was read from the socket and added to the buffer.
             # return True to indicate that data was read.
             return True
-        except socket.timeout:
+        except socket.timeout as e:
+            if is_os_level_timeout(e):
+                # ETIMEDOUT from the OS (e.g. after a network change): the
+                # connection is dead, not slow. Reporting it as a timeout - or
+                # as "no data" when polling - would hide a broken connection.
+                raise ConnectionError(f"Error while reading from socket: {e.args}")
             if raise_on_timeout:
                 raise TimeoutError("Timeout reading from socket")
             return False
@@ -214,7 +238,14 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
             raise ConnectionError(f"Error while reading from socket: {ex.args}")
         finally:
             if custom_timeout:
-                sock.settimeout(self._socket_timeout)
+                try:
+                    sock.settimeout(self._socket_timeout)
+                except OSError:
+                    # A disconnect from another thread closes the socket, so there
+                    # is nothing left to restore the timeout on. An exception from
+                    # here would replace the outcome the body reported - including
+                    # the retryable ConnectionError above - with EBADF.
+                    pass
 
     def read_response(
         self,
@@ -222,41 +253,41 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
     ):
-        # Bind the reader locally so a concurrent disconnect that clears
-        # self._reader can't turn a later .gets() into an AttributeError;
-        # re-checking the attribute each time would still race.
-        reader = self._reader
-        if reader is None:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        while True:
+            # Bind the reader locally so a concurrent disconnect that clears
+            # self._reader can't turn a later .gets() into an AttributeError;
+            # re-checking the attribute each time would still race. It is
+            # re-bound per frame because a push handler may have disconnected.
+            reader = self._reader
+            if reader is None:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
-        if disable_decoding:
-            response = reader.gets(False)
-        else:
-            response = reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            self.read_from_socket(timeout=timeout)
             if disable_decoding:
                 response = reader.gets(False)
             else:
                 response = reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                self.read_from_socket(timeout=timeout)
+                if disable_decoding:
+                    response = reader.gets(False)
+                else:
+                    response = reader.gets()
+            if self._hiredis_PushNotificationType is None or not isinstance(
+                response, self._hiredis_PushNotificationType
+            ):
+                break
+            response = self.handle_push_response(response)
+            if push_request:
+                return response
+            # Otherwise read the reply the push interleaved with. Looping
+            # instead of recursing keeps a burst of consecutive push frames
+            # from growing the stack.
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad
         # happened
         if isinstance(response, ConnectionError):
             raise response
-        elif self._hiredis_PushNotificationType is not None and isinstance(
-            response, self._hiredis_PushNotificationType
-        ):
-            response = self.handle_push_response(response)
-            if push_request:
-                return response
-            return self.read_response(
-                disable_decoding=disable_decoding,
-                push_request=push_request,
-                timeout=timeout,
-            )
-
         elif (
             isinstance(response, list)
             and response
@@ -323,9 +354,17 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
         # connection state, not only whether application data can be read.
         if not self._connected:
             raise OSError("Buffer is closed.")
-        # EOF means the connection is closed and not safe to reuse.
-        if self._reader.has_data() or self._stream.at_eof():
+        # buffered data wins over EOF, like the sync parser: a pending
+        # response or push notification must stay readable even if the
+        # server has since closed the connection.
+        if self._reader.has_data():
             return True
+        if self._stream.at_eof() or self._stream.exception() is not None:
+            # Raise like the sync parser does on a server-closed connection,
+            # so callers that tolerate pending data (push notifications)
+            # can't mistake EOF for a readable connection.
+            # A reset (RST) leaves no EOF but an exception on the stream.
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
         # asyncio.StreamReader has no public non-destructive API for checking
         # buffered bytes. Preserve dirty-connection detection for hiredis; tests
         # with a real StreamReader guard this private buffer API in CI.
@@ -343,39 +382,40 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
     async def read_response(
         self, disable_decoding: bool = False, push_request: bool = False
     ) -> Union[EncodableT, List[EncodableT]]:
-        # If `on_disconnect()` has been called, prohibit any more reads
-        # even if they could happen because data might be present.
-        # We still allow reads in progress to finish
-        if not self._connected:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
+        while True:
+            # If `on_disconnect()` has been called, prohibit any more reads
+            # even if they could happen because data might be present.
+            # We still allow reads in progress to finish
+            if not self._connected:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
 
-        if disable_decoding:
-            response = self._reader.gets(False)
-        else:
-            response = self._reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            await self.read_from_socket()
             if disable_decoding:
                 response = self._reader.gets(False)
             else:
                 response = self._reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                await self.read_from_socket()
+                if disable_decoding:
+                    response = self._reader.gets(False)
+                else:
+                    response = self._reader.gets()
+            if self._hiredis_PushNotificationType is None or not isinstance(
+                response, self._hiredis_PushNotificationType
+            ):
+                break
+            response = await self.handle_push_response(response)
+            if push_request:
+                return response
+            # Otherwise read the reply the push interleaved with. Looping
+            # instead of recursing keeps a burst of consecutive push frames
+            # from growing the stack.
 
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad
         # happened
         if isinstance(response, ConnectionError):
             raise response
-        elif self._hiredis_PushNotificationType is not None and isinstance(
-            response, self._hiredis_PushNotificationType
-        ):
-            response = await self.handle_push_response(response)
-            if not push_request:
-                return await self.read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
-                )
-            else:
-                return response
         elif (
             isinstance(response, list)
             and response

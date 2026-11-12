@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -39,11 +40,14 @@ from redis.utils import deprecated_function
 from .core import (
     ACLCommands,
     AsyncACLCommands,
+    AsyncBlessCommands,
     AsyncDataAccessCommands,
     AsyncFunctionCommands,
     AsyncManagementCommands,
     AsyncModuleCommands,
     AsyncScriptCommands,
+    BlessCommands,
+    BlessFlag,
     DataAccessCommands,
     FunctionCommands,
     HotkeysMetricsTypes,
@@ -57,9 +61,17 @@ from .redismodules import AsyncRedisModuleCommands, RedisModuleCommands
 
 if TYPE_CHECKING:
     from redis.asyncio.cluster import TargetNodesT
+    from redis.cluster import LoadBalancingStrategy
 
-# Not complete, but covers the major ones
-# https://redis.io/commands
+# DEPRECATED - no longer consulted by the default metadata routing, and it will be removed in a future release.
+#
+# Replica safety is now decided from command metadata by the metadata resolver,
+# so this set no longer describes what commands are safe to execute on replicas.
+# It is kept as a public attribute only so an external caller reading it keeps working;
+# editing it changes nothing.
+#
+# To change replica safety, edit ``redis.commands.metadata._STATIC_COMMAND_METADATA`` or pass
+# a ``metadata_resolver`` to the client. Nothing here.
 READ_COMMANDS = frozenset(
     [
         # Bit Operations
@@ -179,6 +191,15 @@ class ClusterMultiKeyCommands(ClusterCommandsProtocol):
     A class containing commands that handle more than one key
     """
 
+    # Read-routing configuration, which the cluster clients all set on the instance. The
+    # defaults are here for a host class that mixes these commands in without one - see
+    # ``_is_replica_safe`` below, which is the same fallback for the same audience - so
+    # that ``_execute_pipeline_by_slot`` reads a value rather than raising
+    # ``AttributeError``. Typed under TYPE_CHECKING because ``redis.cluster`` imports this
+    # module.
+    read_from_replicas: bool = False
+    load_balancing_strategy: LoadBalancingStrategy | None = None
+
     def _partition_keys_by_slot(self, keys: Iterable[KeyT]) -> Dict[int, List[KeyT]]:
         """Split keys into a dictionary that maps a slot to a list of keys."""
 
@@ -201,17 +222,32 @@ class ClusterMultiKeyCommands(ClusterCommandsProtocol):
 
         return slots_to_pairs
 
+    def _is_replica_safe(self, command_name: str) -> bool:
+        warnings.warn(
+            "Using READ_COMMANDS for replica-safe checks is deprecated and will be removed in a future release. "
+            "Use a MetadataResolver instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return isinstance(command_name, str) and command_name.upper() in READ_COMMANDS
+
     def _execute_pipeline_by_slot(
         self, command: str, slots_to_args: Mapping[int, Iterable[EncodableT]]
     ) -> List[Any]:
-        read_from_replicas = self.read_from_replicas and command in READ_COMMANDS
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and self._is_replica_safe(command)
         pipe = self.pipeline()
         [
             pipe.execute_command(
                 command,
                 *slot_args,
                 target_nodes=[
-                    self.nodes_manager.get_node_from_slot(slot, read_from_replicas)
+                    self.nodes_manager.get_node_from_slot(
+                        slot,
+                        replica_safe,
+                        self.load_balancing_strategy if replica_safe else None,
+                    )
                 ],
             )
             for slot, slot_args in slots_to_args.items()
@@ -421,19 +457,37 @@ class AsyncClusterMultiKeyCommands(ClusterMultiKeyCommands):
         # Sum up the reply from each command
         return sum(await self._execute_pipeline_by_slot(command, slots_to_keys))
 
+    async def _is_replica_safe(self, command_name: str) -> bool:
+        warnings.warn(
+            "Using READ_COMMANDS for replica-safe checks is deprecated and will be removed in a future release. "
+            "Use an AsyncMetadataResolver instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return isinstance(command_name, str) and command_name.upper() in READ_COMMANDS
+
     async def _execute_pipeline_by_slot(
         self, command: str, slots_to_args: Mapping[int, Iterable[EncodableT]]
     ) -> List[Any]:
+        # Only _initialize and initialize() are asked of the host class (other
+        # clients may use this mixin), and initialize() returns at once while
+        # a requested refresh is not due
         if self._initialize:
             await self.initialize()
-        read_from_replicas = self.read_from_replicas and command in READ_COMMANDS
+        replica_safe = (
+            self.read_from_replicas or self.load_balancing_strategy is not None
+        ) and await self._is_replica_safe(command)
         pipe = self.pipeline()
         [
             pipe.execute_command(
                 command,
                 *slot_args,
                 target_nodes=[
-                    self.nodes_manager.get_node_from_slot(slot, read_from_replicas)
+                    self.nodes_manager.get_node_from_slot(
+                        slot,
+                        replica_safe,
+                        self.load_balancing_strategy if replica_safe else None,
+                    )
                 ],
             )
             for slot, slot_args in slots_to_args.items()
@@ -1075,6 +1129,9 @@ class ClusterManagementCommands(ManagementCommands):
         connection with this id should be provided.
         When clientid is not provided - target_nodes can be any node.
 
+        On a client with client-side caching enabled this raises ``RedisError``:
+        the cache enables tracking itself.
+
         For more information see https://redis.io/commands/client-tracking
         """
         return self.client_tracking(
@@ -1109,6 +1166,9 @@ class ClusterManagementCommands(ManagementCommands):
         When clientid is provided - in target_nodes only the node that owns the
         connection with this id should be provided.
         When clientid is not provided - target_nodes can be any node.
+
+        On a client with client-side caching enabled this raises ``RedisError``:
+        turning tracking off would stop invalidations for cached replies.
 
         For more information see https://redis.io/commands/client-tracking
         """
@@ -1484,6 +1544,94 @@ class AsyncClusterDataAccessCommands(
                 }
 
 
+class ClusterBlessCommands(BlessCommands):
+    """
+    A class for Redis Cluster BLESS commands
+
+    The class inherits from Redis's core BlessCommands class and does the
+    required adjustments to work with cluster mode
+    """
+
+    def bless_scan_iter(
+        self,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> Iterator[bytes | str]:
+        # Do the first query with cursor=0 for all nodes
+        cursors, data = self.bless_scan(cursor=0, flag=flag, count=count, **kwargs)
+        yield from data
+
+        cursors = {name: cursor for name, cursor in cursors.items() if cursor != 0}
+        if cursors:
+            # Get nodes by name
+            nodes = {name: self.get_node(node_name=name) for name in cursors.keys()}
+
+            # Iterate over each node till its cursor is 0
+            kwargs.pop("target_nodes", None)
+            while cursors:
+                for name, cursor in cursors.items():
+                    cur, data = self.bless_scan(
+                        cursor=cursor,
+                        flag=flag,
+                        count=count,
+                        target_nodes=nodes[name],
+                        **kwargs,
+                    )
+                    yield from data
+                    cursors[name] = cur[name]
+
+                cursors = {
+                    name: cursor for name, cursor in cursors.items() if cursor != 0
+                }
+
+
+class AsyncClusterBlessCommands(ClusterBlessCommands, AsyncBlessCommands):
+    """
+    A class for Redis Cluster BLESS commands
+
+    The class inherits from Redis's core BlessCommands class and does the
+    required adjustments to work with cluster mode
+    """
+
+    async def bless_scan_iter(
+        self,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> AsyncIterator[bytes | str]:
+        # Do the first query with cursor=0 for all nodes
+        cursors, data = await self.bless_scan(
+            cursor=0, flag=flag, count=count, **kwargs
+        )
+        for value in data:
+            yield value
+
+        cursors = {name: cursor for name, cursor in cursors.items() if cursor != 0}
+        if cursors:
+            # Get nodes by name
+            nodes = {name: self.get_node(node_name=name) for name in cursors.keys()}
+
+            # Iterate over each node till its cursor is 0
+            kwargs.pop("target_nodes", None)
+            while cursors:
+                for name, cursor in cursors.items():
+                    cur, data = await self.bless_scan(
+                        cursor=cursor,
+                        flag=flag,
+                        count=count,
+                        target_nodes=nodes[name],
+                        **kwargs,
+                    )
+                    for value in data:
+                        yield value
+                    cursors[name] = cur[name]
+
+                cursors = {
+                    name: cursor for name, cursor in cursors.items() if cursor != 0
+                }
+
+
 class RedisClusterCommands(
     ClusterMultiKeyCommands,
     ClusterManagementCommands,
@@ -1492,6 +1640,7 @@ class RedisClusterCommands(
     ClusterDataAccessCommands,
     ScriptCommands,
     FunctionCommands,
+    ClusterBlessCommands,
     ModuleCommands,
     RedisModuleCommands,
 ):
@@ -1504,7 +1653,7 @@ class RedisClusterCommands(
     target specific nodes. By default, if target_nodes is not specified, the
     command will be executed on the default cluster node.
 
-    :param :target_nodes: type can be one of the followings:
+    :param target_nodes: type can be one of the following:
         - nodes flag: ALL_NODES, PRIMARIES, REPLICAS, RANDOM
         - 'ClusterNode'
         - 'list(ClusterNodes)'
@@ -1523,6 +1672,7 @@ class AsyncRedisClusterCommands(
     AsyncClusterDataAccessCommands,
     AsyncScriptCommands,
     AsyncFunctionCommands,
+    AsyncClusterBlessCommands,
     AsyncModuleCommands,
     AsyncRedisModuleCommands,
 ):
@@ -1535,7 +1685,7 @@ class AsyncRedisClusterCommands(
     target specific nodes. By default, if target_nodes is not specified, the
     command will be executed on the default cluster node.
 
-    :param :target_nodes: type can be one of the followings:
+    :param target_nodes: type can be one of the following:
         - nodes flag: ALL_NODES, PRIMARIES, REPLICAS, RANDOM
         - 'ClusterNode'
         - 'list(ClusterNodes)'

@@ -31,13 +31,18 @@ class TaskStatuses:
 class ActionType(str, Enum):
     DMC_RESTART = "dmc_restart"
     FAILOVER = "failover"
+    NODE_FAILURE = "node_failure"
+    PROXY_FAILURE = "proxy_failure"
     RESHARD = "reshard"
+    SHARD_FAILURE = "shard_failure"
     CREATE_DATABASE = "create_database"
     DELETE_DATABASE = "delete_database"
     SEQUENCE_OF_ACTIONS = "sequence_of_actions"
     NETWORK_FAILURE = "network_failure"
     EXECUTE_RLUTIL_COMMAND = "execute_rlutil_command"
     EXECUTE_RLADMIN_COMMAND = "execute_rladmin_command"
+    MIGRATE = "migrate"
+    WAIT_FOR_DATABASE_ACTIVE = "wait_for_database_active"
     SLOT_MIGRATE = "slot_migrate"
     TOPOLOGY_CHANGE_STANDALONE = "topology_change_standalone"
 
@@ -140,6 +145,21 @@ class FaultInjectorClient(ABC):
         source_node: Optional[str] = None,
         target_node: Optional[str] = None,
         skip_end_notification: bool = False,
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def migrate(
+        self,
+        endpoint_config: Dict[str, Any],
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def wait_for_database_active(
+        self,
+        endpoint_config: Dict[str, Any],
+        active_timeout: Optional[int] = None,
     ) -> str:
         pass
 
@@ -431,6 +451,58 @@ class REFaultInjector(FaultInjectorClient):
         except Exception as e:
             raise Exception(f"Failed to execute slot migrate: {e}")
 
+    def migrate(
+        self,
+        endpoint_config: Dict[str, Any],
+    ) -> str:
+        """Migrate all master shards of the database to another node.
+
+        The fault injector selects the target node itself - one holding neither a
+        master nor a replica of this database - so the caller never inspects the
+        cluster topology.
+        """
+        action = ActionRequest(
+            action_type=ActionType.MIGRATE,
+            parameters={
+                "bdb_id": endpoint_config.get("bdb_id"),
+                "cluster_index": 0,
+            },
+        )
+        result = self.trigger_action(action)
+        action_id = result.get("action_id")
+        if not action_id:
+            raise Exception(f"Failed to trigger migrate action: {result}")
+        return action_id
+
+    def wait_for_database_active(
+        self,
+        endpoint_config: Dict[str, Any],
+        active_timeout: Optional[int] = None,
+    ) -> str:
+        """Wait server-side until the database reports 'active'.
+
+        The failure actions can run the same wait inline via 'wait_for_active'; this
+        is the standalone form, for when the fault and the wait are separate calls.
+        """
+        parameters: Dict[str, Any] = {
+            "bdb_id": endpoint_config.get("bdb_id"),
+            "cluster_index": 0,
+        }
+        if active_timeout is not None:
+            parameters["active_timeout"] = active_timeout
+
+        action = ActionRequest(
+            action_type=ActionType.WAIT_FOR_DATABASE_ACTIVE,
+            parameters=parameters,
+        )
+        result = self.trigger_action(action)
+        action_id = result.get("action_id")
+        if not action_id:
+            raise Exception(
+                f"Failed to trigger wait_for_database_active action: {result}"
+            )
+        return action_id
+
     def get_moving_ttl(self) -> int:
         return self.MOVING_TTL
 
@@ -545,4 +617,17 @@ class ProxyServerFaultInjector(MockProxyFaultInjector, FaultInjectorClient):
         Trigger the desired effect. For the proxy server,
         this will need to be implemented in next iterations.
         """
+        raise NotImplementedError("Not implemented for proxy server")
+
+    def migrate(
+        self,
+        endpoint_config: Dict[str, Any],
+    ) -> str:
+        raise NotImplementedError("Not implemented for proxy server")
+
+    def wait_for_database_active(
+        self,
+        endpoint_config: Dict[str, Any],
+        active_timeout: Optional[int] = None,
+    ) -> str:
         raise NotImplementedError("Not implemented for proxy server")

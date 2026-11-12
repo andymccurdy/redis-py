@@ -31,7 +31,7 @@ This library ships two parallel stacks (sync under `redis/`, async under `redis/
 
 - **Sync vs async**: every behavior question has a sync (`redis/...`) and async (`redis/asyncio/...`) variant; tests mirror under `tests/` and `tests/test_asyncio/`. A defect or fix on one side usually has a counterpart on the other (`specs/sync_async_deduplication_analysis.md`).
 - **Wire protocol vs response shape**: `protocol=2|3` chooses RESP2/RESP3 on the wire; `legacy_responses=True|False` chooses the Python response shape independently. Both axes are exercised in CI (`invoke run-test-matrix`; see `specs/unified_responses_migration_guide.md`). A claim or fix may behave differently across these four combinations.
-- **Topology**: standalone, cluster (`redis/cluster.py`), and sentinel (`redis/sentinel.py`) have distinct routing, connection, and failure behavior. Cluster adds slot mapping, MOVED/ASK redirection, `READ_COMMANDS` replica routing, and `RequestPolicy`/`ResponsePolicy` resolution.
+- **Topology**: standalone, cluster (`redis/cluster.py`), and sentinel (`redis/sentinel.py`) have distinct routing, connection, and failure behavior. Cluster adds slot mapping, MOVED/ASK redirection, metadata-driven replica routing (`MetadataResolver.is_replica_safe`), and `RequestPolicy`/`ResponsePolicy` resolution.
 - **Parser backend**: pure-Python (`redis/_parsers/resp2.py`, `resp3.py`) vs optional C-accelerated `hiredis`. Behavior must match across both.
 - **Public API compatibility**: signatures, argument names, defaults, return types, error/exception types, and `response_callbacks` shaping are contracts. The compatibility boundary is the latest released version on PyPI, not unreleased branch churn.
 
@@ -129,6 +129,15 @@ redis-py requires the sync and async stacks to stay aligned. Before any positive
 
 A behavior fix applied to only one stack is normally `Merge-worthy after focused changes` at best, with the missing mirror called out as required work — unless the divergence is deliberate and documented.
 
+##### Mandatory shared-helper contract pass
+
+Run this pass before any positive PR assessment when a patch changes what an existing function, method, or helper does, not only how it does it. A fix placed in a shared helper changes every path that calls it, including paths the PR does not claim to fix.
+
+1. List every caller of the changed helper on base and head, including tests that patch or wrap it.
+2. For each caller, state its observable behavior before and after the patch, and label the change as (a) required by the claimed fix, (b) an incidental side effect of where the change was placed, (c) an intended change with its own justification in the PR, or (d) unchanged, because the caller never reaches the changed behavior.
+3. Treat every (b) as a finding. If the new behavior is not correct for that caller, request that it move to the caller that needs it. If the helper is the owning layer and the behavior is correct for every caller, it can stay in the helper, but the PR must state and test the change for that caller; only then does it count as (c).
+4. Check that the helper's name, docstring, and return value still describe what it does, and that it still mirrors its counterpart where one exists (for example an increment/decrement or acquire/release pair). A helper that no longer matches its counterpart is a placement finding too.
+
 ##### Mandatory interleaving and ownership pass
 
 Run this pass before any positive PR assessment when a patch adds, removes, or reorders cleanup, retry, reconnect, cancellation, listeners, shared coroutines/tasks, sockets or connections, pool state, state flags, or mutable state across an `await`, callback, event, or deferred completion. In redis-py this most often means connection-pool acquire/release, async locks held across awaits, pub/sub reconnect, retry/backoff, cluster MOVED/ASK re-slotting, maintenance-notification handlers, and multidb health-check/failover.
@@ -142,7 +151,7 @@ Run this pass before any positive PR assessment when a patch adds, removes, or r
 Do not mark a concurrency-sensitive patch `Merge-worthy as-is` merely because sequential reconnect, retry, failure, and disconnect tests pass. If the code trace proves an unsafe interleaving, conclude from static evidence and request a focused fix and regression test. If ownership remains ambiguous, keep the result preliminary and request approval for the smallest decisive runtime probe.
 
 - If the claim or PR is decisively negative from a complete reachable code-path trace, conclude the review without a runtime probe. Examples include an impossible or unsupported path, duplicated existing handling, a demonstrated no-op, a direct compatibility break, or a clearly wrong abstraction. Do not call an ambiguous result negative merely to avoid a probe.
-- If the initial result is positive and there is no unresolved runtime concern, and any triggered parity and interleaving passes are complete, the desk review may be sufficient for a final maintainer decision. Do not run a probe only to restate evidence that cannot plausibly change the decision.
+- If the initial result is positive and there is no unresolved runtime concern, and any triggered parity, shared-helper contract, and interleaving passes are complete, the desk review may be sufficient for a final maintainer decision. Do not run a probe only to restate evidence that cannot plausibly change the decision.
 - If the initial result is positive but there is any unresolved runtime concern that could plausibly change claim validity, severity, merge-worthiness, required changes, or the preferred competing PR, stop before executing code. Report a `Preliminary assessment`, name the concern, propose the smallest decisive probe and control, and ask the user for approval to run it.
 - A purely stylistic, documentation, CI-status, or repository-readiness concern does not trigger a runtime probe unless it masks a runtime question.
 
@@ -175,6 +184,8 @@ Assess claim validity, realistic reach (which stacks, protocols, topologies, and
 Report the `Need evidence` status before classifying the need as a capability gap, ergonomics or discoverability gap, unsupported use case, no demonstrated gap, or a defect in supported behavior. Do not assign practical impact to the absence of the requested mechanism when an existing supported workflow already produces the requested outcome. Do not infer practical importance merely from reachability, API asymmetry, or a technically successful patch.
 
 For a PR, make `Severity` describe the underlying issue or user need. Report patch-induced regression, compatibility, lifecycle, or maintenance risk separately as `Patch risk`.
+
+A behavior change on a path the PR does not claim to fix is scope creep by default, even when it looks like an improvement. Report it as a required change, not as accepted risk, unless the PR justifies it separately.
 
 Do not speculate about AI authorship or contributor intent. Identify weak reports through objective evidence: no reproduction, unsupported input, impossible path, duplicated handling, a test that does not exercise the claim, or a fix that is a runtime no-op.
 
@@ -209,6 +220,8 @@ Choose the assessment language from the current user request and governing repos
 Use the matching compact report in the evaluation framework. While runtime approval is pending, use its preliminary-assessment variant and end with the approval request instead of presenting a final recommendation. Keep the report decision-oriented, put unexpected/negative evidence first, and use no more than five evidence bullets by default.
 
 For PRs, put `Need evidence` before the code recommendation. When the need is not `Demonstrated`, lead with that result, omit repository readiness, and avoid presenting patch fixes as the primary maintainer action.
+
+For every PR, suggest the category label it should carry, using `.agents/skills/generate-release-notes/references/pr-labels-guide.md` as the authoritative mapping. Judge it from the actual change, not from the PR title or its current labels. For example, a new opt-in public option is `feature`, even when the title says `fix`. Compare the suggestion with the labels the PR already has. If they differ, say which label to add and which to remove, and also suggest a matching title when the title prefix is misleading. Only suggest labels; never apply them.
 
 When existing functionality or a better alternative materially affects the decision, state it explicitly in the evidence and recommendation. Name the exact supported path, what it does and does not cover, and why it is preferable. Do not bury a `Not worth completing` or `Supersede with a simpler alternative` conclusion beneath praise for implementation quality.
 

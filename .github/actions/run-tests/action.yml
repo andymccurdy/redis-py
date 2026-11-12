@@ -25,12 +25,29 @@ inputs:
   test-config:
     description: |
       Test configuration to run. Can be "all", "fixed-clients",
+      "<protocol>-<response-shape>" (standalone, then cluster tests),
       or "<protocol>-<response-shape>-<topology>", where protocol is
       "default", "2", or "3", response-shape is "legacy_responses" or
       "unified_responses", and topology is "standalone" or "cluster".
       Legacy aliases like "2-standalone" are also accepted.
     required: false
     default: 'all'
+  run-fixed-clients:
+    description: |
+      When 'true', also run the fixed client tests before test-config. They do
+      not depend on the protocol or response shape, so they are enabled for a
+      single matrix cell per combination instead of a job of their own.
+    required: false
+    default: 'false'
+  junit-suite-names:
+    description: |
+      When 'true', name the testsuite of each JUnit report after the suite that
+      produced it (fixed_client, standalone or cluster) instead of pytest's
+      default "pytest". Test metrics reporting uses the suite name to tell
+      apart tests that run in more than one suite, so this is meant for the
+      metrics job only.
+    required: false
+    default: 'false'
   run-multidb-integration:
     description: |
       When 'true', also run the MultiDBClient (active-active) integration tests
@@ -170,8 +187,26 @@ runs:
       shell: bash
 
     - name: Run tests
+      env:
+        # Coverage on PyPy falls back to the pure-Python tracer, which slows the
+        # suite down several times (much more on PyPy 8.0, where reading
+        # frame.f_lineno inside a trace function is slow). PyPy runs exercise
+        # no code paths the CPython jobs miss, so they skip coverage.
+        PYTEST_ADDOPTS: ${{ startsWith(inputs.python-version, 'pypy') && '--no-cov' || '' }}
       run: |
         set -e
+
+        # Runs a suite's command, naming the testsuite of its JUnit report
+        # after the suite when junit-suite-names is enabled.
+        with_suite_name() {
+          local suite=$1
+          shift
+          if [ "${{inputs.junit-suite-names}}" == "true" ]; then
+            PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-o junit_suite_name=${suite}" "$@"
+          else
+            "$@"
+          fi
+        }
 
         run_tests() {
           local test_config=$1
@@ -184,6 +219,8 @@ runs:
           local legacy_arg=""
           local protocol_group=""
           local response_group=""
+          local topologies=""
+          local rc=0
 
           if [ "${{inputs.event-loop}}" == "uvloop" ]; then
             eventloop="--uvloop"
@@ -194,7 +231,7 @@ runs:
           if [ "$test_config" == "fixed-clients" ]; then
             echo "::group::Fixed client tests"
             echo "Running fixed client tests - in those tests client instance and configuration is fixed and not changed by pytest configuration"
-            invoke fixed-client-tests $eventloop
+            with_suite_name fixed_client invoke fixed-client-tests $eventloop || rc=1
             echo "::endgroup::"
           else
             IFS='-' read -r protocol_label response_shape_label test_type extra <<< "$test_config"
@@ -202,10 +239,15 @@ runs:
               echo "Invalid test configuration: ${test_config}"
               exit 1
             fi
-            if [ -z "$test_type" ]; then
+            if [ -n "$test_type" ]; then
+              topologies="$test_type"
+            elif [ "$response_shape_label" == "legacy_responses" ] || [ "$response_shape_label" == "unified_responses" ]; then
+              # "<protocol>-<response-shape>" runs both topologies.
+              topologies="standalone cluster"
+            else
               # Backward-compatible support for old labels such as
               # "2-standalone"; they always meant legacy responses.
-              test_type="$response_shape_label"
+              topologies="$response_shape_label"
               response_shape_label="legacy_responses"
             fi
 
@@ -230,42 +272,49 @@ runs:
               exit 1
             fi
 
-            if [ "$test_type" == "standalone" ]; then
-              echo "::group::${protocol_group} standalone tests (${response_group})"
-              invoke standalone-tests --redis-mod-url=${REDIS_MOD_URL} $eventloop ${protocol_arg} ${legacy_arg}
-              echo "::endgroup::"
-            elif [ "$test_type" == "cluster" ]; then
-              echo "::group::${protocol_group} cluster tests (${response_group})"
-              invoke cluster-tests $eventloop ${protocol_arg} ${legacy_arg}
-              echo "::endgroup::"
-            else
-              echo "Unknown test type: ${test_type}"
-              exit 1
-            fi
+            for test_type in $topologies; do
+              if [ "$test_type" == "standalone" ]; then
+                echo "::group::${protocol_group} standalone tests (${response_group})"
+                with_suite_name standalone invoke standalone-tests --redis-mod-url=${REDIS_MOD_URL} $eventloop ${protocol_arg} ${legacy_arg} || rc=1
+                echo "::endgroup::"
+              elif [ "$test_type" == "cluster" ]; then
+                echo "::group::${protocol_group} cluster tests (${response_group})"
+                with_suite_name cluster invoke cluster-tests $eventloop ${protocol_arg} ${legacy_arg} || rc=1
+                echo "::endgroup::"
+              else
+                echo "Unknown test type: ${test_type}"
+                exit 1
+              fi
+            done
           fi
+          return $rc
         }
+
+        # A failing suite does not stop the ones after it, so one job reports
+        # every suite it runs; the step fails at the end if any of them failed.
+        failed=0
+
+        if [ "${{inputs.run-fixed-clients}}" == "true" ]; then
+          run_tests fixed-clients || failed=1
+        fi
 
         if [ "${{inputs.test-config}}" == "all" ]; then
           for test_config in \
             fixed-clients \
-            default-legacy_responses-standalone \
-            default-legacy_responses-cluster \
-            default-unified_responses-standalone \
-            default-unified_responses-cluster \
-            2-legacy_responses-standalone \
-            2-legacy_responses-cluster \
-            2-unified_responses-standalone \
-            2-unified_responses-cluster \
-            3-legacy_responses-standalone \
-            3-legacy_responses-cluster \
-            3-unified_responses-standalone \
-            3-unified_responses-cluster
+            default-legacy_responses \
+            default-unified_responses \
+            2-legacy_responses \
+            2-unified_responses \
+            3-legacy_responses \
+            3-unified_responses
           do
-            run_tests "${test_config}"
+            run_tests "${test_config}" || failed=1
           done
         else
-          run_tests "${{inputs.test-config}}"
+          run_tests "${{inputs.test-config}}" || failed=1
         fi
+
+        exit $failed
       shell: bash
 
     - name: Run multi-database integration tests
@@ -303,11 +352,32 @@ runs:
     - name: Debug
       if: failure()
       run: |
+        echo "::group::Docker containers"
+        docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+        echo "::endgroup::"
+
+        for container in $(docker ps -a --format '{{.Names}}'); do
+          echo "::group::Container ${container}"
+          docker inspect -f 'status={{.State.Status}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} finished_at={{.State.FinishedAt}}' "${container}"
+          docker logs --tail 200 "${container}" 2>&1
+          echo "::endgroup::"
+        done
+
+        # Each server logs to dockers/<service>/node-*/redis.log through the
+        # /redis/work bind mount; a crash report ("REDIS BUG REPORT") lands at the end.
+        for log in $(sudo find dockers -name redis.log | sort); do
+          echo "::group::${log}"
+          sudo tail -n 500 "${log}"
+          echo "::endgroup::"
+        done
+
+        echo "::group::Kernel OOM killer"
+        sudo dmesg | grep -iE 'out of memory|oom-kill|killed process' || echo "No OOM kills found"
+        echo "::endgroup::"
+
         sudo apt-get install -y redis-tools
-        echo "Docker Containers:"
-        docker ps
         echo "Cluster nodes:"
-        redis-cli -p 16379 CLUSTER NODES
+        redis-cli -p 16379 CLUSTER NODES || true
       shell: bash
 
     - name: Upload test results and profiling data
@@ -322,6 +392,8 @@ runs:
         retention-days: 10
 
     - name: Upload codecov coverage
+      # PyPy runs skip coverage (see the "Run tests" step), so there is nothing to upload.
+      if: ${{ !startsWith(inputs.python-version, 'pypy') }}
       uses: codecov/codecov-action@v6
       with:
         fail_ci_if_error: false

@@ -59,6 +59,9 @@ class Lock:
         if ARGV[3] == "0" then
             newttl = ARGV[2] + expiration
         end
+        if tonumber(newttl) <= 0 then
+            return 1
+        end
         redis.call('pexpire', KEYS[1], newttl)
         return 1
     """
@@ -72,7 +75,9 @@ class Lock:
         if not token or token ~= ARGV[1] then
             return 0
         end
-        redis.call('pexpire', KEYS[1], ARGV[2])
+        if tonumber(ARGV[2]) > 0 then
+            redis.call('pexpire', KEYS[1], ARGV[2])
+        end
         return 1
     """
 
@@ -212,7 +217,7 @@ class Lock:
         if sleep is None:
             sleep = self.sleep
         if token is None:
-            token = uuid.uuid1().hex.encode()
+            token = uuid.uuid4().hex.encode()
         else:
             encoder = self.redis.get_encoder()
             token = encoder.encode(token)
@@ -265,6 +270,11 @@ class Lock:
     def release(self) -> None:
         """
         Releases the already acquired lock
+
+        The token is only cleared after the Redis release operation completes
+        successfully. If the release fails with a connection or timeout error
+        the lock may still exist in Redis, so the token is preserved and the
+        release can be retried.
         """
         expected_token = self.local.token
         if expected_token is None:
@@ -272,8 +282,19 @@ class Lock:
                 "Cannot release a lock that's not owned or is already unlocked.",
                 lock_name=self.name,
             )
-        self.local.token = None
-        self.do_release(expected_token)
+        try:
+            self.do_release(expected_token)
+        except LockNotOwnedError:
+            # Lock doesn't exist in Redis, so clear the token, but only if it is still
+            # ours. With thread_local=False the namespace is shared, so another acquirer
+            # may already have stored its own token; overwriting it would leave the new
+            # owner unable to release.
+            if self.local.token == expected_token:
+                self.local.token = None
+            raise
+        # Only clear token after successful release, and only if it is still ours.
+        if self.local.token == expected_token:
+            self.local.token = None
 
     def do_release(self, expected_token: str) -> None:
         if not bool(
@@ -296,6 +317,9 @@ class Lock:
         ``replace_ttl`` if False (the default), add `additional_time` to
         the lock's existing ttl. If True, replace the lock's ttl with
         `additional_time`.
+
+        When the resulting TTL is non-positive for a lock with an expiry, the
+        current expiry is left unchanged and ``True`` is returned.
         """
         if self.local.token is None:
             raise LockError("Cannot extend an unlocked lock", lock_name=self.name)
@@ -321,6 +345,9 @@ class Lock:
     def reacquire(self) -> Literal[True]:
         """
         Resets a TTL of an already acquired lock back to a timeout value.
+
+        When the resulting TTL is non-positive, the current expiry is left
+        unchanged and ``True`` is returned.
         """
         if self.local.token is None:
             raise LockError("Cannot reacquire an unlocked lock", lock_name=self.name)

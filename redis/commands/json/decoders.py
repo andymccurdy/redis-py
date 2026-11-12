@@ -34,7 +34,11 @@ def unstring(obj):
     One can't simply call int/float in a try/catch because there is a
     semantic difference between (for example) 15.0 and 15.
     """
-    floatreg = "^\\d+.\\d+$"
+    # The "." must be escaped: as a regex metacharacter it matches *any*
+    # character, so the unescaped pattern also matched things like "1a5" or
+    # "1 5" and then handed the whole match to float(), raising ValueError
+    # instead of falling through to the best-effort "return obj" below.
+    floatreg = "^\\d+\\.\\d+$"
     match = re.findall(floatreg, obj)
     if match != []:
         return float(match[0])

@@ -1,5 +1,5 @@
-import asyncio
-from unittest.mock import Mock
+from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -68,36 +68,48 @@ class TestFailureDetectorAsyncWrapper:
     async def test_failure_detector_do_not_open_circuit_on_interval_exceed(
         self, min_num_failures, failure_rate_threshold
     ):
-        fd = FailureDetectorAsyncWrapper(
-            CommandFailureDetector(min_num_failures, failure_rate_threshold, 0.3)
-        )
-        mock_db = Mock(spec=Database)
-        mock_db.circuit.state = CBState.CLOSED
-        mock_ce = Mock(spec=AsyncCommandExecutor)
-        mock_ce.active_database = mock_db
-        fd.set_command_executor(mock_ce)
-        assert mock_db.circuit.state == CBState.CLOSED
+        # Drive the detector's clock, so the 0.3 s window is crossed exactly
+        # rather than by sleeps a slow runner can stretch. Each read moves it on
+        # by 1 us, as real time would: the window check is strict.
+        now = [datetime(2026, 1, 1)]
 
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_failure(Exception(), ("GET", "key"))
-        await asyncio.sleep(0.16)
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_failure(Exception(), ("GET", "key"))
-        await asyncio.sleep(0.16)
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_failure(Exception(), ("GET", "key"))
+        def tick():
+            now[0] += timedelta(microseconds=1)
+            return now[0]
 
-        assert mock_db.circuit.state == CBState.CLOSED
+        with patch("redis.multidb.failure_detector.datetime") as mock_datetime:
+            mock_datetime.now.side_effect = tick
 
-        # 2 more failure as last one already refreshed timer
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_failure(Exception(), ("GET", "key"))
-        await fd.register_command_execution(("GET", "key"))
-        await fd.register_failure(Exception(), ("GET", "key"))
+            fd = FailureDetectorAsyncWrapper(
+                CommandFailureDetector(min_num_failures, failure_rate_threshold, 0.3)
+            )
+            mock_db = Mock(spec=Database)
+            mock_db.circuit.state = CBState.CLOSED
+            mock_ce = Mock(spec=AsyncCommandExecutor)
+            mock_ce.active_database = mock_db
+            fd.set_command_executor(mock_ce)
+            assert mock_db.circuit.state == CBState.CLOSED
 
-        assert mock_db.circuit.state == CBState.OPEN
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_failure(Exception(), ("GET", "key"))
+            now[0] += timedelta(seconds=0.16)
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_failure(Exception(), ("GET", "key"))
+            now[0] += timedelta(seconds=0.16)
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_failure(Exception(), ("GET", "key"))
+
+            assert mock_db.circuit.state == CBState.CLOSED
+
+            # 2 more failure as last one already refreshed timer
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_failure(Exception(), ("GET", "key"))
+            await fd.register_command_execution(("GET", "key"))
+            await fd.register_failure(Exception(), ("GET", "key"))
+
+            assert mock_db.circuit.state == CBState.OPEN
 
     @pytest.mark.asyncio
     async def test_failure_detector_open_circuit_on_specific_exception_threshold_exceed(

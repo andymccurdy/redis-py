@@ -134,9 +134,14 @@ and then run:
 
 `$ apt update && apt install <package>`
 
-You can see the logging output of a containers like this:
+To follow logs from a development service, run the following from the
+repository root:
 
-`$ docker logs -f <service>`
+`$ docker compose logs -f <service>`
+
+For example, `docker compose logs -f redis` follows the standalone Redis service.
+The service name comes from `docker-compose.yml`; `docker logs` instead expects a
+container name or ID, such as `redis-standalone`.
 
 ### Troubleshooting
 
@@ -152,7 +157,13 @@ Please try at least versions of Docker.
 ### Security Vulnerabilities
 
 **NOTE**: If you find a security vulnerability, do NOT open an issue.
-Email [Redis Open Source (<oss@redis.com>)](mailto:oss@redis.com) instead.
+
+If you believe you have found a security vulnerability, to ensure proper
+review and assessment, we kindly ask vulnerability reports be submitted
+through our [Redis Vulnerability Disclosure
+Program](https://redis.io/redis-responsible-vulnerability-disclosure/).
+Alternatively reach out via email to
+[security@redis.com](mailto:security@redis.com).
 
 In order to determine whether you are dealing with a security issue, ask
 yourself these two questions:
@@ -164,7 +175,10 @@ yourself these two questions:
 If the answer to either of those two questions are *yes*, then you're
 probably dealing with a security issue. Note that even if you answer
 *no*  to both questions, you may still be dealing with a security
-issue, so if you're unsure, just email [us](mailto:oss@redis.com).
+issue, so if you're unsure, report it through the
+[Redis Vulnerability Disclosure
+Program](https://redis.io/redis-responsible-vulnerability-disclosure/) or
+email [us](mailto:security@redis.com).
 
 ### Everything Else
 

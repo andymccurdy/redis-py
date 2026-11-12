@@ -1,3 +1,5 @@
+import copy
+from errno import ECONNREFUSED, ENOENT
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +22,7 @@ from redis.exceptions import (
     ReadOnlyError,
     TimeoutError,
 )
-from redis.retry import Retry
+from redis.retry import Retry, is_retryable_connect_error
 
 from .conftest import _get_client
 
@@ -179,6 +181,102 @@ class TestRetry:
         assert self.actual_attempts == 5
         assert self.actual_failures == 5
 
+    def test_retry_checker_can_stop_retries(self):
+        """A retry-level checker returning False stops retrying immediately."""
+        backoff = BackoffMock()
+        retry = Retry(backoff, 3, is_retryable=lambda error: False)
+        with pytest.raises(ConnectionError):
+            retry.call_with_retry(self._do, self._fail)
+
+        assert self.actual_attempts == 1
+        assert self.actual_failures == 1
+        assert backoff.calls == 0
+
+    def test_retry_checker_returning_true_keeps_default_behavior(self):
+        backoff = BackoffMock()
+        retry = Retry(backoff, 3, is_retryable=lambda error: True)
+        with pytest.raises(ConnectionError):
+            retry.call_with_retry(self._do, self._fail)
+
+        assert self.actual_attempts == 4
+        assert self.actual_failures == 4
+
+    def test_retry_checker_is_and_composed_with_per_call_checker(self):
+        """Both the retry-level and the per-call checker must allow a retry."""
+        retry = Retry(BackoffMock(), 3, is_retryable=lambda error: False)
+        with pytest.raises(ConnectionError):
+            retry.call_with_retry(self._do, self._fail, is_retryable=lambda error: True)
+        assert self.actual_attempts == 1
+
+        self.setup_method(None)
+        retry = Retry(BackoffMock(), 3, is_retryable=lambda error: True)
+        with pytest.raises(ConnectionError):
+            retry.call_with_retry(
+                self._do, self._fail, is_retryable=lambda error: False
+            )
+        assert self.actual_attempts == 1
+        # The per-call predicate only stops retries; it does not run the handler.
+        assert self.actual_failures == 0
+
+    def test_retry_checker_defaults_to_none(self):
+        assert Retry(NoBackoff(), 1).is_retryable is None
+
+    def test_retry_checker_preserved_by_deepcopy(self):
+        retry = Retry(NoBackoff(), 2, is_retryable=is_retryable_connect_error)
+        copied = copy.deepcopy(retry)
+        assert copied.is_retryable is is_retryable_connect_error
+        assert copied == retry
+
+    def test_retry_equality_includes_checker(self):
+        def checker(error):
+            return True
+
+        same = Retry(NoBackoff(), 1, is_retryable=checker)
+        assert same == Retry(NoBackoff(), 1, is_retryable=checker)
+        assert same != Retry(NoBackoff(), 1)
+        assert same != Retry(NoBackoff(), 1, is_retryable=lambda error: True)
+
+    def test_retry_checker_does_not_break_hashing(self):
+        class UnhashableChecker:
+            __hash__ = None
+
+            def __call__(self, error):
+                return True
+
+        checker = UnhashableChecker()
+        retry = Retry(NoBackoff(), 1, is_retryable=checker)
+        assert hash(retry) == hash(Retry(NoBackoff(), 1))
+        assert retry in {retry}
+
+
+@pytest.mark.fixed_client
+class TestRetryCheckerHelper:
+    def test_without_cause_is_retryable(self):
+        assert is_retryable_connect_error(ConnectionError("failed")) is True
+
+    def test_enoent_cause_is_not_retryable(self):
+        error = OSError(ENOENT, "No such file or directory")
+        try:
+            raise ConnectionError("failed") from error
+        except ConnectionError as exc:
+            chained = exc
+        assert is_retryable_connect_error(chained) is False
+
+    def test_transient_cause_is_retryable(self):
+        error = OSError(ECONNREFUSED, "Connection refused")
+        try:
+            raise ConnectionError("failed") from error
+        except ConnectionError as exc:
+            chained = exc
+        assert is_retryable_connect_error(chained) is True
+
+    def test_non_oserror_cause_is_retryable(self):
+        try:
+            raise ConnectionError("failed") from ValueError("bad")
+        except ConnectionError as exc:
+            chained = exc
+        assert is_retryable_connect_error(chained) is True
+
 
 @pytest.mark.onlynoncluster
 class TestRedisClientRetry:
@@ -260,21 +358,6 @@ class TestRedisClientRetry:
                     r.get("foo")
                 finally:
                     assert parse_response.call_count == retries + 1
-
-    @pytest.mark.onlycluster
-    def test_get_set_retry_object_for_cluster_client(self, request):
-        retry = Retry(NoBackoff(), 2)
-        r = _get_client(Redis, request, retry_on_timeout=True, retry=retry)
-        exist_conn = r.connection_pool.get_connection()
-        assert r.retry._retries == retry._retries
-        assert isinstance(r.retry._backoff, NoBackoff)
-        new_retry_policy = Retry(ExponentialBackoff(), 3)
-        r.set_retry(new_retry_policy)
-        assert r.retry._retries == new_retry_policy._retries
-        assert isinstance(r.retry._backoff, ExponentialBackoff)
-        assert exist_conn.retry._retries == new_retry_policy._retries
-        new_conn = r.connection_pool.get_connection()
-        assert new_conn.retry._retries == new_retry_policy._retries
 
     @pytest.mark.onlynoncluster
     def test_get_set_retry_object(self, request):

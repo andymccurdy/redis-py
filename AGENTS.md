@@ -24,7 +24,7 @@ pytest tests/test_asyncio/test_commands.py -k "test_set and not cluster"
 pytest --redis-url=redis://localhost:16379/0 -m onlycluster tests/test_cluster.py
 ```
 
-The pytest plugin in `tests/conftest.py` adds these options (also exposed via invoke wrappers): `--redis-url`, `--redis-ssl-url`, `--redis-mod-url`, `--protocol` (`""` = library default, currently RESP3), `--legacy-responses` (`true|false|default`), `--redis-cluster-nodes`, `--uvloop`.
+The pytest plugin in `tests/conftest.py` adds these options (also exposed via invoke wrappers): `--redis-url`, `--redis-ssl-url`, `--redis-mod-url`, `--protocol` (`""` = library default, currently RESP3), `--legacy-responses` (`true|false|default`), `--redis-cluster-nodes`, `--uvloop`. It also adds `--tracemalloc` (off by default, not exposed via invoke), which traces allocations so `ResourceWarning`s show where the object was allocated; it makes cluster client setup several times slower.
 
 ### pytest markers
 
@@ -53,13 +53,14 @@ When changing behavior in one stack, the equivalent change almost always belongs
 Command surface is composed via mixin classes in `redis/commands/`:
 
 - `core.py` — `CoreCommands` / `AsyncCoreCommands` (every standard Redis command).
-- `cluster.py` — `RedisClusterCommands` / `AsyncRedisClusterCommands`; also exports `READ_COMMANDS` (the set of commands that can be routed to replicas).
+- `cluster.py` — `RedisClusterCommands` / `AsyncRedisClusterCommands`; also exports `READ_COMMANDS`, which is **deprecated and unread**: replica eligibility is decided by the metadata resolver's `is_replica_safe`, so editing this set changes nothing. It is kept only so external importers keep working.
 - `sentinel.py` — sentinel-specific commands.
 - `redismodules.py` — aggregates module mixins (`bf/` Bloom, `json/`, `search/`, `timeseries/`, `vectorset/`). Each module subpackage owns its own command surface and response parsing.
-- `policies.py` — `PolicyResolver` / `StaticPolicyResolver` and the `STATIC_POLICIES` table used by the cluster client to decide routing and aggregation per command. The `RequestPolicy` / `ResponsePolicy` enums themselves live in `redis/_parsers/commands.py` alongside `CommandsParser`.
+- `policies.py` — `PolicyResolver` / `StaticPolicyResolver`, the routing view the cluster client resolves per command. Also holds `STATIC_POLICIES`, which is **deprecated and unread**: a frozen verbatim copy of the 7.1.0 table, kept only for external importers and deliberately not derived from or synced with `_STATIC_COMMAND_METADATA`. Change routing in `metadata.py`, never there.
+- `metadata.py` — the command metadata record types: `RequestPolicy` / `ResponsePolicy`, `CommandPolicies` / `PolicyRecords`, and `CommandMetadata` / `CommandMetadataRecordsCache`, plus the metadata resolvers. `CommandMetadata` is the superset record; `_to_command_policies` projects one down to the routing view a `PolicyResolver` serves - projecting to `None` when the record withholds its routing policies, which is how a resolver tells the cluster client to resolve the target itself (`SCAN`, `RANDOMKEY` and the other `COMMAND_FLAGS` commands need this). The `movablekeys` reads are recorded `DEFAULT_KEYED`, which `_build_command_records` also derives from their key specs, and the cluster client finds their keys from the key specs `CommandsParser.initialize()` compiles, asking `COMMAND GETKEYS` only where those specs are not enough. The two types are kept separate deliberately: `CommandPolicies` shipped in 7.1.0 as a mutable class, and `CommandMetadata` is frozen so one record can be shared across many commands. `redis/_parsers/commands.py` re-exports the policy types from here for backwards compatibility; import them from `redis.commands.metadata`. A resolver is a client-level constructor argument (`metadata_resolver=` on `Redis`, `ConnectionPool`, `RedisCluster`, `NodesManager` and `ClusterPipeline`; on the async side only on `redis.asyncio.RedisCluster`, because the async stack has no client-side cache to be the second consumer), built once and shared with every node client; it serves cluster routing through `resolve_policies`, replica safety through `is_replica_safe`, and client-side-cache eligibility through `is_cacheable`. When only `metadata_resolver` is given the routing resolver is derived from it; an explicit `policy_resolver` still wins for the routing view - which nodes a command targets - but not for anything that view cannot express: replica safety and cache eligibility keep resolving through `metadata_resolver` either way, because a `CommandPolicies` record carries no `is_readonly` flag to answer them with.
 - `helpers.py` — shared utilities (`list_or_args`, pubsub subscription partitioning, etc.).
 
-`Redis` (sync) and `redis.asyncio.Redis` are assembled by inheriting these mixins plus the connection/pool plumbing. Adding a new command means editing both the sync and async mixin classes and, for cluster routing, possibly `READ_COMMANDS` and the policy resolver. There is a `/add-new-command` skill (`.claude/commands/add-new-command.md`) that follows the project's expected workflow; use the spec template at `.agents/commands/add-new-command/command-specification-template.md`. Before adding commands, also read this file (AGENTS.md) and `.agents/sync_async_type_hints_overload_guide.md` — they document the sync/async type-overload convention that command additions must follow. The `/sync-claude-md` skill audits and refreshes this file when the project structure changes.
+`Redis` (sync) and `redis.asyncio.Redis` are assembled by inheriting these mixins plus the connection/pool plumbing. Adding a new command means editing both the sync and async mixin classes and, for cluster routing, possibly the command metadata in `metadata.py`, which drives both the routing policies and replica eligibility. Not `READ_COMMANDS` - it is deprecated and unread. There is a `/add-new-command` skill (`.claude/commands/add-new-command.md`) that follows the project's expected workflow; use the spec template at `.agents/commands/add-new-command/command-specification-template.md`. Before adding commands, also read this file (AGENTS.md) and `.agents/sync_async_type_hints_overload_guide.md` — they document the sync/async type-overload convention that command additions must follow. The `/sync-claude-md` skill audits and refreshes this file when the project structure changes.
 
 ### Wire protocol and response parsing
 
@@ -68,7 +69,7 @@ Command surface is composed via mixin classes in `redis/commands/`:
 - `resp2.py`, `resp3.py` — pure-Python parsers.
 - `hiredis.py` — optional C-accelerated parser; auto-used if `hiredis>=3.2.0` is installed.
 - `response_callbacks.py` — per-command response post-processing (the place where the library reshapes raw protocol output into Python types).
-- `commands.py` — `CommandsParser` and policy types used by the cluster client to learn command metadata via `COMMAND INFO`.
+- `commands.py` — `CommandsParser`, used by the cluster client to learn command metadata via `COMMAND INFO`; the policy record types it returns live in `redis/commands/metadata.py`.
 - `encoders.py` — request encoding.
 
 RESP3 is now the default on the wire. Two knobs interact:
@@ -78,7 +79,7 @@ RESP3 is now the default on the wire. Two knobs interact:
 
 ### Cluster client
 
-`redis/cluster.py` (`redis/asyncio/cluster.py`) implements topology discovery, slot mapping (`redis/crc.py`, `key_slot`), per-node connection pools, MOVED/ASK redirection, and routing using `RequestPolicy`/`ResponsePolicy` enums from `redis/_parsers/commands.py` resolved via `redis/commands/policies.py`. `READ_COMMANDS` controls replica-eligibility for read routing.
+`redis/cluster.py` (`redis/asyncio/cluster.py`) implements topology discovery, slot mapping (`redis/crc.py`, `key_slot`), per-node connection pools, MOVED/ASK redirection, and routing using `RequestPolicy`/`ResponsePolicy` enums from `redis/commands/metadata.py` resolved via `redis/commands/policies.py`. Replica eligibility for read routing is decided by the metadata resolver's `is_replica_safe`, which reads the `is_readonly` flag on the command metadata record; `READ_COMMANDS` is deprecated and no longer consulted.
 
 ### Multi-database (Active-Active) client
 
@@ -87,8 +88,8 @@ RESP3 is now the default on the wire. Two knobs interact:
 ### Cross-cutting subsystems
 
 - `redis/auth/` — credential providers and token-based auth (EntraID via `redis-entraid`; JWT support).
-- `redis/cache.py` — client-side caching configuration.
-- `redis/maint_notifications.py` — server-pushed maintenance notifications and the handler that reacts to them.
+- `redis/cache.py` — client-side caching configuration. `CacheConfig.is_allowed_to_cache` is the single eligibility decision point, and delegates to the `MetadataResolver` the config holds (`redis/commands/metadata.py`), defaulted to the static table and injected by `ConnectionPool.__init__` from the client-level `metadata_resolver=`. `DEFAULT_ALLOW_LIST` is deprecated and unread - change eligibility in `metadata.py`, never there. `CacheProxyConnection.send_command` asks that decision point and then requires the invocation to carry `keys`; a cacheable command without them bypasses the cache rather than raising, so plumbing `keys=` into a command method is a purely additive way to start caching it.
+- `redis/maint_notifications.py` — server-pushed maintenance notifications and the handler that reacts to them. The handlers report the relaxation they apply as `MaintenanceStartedEvent` / `MaintenanceCompletedEvent` (`redis/event.py`) to the optional `event_dispatcher` on `MaintNotificationsConfig`; the MultiDB health check policy (`redis/asyncio/multidb/healthcheck.py`) is the in-tree consumer, relaxing a database's `health_check_timeout` to `probes * (relaxed_timeout + delay)` while its probe client is under maintenance. With notifications enabled, a pooled connection that has readable data while idle is not reconnected outright by `ensure_connection`: `handle_pending_push_notifications` (both connection mixins) drains the buffered pushes with the handlers deferred, applies them only if the socket is still alive (the maintenance is still in progress), and discards them and raises for the pool to reconnect if the server has closed the socket or a stale reply was left on it.
 - `redis/keyspace_notifications.py` — keyspace/keyevent subscription helpers (sync and async variants live side by side).
 - `redis/observability/` (and `redis/asyncio/observability/`) — OpenTelemetry instrumentation. Modules: `attributes.py` (span/metric attribute keys), `config.py`, `metrics.py`, `providers.py`, `recorder.py` (the API the rest of the code calls — `record_operation_duration`, `record_error_count`, `record_pubsub_message`, `record_streaming_lag_from_response`), `registry.py`. Optional, gated by the `otel` extra. The async stack has only `recorder.py` and delegates the rest to the sync package.
 - `redis/event.py` — `EventDispatcher` used to notify subscribers on connection lifecycle events.
@@ -101,9 +102,9 @@ RESP3 is now the default on the wire. Two knobs interact:
 
 ## Python and dependency notes
 
-- `requires-python = ">=3.10"`; `pyproject.toml` lists the supported versions.
+- `requires-python = ">=3.11"`; `pyproject.toml` lists the supported versions.
 - Optional extras: `hiredis`, `xxhash`, `ocsp`, `jwt`, `circuit_breaker`, `otel`.
-- Ruff is the only formatter/linter (`target-version = "py310"`, `line-length = 88`). `tests/*` has relaxed naming rules; module command packages (`bf`, `timeseries`, `json`, `search`) opt out of pep8 naming.
+- Ruff is the only formatter/linter (`target-version = "py311"`, `line-length = 88`). `tests/*` has relaxed naming rules; module command packages (`bf`, `timeseries`, `json`, `search`) opt out of pep8 naming.
 - `whitelist.py` is the vulture allowlist — extend it instead of silencing vulture inline.
 
 ---

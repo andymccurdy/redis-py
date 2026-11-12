@@ -7,6 +7,9 @@ from redis.client import StrictRedis
 
 import redis.sentinel
 from redis import exceptions
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
+from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.sentinel import (
     MasterNotFoundError,
     ReplicaNotFoundError,
@@ -29,6 +32,7 @@ class SentinelTestClient:
     def sentinel_masters(self):
         self.cluster.connection_error_if_down(self)
         self.cluster.timeout_if_down(self)
+        self.cluster.response_error_if_down(self)
         return {self.cluster.service_name: self.cluster.master}
 
     def sentinel_slaves(self, master_name):
@@ -60,6 +64,7 @@ class SentinelTestCluster:
         self.slaves = []
         self.nodes_down = set()
         self.nodes_timeout = set()
+        self.nodes_response_error = set()
 
     def connection_error_if_down(self, node):
         if node.id in self.nodes_down:
@@ -68,6 +73,12 @@ class SentinelTestCluster:
     def timeout_if_down(self, node):
         if node.id in self.nodes_timeout:
             raise exceptions.TimeoutError
+
+    def response_error_if_down(self, node):
+        if node.id in self.nodes_response_error:
+            raise exceptions.ResponseError(
+                "unknown command 'SENTINEL', with args beginning with: 'masters'"
+            )
 
     def client(self, host, port, **kwargs):
         return SentinelTestClient(self, (host, port))
@@ -159,6 +170,26 @@ def test_discover_master_sentinel_timeout(cluster, sentinel, master_ip):
     assert address == (master_ip, 6379)
     # 'bar' is now first sentinel
     assert sentinel.sentinels[0].id == ("bar", 26379)
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_sentinel_response_error(cluster, sentinel, master_ip):
+    # 'foo' answers SENTINEL MASTERS with an error reply (a node that is not a
+    # sentinel, or an ACL that denies the command): try 'bar' instead
+    cluster.nodes_response_error.add(("foo", 26379))
+    address = sentinel.discover_master("mymaster")
+    assert address == (master_ip, 6379)
+    # 'bar' is now first sentinel
+    assert sentinel.sentinels[0].id == ("bar", 26379)
+
+
+@pytest.mark.onlynoncluster
+def test_discover_master_error_names_response_error(cluster, sentinel):
+    cluster.nodes_response_error.update({("foo", 26379), ("bar", 26379)})
+    with pytest.raises(
+        MasterNotFoundError, match="ResponseError: unknown command 'SENTINEL'"
+    ):
+        sentinel.discover_master("mymaster")
 
 
 @pytest.mark.onlynoncluster
@@ -294,7 +325,6 @@ def test_slave_round_robin(cluster, sentinel, master_ip):
 
 
 @pytest.mark.fixed_client
-@pytest.mark.onlynoncluster
 def test_master_failover_reclaims_discarded_connection_slot():
     master_a = ("master-a", 6379)
     master_b = ("master-b", 6379)
@@ -332,6 +362,50 @@ def test_master_failover_reclaims_discarded_connection_slot():
 
     assert pool._created_connections == 0
     pool.get_connection()
+
+
+@pytest.mark.fixed_client
+def test_master_failover_release_decrements_used_count():
+    master_a = ("master-a", 6379)
+    master_b = ("master-b", 6379)
+
+    class FakeConnection:
+        def __init__(self, **kwargs):
+            self.host, self.port = master_a
+            self.pid = os.getpid()
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def can_read(self, timeout=0):
+            return False
+
+        def should_reconnect(self):
+            return False
+
+    pool = SentinelConnectionPool(
+        "mymaster",
+        mock.MagicMock(),
+        connection_class=FakeConnection,
+        max_connections=2,
+    )
+    pool.proxy.master_address = master_a
+    pool_name = get_pool_name(pool)
+
+    with mock.patch("redis.connection.record_connection_count") as mock_rec:
+        connection = pool.get_connection()
+        pool.proxy.master_address = master_b
+        pool.release(connection)
+
+    net = {ConnectionState.IDLE: 0, ConnectionState.USED: 0}
+    for c in mock_rec.call_args_list:
+        if c.kwargs["pool_name"] == pool_name:
+            net[c.kwargs["connection_state"]] += c.kwargs["counter"]
+    assert net[ConnectionState.USED] == 0
+    assert net[ConnectionState.IDLE] == 0
 
 
 @pytest.mark.onlynoncluster
@@ -561,3 +635,36 @@ def test_himport_prepare_set_survives_reconnect(deployed_sentinel):
     master.delete("himport:sentinel:2")
     master.himport_set("himport:sentinel:2", "users", ["bob", "b@x.com"])
     assert master.hget("himport:sentinel:2", "email") == "b@x.com"
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_do_not_retry_by_default():
+    # Master discovery moves on to the next sentinel by itself; retrying an
+    # unreachable sentinel with the client default policy multiplies its timeout.
+    sentinel = Sentinel([("localhost", 26379), ("localhost", 26380)])
+    assert [s.get_retry().get_retries() for s in sentinel.sentinels] == [0, 0]
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_retry_once_on_error_when_asked():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry_on_error": [exceptions.ConnectionError]},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 1
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_clients_use_the_given_retry():
+    sentinel = Sentinel(
+        [("localhost", 26379)],
+        sentinel_kwargs={"retry": Retry(ExponentialBackoff(), 2)},
+    )
+    assert sentinel.sentinels[0].get_retry().get_retries() == 2
+
+
+@pytest.mark.onlynoncluster
+def test_sentinel_kwargs_are_not_modified():
+    sentinel_kwargs = {"socket_timeout": 1}
+    Sentinel([("localhost", 26379)], sentinel_kwargs=sentinel_kwargs)
+    assert sentinel_kwargs == {"socket_timeout": 1}

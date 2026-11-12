@@ -1,48 +1,53 @@
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Awaitable, Dict, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
-from redis.exceptions import IncorrectPolicyType, RedisError, ResponseError
-from redis.utils import str_if_bytes
+from redis.commands.metadata import (
+    CommandMetadata,
+    CommandMetadataRecordsCache,
+    CommandPolicies,
+    PolicyRecords,
+    RequestPolicy,
+    ResponsePolicy,
+)
+from redis.exceptions import (
+    DataError,
+    IncorrectPolicyType,
+    RedisError,
+    ResponseError,
+)
+from redis.utils import deprecated_function, str_if_bytes
 
 if TYPE_CHECKING:
+    from redis._parsers.encoders import Encoder
     from redis.asyncio.cluster import ClusterNode
 
+# The record type ``_build_command_records`` builds per command: policies or full metadata.
+# Constrained to the two, rather than left open, so a ``to_record`` that builds anything else
+# is a type error at the call site.
+_RecordT = TypeVar("_RecordT", CommandPolicies, CommandMetadata)
 
-class RequestPolicy(Enum):
-    ALL_NODES = "all_nodes"
-    ALL_SHARDS = "all_shards"
-    ALL_REPLICAS = "all_replicas"
-    MULTI_SHARD = "multi_shard"
-    SPECIAL = "special"
-    DEFAULT_KEYLESS = "default_keyless"
-    DEFAULT_KEYED = "default_keyed"
-    DEFAULT_NODE = "default_node"
-
-
-class ResponsePolicy(Enum):
-    ONE_SUCCEEDED = "one_succeeded"
-    ALL_SUCCEEDED = "all_succeeded"
-    AGG_LOGICAL_AND = "agg_logical_and"
-    AGG_LOGICAL_OR = "agg_logical_or"
-    AGG_MIN = "agg_min"
-    AGG_MAX = "agg_max"
-    AGG_SUM = "agg_sum"
-    SPECIAL = "special"
-    DEFAULT_KEYLESS = "default_keyless"
-    DEFAULT_KEYED = "default_keyed"
-
-
-class CommandPolicies:
-    def __init__(
-        self,
-        request_policy: RequestPolicy = RequestPolicy.DEFAULT_KEYLESS,
-        response_policy: ResponsePolicy = ResponsePolicy.DEFAULT_KEYLESS,
-    ):
-        self.request_policy = request_policy
-        self.response_policy = response_policy
-
-
-PolicyRecords = dict[str, dict[str, CommandPolicies]]
+# Re-exported for backwards compatibility: these types used to be defined here and are
+# now owned by ``redis.commands.metadata``. Import them from their new home instead.
+__all__ = [
+    "AbstractCommandsParser",
+    "AsyncCommandsParser",
+    "CommandPolicies",
+    "CommandsParser",
+    "PolicyRecords",
+    "RequestPolicy",
+    "ResponsePolicy",
+]
 
 
 class AbstractCommandsParser:
@@ -76,19 +81,132 @@ class AbstractCommandsParser:
         return keys
 
     def parse_subcommand(self, command, **options):
-        cmd_dict = {}
-        cmd_name = str_if_bytes(command[0])
-        cmd_dict["name"] = cmd_name
-        cmd_dict["arity"] = int(command[1])
-        cmd_dict["flags"] = [str_if_bytes(flag) for flag in command[2]]
-        cmd_dict["first_key_pos"] = command[3]
-        cmd_dict["last_key_pos"] = command[4]
-        cmd_dict["step_count"] = command[5]
-        if len(command) > 7:
-            cmd_dict["tips"] = command[7]
-            cmd_dict["key_specifications"] = command[8]
-            cmd_dict["subcommands"] = command[9]
-        return cmd_dict
+        return _parse_subcommand(command)
+
+    def _get_keys_from_specs(self, cmd_name, args):
+        """
+        Find the keys of a movablekeys command from the key specs compiled in
+        initialize(), the way the server does, which saves the COMMAND GETKEYS
+        round trip. Returns None when the server has to be asked.
+        """
+        compiled = self._movablekeys_specs.get(cmd_name)
+        if compiled is None:
+            return None
+        arity, specs = compiled
+        argc = len(args)
+        # COMMAND GETKEYS rejects a wrong argument count before reading specs.
+        if argc < abs(arity) or (arity > 0 and argc != arity):
+            return None
+        keys = []
+        for find_type, first, a, b, step in specs:
+            if find_type == "range":
+                lastkey, limit = a, b
+                if lastkey >= 0:
+                    last = first + lastkey
+                elif not limit:
+                    last = argc + lastkey
+                else:
+                    last = first + (argc - first) // limit + lastkey
+            else:
+                keynumidx, firstkey = a, b
+                if first + keynumidx >= argc:
+                    return None
+                numkeys = _parse_numkeys(args[first + keynumidx], self._encoder)
+                if numkeys is None or numkeys < 0:
+                    return None
+                first += firstkey
+                last = first + (numkeys - 1) * step
+            if last < first:
+                # No keys, as for the server; a negative slice end would wrap.
+                continue
+            if last >= argc:
+                return None
+            keys.extend(args[first : last + 1 : step])
+        return keys
+
+
+def _parse_numkeys(value, encoder):
+    """
+    The key count as the server reads it, or None for a value it rejects.
+    Checks the bytes the client sends: int() also accepts "+2", " 2", "02",
+    "2_0" and 2.5, and a str is sent in the client's encoding.
+    """
+    try:
+        raw = encoder.encode(value)
+    except DataError:
+        return None
+    if not isinstance(raw, (bytes, bytearray)) or not raw.isdigit():
+        return None
+    if len(raw) > 1 and raw.startswith(b"0"):
+        return None
+    # More digits than a signed 64-bit count; int() would also refuse 4300+.
+    if len(raw) > 19:
+        return None
+    return int(raw)
+
+
+def _compile_movablekeys_specs(commands):
+    """
+    Compile every movablekeys command into an ``(arity, specs)`` pair that
+    _get_keys_from_specs evaluates, or None where COMMAND GETKEYS has to be
+    asked: no specs, a spec flagged incomplete or variable_flags (the server
+    then ignores the specs too), or a search the client does not implement.
+    """
+    compiled = {}
+    for name, command in commands.items():
+        if "movablekeys" in command["flags"]:
+            specs = _compile_key_specs(command.get("key_specifications"))
+            if specs is not None:
+                specs = (int(command["arity"]), specs)
+            compiled[name] = specs
+    return compiled
+
+
+def _compile_key_specs(specs):
+    if not specs:
+        return None
+    compiled = []
+    for spec in specs:
+        flags = _key_spec_flags(spec)
+        if "incomplete" in flags or "variable_flags" in flags:
+            return None
+        if "not_key" in flags:
+            continue
+        spec = _spec_dict(spec)
+        begin = _spec_dict(spec.get("begin_search", ()))
+        find = _spec_dict(spec.get("find_keys", ()))
+        if str_if_bytes(begin.get("type")) != "index":
+            return None
+        first = _spec_dict(begin["spec"])["index"]
+        find_type = str_if_bytes(find.get("type"))
+        find_spec = _spec_dict(find.get("spec", ()))
+        step = find_spec.get("keystep", 0)
+        if first < 1 or step < 1:
+            return None
+        if find_type == "range":
+            compiled.append(
+                (find_type, first, find_spec["lastkey"], find_spec["limit"], step)
+            )
+        elif find_type == "keynum":
+            compiled.append(
+                (
+                    find_type,
+                    first,
+                    find_spec["keynumidx"],
+                    find_spec["firstkey"],
+                    step,
+                )
+            )
+        else:
+            return None
+    return tuple(compiled)
+
+
+def _spec_dict(spec):
+    # RESP2 sends a key spec as a flat [name, value, ...] list, RESP3 as a map.
+    if isinstance(spec, dict):
+        return {str_if_bytes(k): v for k, v in spec.items()}
+    return {str_if_bytes(k): v for k, v in zip(spec[::2], spec[1::2])}
 
 
 class CommandsParser(AbstractCommandsParser):
@@ -96,12 +214,14 @@ class CommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
     COMMAND output is used to determine key locations.
     Commands that do not have a predefined key location are flagged with
-    'movablekeys', and these commands' keys are determined by the command
-    'COMMAND GETKEYS'.
+    'movablekeys'. Their keys are read from the command's key specs, and
+    'COMMAND GETKEYS' is asked only when the specs are not enough.
     """
 
     def __init__(self, redis_connection):
         self.commands = {}
+        self._movablekeys_specs = {}
+        self._encoder = None
         self.redis_connection = redis_connection
         self.initialize(self.redis_connection)
 
@@ -114,6 +234,8 @@ class CommandsParser(AbstractCommandsParser):
         for cmd in uppercase_commands:
             commands[cmd.lower()] = commands.pop(cmd)
         self.commands = commands
+        self._movablekeys_specs = _compile_movablekeys_specs(commands)
+        self._encoder = r.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -153,7 +275,9 @@ class CommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = self._get_moveable_keys(redis_conn, *args)
+            keys = self._get_keys_from_specs(cmd_name, args)
+            if keys is None:
+                keys = self._get_moveable_keys(redis_conn, *args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -210,56 +334,29 @@ class CommandsParser(AbstractCommandsParser):
                 raise e
         return keys
 
-    def _is_keyless_command(
-        self, command_name: str, subcommand_name: Optional[str] = None
-    ) -> bool:
-        """
-        Determines whether a given command or subcommand is considered "keyless".
-
-        A keyless command does not operate on specific keys, which is determined based
-        on the first key position in the command or subcommand details. If the command
-        or subcommand's first key position is zero or negative, it is treated as keyless.
-
-        Parameters:
-            command_name: str
-                The name of the command to check.
-            subcommand_name: Optional[str], default=None
-                The name of the subcommand to check, if applicable. If not provided,
-                the check is performed only on the command.
-
-        Returns:
-            bool
-                True if the specified command or subcommand is considered keyless,
-                False otherwise.
-
-        Raises:
-            ValueError
-                If the specified subcommand is not found within the command or the
-                specified command does not exist in the available commands.
-        """
-        if subcommand_name:
-            for subcommand in self.commands.get(command_name)["subcommands"]:
-                if str_if_bytes(subcommand[0]) == subcommand_name:
-                    parsed_subcmd = self.parse_subcommand(subcommand)
-                    return parsed_subcmd["first_key_pos"] <= 0
-            raise ValueError(
-                f"Subcommand {subcommand_name} not found in command {command_name}"
-            )
-        else:
-            command_details = self.commands.get(command_name, None)
-            if command_details is not None:
-                return command_details["first_key_pos"] <= 0
-
-            raise ValueError(f"Command {command_name} not found in commands")
-
+    @deprecated_function(
+        version="8.2.0",
+        reason="Use get_commands_metadata_cache() instead.",
+    )
     def get_command_policies(self) -> PolicyRecords:
         """
         Retrieve and process the command policies for all commands and subcommands.
+
+        DEPRECATED: use :meth:`get_commands_metadata_cache` instead. Nothing in this library calls this
+        method any more, and it will be removed in a future release. A metadata resolver keeps a
+        compatibility shim for an object that serves only this method, because it was the whole
+        contract in 7.1.0; that shim is not an invitation to write one. To decide routing
+        yourself, implement the public ``PolicyResolver`` ABC instead.
 
         This method traverses through commands and subcommands, extracting policy details
         from associated data structures and constructing a dictionary of commands with their
         associated policies. It supports nested data structures and handles both main commands
         and their subcommands.
+
+        This is the routing view of :meth:`get_commands_metadata_cache`: the same traversal of the
+        same reply, keyed the same way, projected down to the two policies the cluster client
+        routes by. A caller that also needs the client-side-caching metadata asks for the
+        metadata records instead.
 
         Returns:
             PolicyRecords: A collection of commands and subcommands associated with their
@@ -268,131 +365,26 @@ class CommandsParser(AbstractCommandsParser):
         Raises:
             IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
         """
-        command_with_policies = {}
+        return _build_policy_records(self.commands)
 
-        def extract_policies(data, module_name, command_name):
-            """
-            Recursively extract policies from nested data structures.
+    def get_commands_metadata_cache(self) -> CommandMetadataRecordsCache:
+        """
+        Retrieve and process the metadata records cache for all commands and subcommands.
 
-            Args:
-                data: The data structure to search (can be list, dict, str, bytes, etc.)
-                command_name: The command name to associate with found policies
-            """
-            if isinstance(data, (str, bytes)):
-                # Decode bytes to string if needed
-                policy = str_if_bytes(data.decode())
+        This method normalizes the command flags, command tips and key metadata of the
+        ``COMMAND`` output into metadata records, keyed the same way as the policy records
+        that the deprecated ``get_command_policies`` returns. The routing policies each
+        record carries are the ones that method resolves, so both views of the same reply
+        stay in step.
 
-                # Check if this is a policy string
-                if policy.startswith("request_policy") or policy.startswith(
-                    "response_policy"
-                ):
-                    if policy.startswith("request_policy"):
-                        policy_type = policy.split(":")[1]
+        Returns:
+            CommandMetadataRecordsCache: A collection of commands and subcommands
+            associated with their respective metadata.
 
-                        try:
-                            command_with_policies[module_name][
-                                command_name
-                            ].request_policy = RequestPolicy(policy_type)
-                        except ValueError:
-                            raise IncorrectPolicyType(
-                                f"Incorrect request policy type: {policy_type}"
-                            )
-
-                    if policy.startswith("response_policy"):
-                        policy_type = policy.split(":")[1]
-
-                        try:
-                            command_with_policies[module_name][
-                                command_name
-                            ].response_policy = ResponsePolicy(policy_type)
-                        except ValueError:
-                            raise IncorrectPolicyType(
-                                f"Incorrect response policy type: {policy_type}"
-                            )
-
-            elif isinstance(data, list):
-                # For lists, recursively process each element
-                for item in data:
-                    extract_policies(item, module_name, command_name)
-
-            elif isinstance(data, dict):
-                # For dictionaries, recursively process each value
-                for value in data.values():
-                    extract_policies(value, module_name, command_name)
-
-        for command, details in self.commands.items():
-            # Check whether the command has keys
-            is_keyless = self._is_keyless_command(command)
-
-            if is_keyless:
-                default_request_policy = RequestPolicy.DEFAULT_KEYLESS
-                default_response_policy = ResponsePolicy.DEFAULT_KEYLESS
-            else:
-                default_request_policy = RequestPolicy.DEFAULT_KEYED
-                default_response_policy = ResponsePolicy.DEFAULT_KEYED
-
-            # Check if it's a core or module command
-            split_name = command.split(".")
-
-            if len(split_name) > 1:
-                module_name = split_name[0]
-                command_name = split_name[1]
-            else:
-                module_name = "core"
-                command_name = split_name[0]
-
-            # Create a CommandPolicies object with default policies on the new command.
-            if command_with_policies.get(module_name, None) is None:
-                command_with_policies[module_name] = {
-                    command_name: CommandPolicies(
-                        request_policy=default_request_policy,
-                        response_policy=default_response_policy,
-                    )
-                }
-            else:
-                command_with_policies[module_name][command_name] = CommandPolicies(
-                    request_policy=default_request_policy,
-                    response_policy=default_response_policy,
-                )
-
-            tips = details.get("tips")
-            subcommands = details.get("subcommands")
-
-            # Process tips for the main command
-            if tips:
-                extract_policies(tips, module_name, command_name)
-
-            # Process subcommands
-            if subcommands:
-                for subcommand_details in subcommands:
-                    # Get the subcommand name (first element)
-                    subcmd_name = subcommand_details[0]
-                    if isinstance(subcmd_name, bytes):
-                        subcmd_name = subcmd_name.decode()
-
-                    # Check whether the subcommand has keys
-                    is_keyless = self._is_keyless_command(command, subcmd_name)
-
-                    if is_keyless:
-                        default_request_policy = RequestPolicy.DEFAULT_KEYLESS
-                        default_response_policy = ResponsePolicy.DEFAULT_KEYLESS
-                    else:
-                        default_request_policy = RequestPolicy.DEFAULT_KEYED
-                        default_response_policy = ResponsePolicy.DEFAULT_KEYED
-
-                    subcmd_name = subcmd_name.replace("|", " ")
-
-                    # Create a CommandPolicies object with default policies on the new command.
-                    command_with_policies[module_name][subcmd_name] = CommandPolicies(
-                        request_policy=default_request_policy,
-                        response_policy=default_response_policy,
-                    )
-
-                    # Recursively extract policies from the rest of the subcommand details
-                    for subcommand_detail in subcommand_details[1:]:
-                        extract_policies(subcommand_detail, module_name, subcmd_name)
-
-        return command_with_policies
+        Raises:
+            IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
+        """
+        return _build_commands_metadata_cache(self.commands)
 
 
 class AsyncCommandsParser(AbstractCommandsParser):
@@ -400,8 +392,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
     Parses Redis commands to get command keys.
 
     COMMAND output is used to determine key locations.
-    Commands that do not have a predefined key location are flagged with 'movablekeys',
-    and these commands' keys are determined by the command 'COMMAND GETKEYS'.
+    Commands that do not have a predefined key location are flagged with 'movablekeys'.
+    Their keys are read from the command's key specs, and 'COMMAND GETKEYS' is asked
+    only when the specs are not enough.
 
     NOTE: Due to a bug in redis<7.0, this does not work properly
     for EVAL or EVALSHA when the `numkeys` arg is 0.
@@ -411,10 +404,12 @@ class AsyncCommandsParser(AbstractCommandsParser):
     So, don't use this with EVAL or EVALSHA.
     """
 
-    __slots__ = ("commands", "node")
+    __slots__ = ("commands", "node", "_movablekeys_specs")
 
     def __init__(self) -> None:
         self.commands: Dict[str, Union[int, Dict[str, Any]]] = {}
+        self._movablekeys_specs: Dict[str, Optional[Tuple]] = {}
+        self._encoder: Optional["Encoder"] = None
 
     async def initialize(self, node: Optional["ClusterNode"] = None) -> None:
         if node:
@@ -422,6 +417,8 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         commands = await self.node.execute_command("COMMAND")
         self.commands = {cmd.lower(): command for cmd, command in commands.items()}
+        self._movablekeys_specs = _compile_movablekeys_specs(self.commands)
+        self._encoder = self.node.get_encoder()
 
     # As soon as this PR is merged into Redis, we should reimplement
     # our logic to use COMMAND INFO changes to determine the key positions
@@ -461,7 +458,9 @@ class AsyncCommandsParser(AbstractCommandsParser):
 
         command = self.commands.get(cmd_name)
         if "movablekeys" in command["flags"]:
-            keys = await self._get_moveable_keys(*args)
+            keys = self._get_keys_from_specs(cmd_name, args)
+            if keys is None:
+                keys = await self._get_moveable_keys(*args)
         elif "pubsub" in command["flags"] or command["name"] == "pubsub":
             keys = self._get_pubsub_keys(*args)
         else:
@@ -507,56 +506,29 @@ class AsyncCommandsParser(AbstractCommandsParser):
                 raise e
         return keys
 
-    async def _is_keyless_command(
-        self, command_name: str, subcommand_name: Optional[str] = None
-    ) -> bool:
-        """
-        Determines whether a given command or subcommand is considered "keyless".
-
-        A keyless command does not operate on specific keys, which is determined based
-        on the first key position in the command or subcommand details. If the command
-        or subcommand's first key position is zero or negative, it is treated as keyless.
-
-        Parameters:
-            command_name: str
-                The name of the command to check.
-            subcommand_name: Optional[str], default=None
-                The name of the subcommand to check, if applicable. If not provided,
-                the check is performed only on the command.
-
-        Returns:
-            bool
-                True if the specified command or subcommand is considered keyless,
-                False otherwise.
-
-        Raises:
-            ValueError
-                If the specified subcommand is not found within the command or the
-                specified command does not exist in the available commands.
-        """
-        if subcommand_name:
-            for subcommand in self.commands.get(command_name)["subcommands"]:
-                if str_if_bytes(subcommand[0]) == subcommand_name:
-                    parsed_subcmd = self.parse_subcommand(subcommand)
-                    return parsed_subcmd["first_key_pos"] <= 0
-            raise ValueError(
-                f"Subcommand {subcommand_name} not found in command {command_name}"
-            )
-        else:
-            command_details = self.commands.get(command_name, None)
-            if command_details is not None:
-                return command_details["first_key_pos"] <= 0
-
-            raise ValueError(f"Command {command_name} not found in commands")
-
-    async def get_command_policies(self) -> Awaitable[PolicyRecords]:
+    @deprecated_function(
+        version="8.2.0",
+        reason="Use get_commands_metadata_cache() instead.",
+    )
+    async def get_command_policies(self) -> PolicyRecords:
         """
         Retrieve and process the command policies for all commands and subcommands.
+
+        DEPRECATED: use :meth:`get_commands_metadata_cache` instead. Nothing in this library calls this
+        method any more, and it will be removed in a future release. A metadata resolver keeps a
+        compatibility shim for an object that serves only this method, because it was the whole
+        contract in 7.1.0; that shim is not an invitation to write one. To decide routing
+        yourself, implement the public ``PolicyResolver`` ABC instead.
 
         This method traverses through commands and subcommands, extracting policy details
         from associated data structures and constructing a dictionary of commands with their
         associated policies. It supports nested data structures and handles both main commands
         and their subcommands.
+
+        This is the routing view of :meth:`get_commands_metadata_cache`: the same traversal of the
+        same reply, keyed the same way, projected down to the two policies the cluster client
+        routes by. A caller that also needs the client-side-caching metadata asks for the
+        metadata records instead.
 
         Returns:
             PolicyRecords: A collection of commands and subcommands associated with their
@@ -565,128 +537,430 @@ class AsyncCommandsParser(AbstractCommandsParser):
         Raises:
             IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
         """
-        command_with_policies = {}
+        return _build_policy_records(self.commands)
 
-        def extract_policies(data, module_name, command_name):
-            """
-            Recursively extract policies from nested data structures.
+    async def get_commands_metadata_cache(self) -> CommandMetadataRecordsCache:
+        """
+        Retrieve and process the metadata records cache for all commands and subcommands.
 
-            Args:
-                data: The data structure to search (can be list, dict, str, bytes, etc.)
-                command_name: The command name to associate with found policies
-            """
-            if isinstance(data, (str, bytes)):
-                # Decode bytes to string if needed
-                policy = str_if_bytes(data.decode())
+        This method normalizes the command flags, command tips and key metadata of the
+        ``COMMAND`` output into metadata records, keyed the same way as the policy records
+        that the deprecated ``get_command_policies`` returns. The routing policies each
+        record carries are the ones that method resolves, so both views of the same reply
+        stay in step.
 
-                # Check if this is a policy string
-                if policy.startswith("request_policy") or policy.startswith(
-                    "response_policy"
-                ):
-                    if policy.startswith("request_policy"):
-                        policy_type = policy.split(":")[1]
+        Returns:
+            CommandMetadataRecordsCache: A collection of commands and subcommands
+            associated with their respective metadata.
 
-                        try:
-                            command_with_policies[module_name][
-                                command_name
-                            ].request_policy = RequestPolicy(policy_type)
-                        except ValueError:
-                            raise IncorrectPolicyType(
-                                f"Incorrect request policy type: {policy_type}"
-                            )
+        Raises:
+            IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
+        """
+        return _build_commands_metadata_cache(self.commands)
 
-                    if policy.startswith("response_policy"):
-                        policy_type = policy.split(":")[1]
 
-                        try:
-                            command_with_policies[module_name][
-                                command_name
-                            ].response_policy = ResponsePolicy(policy_type)
-                        except ValueError:
-                            raise IncorrectPolicyType(
-                                f"Incorrect response policy type: {policy_type}"
-                            )
+# =============================================================================
+# Private helpers
+# =============================================================================
+def _parse_subcommand(command: Any) -> Dict[str, Any]:
+    """
+    Parse a single entry of a command's ``subcommands`` field into a details dict
+    with the same shape as a top-level ``COMMAND`` entry.
+    """
+    cmd_dict = {}
+    cmd_name = str_if_bytes(command[0])
+    cmd_dict["name"] = cmd_name
+    cmd_dict["arity"] = int(command[1])
+    cmd_dict["flags"] = [str_if_bytes(flag) for flag in command[2]]
+    cmd_dict["first_key_pos"] = command[3]
+    cmd_dict["last_key_pos"] = command[4]
+    cmd_dict["step_count"] = command[5]
+    if len(command) > 7:
+        cmd_dict["tips"] = command[7]
+        cmd_dict["key_specifications"] = command[8]
+        cmd_dict["subcommands"] = command[9]
+    return cmd_dict
 
-            elif isinstance(data, list):
-                # For lists, recursively process each element
-                for item in data:
-                    extract_policies(item, module_name, command_name)
 
-            elif isinstance(data, dict):
-                # For dictionaries, recursively process each value
-                for value in data.values():
-                    extract_policies(value, module_name, command_name)
+def _is_keyless_command(
+    commands: Dict[str, Any],
+    command_name: str,
+    subcommand_name: Optional[str] = None,
+) -> bool:
+    """
+    Determines whether a given command or subcommand is considered "keyless".
 
-        for command, details in self.commands.items():
-            # Check whether the command has keys
-            is_keyless = await self._is_keyless_command(command)
+    A keyless command does not operate on specific keys, which is determined based
+    on the first key position in the command or subcommand details. If the command
+    or subcommand's first key position is zero or negative, it is treated as keyless -
+    unless it is flagged ``movablekeys`` and its key specs report a key argument. A
+    ``movablekeys`` command reports ``first_key_pos == 0`` because its keys are found by
+    scanning the arguments, so only the key specs say that it takes keys at all.
 
-            if is_keyless:
-                default_request_policy = RequestPolicy.DEFAULT_KEYLESS
-                default_response_policy = ResponsePolicy.DEFAULT_KEYLESS
-            else:
-                default_request_policy = RequestPolicy.DEFAULT_KEYED
-                default_response_policy = ResponsePolicy.DEFAULT_KEYED
+    Parameters:
+        commands: Dict[str, Any]
+            The parsed ``COMMAND`` output to look the command up in.
+        command_name: str
+            The name of the command to check.
+        subcommand_name: Optional[str], default=None
+            The name of the subcommand to check, if applicable. If not provided,
+            the check is performed only on the command.
 
-            # Check if it's a core or module command
-            split_name = command.split(".")
+    Returns:
+        bool
+            True if the specified command or subcommand is considered keyless,
+            False otherwise.
 
-            if len(split_name) > 1:
-                module_name = split_name[0]
-                command_name = split_name[1]
-            else:
-                module_name = "core"
-                command_name = split_name[0]
+    Raises:
+        ValueError
+            If the specified subcommand is not found within the command or the
+            specified command does not exist in the available commands.
+    """
+    if subcommand_name:
+        for subcommand in commands.get(command_name)["subcommands"]:
+            if str_if_bytes(subcommand[0]) == subcommand_name:
+                return _is_keyless(_parse_subcommand(subcommand))
+        raise ValueError(
+            f"Subcommand {subcommand_name} not found in command {command_name}"
+        )
+    else:
+        command_details = commands.get(command_name, None)
+        if command_details is not None:
+            return _is_keyless(command_details)
 
-            # Create a CommandPolicies object with default policies on the new command.
-            if command_with_policies.get(module_name, None) is None:
-                command_with_policies[module_name] = {
-                    command_name: CommandPolicies(
-                        request_policy=default_request_policy,
-                        response_policy=default_response_policy,
-                    )
-                }
-            else:
-                command_with_policies[module_name][command_name] = CommandPolicies(
-                    request_policy=default_request_policy,
-                    response_policy=default_response_policy,
+        raise ValueError(f"Command {command_name} not found in commands")
+
+
+def _is_keyless(details: Dict[str, Any]) -> bool:
+    """
+    The keyless test of :func:`_is_keyless_command`, for one command's parsed details.
+
+    ``first_key_pos`` alone decides a command that reports it, so a command whose key specs
+    are all ``not_key`` - SPUBLISH's shard channel - keeps routing by that argument's slot.
+    """
+    if details["first_key_pos"] > 0:
+        return False
+
+    return not ("movablekeys" in details["flags"] and _has_key_argument(details))
+
+
+# Slots of the two-element buffer ``_apply_policy_tips`` writes into. A list rather than a
+# record, so one buffer can be reused for every command of a ``COMMAND`` reply instead of a
+# policy object being allocated per command and thrown away.
+_REQUEST_POLICY = 0
+_RESPONSE_POLICY = 1
+
+
+def _walk_tips(data: Any) -> Iterator[str]:
+    """
+    Recursively yield every tip string of a ``COMMAND`` reply fragment, decoding bytes.
+
+    The one traversal both tip readers share, so the routing view and the metadata view
+    cannot disagree about which structures a tip may be nested inside. That matters because a
+    metadata record is the superset of a policy record: it carries the two routing policies
+    plus the cacheability markers, so it has to read at least everything the policy view
+    reads off the same field.
+
+    A ``COMMAND`` reply reports a command's ``tips`` as a flat array, but the fragments
+    :func:`_apply_policy_tips` is handed for a container subcommand are whole reply entries,
+    whose nested arrays and maps have to be walked. Anything that is neither a string, an
+    array nor a map carries no tip and is skipped.
+
+    Args:
+        data: The fragment to walk (can be list, dict, str, bytes, etc.)
+
+    Yields:
+        Each tip string found, in reply order, so that a caller keeping only one value per
+        slot ends up with the last one the reply carried.
+    """
+    if isinstance(data, (str, bytes)):
+        # Decode bytes to string if needed
+        yield str_if_bytes(data)
+
+    elif isinstance(data, list):
+        # For lists, recursively process each element
+        for item in data:
+            yield from _walk_tips(item)
+
+    elif isinstance(data, dict):
+        # For dictionaries, recursively process each value
+        for value in data.values():
+            yield from _walk_tips(value)
+
+
+def _apply_policy_tips(policy_pair: List[Any], data: Any) -> None:
+    """
+    Extract policies from nested data structures.
+
+    Args:
+        policy_pair: The ``[request_policy, response_policy]`` buffer to update in place.
+            The last policy tip found for a slot wins.
+        data: The data structure to search, walked by :func:`_walk_tips`.
+
+    Raises:
+        IncorrectPolicyType: If an invalid policy type is encountered.
+    """
+    for policy in _walk_tips(data):
+        # Check if this is a policy string
+        if policy.startswith("request_policy"):
+            policy_type = policy.split(":")[1]
+
+            try:
+                policy_pair[_REQUEST_POLICY] = RequestPolicy(policy_type)
+            except ValueError:
+                raise IncorrectPolicyType(
+                    f"Incorrect request policy type: {policy_type}"
                 )
 
-            tips = details.get("tips")
-            subcommands = details.get("subcommands")
+        elif policy.startswith("response_policy"):
+            policy_type = policy.split(":")[1]
 
-            # Process tips for the main command
-            if tips:
-                extract_policies(tips, module_name, command_name)
+            try:
+                policy_pair[_RESPONSE_POLICY] = ResponsePolicy(policy_type)
+            except ValueError:
+                raise IncorrectPolicyType(
+                    f"Incorrect response policy type: {policy_type}"
+                )
 
-            # Process subcommands
-            if subcommands:
-                for subcommand_details in subcommands:
-                    # Get the subcommand name (first element)
-                    subcmd_name = subcommand_details[0]
-                    if isinstance(subcmd_name, bytes):
-                        subcmd_name = subcmd_name.decode()
 
-                    # Check whether the subcommand has keys
-                    is_keyless = await self._is_keyless_command(command, subcmd_name)
+def _build_command_records(
+    commands: Dict[str, Any],
+    to_record: Callable[[Dict[str, Any], RequestPolicy, ResponsePolicy], _RecordT],
+) -> Dict[str, Dict[str, _RecordT]]:
+    """
+    Traverse a parsed ``COMMAND`` reply, resolving the policies of every command, and build
+    one record per command with ``to_record``.
 
-                    if is_keyless:
-                        default_request_policy = RequestPolicy.DEFAULT_KEYLESS
-                        default_response_policy = ResponsePolicy.DEFAULT_KEYLESS
-                    else:
-                        default_request_policy = RequestPolicy.DEFAULT_KEYED
-                        default_response_policy = ResponsePolicy.DEFAULT_KEYED
+    ``to_record`` is called once per command and once per container subcommand, with the
+    command's details and its resolved policies. Policies start at the keyed or keyless
+    defaults, chosen by whether the command takes keys, and are then overwritten by the
+    ``request_policy`` and ``response_policy`` command tips.
 
-                    subcmd_name = subcmd_name.replace("|", " ")
+    This is the single traversal behind both the policy records and the metadata records, so
+    the two are keyed identically by construction and the tips of a reply are walked once no
+    matter which view a caller asks for. The policies are handed over as plain enum members,
+    so the caller that wants a ``CommandPolicies`` record builds one and the caller that
+    wants a ``CommandMetadata`` record is not charged for one it would discard.
 
-                    # Create a CommandPolicies object with default policies on the new command.
-                    command_with_policies[module_name][subcmd_name] = CommandPolicies(
-                        request_policy=default_request_policy,
-                        response_policy=default_response_policy,
-                    )
+    Args:
+        commands: The parsed ``COMMAND`` output to traverse.
+        to_record: Builds the record for one command from its details and policies.
 
-                    # Recursively extract policies from the rest of the subcommand details
-                    for subcommand_detail in subcommand_details[1:]:
-                        extract_policies(subcommand_detail, module_name, subcmd_name)
+    Returns:
+        The records of every command and subcommand, keyed by module name, then by command
+        name.
 
-        return command_with_policies
+    Raises:
+        IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
+    """
+    command_records: Dict[str, Dict[str, _RecordT]] = {}
+    # Reused by every command below: the policies are read out of it before the next command
+    # resets it, so no per-command buffer is allocated.
+    policy_pair: List[Any] = [
+        RequestPolicy.DEFAULT_KEYLESS,
+        ResponsePolicy.DEFAULT_KEYLESS,
+    ]
+
+    for command, details in commands.items():
+        # Check whether the command has keys
+        is_keyless = _is_keyless_command(commands, command)
+
+        if is_keyless:
+            policy_pair[_REQUEST_POLICY] = RequestPolicy.DEFAULT_KEYLESS
+            policy_pair[_RESPONSE_POLICY] = ResponsePolicy.DEFAULT_KEYLESS
+        else:
+            policy_pair[_REQUEST_POLICY] = RequestPolicy.DEFAULT_KEYED
+            policy_pair[_RESPONSE_POLICY] = ResponsePolicy.DEFAULT_KEYED
+
+        module_name, command_name = _split_module_and_command(command)
+        module_records = command_records.setdefault(module_name, {})
+
+        tips = details.get("tips")
+        subcommands = details.get("subcommands")
+
+        # Process tips for the main command
+        if tips:
+            _apply_policy_tips(policy_pair, tips)
+
+        module_records[command_name] = to_record(
+            details, policy_pair[_REQUEST_POLICY], policy_pair[_RESPONSE_POLICY]
+        )
+
+        # Process subcommands
+        if subcommands:
+            for subcommand_details in subcommands:
+                # Get the subcommand name (first element)
+                subcmd_name = subcommand_details[0]
+                if isinstance(subcmd_name, bytes):
+                    subcmd_name = subcmd_name.decode()
+
+                # Check whether the subcommand has keys
+                is_keyless = _is_keyless_command(commands, command, subcmd_name)
+
+                if is_keyless:
+                    policy_pair[_REQUEST_POLICY] = RequestPolicy.DEFAULT_KEYLESS
+                    policy_pair[_RESPONSE_POLICY] = ResponsePolicy.DEFAULT_KEYLESS
+                else:
+                    policy_pair[_REQUEST_POLICY] = RequestPolicy.DEFAULT_KEYED
+                    policy_pair[_RESPONSE_POLICY] = ResponsePolicy.DEFAULT_KEYED
+
+                # Container subcommands are keyed by their space-joined name, e.g.
+                # ``memory usage``, which is the form ``execute_command`` receives.
+                subcmd_name = subcmd_name.replace("|", " ")
+
+                # Recursively extract policies from the rest of the subcommand details
+                for subcommand_detail in subcommand_details[1:]:
+                    _apply_policy_tips(policy_pair, subcommand_detail)
+
+                module_records[subcmd_name] = to_record(
+                    _parse_subcommand(subcommand_details),
+                    policy_pair[_REQUEST_POLICY],
+                    policy_pair[_RESPONSE_POLICY],
+                )
+
+    return command_records
+
+
+def _to_command_policies(
+    details: Dict[str, Any],
+    request_policy: RequestPolicy,
+    response_policy: ResponsePolicy,
+) -> CommandPolicies:
+    """Build the policy record for a single entry of a ``COMMAND`` reply."""
+    return CommandPolicies(
+        request_policy=request_policy, response_policy=response_policy
+    )
+
+
+def _build_policy_records(commands: Dict[str, Any]) -> PolicyRecords:
+    """
+    Retrieve and process the command policies for all commands and subcommands.
+
+    This function traverses through commands and subcommands, extracting policy details
+    from associated data structures and constructing a dictionary of commands with their
+    associated policies. It supports nested data structures and handles both main commands
+    and their subcommands.
+
+    Args:
+        commands: The parsed ``COMMAND`` output to build the policy records from.
+
+    Returns:
+        PolicyRecords: A collection of commands and subcommands associated with their
+        respective policies.
+
+    Raises:
+        IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
+    """
+    return _build_command_records(commands, _to_command_policies)
+
+
+def _split_module_and_command(command: str) -> Tuple[str, str]:
+    """
+    Split a name from a ``COMMAND`` reply into the ``(module, command)`` pair the record
+    tables are keyed by. Non-module commands live under ``"core"``.
+    """
+    split_name = command.split(".")
+
+    if len(split_name) > 1:
+        return split_name[0], split_name[1]
+
+    return "core", split_name[0]
+
+
+def _key_spec_flags(key_spec: Any) -> Set[str]:
+    """
+    The flags of a single key specification.
+
+    RESP3 reports a key spec as a map and RESP2 as a flat ``[name, value, ...]`` sequence,
+    so both shapes are read here.
+    """
+    if isinstance(key_spec, dict):
+        flags = key_spec.get(b"flags") or key_spec.get("flags") or ()
+    else:
+        flags = ()
+        for index in range(0, len(key_spec) - 1, 2):
+            if str_if_bytes(key_spec[index]) == "flags":
+                flags = key_spec[index + 1]
+                break
+
+    return {str_if_bytes(flag) for flag in flags}
+
+
+def _has_key_argument(details: Dict[str, Any]) -> bool:
+    """
+    Whether the command accepts at least one Redis key name argument.
+
+    Key specs decide it whenever the server reports them, including for ``movablekeys``
+    commands, whose keys are not discoverable from the legacy positions at all. A spec
+    flagged ``not_key`` describes an argument that is not a key name, such as a shard
+    pubsub channel, so a command whose every spec is ``not_key`` takes no keys.
+
+    Only a server that reports no key specs falls back to the legacy positions.
+    ``last_key_pos`` is never consulted: it is ``-1`` for variadic commands whose key
+    arguments run to the end of the argument list, and must not disqualify one.
+    """
+    key_specs = details.get("key_specifications")
+
+    if key_specs:
+        return any("not_key" not in _key_spec_flags(spec) for spec in key_specs)
+
+    return details.get("first_key_pos", 0) > 0 and details.get("step_count", 0) > 0
+
+
+def _to_command_metadata(
+    details: Dict[str, Any],
+    request_policy: RequestPolicy,
+    response_policy: ResponsePolicy,
+) -> CommandMetadata:
+    """
+    Build the metadata record for a single entry of a ``COMMAND`` reply.
+
+    ``details`` is either a top-level entry or a ``_parse_subcommand`` result. The routing
+    policies are passed in rather than derived again, so a record always carries the same
+    policies ``_build_policy_records`` resolves for the command.
+    """
+    flags = {str_if_bytes(flag) for flag in details.get("flags") or ()}
+    # Walked rather than read as a flat sequence, through the same traversal the routing view
+    # resolves its tips with: a metadata record is the superset of a policy record, so it must
+    # not read less of the field than the policy view does.
+    tips = set(_walk_tips(details.get("tips")))
+
+    return CommandMetadata(
+        request_policy=request_policy,
+        response_policy=response_policy,
+        is_readonly="readonly" in flags,
+        is_blocking="blocking" in flags,
+        has_key_argument=_has_key_argument(details),
+        # Matched exactly: ``nondeterministic_output_order`` is a different tip, denoting
+        # only that element order varies.
+        has_nondeterministic_output="nondeterministic_output" in tips,
+        is_script_runner="script_runner" in flags,
+        is_dont_cache="dont_cache" in tips,
+        # An empty tips list is a real answer; a missing tips key means the server is too
+        # old to report tips at all, which makes the negative markers undetectable.
+        has_complete_metadata="flags" in details and "tips" in details,
+    )
+
+
+def _build_commands_metadata_cache(
+    commands: Dict[str, Any],
+) -> CommandMetadataRecordsCache:
+    """
+    Retrieve and process the metadata records cache for all commands and subcommands.
+
+    This function traverses through commands and subcommands, normalizing the command
+    flags, command tips and key metadata of each into a metadata record. It shares its
+    traversal with ``_build_policy_records``, so records are keyed the same way and carry
+    the same policies, and a metadata resolver and a policy resolver agree on the same reply.
+
+    Args:
+        commands: The parsed ``COMMAND`` output to build the metadata records from.
+
+    Returns:
+        CommandMetadataRecordsCache: A collection of commands and subcommands associated
+        with their respective metadata.
+
+    Raises:
+        IncorrectPolicyType: If an invalid policy type is encountered during policy extraction.
+    """
+    return _build_command_records(commands, _to_command_metadata)

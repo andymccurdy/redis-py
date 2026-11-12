@@ -1,7 +1,7 @@
 import base64
 import datetime
 import ssl
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urlparse
 
 import cryptography.hazmat.primitives.hashes
 import requests
@@ -47,7 +47,18 @@ def _verify_response(issuer_cert, ocsp_response):
         raise ConnectionError("failed to valid ocsp response")
 
 
-def _check_certificate(issuer_cert, ocsp_bytes, validate=True):
+def _utc_time(obj, name):
+    """Read the timezone-aware ``<name>_utc`` property, falling back to the naive
+    UTC ``<name>`` on cryptography releases that predate it. The naive properties
+    are deprecated and warn on every access where the aware ones exist."""
+    try:
+        return getattr(obj, f"{name}_utc")
+    except AttributeError:
+        value = getattr(obj, name)
+        return value and value.replace(tzinfo=datetime.timezone.utc)
+
+
+def _check_certificate(issuer_cert, cert, ocsp_bytes, validate=True):
     """A wrapper the return the validity of a known ocsp certificate"""
 
     ocsp_response = ocsp.load_der_ocsp_response(ocsp_bytes)
@@ -55,6 +66,14 @@ def _check_certificate(issuer_cert, ocsp_bytes, validate=True):
     if ocsp_response.response_status == ocsp.OCSPResponseStatus.UNAUTHORIZED:
         raise AuthorizationError("you are not authorized to view this ocsp certificate")
     if ocsp_response.response_status == ocsp.OCSPResponseStatus.SUCCESSFUL:
+        # Bind the response to the certificate we are validating. A response is
+        # only about the serial it names, so a validly signed GOOD response for
+        # a different (non-revoked) certificate from the same issuer must not be
+        # accepted in place of the one under check.
+        if ocsp_response.serial_number != cert.serial_number:
+            raise ConnectionError(
+                "ocsp response serial number does not match the certificate"
+            )
         if ocsp_response.certificate_status != ocsp.OCSPCertStatus.GOOD:
             raise ConnectionError(
                 f"Received an {str(ocsp_response.certificate_status).split('.')[1]} "
@@ -65,13 +84,16 @@ def _check_certificate(issuer_cert, ocsp_bytes, validate=True):
             "failed to retrieve a successful response from the ocsp responder"
         )
 
-    if ocsp_response.this_update >= datetime.datetime.now():
+    # this_update / next_update are timezone-aware UTC, so compare against an
+    # aware UTC now rather than datetime.now(), which is local time. Comparing a
+    # UTC timestamp to local time let a stale response (next_update already in
+    # the past) pass the freshness check by the host's offset west of UTC.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if _utc_time(ocsp_response, "this_update") >= now:
         raise ConnectionError("ocsp certificate was issued in the future")
 
-    if (
-        ocsp_response.next_update
-        and ocsp_response.next_update < datetime.datetime.now()
-    ):
+    next_update = _utc_time(ocsp_response, "next_update")
+    if next_update and next_update < now:
         raise ConnectionError("ocsp certificate has invalid update - in the past")
 
     responder_name = ocsp_response.responder_name
@@ -99,9 +121,30 @@ def _check_certificate(issuer_cert, ocsp_bytes, validate=True):
         ext = responder_cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
         if ext is None or x509.oid.ExtendedKeyUsageOID.OCSP_SIGNING not in ext.value:
             raise ConnectionError("delegate not authorized for ocsp signing")
+        # A delegate normally carries id-pkix-ocsp-nocheck, so it is never
+        # checked for revocation and its validity period is all that bounds
+        # how long its key is trusted.
+        if not (
+            _utc_time(responder_cert, "not_valid_before")
+            <= now
+            <= _utc_time(responder_cert, "not_valid_after")
+        ):
+            raise ConnectionError("delegate certificate is outside its validity period")
         cert_to_validate = responder_cert
 
     if validate:
+        # The issuer and any delegated responder certificate come from the
+        # peer's chain, the AIA fetch or the response itself, none of which is
+        # authenticated. Without these checks anyone can mint a key pair with
+        # the issuer's name and sign a GOOD response for a revoked certificate.
+        try:
+            cert.verify_directly_issued_by(issuer_cert)
+            if cert_to_validate is not issuer_cert:
+                cert_to_validate.verify_directly_issued_by(issuer_cert)
+        except (ValueError, TypeError, InvalidSignature):
+            raise ConnectionError(
+                f"certificate was not issued by {issuer_cert.subject.rfc4514_string()}"
+            )
         _verify_response(cert_to_validate, ocsp_response)
     return True
 
@@ -164,7 +207,7 @@ def ocsp_staple_verifier(con, ocsp_bytes, expected=None):
         if peer_cert != e:
             raise ConnectionError("received and expected certificates do not match")
 
-    return _check_certificate(issuer_cert, ocsp_bytes)
+    return _check_certificate(issuer_cert, peer_cert, ocsp_bytes)
 
 
 class OCSPVerifier:
@@ -263,7 +306,11 @@ class OCSPVerifier:
         path = base64.b64encode(
             request.public_bytes(hazmat.primitives.serialization.Encoding.DER)
         )
-        url = urljoin(server, path.decode("ascii"))
+        # RFC 6960 Appendix A.1: the base64 is url-encoded and appended to the
+        # responder url.
+        if not server.endswith("/"):
+            server += "/"
+        url = server + quote(path.decode("ascii"), safe="")
         return url
 
     def check_certificate(self, server, cert, issuer_url):
@@ -285,7 +332,7 @@ class OCSPVerifier:
         r = requests.get(ocsp_url, headers=header)
         if not r.ok:
             raise ConnectionError("failed to fetch ocsp certificate")
-        return _check_certificate(issuer_cert, r.content, True)
+        return _check_certificate(issuer_cert, cert, r.content, True)
 
     def is_valid(self):
         """Returns the validity of the certificate wrapping our socket.
@@ -295,14 +342,10 @@ class OCSPVerifier:
         the validity of OCSP revocation status.
         """
 
-        # validate the certificate
-        try:
-            cert, issuer_url, ocsp_server = self.components_from_socket()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
-        except AuthorizationError:
-            cert, issuer_url, ocsp_server = self.components_from_direct_connection()
-            if issuer_url is None:
-                raise ConnectionError("no issuers found in certificate chain")
-            return self.check_certificate(ocsp_server, cert, issuer_url)
+        # validate the certificate. An UNAUTHORIZED response fails closed:
+        # OCSP error statuses are unsigned, and asking again about the same
+        # certificate would send the responder the identical request.
+        cert, issuer_url, ocsp_server = self.components_from_socket()
+        if issuer_url is None:
+            raise ConnectionError("no issuers found in certificate chain")
+        return self.check_certificate(ocsp_server, cert, issuer_url)

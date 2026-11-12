@@ -20,6 +20,7 @@ from redis.keyspace_notifications import (
 )
 
 
+@pytest.mark.fixed_client
 class TestAsyncStandaloneKeyspaceNotificationsMocked:
     """
     Mock-based unit tests for AsyncKeyspaceNotifications (standalone Redis).
@@ -344,6 +345,7 @@ class TestAsyncStandaloneKeyspaceNotificationsMocked:
         await notifications.aclose()
 
 
+@pytest.mark.fixed_client
 class TestAsyncClusterKeyspaceNotificationsMocked:
     """
     Mock-based unit tests for AsyncClusterKeyspaceNotifications.
@@ -738,12 +740,13 @@ class TestAsyncSubkeyNotifications:
             else [notifications._pubsub]
         )
         for pubsub in pubsubs:
-            while True:
-                msg = await pubsub.get_message(timeout=0.05)
-                if msg is None:
-                    break
-                if msg["type"] not in ("subscribe", "psubscribe"):
-                    break
+            # One ack per subscribed channel or pattern. Reading exactly that
+            # many, each with a generous timeout, cannot stop early on a slow
+            # runner and leave an ack for the test to read.
+            for _ in range(len(pubsub.channels) + len(pubsub.patterns)):
+                msg = await pubsub.get_message(timeout=2.0)
+                assert msg is not None, "subscribe ack not received"
+                assert msg["type"] in ("subscribe", "psubscribe"), msg
 
     @pytest.mark.asyncio
     async def test_create_hash_field_subkeyspace_notification(
@@ -1017,12 +1020,9 @@ class TestAsyncSubkeyNotifications:
         await notifications.subscribe_subkeyspaceitem("test:hash8", "watched_field")
         await self._drain_subscribe_messages(notifications)
 
-        # Modify a different field — should NOT trigger a notification
+        # Modify a different field, then the watched one. Notifications arrive
+        # in order, so if the first write had notified, it would be read first.
         await r.hset("test:hash8", "other_field", "value")
-        msg = await notifications.get_message(timeout=1.0)
-        assert msg is None
-
-        # Modify the watched field — should trigger a notification
         await r.hset("test:hash8", "watched_field", "updated")
         msg = await notifications.get_message(timeout=2.0)
         assert msg is not None
@@ -1096,10 +1096,13 @@ class TestAsyncSubkeyNotifications:
             assert msg.key == "test:hash10"
             assert msg.event_type == "hset"
 
-        # A non-matching field should NOT produce a notification
+        # A non-matching field should NOT produce a notification. Write it
+        # before a matching one: if it notified, it would be read first.
         await r.hset("test:hash10", "other", "value")
-        msg = await notifications.get_message(timeout=1.0)
-        assert msg is None
+        await r.hset("test:hash10", "field4", "value4")
+        msg = await notifications.get_message(timeout=2.0)
+        assert msg is not None
+        assert msg.subkeys == ["field4"]
 
         await notifications.aclose()
         await r.delete("test:hash10")

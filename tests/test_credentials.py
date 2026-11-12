@@ -2,6 +2,7 @@ import functools
 import random
 import string
 import threading
+import time
 from time import sleep
 from typing import Optional, Tuple, Union
 from unittest.mock import Mock, call
@@ -31,6 +32,19 @@ try:
     from redis_entraid.cred_provider import EntraIdCredentialsProvider
 except ImportError:
     EntraIdCredentialsProvider = None
+
+
+def _wait_until_passes(check, timeout=5.0):
+    """Re-run ``check`` until its assertions pass, or re-raise at the deadline."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            check()
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            sleep(0.01)
 
 
 @pytest.fixture()
@@ -66,6 +80,19 @@ def r_entra(request, endpoint):
 class NoPassCredProvider(CredentialProvider):
     def get_credentials(self) -> Union[Tuple[str], Tuple[str, str]]:
         return "username", ""
+
+
+class FlakyCredProvider(CredentialProvider):
+    """Fails on the first fetch only, as a token or secrets backend can."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_credentials(self) -> Union[Tuple[str], Tuple[str, str]]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RequestTokenErr("token endpoint unavailable")
+        return "username", "password"
 
 
 class RandomAuthCredProvider(CredentialProvider):
@@ -222,6 +249,26 @@ class TestCredentialsProvider:
         assert e.match("invalid username-password")
 
     @pytest.mark.onlynoncluster
+    def test_credential_provider_error_does_not_skip_authentication(self, r, request):
+        init_acl_user(r, request, "username", "password")
+        provider = FlakyCredProvider()
+        r2 = _get_client(
+            redis.Redis,
+            request,
+            flushdb=False,
+            single_connection_client=False,
+            credential_provider=provider,
+        )
+
+        with pytest.raises(RequestTokenErr):
+            r2.ping()
+
+        # The failed connection must not be reused as if the handshake had run
+        assert r2.ping() is True
+        assert provider.calls == 2
+        assert "username" in [client["user"] for client in r.client_list()]
+
+    @pytest.mark.onlynoncluster
     def test_password_and_username_together_with_cred_provider_raise_error(
         self, r, request
     ):
@@ -302,7 +349,7 @@ class TestUsernamePasswordCredentialProvider:
         assert r2.ping() is True
 
 
-@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
 @pytest.mark.skipif(not EntraIdCredentialsProvider, reason="requires redis-entraid")
 class TestStreamingCredentialProvider:
     @pytest.mark.parametrize(
@@ -351,14 +398,18 @@ class TestStreamingCredentialProvider:
         )
 
         credential_provider.get_credentials()
-        sleep(0.5)
 
-        mock_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -426,11 +477,16 @@ class TestStreamingCredentialProvider:
         )
 
         credential_provider.get_credentials()
-        sleep(0.5)
 
-        mock_connection.read_response.assert_has_calls([call()])
-        mock_another_connection.read_response.assert_has_calls([call()])
-        mock_failed_connection.read_response.assert_has_calls([call(), call(), call()])
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            mock_connection.read_response.assert_has_calls([call()])
+            mock_another_connection.read_response.assert_has_calls([call()])
+            mock_failed_connection.read_response.assert_has_calls(
+                [call(), call(), call()]
+            )
+
+        _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -487,17 +543,21 @@ class TestStreamingCredentialProvider:
         p = r.pubsub()
         p.subscribe("test")
         credential_provider.get_credentials()
-        sleep(0.5)
 
-        mock_pubsub_connection.send_command.assert_has_calls(
-            [
-                call("SUBSCRIBE", "test", check_health=True),
-                call("AUTH", auth_token.try_get("oid"), auth_token.get_value()),
-            ]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_pubsub_connection.send_command.assert_has_calls(
+                [
+                    call("SUBSCRIBE", "test", check_health=True),
+                    call("AUTH", auth_token.try_get("oid"), auth_token.get_value()),
+                ]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -554,16 +614,20 @@ class TestStreamingCredentialProvider:
         p = r.pubsub()
         p.subscribe("test")
         credential_provider.get_credentials()
-        sleep(0.5)
 
-        mock_pubsub_connection.send_command.assert_has_calls(
-            [
-                call("SUBSCRIBE", "test", check_health=True),
-            ]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_pubsub_connection.send_command.assert_has_calls(
+                [
+                    call("SUBSCRIBE", "test", check_health=True),
+                ]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",

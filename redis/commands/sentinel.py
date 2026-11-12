@@ -243,7 +243,7 @@ class SentinelCommands:
         is persisted on disk across restart).
         However sometimes it is possible that the configuration file is lost
         because of operation errors, disk failures, package upgrade scripts or
-        configuration managers. In those cases a way to to force Sentinel to
+        configuration managers. In those cases a way to force Sentinel to
         rewrite the configuration file is handy.
 
         This command works even if the previous configuration file is

@@ -1,6 +1,8 @@
+import asyncio
 import functools
 import random
 import string
+import time
 from asyncio import Lock as AsyncLock
 from asyncio import sleep as async_sleep
 from typing import Optional, Tuple, Union
@@ -25,6 +27,19 @@ try:
     from redis_entraid.cred_provider import EntraIdCredentialsProvider
 except ImportError:
     EntraIdCredentialsProvider = None
+
+
+async def _wait_until_passes(check, timeout=5.0):
+    """Re-run ``check`` until its assertions pass, or re-raise at the deadline."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            check()
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            await async_sleep(0.01)
 
 
 @pytest.fixture()
@@ -92,6 +107,24 @@ async def r_required_pass_teardown(r: redis.Redis):
 class NoPassCredProvider(CredentialProvider):
     def get_credentials(self) -> Union[Tuple[str], Tuple[str, str]]:
         return "username", ""
+
+
+class FlakyCredProvider(CredentialProvider):
+    """Fails, or stalls until cancelled, on the first fetch only."""
+
+    def __init__(self, stall: bool = False):
+        self.stall = stall
+        self.calls = 0
+        self.fetching = asyncio.Event()
+
+    async def get_credentials_async(self) -> Union[Tuple[str], Tuple[str, str]]:
+        self.calls += 1
+        if self.calls == 1:
+            self.fetching.set()
+            if self.stall:
+                await asyncio.Event().wait()
+            raise RequestTokenErr("token endpoint unavailable")
+        return "username", "password"
 
 
 class AsyncRandomAuthCredProvider(CredentialProvider):
@@ -245,6 +278,47 @@ class TestCredentialsProvider:
         assert await r.acl_deluser(username)
 
     @pytest.mark.onlynoncluster
+    @pytest.mark.parametrize("create_redis", [(False,)], ids=["pool"], indirect=True)
+    async def test_credential_provider_error_does_not_skip_authentication(
+        self, r_acl_teardown, create_redis
+    ):
+        username = "username"
+        r = r_acl_teardown(username)
+        await init_acl_user(r, username, "password")
+        provider = FlakyCredProvider()
+        r2 = await create_redis(flushdb=False, credential_provider=provider)
+
+        with pytest.raises(RequestTokenErr):
+            await r2.ping()
+
+        # The failed connection must not be reused as if the handshake had run
+        assert await r2.ping() is True
+        assert provider.calls == 2
+        assert username in [client["user"] for client in await r.client_list()]
+
+    @pytest.mark.onlynoncluster
+    @pytest.mark.parametrize("create_redis", [(False,)], ids=["pool"], indirect=True)
+    async def test_cancelled_credential_fetch_does_not_skip_authentication(
+        self, r_acl_teardown, create_redis
+    ):
+        username = "username"
+        r = r_acl_teardown(username)
+        await init_acl_user(r, username, "password")
+        provider = FlakyCredProvider(stall=True)
+        r2 = await create_redis(flushdb=False, credential_provider=provider)
+
+        ping = asyncio.create_task(r2.ping())
+        await provider.fetching.wait()
+        ping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ping
+
+        # The failed connection must not be reused as if the handshake had run
+        assert await r2.ping() is True
+        assert provider.calls == 2
+        assert username in [client["user"] for client in await r.client_list()]
+
+    @pytest.mark.onlynoncluster
     async def test_password_and_username_together_with_cred_provider_raise_error(
         self, r_acl_teardown, create_redis
     ):
@@ -324,8 +398,8 @@ class TestUsernamePasswordCredentialProvider:
         assert await r2.ping() is True
 
 
+@pytest.mark.fixed_client
 @pytest.mark.asyncio
-@pytest.mark.onlynoncluster
 @pytest.mark.skipif(not EntraIdCredentialsProvider, reason="requires redis-entraid")
 class TestStreamingCredentialProvider:
     @pytest.mark.parametrize(
@@ -370,14 +444,18 @@ class TestStreamingCredentialProvider:
         )
 
         await credential_provider.get_credentials_async()
-        await async_sleep(0.5)
 
-        mock_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        await _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -436,11 +514,16 @@ class TestStreamingCredentialProvider:
         )
 
         await credential_provider.get_credentials_async()
-        await async_sleep(0.5)
 
-        mock_connection.read_response.assert_has_calls([call()])
-        mock_another_connection.read_response.assert_has_calls([call()])
-        mock_failed_connection.read_response.assert_has_calls([call(), call(), call()])
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            mock_connection.read_response.assert_has_calls([call()])
+            mock_another_connection.read_response.assert_has_calls([call()])
+            mock_failed_connection.read_response.assert_has_calls(
+                [call(), call(), call()]
+            )
+
+        await _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -503,17 +586,21 @@ class TestStreamingCredentialProvider:
         p = r.pubsub()
         await p.subscribe("test")
         await credential_provider.get_credentials_async()
-        await async_sleep(0.5)
 
-        mock_pubsub_connection.send_command.assert_has_calls(
-            [
-                call("SUBSCRIBE", "test", check_health=True),
-                call("AUTH", auth_token.try_get("oid"), auth_token.get_value()),
-            ]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_pubsub_connection.send_command.assert_has_calls(
+                [
+                    call("SUBSCRIBE", "test", check_health=True),
+                    call("AUTH", auth_token.try_get("oid"), auth_token.get_value()),
+                ]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        await _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",
@@ -576,16 +663,20 @@ class TestStreamingCredentialProvider:
         p = r.pubsub()
         await p.subscribe("test")
         await credential_provider.get_credentials_async()
-        await async_sleep(0.5)
 
-        mock_pubsub_connection.send_command.assert_has_calls(
-            [
-                call("SUBSCRIBE", "test", check_health=True),
-            ]
-        )
-        mock_another_connection.send_command.assert_has_calls(
-            [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
-        )
+        # the re-auth runs in the background; poll instead of sleeping
+        def reauth_done():
+            assert auth_token is not None
+            mock_pubsub_connection.send_command.assert_has_calls(
+                [
+                    call("SUBSCRIBE", "test", check_health=True),
+                ]
+            )
+            mock_another_connection.send_command.assert_has_calls(
+                [call("AUTH", auth_token.try_get("oid"), auth_token.get_value())]
+            )
+
+        await _wait_until_passes(reauth_done)
 
     @pytest.mark.parametrize(
         "credential_provider",

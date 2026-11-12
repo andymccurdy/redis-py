@@ -220,24 +220,37 @@ class EventType:
     SETIFNE = "setifne"
 
 
-def _parse_length_prefixed_subkeys(s: str) -> list[str]:
+def _parse_length_prefixed_subkeys(s: bytes | str) -> list[str]:
     """Parse a length-prefixed subkey list.
 
     The wire format is ``<len>:<subkey>[,<len>:<subkey>...]``.
 
+    The server writes ``<len>`` as the subkey size in **bytes** (it uses
+    ``sdslen`` when formatting the notification), so parsing must happen in
+    the byte domain; splitting the decoded string by character count
+    corrupts every multi-byte subkey and desynchronizes the whole list.
+
     Returns:
         A list of subkey strings.
     """
+    raw = s.encode("utf-8") if isinstance(s, str) else bytes(s)
     subkeys: list[str] = []
     pos = 0
-    while pos < len(s):
-        colon = s.index(":", pos)
-        length = int(s[pos:colon])
+    while pos < len(raw):
+        colon = raw.find(b":", pos)
+        if colon < 0 or not raw[pos:colon].isdigit():
+            raise ValueError("Invalid subkey length prefix")
+        length = int(raw[pos:colon])
         start = colon + 1
-        subkeys.append(s[start : start + length])
-        pos = start + length
-        if pos < len(s) and s[pos] == ",":
-            pos += 1  # skip comma separator
+        end = start + length
+        if end > len(raw):
+            raise ValueError("Truncated subkey")
+        subkeys.append(raw[start:end].decode("utf-8", "replace"))
+        pos = end
+        if pos < len(raw):
+            if raw[pos] != ord(",") or pos + 1 == len(raw):
+                raise ValueError("Invalid subkey separator")
+            pos += 1
     return subkeys
 
 
@@ -265,14 +278,17 @@ class KeyNotification:
 
     # Regex patterns for parsing keyspace/keyevent channels
     # Pattern: __keyspace@<db>__:<key> or __keyevent@<db>__:<event>
+    # A key may contain any byte, newlines included, so the patterns that capture
+    # one need re.DOTALL: without it "." stops at a newline and "$" matches before
+    # a trailing one, dropping or truncating the key.
     _KEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__keyspace@(\d+|\*)__:(.+)$"
+        r"^__keyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _KEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__keyevent@(\d+|\*)__:(.+)$"
     )
     _SUBKEYSPACE_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__subkeyspace@(\d+|\*)__:(.+)$"
+        r"^__subkeyspace@(\d+|\*)__:(.*)$", re.DOTALL
     )
     _SUBKEYEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^__subkeyevent@(\d+|\*)__:(.+)$"
@@ -281,7 +297,7 @@ class KeyNotification:
         r"^__subkeyspaceitem@(\d+|\*)__:(.+)$", re.DOTALL
     )
     _SUBKEYSPACEEVENT_PATTERN: ClassVar[re.Pattern] = re.compile(
-        r"^__subkeyspaceevent@(\d+|\*)__:(.+)$"
+        r"^__subkeyspaceevent@(\d+|\*)__:(.+)$", re.DOTALL
     )
 
     key: str
@@ -365,10 +381,14 @@ class KeyNotification:
         Returns:
             A KeyNotification if valid, None otherwise.
         """
+        raw_data = bytes(data) if isinstance(data, (bytes, bytearray)) else None
         channel = safe_str(channel)
         data = safe_str(data)
 
-        return cls._parse(channel, data, key_prefix)
+        try:
+            return cls._parse(channel, data, key_prefix, raw_data=raw_data)
+        except ValueError:
+            return None
 
     @classmethod
     def _parse(
@@ -376,10 +396,16 @@ class KeyNotification:
         channel: str,
         data: str,
         key_prefix: str | bytes | None = None,
+        raw_data: bytes | None = None,
     ) -> KeyNotification | None:
         """Internal parsing logic."""
         # Normalize key_prefix
         key_prefix = safe_str(key_prefix) if key_prefix else None
+        # Byte-domain view of the payload: the server prefixes every element
+        # with its size in bytes (sdslen), so length-prefixed fields must be
+        # split before decoding. When the caller only has the decoded string
+        # (decode_responses=True) the exact bytes are recovered by re-encoding.
+        raw = raw_data if raw_data is not None else data.encode("utf-8")
 
         # Try keyspace pattern first: __keyspace@<db>__:<key>
         match = cls._KEYSPACE_PATTERN.match(channel)
@@ -431,9 +457,9 @@ class KeyNotification:
         if match:
             db_str, key = match.groups()
             database = int(db_str) if db_str != "*" else -1
-            pipe_idx = data.index("|")
-            event_type = data[:pipe_idx]
-            subkeys = _parse_length_prefixed_subkeys(data[pipe_idx + 1 :])
+            pipe_idx = raw.index(b"|")
+            event_type = raw[:pipe_idx].decode("utf-8", "replace")
+            subkeys = _parse_length_prefixed_subkeys(raw[pipe_idx + 1 :])
 
             if key_prefix:
                 if not key.startswith(key_prefix):
@@ -457,13 +483,16 @@ class KeyNotification:
             db_str, event_type = match.groups()
             database = int(db_str) if db_str != "*" else -1
             # Parse key by length prefix
-            colon_idx = data.index(":")
-            key_len = int(data[:colon_idx])
+            colon_idx = raw.index(b":")
+            key_len = int(raw[:colon_idx])
             key_start = colon_idx + 1
-            key = data[key_start : key_start + key_len]
+            separator = key_start + key_len
+            if key_len < 0 or separator >= len(raw) or raw[separator] != ord("|"):
+                raise ValueError("Invalid subkeyevent key separator")
+            key = raw[key_start : key_start + key_len].decode("utf-8", "replace")
             # After key, expect '|' then subkeys
-            subkeys_start = key_start + key_len + 1  # +1 for '|'
-            subkeys = _parse_length_prefixed_subkeys(data[subkeys_start:])
+            subkeys_start = separator + 1
+            subkeys = _parse_length_prefixed_subkeys(raw[subkeys_start:])
 
             if key_prefix:
                 if not key.startswith(key_prefix):
@@ -515,7 +544,7 @@ class KeyNotification:
             pipe_idx = event_and_key.index("|")
             event_type = event_and_key[:pipe_idx]
             key = event_and_key[pipe_idx + 1 :]
-            subkeys = _parse_length_prefixed_subkeys(data)
+            subkeys = _parse_length_prefixed_subkeys(raw)
 
             if key_prefix:
                 if not key.startswith(key_prefix):

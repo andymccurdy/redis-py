@@ -110,13 +110,21 @@ def fixed_client_tests(c, uvloop=False, profile=False):
     """Run tests that use the fixed client fixture."""
     _ensure_junit_results_dir()
     profile_arg = "--profile" if profile else ""
+    # Ignore the scenario suites explicitly, as standalone_tests and cluster_tests
+    # do. `-m fixed_client` deselects after collection, so without this pytest still
+    # imports them - and the maint-notification scenario modules call
+    # generate_params() inside @pytest.mark.parametrize, which queries the fault
+    # injector at class-definition time and fails collection where none is running.
+    ignore_scenario = (
+        "--ignore=tests/test_scenario --ignore=tests/test_asyncio/test_scenario"
+    )
     if uvloop:
         run(
-            f"pytest {profile_arg} --uvloop --cov=./ --cov-report=xml:coverage_fixed_client_uvloop.xml --junit-xml=junit-results/fixed_client-uvloop-results.xml -m fixed_client"
+            f"pytest {profile_arg} {ignore_scenario} --uvloop --cov=./ --cov-report=xml:coverage_fixed_client_uvloop.xml --junit-xml=junit-results/fixed_client-uvloop-results.xml -m fixed_client"
         )
     else:
         run(
-            f"pytest {profile_arg} --cov=./ --cov-report=xml:coverage_fixed_client.xml --junit-xml=junit-results/fixed_client-results.xml -m fixed_client"
+            f"pytest {profile_arg} {ignore_scenario} --cov=./ --cov-report=xml:coverage_fixed_client.xml --junit-xml=junit-results/fixed_client-results.xml -m fixed_client"
         )
 
 

@@ -106,6 +106,47 @@ Connection Pools
 
 See complete example: `here <examples/connection_examples.html>`__
 
+Each client takes its connections from a pool. Since redis-py 8.0, a ``ConnectionPool`` holds at
+most 100 connections by default (``max_connections=100``). When all of them are in use, it does
+not wait for one to be released: it raises ``MaxConnectionsError`` ("Too many connections")
+straight away. This is easiest to hit with the asyncio client, where many commands can be in
+flight at the same time.
+
+There are two ways to handle bursts of concurrent requests:
+
+* Raise the limit, if Redis and your system can take more connections:
+
+  .. code-block:: python
+
+     import redis
+
+     r = redis.Redis(host="localhost", port=6379, max_connections=500)
+
+* Use a ``BlockingConnectionPool``. When all of its connections are in use, a caller waits for one
+  to be released, for up to ``timeout`` seconds, and only then raises ``ConnectionError``:
+
+  .. code-block:: python
+
+     import redis
+
+     pool = redis.BlockingConnectionPool(
+         host="localhost", port=6379, max_connections=100, timeout=10
+     )
+     r = redis.Redis(connection_pool=pool)
+
+  The asyncio client has the same pool:
+
+  .. code-block:: python
+
+     import redis.asyncio
+
+     pool = redis.asyncio.BlockingConnectionPool.from_url(
+         "redis://localhost:6379", max_connections=100, timeout=10
+     )
+     r = redis.asyncio.Redis.from_pool(pool)
+
+  ``BlockingConnectionPool`` has its own defaults: 50 connections and a 20 second timeout.
+
 ConnectionPool
 ==============
 .. autoclass:: redis.connection.ConnectionPool
@@ -114,4 +155,14 @@ ConnectionPool
 ConnectionPool (Async)
 ======================
 .. autoclass:: redis.asyncio.connection.ConnectionPool
+    :members:
+
+BlockingConnectionPool
+======================
+.. autoclass:: redis.connection.BlockingConnectionPool
+    :members:
+
+BlockingConnectionPool (Async)
+==============================
+.. autoclass:: redis.asyncio.connection.BlockingConnectionPool
     :members:

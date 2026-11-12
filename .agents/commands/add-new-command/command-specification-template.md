@@ -20,6 +20,14 @@ $COMMAND_NAME $key $member [NX|XX] [CH] [INCR]
 
 Add relevant Redis-CLI examples here.
 
+## Command metadata
+
+Paste the output of `COMMAND INFO $COMMAND_NAME` from a server that ships the command. It is
+the source for the command's record in `_STATIC_COMMAND_METADATA`
+(`redis/commands/metadata.py`): the command flags, the `request_policy:` / `response_policy:`
+/ `nondeterministic_output` / `dont_cache` tips and the key specifications. For a container
+command, include the nested subcommands.
+
 ## Test plan
 
 Specify how you want to test the command in terms of integration testing. For example:

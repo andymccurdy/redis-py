@@ -43,6 +43,19 @@ def parse_vemb_result(response, **options):
         return result
 
 
+def parse_vemb_result_unified(response, **options):
+    """
+    Handle VEMB result for unified responses.
+
+    RESP3 returns the vector components as doubles, while the RESP2 parsing
+    above returns components with integral values as ints. Return floats so
+    the result is the same on both protocols.
+    """
+    if response is None or options.get(CallbacksOptions.RAW.value):
+        return parse_vemb_result(response, **options)
+    return [float(value) for value in response]
+
+
 def parse_vlinks_result(response, **options):
     """
     Handle VLINKS result since the command can be returning different result
@@ -87,6 +100,11 @@ def parse_vsim_result(response, **options):
 
     withscores = bool(options.get(CallbacksOptions.WITHSCORES.value))
     withattribs = bool(options.get(CallbacksOptions.WITHATTRIBS.value))
+
+    # Redis replies to a missing key with an empty array, also with RESP3,
+    # where the elements with scores or attributes are otherwise in a map
+    if not response and (withscores or withattribs):
+        return {}
 
     # Exactly one of withscores or withattribs is True
     if (withscores and not withattribs) or (not withscores and withattribs):

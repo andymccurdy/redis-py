@@ -6,29 +6,35 @@ import pytest
 
 from redis.background import BackgroundScheduler
 
+# The scheduler waits with ``loop.call_later``, whose timer can fire a hair
+# before the requested delay on a coarse event loop clock. Far below any
+# interval a test asserts on, so it cannot mask a callback that ran early.
+EVENT_LOOP_TIMER_SLACK = 0.005
 
+
+def _wait_until(predicate, timeout=5.0):
+    """Poll until ``predicate()`` is true; fail if the deadline passes first.
+
+    The deadline only matters on a stalled runner: a passing run returns as
+    soon as the condition holds.
+    """
+    deadline = monotonic() + timeout
+    while not predicate():
+        assert monotonic() < deadline, "condition not met before the deadline"
+        sleep(0.002)
+
+
+async def _wait_until_async(predicate, timeout=5.0):
+    """Async twin of ``_wait_until``."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, "condition not met before the deadline"
+        await asyncio.sleep(0.002)
+
+
+@pytest.mark.fixed_client
 class TestBackgroundScheduler:
-    @staticmethod
-    def _wait_for_calls(execute_counter, min_call_count, timeout):
-        if min_call_count == 0:
-            sleep(timeout)
-            return
-
-        deadline = monotonic() + max(timeout, 0.2)
-        while len(execute_counter) < min_call_count and monotonic() < deadline:
-            sleep(0.002)
-
-    @staticmethod
-    async def _wait_for_calls_async(execute_counter, min_call_count, timeout):
-        if min_call_count == 0:
-            await asyncio.sleep(timeout)
-            return
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(timeout, 0.2)
-        while len(execute_counter) < min_call_count and loop.time() < deadline:
-            await asyncio.sleep(0.002)
-
     def test_run_once(self):
         execute_counter = 0
         one = "arg1"
@@ -45,22 +51,24 @@ class TestBackgroundScheduler:
             assert arg2 == two
 
         scheduler = BackgroundScheduler()
+        registered = monotonic()
         scheduler.run_once(0.1, callback, one, two)
         assert execute_counter == 0
 
-        sleep(0.15)
+        _wait_until(lambda: execute_counter >= 1)
+        called = monotonic()
 
         assert execute_counter == 1
+        assert called - registered >= 0.1 - EVENT_LOOP_TIMER_SLACK
 
     @pytest.mark.parametrize(
-        "interval,timeout,min_call_count",
+        "interval,min_call_count",
         [
-            (0.012, 0.04, 2),  # At least 2 calls (was 3, but timing on CI can vary)
-            (0.035, 0.04, 1),
-            (0.045, 0.04, 0),
+            (0.012, 2),
+            (0.035, 1),
         ],
     )
-    def test_run_recurring(self, interval, timeout, min_call_count):
+    def test_run_recurring(self, interval, min_call_count):
         execute_counter = []
         one = "arg1"
         two = 9999
@@ -70,30 +78,29 @@ class TestBackgroundScheduler:
             nonlocal one
             nonlocal two
 
-            execute_counter.append(1)
+            execute_counter.append(monotonic())
 
             assert arg1 == one
             assert arg2 == two
 
         scheduler = BackgroundScheduler()
+        registered = monotonic()
         scheduler.run_recurring(interval, callback, one, two)
         assert len(execute_counter) == 0
 
-        self._wait_for_calls(execute_counter, min_call_count, timeout)
-
-        # Use >= instead of == to account for timing variations on CI runners
-        assert len(execute_counter) >= min_call_count
+        _wait_until(lambda: len(execute_counter) >= min_call_count)
+        # the first call waits out the interval, rather than firing on registration
+        assert execute_counter[0] - registered >= interval - EVENT_LOOP_TIMER_SLACK
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "interval,timeout,min_call_count",
+        "interval,min_call_count",
         [
-            (0.012, 0.04, 2),  # At least 2 calls (was 3, but timing on CI can vary)
-            (0.035, 0.04, 1),
-            (0.045, 0.04, 0),
+            (0.012, 2),
+            (0.035, 1),
         ],
     )
-    async def test_run_recurring_async(self, interval, timeout, min_call_count):
+    async def test_run_recurring_async(self, interval, min_call_count):
         execute_counter = []
         one = "arg1"
         two = 9999
@@ -103,29 +110,28 @@ class TestBackgroundScheduler:
             nonlocal one
             nonlocal two
 
-            execute_counter.append(1)
+            execute_counter.append(monotonic())
 
             assert arg1 == one
             assert arg2 == two
 
         scheduler = BackgroundScheduler()
+        registered = monotonic()
         await scheduler.run_recurring_async(interval, callback, one, two)
         assert len(execute_counter) == 0
 
-        await self._wait_for_calls_async(execute_counter, min_call_count, timeout)
-
-        # Use >= instead of == to account for timing variations on CI runners
-        assert len(execute_counter) >= min_call_count
+        await _wait_until_async(lambda: len(execute_counter) >= min_call_count)
+        # the first call waits out the interval, rather than firing on registration
+        assert execute_counter[0] - registered >= interval - EVENT_LOOP_TIMER_SLACK
 
     @pytest.mark.parametrize(
-        "interval,timeout,min_call_count",
+        "interval,min_call_count",
         [
-            (0.012, 0.04, 2),  # At least 2 calls
-            (0.035, 0.04, 1),
-            (0.045, 0.04, 0),
+            (0.012, 2),
+            (0.035, 1),
         ],
     )
-    def test_run_recurring_coro(self, interval, timeout, min_call_count):
+    def test_run_recurring_coro(self, interval, min_call_count):
         """
         Test that run_recurring_coro executes coroutines in a background thread.
         This is used by sync MultiDBClient for async health checks.
@@ -136,19 +142,19 @@ class TestBackgroundScheduler:
 
         async def coro_callback(arg1: str, arg2: int):
             nonlocal execute_counter
-            execute_counter.append(1)
+            execute_counter.append(monotonic())
             assert arg1 == one
             assert arg2 == two
 
         scheduler = BackgroundScheduler()
+        registered = monotonic()
         scheduler.run_recurring_coro(interval, coro_callback, one, two)
         assert len(execute_counter) == 0
 
-        self._wait_for_calls(execute_counter, min_call_count, timeout)
-
-        # Use >= instead of == to account for timing variations on CI runners
-        assert len(execute_counter) >= min_call_count
+        _wait_until(lambda: len(execute_counter) >= min_call_count)
         scheduler.stop()
+        # the first call waits out the interval, rather than firing on registration
+        assert execute_counter[0] - registered >= interval - EVENT_LOOP_TIMER_SLACK
 
     def test_run_recurring_coro_runs_in_background_thread(self):
         """
@@ -164,9 +170,8 @@ class TestBackgroundScheduler:
         scheduler = BackgroundScheduler()
         scheduler.run_recurring_coro(0.01, coro_callback)
 
-        sleep(0.05)  # Wait for at least one execution
+        _wait_until(lambda: len(coro_thread_ids) >= 1)
 
-        assert len(coro_thread_ids) >= 1
         # Coroutine should run in a different thread than main
         assert all(tid != main_thread_id for tid in coro_thread_ids)
         scheduler.stop()
@@ -198,12 +203,11 @@ class TestBackgroundScheduler:
         scheduler.run_recurring_coro(0.01, slow_coro, "slow")
         scheduler.run_recurring_coro(0.01, fast_coro, "fast")
 
-        sleep(0.1)
-        scheduler.stop()
-
         # Both coroutines should have executed
-        assert "slow_start" in execution_order
-        assert "fast_start" in execution_order
+        _wait_until(
+            lambda: "slow_start" in execution_order and "fast_start" in execution_order
+        )
+        scheduler.stop()
 
     def test_run_recurring_coro_with_timeout(self):
         """
@@ -226,11 +230,9 @@ class TestBackgroundScheduler:
         scheduler = BackgroundScheduler()
         scheduler.run_recurring_coro(0.02, coro_with_timeout)
 
-        sleep(0.1)
-        scheduler.stop()
-
         # Should have at least one timeout result
-        assert len(results) >= 1
+        _wait_until(lambda: len(results) >= 1)
+        scheduler.stop()
         assert all(r[0] == "timeout" for r in results)
 
     def test_run_recurring_coro_stops_cleanly(self):
@@ -245,11 +247,11 @@ class TestBackgroundScheduler:
         scheduler = BackgroundScheduler()
         scheduler.run_recurring_coro(0.01, coro_callback)
 
-        sleep(0.05)
+        _wait_until(lambda: len(execute_counter) >= 1)
         count_before_stop = len(execute_counter)
-        assert count_before_stop >= 1
 
         scheduler.stop()
+        # a negative window: no new execution may start during it
         sleep(0.05)
 
         # No more executions after stop
@@ -273,13 +275,9 @@ class TestBackgroundScheduler:
         scheduler = BackgroundScheduler()
         scheduler.run_recurring_coro(0.01, flaky_coro)
 
-        sleep(0.1)
+        # The scheduler keeps running after a coroutine raises
+        _wait_until(lambda: len(success_count) + len(error_count) >= 2)
         scheduler.stop()
-
-        # Both successes and errors should have occurred
-        # (scheduler continues despite exceptions)
-        total_executions = len(success_count) + len(error_count)
-        assert total_executions >= 2
 
     def test_run_recurring_coro_prevents_overlapping_executions(self):
         """
@@ -300,7 +298,8 @@ class TestBackgroundScheduler:
         # Interval is 10ms but execution takes 50ms
         scheduler.run_recurring_coro(0.01, slow_coro)
 
-        sleep(0.2)
+        # Wait for a few runs, so there is something to check for overlaps
+        _wait_until(lambda: sum(1 for event, _ in execution_log if event == "end") >= 3)
         scheduler.stop()
 
         # Verify no overlapping: each "start" should be followed by "end" before next "start"

@@ -4185,6 +4185,8 @@ class PipelineStrategy(AbstractStrategy):
             # A node whose task raised answered none of its commands, so its copies are
             # not taken for successes when they are merged - and the slots of a split
             # command that did succeed are kept for the attempt the error leads to.
+            # A command the merge answered with a success keeps it, as ONE_SUCCEEDED
+            # asks, even though one of its nodes failed.
             for (_, commands), e in zip(nodes.values(), errors):
                 if isinstance(e, BaseException):
                     for queued_command in commands:
@@ -4193,15 +4195,37 @@ class PipelineStrategy(AbstractStrategy):
                 cmd.result = self._merge_node_results(
                     client, cmd, command, copies, splits
                 )
-        for (node, _), e in zip(nodes.values(), errors):
-            if isinstance(e, BaseException):
-                # The write failed (the connection connects lazily on it): the
-                # error carries no node, so take it from the task that raised it
-                if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
-                    e, RedisCluster.NOT_NODE_FAILURE_ERRORS
-                ):
-                    self._try_failed_node_last(client, node)
-                raise e
+        # The first node error that fails a command is raised, but only after every
+        # node whose error fails nothing has been tried last, so the raise skips none
+        # of them and the node it came from is still the one tried last.
+        raised: tuple["ClusterNode", BaseException] | None = None
+        for (node, commands), e in zip(nodes.values(), errors):
+            if not isinstance(e, BaseException):
+                continue
+            # A copy shares the position of the command it was made from, which is
+            # that command's index in the stack. When every command the node held is
+            # a copy of a command that merged to a success, the error fails nothing,
+            # so it is not raised.
+            if not fanned_out or not all(
+                c is not stack[c.position]
+                and not isinstance(stack[c.position].result, BaseException)
+                for c in commands
+            ):
+                if raised is None:
+                    raised = (node, e)
+            # The write failed (the connection connects lazily on it): the error
+            # carries no node, so take it from the task that raised it
+            elif isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+        if raised is not None:
+            node, e = raised
+            if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+            raise e
 
         # Record operation duration for each node
         for (node, commands), failed in zip(nodes.values(), errors):
@@ -4212,7 +4236,8 @@ class PipelineStrategy(AbstractStrategy):
                     node_error = cmd.result
                     break
 
-            if failed:
+            # A node task that raised was tried last above
+            if failed is True:
                 # A read failed. Commands before it may have been redirected,
                 # so look past the first error for a connection error
                 for cmd in commands:

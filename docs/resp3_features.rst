@@ -166,8 +166,10 @@ commands with the ``movablekeys`` flag. Examples are ``SINTERCARD``, ``ZDIFF``, 
 - The static table lists them as keyed commands.
 - With the server metadata, the parser reads their key specs and marks them as keyed.
 
-In both cases, the Cluster client asks the server for their keys with ``COMMAND GETKEYS``
-and routes the command by those keys.
+In both cases, the Cluster client finds their keys from the key specs that ``COMMAND``
+reports and routes the command by those keys. It asks the server with ``COMMAND GETKEYS``
+only when the specs are not enough: a server older than 7.0 without key specs, a spec
+flagged ``incomplete`` or ``variable_flags``, or a keyword search.
 
 The same argument is accepted by ``ConnectionPool`` (configure it there when you supply your
 own ``connection_pool=``) and by ``RedisCluster``, which shares the one resolver with every

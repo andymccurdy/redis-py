@@ -1,6 +1,6 @@
 from base import Benchmark
 
-from redis.connection import SYM_CRLF, SYM_DOLLAR, SYM_EMPTY, SYM_STAR, Connection
+from redis.connection import SYM_CRLF, SYM_EMPTY, Connection
 
 
 class StringJoiningConnection(Connection):
@@ -24,16 +24,9 @@ class StringJoiningConnection(Connection):
     def pack_command(self, *args):
         "Pack a series of arguments into a value Redis command"
         args_output = SYM_EMPTY.join(
-            [
-                SYM_EMPTY.join(
-                    (SYM_DOLLAR, str(len(k)).encode(), SYM_CRLF, k, SYM_CRLF)
-                )
-                for k in map(self.encoder.encode, args)
-            ]
+            [b"$%d\r\n%s\r\n" % (len(k), k) for k in map(self.encoder.encode, args)]
         )
-        output = SYM_EMPTY.join(
-            (SYM_STAR, str(len(args)).encode(), SYM_CRLF, args_output)
-        )
+        output = b"*%d\r\n%s" % (len(args), args_output)
         return output
 
 
@@ -59,20 +52,15 @@ class ListJoiningConnection(Connection):
 
     def pack_command(self, *args):
         output = []
-        buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
+        buff = b"*%d\r\n" % len(args)
 
         for k in map(self.encoder.encode, args):
             if len(buff) > 6000 or len(k) > 6000:
-                buff = SYM_EMPTY.join(
-                    (buff, SYM_DOLLAR, str(len(k)).encode(), SYM_CRLF)
-                )
-                output.append(buff)
+                output.append(b"%s$%d\r\n" % (buff, len(k)))
                 output.append(k)
                 buff = SYM_CRLF
             else:
-                buff = SYM_EMPTY.join(
-                    (buff, SYM_DOLLAR, str(len(k)).encode(), SYM_CRLF, k, SYM_CRLF)
-                )
+                buff = b"%s$%d\r\n%s\r\n" % (buff, len(k), k)
         output.append(buff)
         return output
 

@@ -72,6 +72,7 @@ from redis.exceptions import (
     AskError,
     AuthenticationError,
     ClusterDownError,
+    ClusterError,
     ConnectionError,
     CrossSlotTransactionError,
     DataError,
@@ -3252,7 +3253,8 @@ class TestStaticMetadataRouting:
 
     The ``movablekeys`` reads are the sharp case, and get their own test. Their keys live only in
     the ``COMMAND`` key specifications, so ``first_key_pos`` is 0; their records carry the keyed
-    defaults, and the client finds the keys through ``COMMAND GETKEYS``.
+    defaults, and the client reads the keys from those specs, asking the server with
+    ``COMMAND GETKEYS`` only where a spec is incomplete.
 
     Key extraction itself is covered by ``tests/test_command_parser.py``, so it is stubbed here
     and these tests assert only the node the command is dispatched to.
@@ -4161,13 +4163,10 @@ class TestResponsePolicies:
         finally:
             busy.redis_connection.function_delete("spinlib")
 
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
     @pytest.mark.parametrize(
-        "error",
-        [
-            TryAgainError("TRYAGAIN"),
-            AskError("1 127.0.0.1:7001"),
-            ConnectionError("lost"),
-        ],
+        "error", [ClusterError("TTL exhausted."), ConnectionError("lost")]
     )
     def test_one_succeeded_answers_with_the_success_despite_an_error_in_doubt(
         self, r, error
@@ -4188,9 +4187,9 @@ class TestResponsePolicies:
 
         assert len(sent) == len(r.get_primaries())
 
-    @pytest.mark.parametrize(
-        "error", [TryAgainError("TRYAGAIN"), AskError("1 127.0.0.1:7001")]
-    )
+    # TRYAGAIN and ASK are retried inside ``_execute_command``, and once its TTL runs out
+    # they reach the fan-out loop as this ``ClusterError``
+    @pytest.mark.parametrize("error", [ClusterError("TTL exhausted.")])
     def test_one_succeeded_reports_an_error_in_doubt_when_no_shard_succeeds(
         self, r, error
     ):
@@ -4785,9 +4784,11 @@ class TestTopologyRefreshPacing:
     """
 
     @staticmethod
-    def _nodes_manager():
+    def _nodes_manager(**nodes_manager_kwargs):
         slots = [[0, 16383, ["127.0.0.1", 7000], ["127.0.0.1", 7003]]]
-        patcher, nm = TestNodesManager._refresh_with_cluster_slots([slots] * 10)
+        patcher, nm = TestNodesManager._refresh_with_cluster_slots(
+            [slots] * 10, **nodes_manager_kwargs
+        )
         return patcher, nm
 
     @pytest.mark.fixed_client
@@ -4801,6 +4802,91 @@ class TestTopologyRefreshPacing:
                 assert nm._refresh_due() is True
         finally:
             patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_refresh_is_due_after_the_configured_interval(self):
+        patcher, nm = self._nodes_manager(topology_refresh_min_interval=5.0)
+        try:
+            nm._last_refresh_at = 100.0
+            with patch_monotonic("redis.cluster", 104.9):
+                assert nm._refresh_due() is False
+            with patch_monotonic("redis.cluster", 105.0):
+                assert nm._refresh_due() is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_zero_interval_makes_every_refresh_due_at_once(self):
+        patcher, nm = self._nodes_manager(topology_refresh_min_interval=0)
+        try:
+            nm._last_refresh_at = 100.0
+            with patch_monotonic("redis.cluster", 100.0):
+                assert nm._refresh_due() is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_unset_interval_follows_the_module_default(self):
+        patcher, nm = self._nodes_manager()
+        try:
+            assert nm._topology_refresh_min_interval is None
+            nm._last_refresh_at = 100.0
+            with patch("redis.cluster._TOPOLOGY_REFRESH_MIN_INTERVAL_SECONDS", 3.0):
+                with patch_monotonic("redis.cluster", 102.9):
+                    assert nm._refresh_due() is False
+                with patch_monotonic("redis.cluster", 103.0):
+                    assert nm._refresh_due() is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_configured_interval_is_the_floor_of_the_failure_backoff(self):
+        patcher, nm = self._nodes_manager(topology_refresh_min_interval=0.5)
+        try:
+            nm._last_refresh_at = 100.0
+            nm._failed_refreshes = 3
+            # A longer backoff still wins over the configured interval
+            retry = Retry(RecordingBackoff(step=1.0), 3)
+            with patch_monotonic("redis.cluster", 102.9):
+                assert nm._refresh_due(retry) is False
+            with patch_monotonic("redis.cluster", 103.0):
+                assert nm._refresh_due(retry) is True
+
+            # A shorter one waits the configured interval
+            nm._refresh_due_at = None
+            short_retry = Retry(RecordingBackoff(step=0.1), 3)
+            nm._failed_refreshes = 1
+            with patch_monotonic("redis.cluster", 100.4):
+                assert nm._refresh_due(short_retry) is False
+            with patch_monotonic("redis.cluster", 100.5):
+                assert nm._refresh_due(short_retry) is True
+        finally:
+            patcher.stop()
+
+    @pytest.mark.fixed_client
+    def test_cluster_client_hands_the_interval_to_its_nodes_manager(self):
+        r = get_mocked_redis_client(
+            host=default_host, port=default_port, topology_refresh_min_interval=2.5
+        )
+        assert r.nodes_manager._topology_refresh_min_interval == 2.5
+        # A pipeline shares the client's nodes manager, and so its interval
+        assert r.pipeline().nodes_manager is r.nodes_manager
+        assert (
+            get_mocked_redis_client(
+                host=default_host, port=default_port
+            ).nodes_manager._topology_refresh_min_interval
+            is None
+        )
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("interval", [-1, float("nan"), float("inf")])
+    def test_invalid_interval_is_rejected(self, interval):
+        with pytest.raises(RedisClusterException, match="must be a finite"):
+            RedisCluster(
+                host=default_host,
+                port=default_port,
+                topology_refresh_min_interval=interval,
+            )
 
     @pytest.mark.fixed_client
     def test_failed_refreshes_wait_as_long_as_the_retry_backoff_says(self):

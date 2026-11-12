@@ -18,7 +18,7 @@ from redis import Subscription
 from redis._parsers import Encoder
 from redis.backoff import NoBackoff
 from redis.client import PubSub
-from redis.cluster import ClusterPubSub
+from redis.cluster import _DISPATCHED, ClusterPubSub
 from redis.crc import key_slot
 from redis.event import EventDispatcher
 from redis.exceptions import (
@@ -4576,6 +4576,19 @@ class TestClusterPubSubSlotMigration:
         assert old_ps.reset_calls == 0
         assert old_node.name in pubsub.node_pubsub_mapping
 
+    @contextmanager
+    def _idle_polls(self, pubsub, time_module):
+        """Polls that find nothing and wait out their timeout on a fake clock."""
+        clock = [time.monotonic()]
+
+        def poll(ps, timeout):
+            clock[0] += timeout
+
+        with mock.patch(time_module) as fake_time:
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            with mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll) as p:
+                yield p
+
     def _prime_generator(self, pubsub):
         from redis.cluster import ClusterPubSub
 
@@ -4600,6 +4613,121 @@ class TestClusterPubSubSlotMigration:
 
         assert source is good
         assert delivered is message
+
+    def test_sharded_message_generator_splits_timeout_across_nodes(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(4)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+
+        with self._idle_polls(pubsub, "redis.cluster.time") as poll:
+            assert pubsub._sharded_message_generator(timeout=0.4) == (None, None)
+
+        # A non-blocking sweep, the timed pass in equal shares, a last sweep.
+        slices = [c.args[1] for c in poll.call_args_list]
+        assert slices[:8] == pytest.approx([0.0] * 4 + [0.1] * 4)
+        assert slices[-4:] == [0.0] * 4
+
+    def test_sharded_message_generator_gives_skipped_share_to_others(self):
+        pubsub = self._make_cluster_pubsub()
+        healthy = self._make_node_pubsub({b"a": None})
+        cooling = self._make_node_pubsub({b"b": None})
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": healthy,
+            "127.0.0.1:7001": cooling,
+        }
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[cooling] = time.monotonic() + 30
+
+        with self._idle_polls(pubsub, "redis.cluster.time") as poll:
+            pubsub._sharded_message_generator(timeout=0.4)
+
+        # [0] is the non-blocking sweep, which skips the cooling node too.
+        assert poll.call_args_list[0].args == (healthy, 0.0)
+        assert poll.call_args_list[1].args == (healthy, pytest.approx(0.4, abs=0.01))
+
+    def test_sharded_message_generator_ends_pass_after_dispatch(self):
+        pubsub = self._make_cluster_pubsub()
+        nodes = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(nodes)
+        }
+        self._prime_generator(pubsub)
+
+        # The sweep finds nothing, then a handler takes the first node's message
+        # in the timed pass: the idle node must not get the rest of the wait.
+        with mock.patch.object(
+            pubsub, "_poll_node_pubsub", side_effect=[None, None, _DISPATCHED, None]
+        ) as poll:
+            assert pubsub._sharded_message_generator(timeout=0.4) == (None, None)
+
+        assert poll.call_count == 3
+
+    def test_sharded_message_generator_sweeps_for_late_message(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = [self._make_node_pubsub({b"c%d" % i: None}) for i in range(2)]
+        pubsub.node_pubsub_mapping = {
+            f"127.0.0.1:700{i}": ps for i, ps in enumerate(idle)
+        }
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"c0", "data": b"late"}
+
+        # The message reaches the first node only after its slice ran out.
+        with mock.patch.object(
+            pubsub, "_poll_node_pubsub", side_effect=[None, None, None, None, msg]
+        ):
+            assert pubsub._sharded_message_generator(timeout=0.4) == (idle[0], msg)
+
+    def test_sharded_message_generator_does_not_block_a_busy_shard(self):
+        pubsub = self._make_cluster_pubsub()
+        hot = self._make_node_pubsub({b"hot": None})
+        idle = self._make_node_pubsub({b"idle": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": hot, "127.0.0.1:7001": idle}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"hot", "data": b"x"}
+
+        def poll(ps, timeout):
+            return msg if ps is hot else None
+
+        with mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll) as p:
+            # The second call starts on the idle node, after the hot one.
+            for _ in range(2):
+                assert pubsub._sharded_message_generator(timeout=0.4) == (hot, msg)
+
+        assert [c.args[1] for c in p.call_args_list] == [0.0, 0.0, 0.0]
+
+    def test_sharded_message_generator_reuses_time_a_fast_shard_left(self):
+        pubsub = self._make_cluster_pubsub()
+        idle = self._make_node_pubsub({b"idle": None})
+        fast = self._make_node_pubsub({b"fast": None})
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": idle, "127.0.0.1:7001": fast}
+        self._prime_generator(pubsub)
+        msg = {"type": "smessage", "channel": b"idle", "data": b"x"}
+        idle_polls = []
+        clock = [time.monotonic()]
+
+        def poll(ps, timeout):
+            if ps is fast:
+                return None
+            idle_polls.append(timeout)
+            # Arrives after the idle node's first slice, within the timeout.
+            if len(idle_polls) == 3:
+                return msg
+            clock[0] += timeout
+            return None
+
+        # A sub-millisecond pass still blocked on the idle node.
+        with (
+            mock.patch("redis.cluster.time") as fake_time,
+            mock.patch.object(pubsub, "_poll_node_pubsub", side_effect=poll),
+        ):
+            fake_time.monotonic.side_effect = lambda: clock[0]
+            assert pubsub._sharded_message_generator(timeout=0.001) == (idle, msg)
+
+        # The sweep, the first timed slice, then a second pass over the rest.
+        assert idle_polls[2] > 0
 
     def test_sharded_message_generator_raises_when_every_pubsub_fails(self):
         """

@@ -1140,9 +1140,9 @@ _METADATA_BY_REQUEST_POLICY: Mapping[RequestPolicy, CommandMetadata] = MappingPr
 #
 # This includes the ``movablekeys`` commands. Their ``first_key_pos`` is 0, but they do take
 # keys, so ``has_key_argument`` is True. The cluster client routes them like any other keyed
-# command: ``determine_slot`` asks the server for their keys with ``COMMAND GETKEYS``. The
-# parsers read their key specs and also mark them keyed, so a live resolver agrees with this
-# record.
+# command: ``determine_slot`` reads their keys from the ``COMMAND`` key specs, and asks the
+# server with ``COMMAND GETKEYS`` only where a spec is incomplete. The parsers also mark them
+# keyed, so a live resolver agrees with this record.
 _CACHEABLE_KEYED = CommandMetadata(
     request_policy=RequestPolicy.DEFAULT_KEYED,
     response_policy=ResponsePolicy.DEFAULT_KEYED,

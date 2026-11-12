@@ -2146,3 +2146,29 @@ def test_ssl_context_with_missing_certificate_file_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         conn.ssl_context.get()
+
+
+@pytest.mark.asyncio
+@pytest.mark.fixed_client
+class TestDeprecatedRespSymbols:
+    """
+    Async mirror of the deprecation warnings. ``redis.asyncio.connection`` defines its own
+    copies of the constants, so it needs its own check.
+    """
+
+    @pytest.mark.parametrize(
+        "name, value",
+        [("SYM_STAR", b"*"), ("SYM_DOLLAR", b"$")],
+    )
+    async def test_warns_on_access(self, name, value):
+        import redis.asyncio.connection as connection_module
+
+        with pytest.warns(DeprecationWarning, match=name):
+            assert getattr(connection_module, name) == value
+
+    async def test_an_unknown_module_attribute_still_raises(self):
+        """The module ``__getattr__`` must not swallow a genuine typo."""
+        import redis.asyncio.connection as connection_module
+
+        with pytest.raises(AttributeError, match="nosuchattribute"):
+            connection_module.nosuchattribute

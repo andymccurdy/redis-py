@@ -43,7 +43,7 @@ from redis.exceptions import (
 from redis.retry import is_retryable_connect_error
 from redis.observability.attributes import ConnectionState, get_pool_name
 from redis.utils import HIREDIS_AVAILABLE
-from tests.conftest import skip_if_server_version_lt
+from tests.conftest import skip_if_redis_enterprise, skip_if_server_version_lt
 
 from .mocks import MockStream
 
@@ -1704,6 +1704,85 @@ class TestAsyncMalformedNumericFrameInvalidatesConnection:
         assert result == 42
         assert conn.is_connected is True
         await conn.disconnect()
+
+
+# The MGET example of the attribute type in the RESP3 specification: the
+# attribute map comes first, then the actual reply.
+RESP3_ATTRIBUTE_BEFORE_REPLY = (
+    b"|1\r\n+key-popularity\r\n"
+    b"%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n"
+    b"*2\r\n:2039123\r\n:9543892\r\n"
+)
+
+
+@pytest.mark.fixed_client
+class TestAsyncRESP3AttributeReply:
+    """Async version: a RESP3 attribute (`|`) is auxiliary data that comes
+    before the part of a reply it describes. The parser skips it and returns
+    that part.
+    """
+
+    async def test_attribute_before_reply(self):
+        conn = Connection(protocol=3, parser_class=_AsyncRESP3Parser)
+        _attach_stream(conn, RESP3_ATTRIBUTE_BEFORE_REPLY + b"+SECOND\r\n")
+
+        assert await conn.read_response() == [2039123, 9543892]
+        assert await conn.read_response() == b"SECOND"
+        assert conn.is_connected is True
+        await conn.disconnect()
+
+    async def test_attribute_before_array_element(self):
+        conn = Connection(protocol=3, parser_class=_AsyncRESP3Parser)
+        _attach_stream(
+            conn, b"*3\r\n:1\r\n:2\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n+SECOND\r\n"
+        )
+
+        assert await conn.read_response() == [1, 2, 3]
+        assert await conn.read_response() == b"SECOND"
+        await conn.disconnect()
+
+    async def test_attribute_is_not_decoded(self):
+        conn = Connection(
+            protocol=3, parser_class=_AsyncRESP3Parser, decode_responses=True
+        )
+        _attach_stream(conn, b"|1\r\n$3\r\nkey\r\n$2\r\n\xff\xfe\r\n$5\r\nvalue\r\n")
+
+        assert await conn.read_response() == "value"
+        await conn.disconnect()
+
+    async def test_attribute_is_not_read_as_a_reply(self):
+        # an error or a push message in an attribute is data of the attribute,
+        # and an attribute in an attribute describes the value after it
+        conn = Connection(protocol=3, parser_class=_AsyncRESP3Parser)
+        _attach_stream(
+            conn,
+            b"|3\r\n"
+            b"+error\r\n-LOADING Redis is loading the dataset in memory\r\n"
+            b"+push\r\n>2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n"
+            b"+attribute\r\n|1\r\n+unit\r\n+ms\r\n:3600\r\n"
+            b"+OK\r\n+SECOND\r\n",
+        )
+
+        assert await conn.read_response() == b"OK"
+        assert await conn.read_response() == b"SECOND"
+        assert conn.is_connected is True
+        await conn.disconnect()
+
+
+@pytest.mark.onlynoncluster
+@pytest.mark.fixed_client
+@skip_if_server_version_lt("6.0.0")
+@skip_if_redis_enterprise()
+async def test_resp3_parser_skips_attribute_from_server(r):
+    args = dict(r.connection_pool.connection_kwargs)
+    args.update(protocol=3, parser_class=_AsyncRESP3Parser)
+    conn = Connection(**args)
+
+    await conn.send_command("DEBUG", "PROTOCOL", "attrib")
+    assert await conn.read_response() == b"Some real reply following the attribute"
+    await conn.send_command("PING")
+    assert await conn.read_response() == b"PONG"
+    await conn.disconnect()
 
 
 class _DummyAsyncConnection:

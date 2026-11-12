@@ -8130,6 +8130,34 @@ class TestClusterPipeline:
             pipe.get("foo")
             assert pipe.execute() == [True, b"bar"]
 
+    def test_command_stack_reflects_queued_commands(self):
+        """
+        ClusterPipeline.command_stack should expose the commands queued on the
+        pipeline. Regression test for #3703: after the execution-strategy
+        refactor (#3611) command_stack was always empty, which silently broke
+        APM/tracing integrations (e.g. Datadog ddtrace) that introspect it.
+        """
+        r = get_mocked_redis_client(host=default_host, port=default_port)
+        with r.pipeline() as pipe:
+            assert pipe.command_stack == []
+
+            pipe.set("{foo}1", "1").set("{foo}2", "2")
+
+            assert len(pipe.command_stack) == 2
+            # command_stack delegates to the execution strategy's command queue
+            assert pipe.command_stack is pipe._execution_strategy.command_queue
+            assert pipe.command_stack[0].args == ("SET", "{foo}1", "1")
+            assert pipe.command_stack[1].args == ("SET", "{foo}2", "2")
+
+    @pytest.mark.parametrize("transaction", [False, True])
+    def test_command_stack_delegates_to_execution_strategy(self, transaction):
+        """command_stack should delegate to the active execution strategy's
+        command queue for both the pipeline and transaction strategies."""
+        r = get_mocked_redis_client(host=default_host, port=default_port)
+        pipe = r.pipeline(transaction=transaction)
+        assert pipe.command_stack is pipe._execution_strategy.command_queue
+        assert pipe.command_stack == []
+
     def test_mget_disabled(self, r):
         """
         Test that mget is disabled for ClusterPipeline

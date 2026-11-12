@@ -8608,6 +8608,29 @@ class TestClusterPipeline:
         finally:
             await client.aclose()
 
+    async def test_command_stack_reflects_queued_commands(self) -> None:
+        """
+        ClusterPipeline.command_stack should expose the commands queued on the
+        pipeline. Regression test for #3703: after the execution-strategy
+        refactor (#3611) the async pipeline had no command_stack at all, which
+        silently broke APM/tracing integrations (e.g. Datadog ddtrace) that
+        introspect it.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            pipeline = r.pipeline()
+            assert pipeline.command_stack == []
+
+            pipeline.set("{foo}1", "1").set("{foo}2", "2")
+
+            assert len(pipeline.command_stack) == 2
+            # command_stack delegates to the execution strategy's command queue
+            assert pipeline.command_stack is pipeline._execution_strategy.command_queue
+            assert pipeline.command_stack[0].args == ("SET", "{foo}1", "1")
+            assert pipeline.command_stack[1].args == ("SET", "{foo}2", "2")
+        finally:
+            await r.aclose()
+
     async def test_blocked_arguments(self, r: RedisCluster) -> None:
         """Test handling for blocked pipeline arguments."""
 

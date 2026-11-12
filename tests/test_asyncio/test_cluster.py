@@ -2774,6 +2774,38 @@ class TestRedisClusterObj:
 
         await rc.aclose()
 
+    async def test_keyed_command_computes_its_slot_once(self, r: RedisCluster) -> None:
+        """
+        A keyed command the policy resolver does not know is routed by the slot that
+        resolving its policies computed, instead of hashing its keys a second time.
+        """
+        with mock.patch.object(
+            r, "_determine_slot", wraps=r._determine_slot
+        ) as determine:
+            assert await r.set("foo", "bar") is True
+
+        determine.assert_awaited_once_with("SET", "foo", "bar")
+
+    async def test_pipeline_keyed_command_computes_its_slot_once(
+        self, r: RedisCluster
+    ) -> None:
+        """
+        The pipeline routes each keyed command by the slot that resolving its policies
+        computed, instead of hashing its keys a second time.
+        """
+        with mock.patch.object(
+            r, "_determine_slot", wraps=r._determine_slot
+        ) as determine:
+            async with r.pipeline() as pipe:
+                pipe.set("foo", "bar")
+                pipe.set("bar", "foo")
+                assert await pipe.execute() == [True, True]
+
+        assert determine.await_args_list == [
+            mock.call("SET", "foo", "bar"),
+            mock.call("SET", "bar", "foo"),
+        ]
+
     async def test_execute_command_errors(self, r: RedisCluster) -> None:
         """
         Test that if no key is provided then exception should be raised.
@@ -3352,6 +3384,67 @@ class TestRedisClusterObjMocked:
                 await cluster.close()
             assert called == 1
         await cluster.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_retry_computes_the_slot_again(self) -> None:
+        """
+        Only the first attempt is routed by the slot that resolving the policies
+        computed. A retry computes it again, as a command without keys gets a new
+        random slot on each attempt.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            with (
+                mock.patch.object(
+                    RedisCluster,
+                    "_execute_command",
+                    side_effect=[ConnectionError("mocked error"), True],
+                ) as execute,
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    new=mock.AsyncMock(return_value=rc.keyslot("foo")),
+                ) as determine,
+            ):
+                assert await rc.set("foo", "bar") is True
+        finally:
+            await rc.aclose()
+
+        assert execute.await_count == 2
+        # once to resolve the policies, which the first attempt reuses, once more
+        # for the retry
+        assert determine.await_count == 2
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_retry_after_an_uncovered_random_slot_picks_another(self) -> None:
+        """
+        A command without keys is sent to a random slot. When no node covers that
+        slot, the retry picks another random slot instead of the same one again.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_default_node()
+        try:
+            with (
+                mock.patch.object(RedisCluster, "_execute_command", return_value=1),
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    new=mock.AsyncMock(side_effect=[100, 200]),
+                ),
+                # patched on the class, as the slotted instance allows no patching
+                mock.patch.object(
+                    NodesManager,
+                    "get_node_from_slot",
+                    side_effect=[SlotNotCoveredError("mocked error"), node],
+                ) as get_node,
+            ):
+                assert await rc.eval("return 1", 0) == 1
+        finally:
+            await rc.aclose()
+
+        assert [c.args[0] for c in get_node.call_args_list] == [100, 200]
 
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("error", RedisCluster.ERRORS_ALLOW_RETRY)
@@ -5425,7 +5518,7 @@ class TestStaticMetadataRouting:
         primaries = rc.get_primaries()
         assert len(primaries) > 1
 
-        _, policies = await rc._resolve_command_policies("scan")
+        _, policies, _ = await rc._resolve_command_policies("scan")
         nodes = await rc._determine_nodes(
             "scan", request_policy=policies.request_policy
         )
@@ -5440,7 +5533,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies(command)
+        _, policies, _ = await rc._resolve_command_policies(command)
         nodes = await rc._determine_nodes(
             command, request_policy=policies.request_policy
         )
@@ -5455,7 +5548,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("dbsize")
+        _, policies, _ = await rc._resolve_command_policies("dbsize")
         nodes = await rc._determine_nodes(
             "dbsize",
             request_policy=policies.request_policy,
@@ -5500,7 +5593,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("COMMAND", "COUNT")
+        _, policies, _ = await rc._resolve_command_policies("COMMAND", "COUNT")
         nodes = await rc._determine_nodes(
             "COMMAND", "COUNT", request_policy=policies.request_policy
         )
@@ -5512,7 +5605,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("command", "count")
+        _, policies, _ = await rc._resolve_command_policies("command", "count")
         nodes = await rc._determine_nodes(
             "command", "count", request_policy=policies.request_policy
         )

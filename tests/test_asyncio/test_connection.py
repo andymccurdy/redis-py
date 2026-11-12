@@ -335,6 +335,84 @@ async def test_async_resp_read_response_raises_after_disconnect(parser_class):
     assert stream.read_called is False
 
 
+# A burst of consecutive push frames ahead of a reply, far more than the default
+# recursion limit allows. Client-side cache invalidations arrive one per key, so
+# writes to many cached keys while a command is in flight queue that many frames
+# in front of its reply.
+PUSH_BURST_SIZE = 5000
+PUSH_BURST_FRAME = b">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nx\r\n"
+PUSH_BURST = PUSH_BURST_FRAME * PUSH_BURST_SIZE + b"+OK\r\n"
+
+ASYNC_RESP3_PARSERS = [
+    _AsyncRESP3Parser,
+    pytest.param(
+        _AsyncHiredisParser,
+        marks=pytest.mark.skipif(
+            not HIREDIS_AVAILABLE, reason="hiredis is not installed"
+        ),
+    ),
+]
+
+
+def _push_burst_connection(parser_class, data):
+    """Keep the returned connection alive: collecting it disconnects its parser."""
+    conn = Connection(protocol=3, parser_class=parser_class)
+    conn._reader = asyncio.StreamReader(limit=2**30)
+    conn._reader.feed_data(data)
+    conn._reader.feed_eof()
+    conn._parser.on_connect(conn)
+    return conn
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", ASYNC_RESP3_PARSERS)
+async def test_read_response_reads_past_a_push_burst(parser_class):
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+    handled = []
+
+    async def handler(response):
+        handled.append(response)
+        return response
+
+    parser.set_pubsub_push_handler(handler)
+
+    assert await parser.read_response() == b"OK"
+    assert len(handled) == PUSH_BURST_SIZE
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", ASYNC_RESP3_PARSERS)
+async def test_read_response_push_request_returns_first_push_of_a_burst(
+    parser_class,
+):
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+
+    assert await parser.read_response(push_request=True) == [b"message", b"ch", b"x"]
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize("parser_class", ASYNC_RESP3_PARSERS)
+async def test_push_handler_disconnect_stops_a_push_burst(parser_class):
+    # The parser re-checks the connection after handling a push frame, so a
+    # push handler that disconnects ends the burst there.
+    conn = _push_burst_connection(parser_class, PUSH_BURST)
+    parser = conn._parser
+    handled = []
+
+    async def handler(response):
+        handled.append(response)
+        parser.on_disconnect()
+        return response
+
+    parser.set_pubsub_push_handler(handler)
+
+    with pytest.raises(ConnectionError):
+        await parser.read_response()
+    assert len(handled) == 1
+
+
 @pytest.mark.fixed_client
 @pytest.mark.parametrize(
     "parser_class",

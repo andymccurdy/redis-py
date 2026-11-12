@@ -27,7 +27,10 @@ import pytest
 import pytest_asyncio
 from _pytest.fixtures import FixtureRequest
 from redis._parsers import AsyncCommandsParser
-from redis.asyncio.client import _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS
+from redis.asyncio.client import (
+    _PIPELINE_PACK_OFFLOAD_MIN_COMMANDS,
+    _PIPELINE_YIELD_MIN_COMMANDS,
+)
 from redis.asyncio.cluster import (
     ClusterNode,
     NodesManager,
@@ -130,6 +133,14 @@ default_port = 7000
 default_cluster_slots = [
     [0, 8191, ["127.0.0.1", 7000, "node_0"], ["127.0.0.1", 7003, "node_3"]],
     [8192, 16383, ["127.0.0.1", 7001, "node_1"], ["127.0.0.1", 7002, "node_2"]],
+]
+
+
+# Three primaries, so one can answer while two others fail
+three_primary_cluster_slots = [
+    [0, 5460, ["127.0.0.1", 7000, "node_0"]],
+    [5461, 10922, ["127.0.0.1", 7001, "node_1"]],
+    [10923, 16383, ["127.0.0.1", 7002, "node_2"]],
 ]
 
 
@@ -1941,6 +1952,180 @@ class TestTopologyRefreshKeepsConnections:
         assert list(nm.nodes_cache)[-1] == failed.name
         assert nm._requested_last_failed_node_name is None
 
+    @staticmethod
+    async def _one_succeeded_pipeline_client(
+        cluster_slots: list = default_cluster_slots,
+    ) -> RedisCluster:
+        # RANDOMKEY sent to every primary, answered by the first success
+        resolver = AsyncDynamicMetadataResolver(
+            {
+                "core": {
+                    "randomkey": CommandMetadata(
+                        request_policy=RequestPolicy.ALL_SHARDS,
+                        response_policy=ResponsePolicy.ONE_SUCCEEDED,
+                    )
+                }
+            }
+        )
+        return await get_mocked_redis_client(
+            host=default_host,
+            port=default_port,
+            retry=Retry(NoBackoff(), 0),
+            metadata_resolver=resolver,
+            cluster_slots=cluster_slots,
+        )
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("default", [False, True], ids=["other", "default"])
+    async def test_pipeline_keeps_a_one_succeeded_success_over_a_node_error(
+        self, default: bool
+    ) -> None:
+        """
+        A node whose write fails holds only a copy of a ONE_SUCCEEDED command that
+        another node answered: the pipeline answers with the success once the retries
+        run out, and the failed node is still tried last on the next refresh. A failed
+        default node is replaced.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        nm = r.nodes_manager
+        default_node = r.get_default_node()
+        primaries = r.get_primaries()
+        assert len(primaries) > 1
+        failed = (
+            default_node
+            if default
+            else next(p for p in primaries if p.name != default_node.name)
+        )
+        assert list(nm.nodes_cache)[-1] != failed.name
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name == failed.name:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                assert await pipe.execute() == [b"key"]
+
+        assert list(nm.nodes_cache)[-1] == failed.name
+        assert nm._requested_last_failed_node_name == failed.name
+        if default:
+            assert r.get_default_node().name != failed.name
+        else:
+            assert r.get_default_node() is default_node
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    async def test_pipeline_raises_a_node_task_s_cancellation(self) -> None:
+        """
+        A node task that is cancelled fails the ONE_SUCCEEDED command it held a copy
+        of, even though another node answered it, and the cancellation is raised.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        cancelled = r.get_primaries()[0]
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name == cancelled.name:
+                raise asyncio.CancelledError()
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                with pytest.raises(asyncio.CancelledError):
+                    await pipe.execute()
+
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "case", ["keyed_command_on_failed_node", "every_node_fails"]
+    )
+    async def test_pipeline_raises_a_node_error_that_fails_a_command(
+        self, case: str
+    ) -> None:
+        """
+        The error of a node whose write fails is raised when it fails a command: one
+        the node held on its own, or a ONE_SUCCEEDED command no node answered.
+        """
+        r = await self._one_succeeded_pipeline_client()
+        failed = r.get_node_from_key("foo")
+        failing = (
+            {failed.name}
+            if case == "keyed_command_on_failed_node"
+            else {node.name for node in r.get_primaries()}
+        )
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name in failing:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command("RANDOMKEY")
+                if case == "keyed_command_on_failed_node":
+                    pipe.get("foo")
+                with pytest.raises(ConnectionError, match="down"):
+                    await pipe.execute()
+
+        await r.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("keyed_first", [False, True], ids=["copy", "keyed"])
+    async def test_pipeline_raised_node_error_tries_a_copy_only_node_last(
+        self, keyed_first: bool
+    ) -> None:
+        """
+        Two writes fail: one on a node that holds only a copy of a ONE_SUCCEEDED command
+        another node answered, and one on a node that holds a keyed command of its own.
+        The keyed command's error is raised, and the copy-only node is still tried last
+        on the next refresh, whichever of the two nodes is handled first. The node the
+        error came from is tried after it, as the last one.
+        """
+        r = await self._one_succeeded_pipeline_client(three_primary_cluster_slots)
+        nm = r.nodes_manager
+        keyed = r.get_node_from_key("foo")
+        copy_only = next(p for p in r.get_primaries() if p.name != keyed.name)
+        failing = {keyed.name, copy_only.name}
+        assert copy_only.name not in list(nm.nodes_cache)[-2:]
+
+        async def execute_pipeline(node, commands) -> bool:
+            if node.name in failing:
+                raise ConnectionError("down")
+            for command in commands:
+                command.result = b"key"
+            return False
+
+        with mock.patch.object(
+            ClusterNode, "execute_pipeline", autospec=True, side_effect=execute_pipeline
+        ):
+            async with r.pipeline() as pipe:
+                if keyed_first:
+                    pipe.get("foo")
+                pipe.execute_command("RANDOMKEY")
+                if not keyed_first:
+                    pipe.get("foo")
+                with pytest.raises(ConnectionError, match="down"):
+                    await pipe.execute()
+
+        assert list(nm.nodes_cache)[-2:] == [copy_only.name, keyed.name]
+        assert nm._requested_last_failed_node_name == keyed.name
+        await r.aclose()
+
     @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     async def test_pipeline_retry_waits_for_sibling_node_tasks(self) -> None:
@@ -2589,6 +2774,38 @@ class TestRedisClusterObj:
 
         await rc.aclose()
 
+    async def test_keyed_command_computes_its_slot_once(self, r: RedisCluster) -> None:
+        """
+        A keyed command the policy resolver does not know is routed by the slot that
+        resolving its policies computed, instead of hashing its keys a second time.
+        """
+        with mock.patch.object(
+            r, "_determine_slot", wraps=r._determine_slot
+        ) as determine:
+            assert await r.set("foo", "bar") is True
+
+        determine.assert_awaited_once_with("SET", "foo", "bar")
+
+    async def test_pipeline_keyed_command_computes_its_slot_once(
+        self, r: RedisCluster
+    ) -> None:
+        """
+        The pipeline routes each keyed command by the slot that resolving its policies
+        computed, instead of hashing its keys a second time.
+        """
+        with mock.patch.object(
+            r, "_determine_slot", wraps=r._determine_slot
+        ) as determine:
+            async with r.pipeline() as pipe:
+                pipe.set("foo", "bar")
+                pipe.set("bar", "foo")
+                assert await pipe.execute() == [True, True]
+
+        assert determine.await_args_list == [
+            mock.call("SET", "foo", "bar"),
+            mock.call("SET", "bar", "foo"),
+        ]
+
     async def test_execute_command_errors(self, r: RedisCluster) -> None:
         """
         Test that if no key is provided then exception should be raised.
@@ -3167,6 +3384,67 @@ class TestRedisClusterObjMocked:
                 await cluster.close()
             assert called == 1
         await cluster.aclose()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_retry_computes_the_slot_again(self) -> None:
+        """
+        Only the first attempt is routed by the slot that resolving the policies
+        computed. A retry computes it again, as a command without keys gets a new
+        random slot on each attempt.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            with (
+                mock.patch.object(
+                    RedisCluster,
+                    "_execute_command",
+                    side_effect=[ConnectionError("mocked error"), True],
+                ) as execute,
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    new=mock.AsyncMock(return_value=rc.keyslot("foo")),
+                ) as determine,
+            ):
+                assert await rc.set("foo", "bar") is True
+        finally:
+            await rc.aclose()
+
+        assert execute.await_count == 2
+        # once to resolve the policies, which the first attempt reuses, once more
+        # for the retry
+        assert determine.await_count == 2
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_retry_after_an_uncovered_random_slot_picks_another(self) -> None:
+        """
+        A command without keys is sent to a random slot. When no node covers that
+        slot, the retry picks another random slot instead of the same one again.
+        """
+        rc = await get_mocked_redis_client(host=default_host, port=default_port)
+        node = rc.get_default_node()
+        try:
+            with (
+                mock.patch.object(RedisCluster, "_execute_command", return_value=1),
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    new=mock.AsyncMock(side_effect=[100, 200]),
+                ),
+                # patched on the class, as the slotted instance allows no patching
+                mock.patch.object(
+                    NodesManager,
+                    "get_node_from_slot",
+                    side_effect=[SlotNotCoveredError("mocked error"), node],
+                ) as get_node,
+            ):
+                assert await rc.eval("return 1", 0) == 1
+        finally:
+            await rc.aclose()
+
+        assert [c.args[0] for c in get_node.call_args_list] == [100, 200]
 
     @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("error", RedisCluster.ERRORS_ALLOW_RETRY)
@@ -3953,6 +4231,20 @@ class TestClusterRedisCommands:
     async def test_memory_doctor(self, r: RedisCluster) -> None:
         with pytest.raises(NotImplementedError):
             await r.memory_doctor()
+
+    @skip_if_server_version_lt("8.10.0")
+    @skip_if_redis_enterprise()
+    async def test_backup_status(self, r: RedisCluster) -> None:
+        node = r.get_primaries()[0]
+        status = await r.backup_status(target_nodes=node)
+        assert status[b"state"] in (
+            b"idle",
+            b"pending",
+            b"snapshotting",
+            b"incrementing",
+            b"sealed",
+            b"failed",
+        )
 
     @skip_if_redis_enterprise()
     async def test_lastsave(self, r: RedisCluster) -> None:
@@ -5226,7 +5518,7 @@ class TestStaticMetadataRouting:
         primaries = rc.get_primaries()
         assert len(primaries) > 1
 
-        _, policies = await rc._resolve_command_policies("scan")
+        _, policies, _ = await rc._resolve_command_policies("scan")
         nodes = await rc._determine_nodes(
             "scan", request_policy=policies.request_policy
         )
@@ -5241,7 +5533,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies(command)
+        _, policies, _ = await rc._resolve_command_policies(command)
         nodes = await rc._determine_nodes(
             command, request_policy=policies.request_policy
         )
@@ -5256,7 +5548,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("dbsize")
+        _, policies, _ = await rc._resolve_command_policies("dbsize")
         nodes = await rc._determine_nodes(
             "dbsize",
             request_policy=policies.request_policy,
@@ -5301,7 +5593,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("COMMAND", "COUNT")
+        _, policies, _ = await rc._resolve_command_policies("COMMAND", "COUNT")
         nodes = await rc._determine_nodes(
             "COMMAND", "COUNT", request_policy=policies.request_policy
         )
@@ -5313,7 +5605,7 @@ class TestStaticMetadataRouting:
         rc = await get_mocked_redis_client(host=default_host, port=7000)
         default_node = rc.get_default_node()
 
-        _, policies = await rc._resolve_command_policies("command", "count")
+        _, policies, _ = await rc._resolve_command_policies("command", "count")
         nodes = await rc._determine_nodes(
             "command", "count", request_policy=policies.request_policy
         )
@@ -5372,6 +5664,73 @@ class TestStaticMetadataRouting:
         with pytest.raises(RedisClusterException, match="No targets were found"):
             await rc._determine_nodes("UNRECOGNIZED_COMMAND", request_policy=None)
         await rc.aclose()
+
+    @pytest.mark.fixed_client
+    async def test_routing_errors_redact_credentials(self) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        async with aclosing(rc):
+            with mock.patch.object(
+                rc.commands_parser,
+                "get_keys",
+                mock.AsyncMock(return_value=None),
+            ):
+                with pytest.raises(
+                    RedisClusterException, match="No way to dispatch"
+                ) as ex:
+                    await rc._determine_slot("CONFIG SET", "requirepass", "s3cret")
+        assert "Command: CONFIG SET <REDACTED>" in str(ex.value)
+        assert "s3cret" not in str(ex.value)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize(
+        "error, label",
+        [
+            (MovedError(f"{key_slot(b'foo')} {default_host}:7000"), "MOVED error"),
+            (TryAgainError(), "TRYAGAIN error"),
+            (ConnectionError("down"), "ConnectionError"),
+        ],
+    )
+    async def test_execute_command_retry_debug_logs_command_name_only(
+        self, caplog, error, label
+    ) -> None:
+        rc = await get_mocked_redis_client(host=default_host, port=7000)
+        node = rc.get_node_from_key("foo")
+        calls = []
+
+        async def execute_command(target, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise error
+            return True
+
+        async with aclosing(rc):
+            with (
+                mock.patch.object(
+                    ClusterNode,
+                    "execute_command",
+                    autospec=True,
+                    side_effect=execute_command,
+                ),
+                mock.patch.object(NodesManager, "move_slot", autospec=True),
+                mock.patch.object(
+                    rc,
+                    "_determine_slot",
+                    mock.AsyncMock(return_value=key_slot(b"foo")),
+                ),
+                caplog.at_level(logging.DEBUG, logger="redis.asyncio.cluster"),
+            ):
+                if isinstance(error, ConnectionError):
+                    with pytest.raises(ConnectionError):
+                        await rc._execute_command(node, "SET", "foo", "s3cret")
+                else:
+                    assert await rc._execute_command(node, "SET", "foo", "s3cret")
+
+        messages = [
+            r.getMessage() for r in caplog.records if r.name == "redis.asyncio.cluster"
+        ]
+        expected = f"{label} received for command SET, on node {node.name}"
+        assert any(m.startswith(expected) for m in messages), messages
+        assert not any("s3cret" in m or "foo" in m for m in messages), messages
 
     @pytest.mark.fixed_client
     async def test_split_command_routing_applies_load_balancing_strategy(self) -> None:
@@ -7947,6 +8306,97 @@ class TestClusterNodeConnectionHandling:
         assert [cmd.result for cmd in commands] == [b"value"] * count
         assert node._free[0] is connection
 
+    @staticmethod
+    def _mock_node_for_pipeline(count):
+        node = ClusterNode(default_host, 7000)
+        connection = mock.MagicMock(spec=Connection)
+        connection.is_connected = False
+        connection.should_reconnect.return_value = False
+        connection.pack_commands.return_value = [b"packed"]
+        node._connections.append(connection)
+        node._free.append(connection)
+        commands = [PipelineCommand(i, "GET", "key") for i in range(count)]
+        return node, connection, commands
+
+    @pytest.mark.parametrize(
+        "count",
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
+    )
+    async def test_execute_pipeline_read_loop_yields_to_event_loop(self, count) -> None:
+        """
+        Reading buffered replies never suspends, so a large batch yields every
+        _PIPELINE_YIELD_MIN_COMMANDS replies (#3416), but never after the last
+        one. Smaller batches never yield.
+        """
+        node, connection, commands = self._mock_node_for_pipeline(count)
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        ticks_before = ticks
+        try:
+            with (
+                mock.patch.object(
+                    ClusterNode,
+                    "parse_response",
+                    new=mock.AsyncMock(return_value=b"value"),
+                ),
+                # Packing is offloaded at this size; a mock keeps it from
+                # suspending
+                mock.patch(
+                    "redis.asyncio.client.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=[b"offloaded"]),
+                ),
+            ):
+                assert await node.execute_pipeline(commands) is False
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+        assert ticks - ticks_before == (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
+        assert [cmd.result for cmd in commands] == [b"value"] * count
+        connection.disconnect.assert_not_called()
+        assert node._free[0] is connection
+
+    async def test_execute_pipeline_cancelled_at_read_loop_yield_disconnects(
+        self,
+    ) -> None:
+        """
+        A cancellation at a read loop yield leaves the rest of the replies on the
+        socket, so the connection is dropped before it is released to the pool.
+        """
+        node, connection, commands = self._mock_node_for_pipeline(
+            _PIPELINE_YIELD_MIN_COMMANDS + 1
+        )
+        parse_response = mock.AsyncMock(return_value=b"value")
+        with (
+            mock.patch.object(ClusterNode, "parse_response", new=parse_response),
+            mock.patch(
+                "redis.asyncio.client.asyncio.to_thread",
+                new=mock.AsyncMock(return_value=[b"offloaded"]),
+            ),
+        ):
+            task = asyncio.create_task(node.execute_pipeline(commands))
+            # The task runs until the first yield, then is cancelled there
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        connection.disconnect.assert_awaited_once_with(nowait=True)
+        assert parse_response.await_count == _PIPELINE_YIELD_MIN_COMMANDS
+        assert node._free[0] is connection
+
     async def test_execute_command_releases_connection_after_disconnect_error(
         self,
     ) -> None:
@@ -9396,6 +9846,179 @@ class TestClusterPipelineMocked:
             assert packed[-1] == ("EXEC",)
         finally:
             await r.aclose()
+
+    @staticmethod
+    async def _run_mocked_transaction(r, count, cancel=False):
+        """
+        Execute a transaction of ``count`` GETs whose replies are already
+        buffered, so parse_response never suspends. Return the event loop turns
+        another task got during the execution, the result and the mocks.
+        """
+        node = r.get_node(host=default_host, port=7000)
+        connection = mock.MagicMock(spec=Connection)
+        connection.should_reconnect.return_value = False
+        connection._resp2_fallback = False
+        connection.host, connection.port, connection.db = default_host, 7000, 0
+        stack = [PipelineCommand(i, "GET", "key") for i in range(count)]
+        strategy = r.pipeline(transaction=True)._execution_strategy
+        strategy._command_queue = stack
+        parse_response = mock.AsyncMock(
+            side_effect=[b"OK", *[b"QUEUED"] * count, [b"value"] * count]
+        )
+        result = None
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        ticks_before = ticks
+        try:
+            with (
+                mock.patch.object(
+                    type(strategy),
+                    "_get_client_and_connection_for_transaction",
+                    return_value=(node, connection),
+                ),
+                mock.patch.object(ClusterNode, "parse_response", new=parse_response),
+                # Packing is offloaded at this size; a mock keeps it from
+                # suspending
+                mock.patch(
+                    "redis.asyncio.client.asyncio.to_thread",
+                    new=mock.AsyncMock(return_value=[b"offloaded"]),
+                ),
+            ):
+                execution = strategy._execute_transaction(stack, raise_on_error=True)
+                if cancel:
+                    task = asyncio.create_task(execution)
+                    # The task runs until the first yield, then is cancelled
+                    # there
+                    await asyncio.sleep(0)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    result = await execution
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+        return ticks - ticks_before, result, connection, parse_response
+
+    @pytest.mark.parametrize(
+        "count",
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
+    )
+    async def test_transaction_reply_loops_yield_to_event_loop(self, count) -> None:
+        """
+        Reading buffered replies never suspends, so a large transaction yields
+        every _PIPELINE_YIELD_MIN_COMMANDS commands in the QUEUED read loop and
+        in the callback loop (#3416), but never after the last command. Smaller
+        transactions never yield.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            # The turns a one-command transaction gives away come from elsewhere
+            # in the execution, so they are subtracted
+            baseline, *_ = await self._run_mocked_transaction(r, 1)
+            ticks, result, connection, _ = await self._run_mocked_transaction(r, count)
+        finally:
+            await r.aclose()
+
+        assert result == [b"value"] * count
+        assert ticks - baseline == 2 * ((count - 1) // _PIPELINE_YIELD_MIN_COMMANDS)
+        connection.disconnect.assert_not_called()
+
+    async def test_transaction_cancelled_at_queued_loop_yield_disconnects(
+        self,
+    ) -> None:
+        """
+        A cancellation at a QUEUED read loop yield leaves the rest of the
+        replies on the socket, so the connection is dropped.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            _, _, connection, parse_response = await self._run_mocked_transaction(
+                r, _PIPELINE_YIELD_MIN_COMMANDS + 1, cancel=True
+            )
+        finally:
+            await r.aclose()
+
+        connection.disconnect.assert_awaited_once_with(nowait=True)
+        # MULTI, plus the QUEUED replies read before the yield
+        assert parse_response.await_count == _PIPELINE_YIELD_MIN_COMMANDS + 1
+
+    @pytest.mark.parametrize(
+        "count",
+        [
+            _PIPELINE_YIELD_MIN_COMMANDS - 1,
+            _PIPELINE_YIELD_MIN_COMMANDS,
+            2 * _PIPELINE_YIELD_MIN_COMMANDS,
+        ],
+    )
+    async def test_pipeline_routing_loop_yields_to_event_loop(self, count) -> None:
+        """
+        Routing a command does not suspend, so a large pipeline yields every
+        _PIPELINE_YIELD_MIN_COMMANDS commands while it routes them (#3416), but
+        never after the last one. Smaller pipelines never yield.
+        """
+
+        async def execute_pipeline(node, commands):
+            # Replies that are already buffered: answering never suspends
+            for cmd in commands:
+                cmd.result = True
+            return False
+
+        async def run(r, count):
+            pipe = r.pipeline()
+            for i in range(count):
+                pipe.set("foo", i)
+            ticks = 0
+
+            async def tick():
+                nonlocal ticks
+                while True:
+                    ticks += 1
+                    await asyncio.sleep(0)
+
+            ticker = asyncio.create_task(tick())
+            await asyncio.sleep(0)
+            ticks_before = ticks
+            try:
+                result = await pipe.execute()
+            finally:
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+            assert result == [True] * count
+            return ticks - ticks_before
+
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        try:
+            with (
+                mock.patch.object(
+                    ClusterNode, "execute_pipeline", new=execute_pipeline
+                ),
+                mock.patch.object(
+                    r,
+                    "_determine_slot",
+                    new=mock.AsyncMock(return_value=r.keyslot("foo")),
+                ),
+            ):
+                # The turns a one-command pipeline gives away come from elsewhere
+                # in the execution (the node tasks), so they are subtracted
+                baseline = await run(r, 1)
+                ticks = await run(r, count)
+        finally:
+            await r.aclose()
+
+        assert ticks - baseline == (count - 1) // _PIPELINE_YIELD_MIN_COMMANDS
 
     async def test_transaction_keeps_held_connection_when_slot_owner_changes(
         self,

@@ -26,7 +26,7 @@ class TestCloseConnectionOnActiveDatabaseChanged:
     def test_standalone_keeps_in_use_connections(self):
         old_database = MagicMock()
         old_database.client = MagicMock(spec=Redis)
-        pool = old_database.client.connection_pool = MagicMock()
+        pool = old_database.client.connection_pool = MagicMock(cache=None)
 
         CloseConnectionOnActiveDatabaseChanged().listen(
             ActiveDatabaseChanged(old_database, MagicMock(), MagicMock())
@@ -41,11 +41,13 @@ class TestCloseConnectionOnActiveDatabaseChanged:
         old_database.client = MagicMock(spec=Redis)
         pool = old_database.client.connection_pool = MagicMock(
             spec=[
+                "cache",
                 "_get_pool_lock",
                 "update_active_connections_for_reconnect",
                 "disconnect_free_connections",
             ]
         )
+        pool.cache = None
 
         CloseConnectionOnActiveDatabaseChanged().listen(
             ActiveDatabaseChanged(old_database, MagicMock(), MagicMock())
@@ -58,6 +60,8 @@ class TestCloseConnectionOnActiveDatabaseChanged:
     def test_cluster_keeps_in_use_connections(self):
         old_database = MagicMock()
         nodes = [MagicMock(), MagicMock()]
+        for node in nodes:
+            node.redis_connection.connection_pool.cache = None
         old_database.client.nodes_manager.nodes_cache = {
             f"node{i}": node for i, node in enumerate(nodes)
         }
@@ -77,6 +81,7 @@ class TestCloseConnectionOnActiveDatabaseChanged:
         nodes_cache = old_database.client.nodes_manager.nodes_cache = {}
         nodes = [MagicMock(), MagicMock()]
         for i, node in enumerate(nodes):
+            node.redis_connection.connection_pool.cache = None
             nodes_cache[f"node{i}"] = node
 
         # A topology refresh on another thread adds a node meanwhile

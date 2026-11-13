@@ -1,10 +1,14 @@
 import enum
 import ipaddress
 import logging
+import os
 import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -794,6 +798,112 @@ def _should_skip_connection_timeout_update(
 # timeout - or, with a blocking socket, indefinitely.
 PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT = 1.0
 
+_maintenance_event_state = threading.local()
+_maintenance_event_lock = threading.Lock()
+_maintenance_event_queues = {}
+_maintenance_event_dispatching = set()
+
+
+@dataclass
+class _PendingMaintenanceEvent:
+    config: MaintNotificationsConfig
+    event: MaintenanceEvent
+    ready: bool
+
+
+def _reset_maintenance_events_after_fork():
+    # Do not inherit a held lock or another thread's pending events.
+    global _maintenance_event_state, _maintenance_event_lock
+    global _maintenance_event_queues, _maintenance_event_dispatching
+    _maintenance_event_state = threading.local()
+    _maintenance_event_lock = threading.Lock()
+    _maintenance_event_queues = {}
+    _maintenance_event_dispatching = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_maintenance_events_after_fork)
+
+
+@contextmanager
+def _defer_maintenance_events():
+    """Release locks before callbacks, without overtaking another thread's events."""
+    previous = getattr(_maintenance_event_state, "pending", None)
+    if previous is not None:
+        yield
+        return
+    pending = []
+    _maintenance_event_state.pending = pending
+    try:
+        yield
+    finally:
+        # Only this scope promotes its deliveries, after releasing the locks
+        # that deferred them. Queue order keeps a later completion behind its
+        # start, even if another thread drains between these promotions.
+        # Do not allocate the iterator under the queue lock: cyclic GC can
+        # disconnect an abandoned connection and enqueue its completion here.
+        _maintenance_event_state.pending = previous
+        if pending:
+            for _, delivery in pending:
+                delivery.ready = True
+            cancellation = None
+            for source in dict.fromkeys(source for source, _ in pending):
+                try:
+                    _drain_maintenance_events(source)
+                except BaseException as error:
+                    if cancellation is None:
+                        cancellation = error
+            if cancellation is not None:
+                raise cancellation
+
+
+def _drain_maintenance_events(source):
+    pid = os.getpid()
+    with _maintenance_event_lock:
+        if source in _maintenance_event_dispatching:
+            return
+        _maintenance_event_dispatching.add(source)
+    cancellation = None
+    try:
+        while True:
+            with _maintenance_event_lock:
+                queue = _maintenance_event_queues.get(source)
+                if not queue or not queue[0].ready:
+                    _maintenance_event_dispatching.remove(source)
+                    if not queue:
+                        _maintenance_event_queues.pop(source, None)
+                    break
+                delivery = queue.popleft()
+            # No queue, handler or ownership lock is held during callbacks.
+            # Reentrant events append to this queue and follow the current
+            # event's listeners instead of recursively overtaking them.
+            dispatcher = delivery.config.event_dispatcher
+            if dispatcher is not None:
+                try:
+                    dispatcher.dispatch(delivery.event)
+                except Exception:
+                    logger.exception(
+                        f"Error dispatching maintenance event: {delivery.event}"
+                    )
+                except BaseException as error:
+                    # A listener may enqueue completion by closing its pool
+                    # before cancelling. Deliver ready events without retrying
+                    # that listener, then propagate the original cancellation.
+                    if cancellation is None:
+                        cancellation = error
+            if os.getpid() != pid:
+                # A listener forked: the child has a fresh dispatch queue.
+                break
+    except BaseException:
+        if os.getpid() == pid:
+            with _maintenance_event_lock:
+                _maintenance_event_dispatching.discard(source)
+                if not _maintenance_event_queues.get(source):
+                    _maintenance_event_queues.pop(source, None)
+        raise
+    if cancellation is not None:
+        raise cancellation
+
 
 def _dispatch_maintenance_event(
     config: MaintNotificationsConfig,
@@ -801,17 +911,30 @@ def _dispatch_maintenance_event(
 ) -> None:
     """
     Dispatch a maintenance event to the dispatcher configured on ``config``,
-    if any. A failing listener is logged and never interrupts the notification
-    handling that emitted the event: the push parser swallows exceptions
-    silently, so letting one out would abort the remaining handling instead.
+    if any. Ordinary listener exceptions are logged: the push parser swallows
+    them silently, so letting one out would abort the remaining handling.
+    Cancellation propagates after ready deliveries have drained.
     """
-    dispatcher = config.event_dispatcher
-    if dispatcher is None:
+    if config.event_dispatcher is None:
         return
-    try:
-        dispatcher.dispatch(event)
-    except Exception:
-        logger.exception(f"Error dispatching maintenance event: {event}")
+    pending = getattr(_maintenance_event_state, "pending", None)
+    # Serialize per pool, also across connection-level and handoff events:
+    # MOVING starts before it completes any connection's previous relaxation.
+    # Standalone connections have their own queue. Queued events retain the
+    # source until delivery, so its identity cannot be reused while pending.
+    source = id(
+        event.connection_pool if event.connection_pool is not None else event.connection
+    )
+    delivery = _PendingMaintenanceEvent(config, event, ready=pending is None)
+    if pending is not None:
+        pending.append((source, delivery))
+    # Allocating a deque can also trigger a connection finalizer. Keep that
+    # allocation outside the non-reentrant lock protecting queue mutations.
+    queue = deque()
+    with _maintenance_event_lock:
+        _maintenance_event_queues.setdefault(source, queue).append(delivery)
+    if pending is None:
+        _drain_maintenance_events(source)
 
 
 def _build_moving_connection_kwargs(
@@ -931,7 +1054,15 @@ class MaintNotificationsPoolHandler:
         ):
             return
 
-        with self._lock:
+        # Proactive reconnect can finalize a pool-owning client. Join any
+        # resulting cached teardown after both handler and pool locks release.
+        with (
+            _defer_maintenance_events(),
+            self.pool._defer_cached_disconnects()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             if notification in self._processed_notifications:
                 # nothing to do in the connection pool handling
                 # the notification has already been handled or is expired
@@ -1044,7 +1175,16 @@ class MaintNotificationsPoolHandler:
             # cancel_scheduled_tasks(): a timer cancelled before it gets the
             # lock does nothing, and one already running finishes before
             # cancellation proceeds.
-            with self._lock:
+            # Completion listeners and finalizers can close a cached owner's
+            # pool while a peer drain needs this handler lock. Defer dispatch
+            # and cached teardown past this wrapper around the callback too.
+            with (
+                _defer_maintenance_events(),
+                self.pool._defer_cached_disconnects()
+                if self.pool.cache is not None
+                else nullcontext(),
+                self._lock,
+            ):
                 if timer not in self._scheduled_timers:
                     return
                 try:
@@ -1058,7 +1198,7 @@ class MaintNotificationsPoolHandler:
         timer.start()
 
     def cancel_scheduled_tasks(self) -> None:
-        with self._lock:
+        with _defer_maintenance_events(), self._lock:
             if not self._scheduled_timers and not self._pending_handoffs:
                 return
             timers = tuple(self._scheduled_timers)
@@ -1088,7 +1228,15 @@ class MaintNotificationsPoolHandler:
         Active connections are marked for reconnect after they complete the current command.
         Inactive connections are disconnected and will be connected on next use.
         """
-        with self._lock:
+        with (
+            _defer_maintenance_events()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self.pool._defer_cached_disconnects()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             with self.pool._lock:
                 # take care for the active connections in the pool
                 # mark them for reconnect after they complete the current command
@@ -1112,7 +1260,7 @@ class MaintNotificationsPoolHandler:
         """
         notification_hash = hash(notification)
 
-        with self._lock:
+        with _defer_maintenance_events(), self._lock:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"Reverting temporary changes related to notification: {notification}, "
@@ -1150,6 +1298,18 @@ class MaintNotificationsPoolHandler:
             if kwargs is not None:
                 self._dispatch_handoff_event(MaintenanceCompletedEvent, notification)
             return kwargs is not None
+
+
+def _get_maintenance_state_lock(connection):
+    # An idle cached owner can process pushes outside the pool lock. Serialize
+    # its state/timeout transition with MOVING updates, without holding this
+    # lock across the parser's socket I/O or application event listeners.
+    handler = getattr(connection, "_maint_notifications_pool_handler", None)
+    # Disconnect and garbage collection can run in a child before _checkpid()
+    # resets the pool. Its inherited lock may belong to a vanished thread.
+    if handler is None or handler.pool.pid != os.getpid():
+        return nullcontext()
+    return handler.pool._lock
 
 
 class MaintNotificationsConnectionHandler:
@@ -1222,89 +1382,94 @@ class MaintNotificationsConnectionHandler:
     def handle_maintenance_start_notification(
         self, maintenance_state: MaintenanceState, notification: MaintenanceNotification
     ):
-        add_debug_log_for_notification(self.connection, notification)
+        with _defer_maintenance_events(), _get_maintenance_state_lock(self.connection):
+            add_debug_log_for_notification(self.connection, notification)
 
-        if _should_skip_connection_timeout_update(
-            self.connection.maintenance_state, self.config
-        ):
-            return
+            if _should_skip_connection_timeout_update(
+                self.connection.maintenance_state, self.config
+            ):
+                return
 
-        self.connection.maintenance_state = maintenance_state
-        self.connection.set_tmp_settings(
-            tmp_relaxed_timeout=self.config.relaxed_timeout
-        )
-        # extend the timeout for all created connections
-        self.connection.update_current_socket_timeout(self.config.relaxed_timeout)
-        if isinstance(notification, OSSNodeMigratingNotification):
-            # add the notification id to the set of processed start maint notifications
-            # this is used to skip the unrelaxing of the timeouts if we have received more than
-            # one start notification before the final end notification
-            self.connection.add_maint_start_notification(notification.id)
+            self.connection.maintenance_state = maintenance_state
+            self.connection.set_tmp_settings(
+                tmp_relaxed_timeout=self.config.relaxed_timeout
+            )
+            # extend the timeout for all created connections
+            self.connection.update_current_socket_timeout(self.config.relaxed_timeout)
+            if isinstance(notification, OSSNodeMigratingNotification):
+                # add the notification id to the set of processed start maint notifications
+                # this is used to skip the unrelaxing of the timeouts if we have received more than
+                # one start notification before the final end notification
+                self.connection.add_maint_start_notification(notification.id)
 
-        maint_notification = _get_maintenance_notification_name(notification)
-        record_connection_relaxed_timeout(
-            connection_name=self._get_pool_name(),
-            maint_notification=maint_notification,
-            relaxed=True,
-        )
-
-        _dispatch_maintenance_event(
-            self.config,
-            MaintenanceStartedEvent(
-                connection_pool=self._get_pool(),
-                connection=self.connection,
-                state=maintenance_state,
-                notification=notification,
-                config=self.config,
-            ),
-        )
-
-    def handle_maintenance_completed_notification(self, **kwargs: Any) -> None:
-        # Only reset timeouts if state is not MOVING and relaxed timeouts are enabled
-        if _should_skip_connection_timeout_update(
-            self.connection.maintenance_state, self.config
-        ):
-            return
-
-        # A completion can reach a connection whose start went to another one,
-        # or none at all; only a connection that was relaxed has a start event
-        # to pair the completion with
-        was_relaxed = self.connection.maintenance_state == MaintenanceState.MAINTENANCE
-
-        notification = None
-        if kwargs.get("notification"):
-            notification = kwargs["notification"]
-        add_debug_log_for_notification(
-            self.connection, notification if notification else "MAINTENANCE_COMPLETED"
-        )
-        self.connection.reset_tmp_settings(reset_relaxed_timeout=True)
-        # Maintenance completed - reset the connection
-        # timeouts by providing -1 as the relaxed timeout
-        self.connection.update_current_socket_timeout(-1)
-        self.connection.maintenance_state = MaintenanceState.NONE
-        # reset the sets that keep track of received start maint
-        # notifications and skipped end maint notifications
-        self.connection.reset_received_notifications()
-
-        if notification:
             maint_notification = _get_maintenance_notification_name(notification)
             record_connection_relaxed_timeout(
                 connection_name=self._get_pool_name(),
                 maint_notification=maint_notification,
-                relaxed=False,
+                relaxed=True,
             )
 
-        if was_relaxed:
             _dispatch_maintenance_event(
                 self.config,
-                MaintenanceCompletedEvent(
+                MaintenanceStartedEvent(
                     connection_pool=self._get_pool(),
                     connection=self.connection,
-                    state=MaintenanceState.MAINTENANCE,
+                    state=maintenance_state,
                     notification=notification,
                     config=self.config,
                 ),
             )
+
+    def handle_maintenance_completed_notification(self, **kwargs: Any) -> None:
+        with _defer_maintenance_events(), _get_maintenance_state_lock(self.connection):
+            # Only reset timeouts if state is not MOVING and relaxed timeouts are enabled
+            if _should_skip_connection_timeout_update(
+                self.connection.maintenance_state, self.config
+            ):
+                return
+
+            # A completion can reach a connection whose start went to another one,
+            # or none at all; only a connection that was relaxed has a start event
+            # to pair the completion with
+            was_relaxed = (
+                self.connection.maintenance_state == MaintenanceState.MAINTENANCE
+            )
+
+            notification = None
+            if kwargs.get("notification"):
+                notification = kwargs["notification"]
+            add_debug_log_for_notification(
+                self.connection,
+                notification if notification else "MAINTENANCE_COMPLETED",
+            )
+            self.connection.reset_tmp_settings(reset_relaxed_timeout=True)
+            # Maintenance completed - reset the connection
+            # timeouts by providing -1 as the relaxed timeout
+            self.connection.update_current_socket_timeout(-1)
+            self.connection.maintenance_state = MaintenanceState.NONE
+            # reset the sets that keep track of received start maint
+            # notifications and skipped end maint notifications
+            self.connection.reset_received_notifications()
+
+            if notification:
+                maint_notification = _get_maintenance_notification_name(notification)
+                record_connection_relaxed_timeout(
+                    connection_name=self._get_pool_name(),
+                    maint_notification=maint_notification,
+                    relaxed=False,
+                )
+
+            if was_relaxed:
+                _dispatch_maintenance_event(
+                    self.config,
+                    MaintenanceCompletedEvent(
+                        connection_pool=self._get_pool(),
+                        connection=self.connection,
+                        state=MaintenanceState.MAINTENANCE,
+                        notification=notification,
+                        config=self.config,
+                    ),
+                )
 
 
 class OSSMaintNotificationsHandler:
@@ -1361,7 +1526,13 @@ class OSSMaintNotificationsHandler:
         # thread and needs _lock - so a thread holding _lock must never wait for
         # _initialization_lock. See the _initialization_lock comment in
         # NodesManager.__init__ for the full ordering rule.
-        with self.cluster_client.nodes_manager._initialization_lock, self._lock:
+        # Topology cleanup can emit completion events. Listeners may reenter a
+        # pool, so defer them until all topology and pool locks are released.
+        with (
+            _defer_maintenance_events(),
+            self.cluster_client.nodes_manager._initialization_lock,
+            self._lock,
+        ):
             if (
                 notification in self._in_progress
                 or notification in self._processed_notifications
@@ -1419,7 +1590,15 @@ class OSSMaintNotificationsHandler:
                 for current_node in all_nodes:
                     if current_node.redis_connection is None:
                         continue
-                    with current_node.redis_connection.connection_pool._lock:
+                    pool = current_node.redis_connection.connection_pool
+                    # Nested pool teardown must wait until the outer lock is
+                    # released, so idle drains can restore their timeouts.
+                    with (
+                        pool._defer_cached_disconnects()
+                        if pool.cache is not None
+                        else nullcontext(),
+                        pool._lock,
+                    ):
                         handoff_recorded = False
                         if current_node in affected_nodes:
                             # mark for reconnect all in use connections to the node - this will force them to
@@ -1449,10 +1628,9 @@ class OSSMaintNotificationsHandler:
                             current_node
                             not in self.cluster_client.nodes_manager.nodes_cache.values()
                         ):
-                            # disconnect all free connections to the node - this node will be dropped
-                            # from the cluster, so we don't need to revert the timeouts
-                            for conn in current_node.redis_connection.connection_pool._get_free_connections():
-                                conn.disconnect()
+                            # A cache owner being drained must keep its parser
+                            # until the read ends; the drainer finishes disconnecting.
+                            current_node.redis_connection.connection_pool.disconnect_free_connections()
 
                             # Only record handoff if not already recorded for this node
                             if not handoff_recorded:

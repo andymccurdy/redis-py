@@ -952,7 +952,7 @@ class TestMaintNotificationsPoolHandlerEvents:
     """The pool handler reports a handoff as a MOVING event pair."""
 
     def setup_method(self):
-        self.mock_pool = Mock()
+        self.mock_pool = Mock(cache=None)
         self.mock_pool._lock = MagicMock()
         self.mock_pool._lock.__enter__.return_value = None
         self.mock_pool._lock.__exit__.return_value = None
@@ -981,20 +981,34 @@ class TestMaintNotificationsPoolHandlerEvents:
         assert event.notification is notification
         assert event.config is self.config
 
-    def test_started_event_precedes_relaxing_the_pool(self):
+    def test_started_event_precedes_completion_of_replaced_maintenance(self):
         """
         Taking over a connection under maintenance completes that connection's
         pair; the handoff's pair must already be open for a listener by then.
         """
-        seen = []
+        connection = Mock(maintenance_state=MaintenanceState.MAINTENANCE)
+        connection._maint_notifications_pool_handler.pool = self.mock_pool
+        handler = MaintNotificationsConnectionHandler(connection, self.config)
         self.mock_pool.update_connections_settings.side_effect = (
-            lambda **kwargs: seen.extend(type(e) for e in self.listener.events)
+            lambda **kwargs: handler.handle_maintenance_completed_notification()
         )
 
         with patch("threading.Timer"):
             self.handler.handle_node_moving_notification(self._moving())
 
-        assert seen == [MaintenanceStartedEvent]
+        # State changes stay under the handler lock; listeners run after it
+        # releases and must still see the handoff open before the old pair ends.
+        assert [type(e) for e in self.listener.events] == [
+            MaintenanceStartedEvent,
+            MaintenanceCompletedEvent,
+        ]
+        assert [e.state for e in self.listener.events] == [
+            MaintenanceState.MOVING,
+            MaintenanceState.MAINTENANCE,
+        ]
+        assert self.listener.events[1].connection is connection
+        assert connection.maintenance_state == MaintenanceState.NONE
+        self.mock_pool.update_connections_settings.assert_called_once()
 
     def test_failed_handoff_closes_its_pair(self):
         """A pool mutation that fails leaves no relaxation to end later."""
@@ -1138,7 +1152,7 @@ class TestMaintNotificationsPoolHandler:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.mock_pool = Mock()
+        self.mock_pool = Mock(cache=None)
         self.mock_pool._lock = MagicMock()
         self.mock_pool._lock.__enter__.return_value = None
         self.mock_pool._lock.__exit__.return_value = None
@@ -1704,7 +1718,7 @@ class TestMaintNotificationsMetricsRecording:
         self, mock_record_connection_handoff
     ):
         """Test that handle_node_moving_notification calls record_connection_handoff."""
-        mock_pool = Mock()
+        mock_pool = Mock(cache=None)
         mock_pool._lock = MagicMock()
         mock_pool._lock.__enter__ = Mock(return_value=None)
         mock_pool._lock.__exit__ = Mock(return_value=None)
@@ -1732,7 +1746,7 @@ class TestMaintNotificationsMetricsRecording:
         self, mock_record_connection_handoff
     ):
         """Test that record_connection_handoff is not called for already processed notification."""
-        mock_pool = Mock()
+        mock_pool = Mock(cache=None)
         mock_pool._lock = MagicMock()
         mock_pool._lock.__enter__ = Mock(return_value=None)
         mock_pool._lock.__exit__ = Mock(return_value=None)

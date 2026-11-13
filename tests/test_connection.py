@@ -1897,6 +1897,10 @@ class TestUnitCacheProxyConnection:
         mock_connection.credential_provider = UsernamePasswordCredentialProvider()
         mock_connection._event_dispatcher = EventDispatcher()
 
+        proxy_connection = CacheProxyConnection(
+            mock_connection, mock_cache, threading.RLock()
+        )
+
         mock_cache.is_cachable.return_value = True
         # Scripted positionally, so it tracks how many lookups the proxy makes:
         #   1st - ``send_command`` checking for an existing entry (None, so it sends)
@@ -1911,7 +1915,7 @@ class TestUnitCacheProxyConnection:
                 ),
                 cache_value=CacheProxyConnection.DUMMY_CACHE_VALUE,
                 status=CacheEntryStatus.IN_PROGRESS,
-                connection_ref=mock_connection,
+                connection_ref=proxy_connection,
             ),
             CacheEntry(
                 cache_key=CacheKey(
@@ -1919,7 +1923,7 @@ class TestUnitCacheProxyConnection:
                 ),
                 cache_value=b"bar",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy_connection,
             ),
             CacheEntry(
                 cache_key=CacheKey(
@@ -1927,7 +1931,7 @@ class TestUnitCacheProxyConnection:
                 ),
                 cache_value=b"bar",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy_connection,
             ),
             CacheEntry(
                 cache_key=CacheKey(
@@ -1935,16 +1939,13 @@ class TestUnitCacheProxyConnection:
                 ),
                 cache_value=b"bar",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy_connection,
             ),
         ]
         mock_connection.send_command.return_value = Any
         mock_connection.read_response.return_value = b"bar"
         mock_connection.can_read.return_value = False
 
-        proxy_connection = CacheProxyConnection(
-            mock_connection, mock_cache, threading.RLock()
-        )
         proxy_connection.send_command(*["GET", "foo"], **{"keys": ["foo"]})
         assert proxy_connection.read_response() == b"bar"
         assert proxy_connection._current_command_cache_key is None
@@ -1961,7 +1962,7 @@ class TestUnitCacheProxyConnection:
                         ),
                         cache_value=CacheProxyConnection.DUMMY_CACHE_VALUE,
                         status=CacheEntryStatus.IN_PROGRESS,
-                        connection_ref=mock_connection,
+                        connection_ref=proxy_connection,
                     )
                 ),
                 call(
@@ -1973,7 +1974,7 @@ class TestUnitCacheProxyConnection:
                         ),
                         cache_value=b"bar",
                         status=CacheEntryStatus.VALID,
-                        connection_ref=mock_connection,
+                        connection_ref=proxy_connection,
                     )
                 ),
             ]
@@ -2032,6 +2033,10 @@ class TestUnitCacheProxyConnection:
         mock_connection.credential_provider = UsernamePasswordCredentialProvider()
         mock_connection._event_dispatcher = EventDispatcher()
 
+        proxy_connection = CacheProxyConnection(
+            mock_connection, mock_cache, threading.RLock()
+        )
+
         cache_key = CacheKey(
             command=command, redis_keys=redis_keys, redis_args=redis_args
         )
@@ -2039,13 +2044,13 @@ class TestUnitCacheProxyConnection:
             cache_key=cache_key,
             cache_value=cached_value,
             status=CacheEntryStatus.VALID,
-            connection_ref=mock_connection,
+            connection_ref=proxy_connection,
         )
         in_progress_entry = CacheEntry(
             cache_key=cache_key,
             cache_value=CacheProxyConnection.DUMMY_CACHE_VALUE,
             status=CacheEntryStatus.IN_PROGRESS,
-            connection_ref=mock_connection,
+            connection_ref=proxy_connection,
         )
         mock_cache.is_cachable.return_value = True
         mock_cache.get.side_effect = [
@@ -2074,9 +2079,6 @@ class TestUnitCacheProxyConnection:
         mock_connection.read_response.return_value = cached_value
         mock_connection.can_read.return_value = False
 
-        proxy_connection = CacheProxyConnection(
-            mock_connection, mock_cache, threading.RLock()
-        )
         proxy_connection.send_command(*list(redis_args), **{"keys": list(redis_keys)})
         # First call: cache miss, reads from connection
         assert proxy_connection.read_response() == cached_value
@@ -2107,6 +2109,8 @@ class TestUnitCacheProxyConnection:
         mock_connection._event_dispatcher = Mock(spec=EventDispatcher)
 
         another_conn = copy.deepcopy(mock_connection)
+        owner = CacheProxyConnection(another_conn, mock_cache, threading.RLock())
+        owner._in_use = False
         another_conn.can_read.side_effect = [True, False]
         another_conn.read_response.return_value = None
         cache_entry = CacheEntry(
@@ -2115,7 +2119,7 @@ class TestUnitCacheProxyConnection:
             ),
             cache_value=b"bar",
             status=CacheEntryStatus.VALID,
-            connection_ref=another_conn,
+            connection_ref=owner,
         )
         mock_cache.is_cachable.return_value = True
         mock_cache.get.return_value = cache_entry
@@ -2140,10 +2144,10 @@ class TestUnitCacheProxyConnection:
         self, mock_cache, mock_connection
     ):
         """
-        The drain takes the pool lock, and an invalidation it reads runs the owner's
-        callback under the owner's cache lock. Holding this connection's cache lock across
-        it orders a cache lock before the pool lock, so two connections draining each other,
-        or a ``pool.disconnect()`` reaching this one, deadlock.
+        The drain takes the owner's checkout lock, and invalidations run the owner's
+        callback under its cache lock. Holding the borrower's cache lock across it
+        could deadlock two connections draining each other. Unrelated pool operations
+        must remain free to proceed.
         """
         mock_connection.retry = "mock"
         mock_connection.host = "mock"
@@ -2152,7 +2156,10 @@ class TestUnitCacheProxyConnection:
         mock_connection.credential_provider = UsernamePasswordCredentialProvider()
         mock_connection._event_dispatcher = Mock(spec=EventDispatcher)
 
+        pool_lock = threading.RLock()
         another_conn = copy.deepcopy(mock_connection)
+        owner = CacheProxyConnection(another_conn, mock_cache, pool_lock)
+        owner._in_use = False
         another_conn.can_read.side_effect = [True, False]
         cache_key = CacheKey(
             command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
@@ -2161,23 +2168,25 @@ class TestUnitCacheProxyConnection:
             cache_key=cache_key,
             cache_value=b"bar",
             status=CacheEntryStatus.VALID,
-            connection_ref=another_conn,
+            connection_ref=owner,
         )
         mock_cache.is_cachable.return_value = True
         mock_cache.get.return_value = cache_entry
         mock_connection.can_read.return_value = False
 
-        pool_lock = threading.RLock()
         proxy_connection = CacheProxyConnection(mock_connection, mock_cache, pool_lock)
         acquired = []
 
         def read_invalidation(**kwargs):
             cache_lock_available = False
             pool_lock_available = False
+            owner_lock_available = False
 
             def probe_locks():
-                nonlocal cache_lock_available, pool_lock_available
-                # The sending thread must still hold the pool lock during this probe.
+                nonlocal cache_lock_available, pool_lock_available, owner_lock_available
+                owner_lock_available = owner._in_use_lock.acquire(blocking=False)
+                if owner_lock_available:
+                    owner._in_use_lock.release()
                 pool_lock_available = pool_lock.acquire(blocking=False)
                 if pool_lock_available:
                     pool_lock.release()
@@ -2191,7 +2200,8 @@ class TestUnitCacheProxyConnection:
             other.start()
             other.join(timeout=5)
             assert not other.is_alive()
-            assert not pool_lock_available
+            assert not owner_lock_available
+            assert pool_lock_available
             acquired.append(cache_lock_available)
             return None
 
@@ -2227,6 +2237,8 @@ class TestUnitCacheProxyConnection:
         mock_connection._event_dispatcher = Mock(spec=EventDispatcher)
 
         another_conn = copy.deepcopy(mock_connection)
+        owner = CacheProxyConnection(another_conn, mock_cache, threading.RLock())
+        owner._in_use = False
         another_conn.can_read.side_effect = [True, False]
         another_conn.read_response.return_value = None
 
@@ -2237,7 +2249,7 @@ class TestUnitCacheProxyConnection:
             cache_key=cache_key,
             cache_value=b"bar",
             status=CacheEntryStatus.VALID,
-            connection_ref=another_conn,
+            connection_ref=owner,
         )
 
         mock_cache.is_cachable.return_value = True
@@ -2268,7 +2280,7 @@ class TestUnitCacheProxyConnection:
                 cache_key=cache_key,
                 cache_value=CacheProxyConnection.DUMMY_CACHE_VALUE,
                 status=CacheEntryStatus.IN_PROGRESS,
-                connection_ref=mock_connection,
+                connection_ref=proxy_connection,
             )
         )
 
@@ -2287,6 +2299,8 @@ class TestUnitCacheProxyConnection:
         mock_connection._event_dispatcher = Mock(spec=EventDispatcher)
 
         another_conn = copy.deepcopy(mock_connection)
+        owner = CacheProxyConnection(another_conn, mock_cache, threading.RLock())
+        owner._in_use = False
         another_conn.can_read.return_value = True
         another_conn.read_response.side_effect = TimeoutError("timeout")
 
@@ -2297,7 +2311,7 @@ class TestUnitCacheProxyConnection:
             cache_key=cache_key,
             cache_value=b"bar",
             status=CacheEntryStatus.VALID,
-            connection_ref=another_conn,
+            connection_ref=owner,
         )
 
         mock_cache.is_cachable.return_value = True
@@ -3372,7 +3386,7 @@ class TestCacheEntryLifecycle:
             if (
                 entry.cache_key == cache_key
                 and entry.status is CacheEntryStatus.IN_PROGRESS
-                and entry.connection_ref is mock_connection
+                and entry.connection_ref is proxy
             ):
                 waiting.set()
                 assert resume.wait(timeout=5)
@@ -3412,20 +3426,25 @@ class TestCacheEntryLifecycle:
             command="GET", redis_keys=("foo",), redis_args=("GET", "foo")
         )
         owner = Mock()
+        owner_proxy = CacheProxyConnection(owner, cache, proxy._pool_lock)
+        owner_proxy._in_use = False
         owner.can_read.side_effect = [True, False]
         candidate = CacheEntry(
             cache_key=cache_key,
             cache_value=b"old",
             status=CacheEntryStatus.VALID,
-            connection_ref=owner,
+            connection_ref=owner_proxy,
         )
         replacement_owner = Mock()
+        replacement_proxy = CacheProxyConnection(
+            replacement_owner, cache, proxy._pool_lock
+        )
         replacement_owner.can_read.side_effect = [True, False]
         replacement = CacheEntry(
             cache_key=cache_key,
             cache_value=b"replacement",
             status=CacheEntryStatus.VALID,
-            connection_ref=replacement_owner,
+            connection_ref=replacement_proxy,
         )
         cache.set(candidate)
         mock_connection.read_response.return_value = b"new"
@@ -3502,7 +3521,7 @@ class TestCacheEntryLifecycle:
                 cache_key=cache_key,
                 cache_value=b"cached",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy,
             )
         )
 
@@ -3533,7 +3552,7 @@ class TestCacheEntryLifecycle:
                 cache_key=cache_key,
                 cache_value=CacheProxyConnection.DUMMY_CACHE_VALUE,
                 status=CacheEntryStatus.IN_PROGRESS,
-                connection_ref=mock_connection,
+                connection_ref=proxy,
             )
         )
         mock_connection.can_read.return_value = False
@@ -3578,7 +3597,7 @@ class TestCacheEntryLifecycle:
 
         owner.read_response.assert_not_called()
         # Our own placeholder replaced the other one.
-        assert cache.get(cache_key).connection_ref is mock_connection
+        assert cache.get(cache_key).connection_ref is proxy
 
     def test_one_shot_keys_are_indexed_under_the_real_keys(
         self, proxy_factory, mock_connection
@@ -3613,7 +3632,7 @@ class TestCacheEntryLifecycle:
                 ),
                 cache_value=b"cached",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy,
             )
         )
 
@@ -3645,7 +3664,7 @@ class TestCacheEntryLifecycle:
                 ),
                 cache_value=b"cached",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy,
             )
         )
         mock_connection.read_response.return_value = b"fresh"
@@ -3675,7 +3694,7 @@ class TestCacheEntryLifecycle:
                 ),
                 cache_value=b"kept",
                 status=CacheEntryStatus.VALID,
-                connection_ref=mock_connection,
+                connection_ref=proxy,
             )
         )
         mock_connection.read_response.side_effect = redirect("3999 127.0.0.1:6381")

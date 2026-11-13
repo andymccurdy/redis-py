@@ -369,40 +369,43 @@ class DefaultCache(CacheInterface):
         return response
 
     def delete_by_redis_keys(self, redis_keys: list[bytes] | list[str]) -> list[bool]:
-        response = []
-        keys_to_delete = []
+        # Independent owners can receive invalidations for the same Redis key.
+        # Keep the holder snapshots and their removal in one atomic operation.
+        with self._cache._lock:
+            response = []
+            keys_to_delete = []
 
-        for redis_key in redis_keys:
-            # Prepare both versions for lookup
-            candidates = [redis_key]
-            if isinstance(redis_key, str):
-                candidates.append(redis_key.encode("utf-8"))
-            elif isinstance(redis_key, bytes):
-                try:
-                    candidates.append(redis_key.decode("utf-8"))
-                except UnicodeDecodeError:
-                    pass  # Non-UTF-8 bytes, skip str version
+            for redis_key in redis_keys:
+                # Prepare both versions for lookup
+                candidates = [redis_key]
+                if isinstance(redis_key, str):
+                    candidates.append(redis_key.encode("utf-8"))
+                elif isinstance(redis_key, bytes):
+                    try:
+                        candidates.append(redis_key.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        pass  # Non-UTF-8 bytes, skip str version
 
-            # The reverse index answers this without walking the map. Both spellings are
-            # looked up because an entry is indexed under its keys exactly as the invocation
-            # supplied them, while the server names them in its own encoding. The two results
-            # are unioned, so an entry indexed under both spellings of this one key is
-            # collected once.
-            holders: set[CacheKey] = set()
-            for candidate in candidates:
-                holders |= self._cache.holders_of(candidate)
+                # The reverse index answers this without walking the map. Both spellings are
+                # looked up because an entry is indexed under its keys exactly as the invocation
+                # supplied them, while the server names them in its own encoding. The two results
+                # are unioned, so an entry indexed under both spellings of this one key is
+                # collected once.
+                holders: set[CacheKey] = set()
+                for candidate in candidates:
+                    holders |= self._cache.holders_of(candidate)
 
-            # An invalidation message never carries more than one key, so an entry holding
-            # several keys (MGET) cannot be collected twice by one call. A duplicate pop for
-            # a multi-key batch is not a reachable case - do not "fix" it.
-            for cache_key in holders:
-                keys_to_delete.append(cache_key)
-                response.append(True)
+                # An invalidation message never carries more than one key, so an entry holding
+                # several keys (MGET) cannot be collected twice by one call. A duplicate pop for
+                # a multi-key batch is not a reachable case - do not "fix" it.
+                for cache_key in holders:
+                    keys_to_delete.append(cache_key)
+                    response.append(True)
 
-        for key in keys_to_delete:
-            self._cache.pop(key)
+            for key in keys_to_delete:
+                self._cache.pop(key)
 
-        return response
+            return response
 
     def flush(self) -> int:
         elem_count = len(self._cache)

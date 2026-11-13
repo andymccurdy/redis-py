@@ -2,7 +2,8 @@ import os
 import re
 import time
 from contextlib import closing
-from threading import Thread
+from queue import LifoQueue
+from threading import Event, Thread, current_thread
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -221,6 +222,35 @@ class TestConnectionPool:
         other.send_command.assert_not_called()
         in_use.set_re_auth_token.assert_not_called()
 
+    @pytest.mark.fixed_client
+    @pytest.mark.parametrize("outcome", ["success", "auth_error", "cancel"])
+    def test_idle_reauth_clears_deferred_token_only_on_success(self, outcome):
+        pool = self.get_pool(connection_class=DummyConnection)
+        connection = Connection(retry=Retry(NoBackoff(), 0))
+        pool._available_connections.append(connection)
+        previous, token = mock.Mock(), mock.Mock()
+        connection.set_re_auth_token(previous)
+
+        class Cancelled(BaseException):
+            pass
+
+        error = None
+        if outcome == "auth_error":
+            error = redis.AuthenticationError("expired")
+        elif outcome == "cancel":
+            error = Cancelled()
+        with (
+            mock.patch.object(connection, "send_command") as send,
+            mock.patch.object(connection, "read_response", side_effect=error),
+        ):
+            if error is None:
+                pool.re_auth_callback(token)
+            else:
+                with pytest.raises(type(error)):
+                    pool.re_auth_callback(token)
+        send.assert_called_once_with("AUTH", token.try_get("oid"), token.get_value())
+        assert connection._re_auth_token is (None if error is None else previous)
+
     def test_reuse_previously_released_connection(self, master_host):
         connection_kwargs = {"host": master_host[0], "port": master_host[1]}
         pool = self.get_pool(connection_kwargs=connection_kwargs)
@@ -296,6 +326,26 @@ class TestConnectionPool:
         assert conn._sock is None
 
 
+class QueueWithoutMutex:
+    """A queue adapter implementing the pool's public queue hook."""
+
+    def __init__(self, maxsize):
+        self._queue = LifoQueue(maxsize)
+
+    @property
+    def queue(self):
+        return self._queue.queue
+
+    def get(self, *args, **kwargs):
+        return self._queue.get(*args, **kwargs)
+
+    def put_nowait(self, value):
+        return self._queue.put_nowait(value)
+
+    def qsize(self):
+        return self._queue.qsize()
+
+
 class TestBlockingConnectionPool:
     def get_pool(self, connection_kwargs=None, max_connections=10, timeout=20):
         connection_kwargs = connection_kwargs or {}
@@ -306,6 +356,133 @@ class TestBlockingConnectionPool:
             **connection_kwargs,
         )
         return pool
+
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.4.0")
+    @pytest.mark.parametrize("protocol,cached", [(2, False), (3, False), (3, True)])
+    @pytest.mark.parametrize("queue_class", [LifoQueue, QueueWithoutMutex])
+    def test_free_disconnect_with_custom_queue(
+        self, request, protocol, cached, queue_class
+    ):
+        pool = redis.BlockingConnectionPool.from_url(
+            request.config.getoption("--redis-url"),
+            protocol=protocol,
+            cache_config=CacheConfig() if cached else None,
+            queue_class=queue_class,
+            max_connections=2,
+            timeout=1,
+        )
+        idle, active = pool.get_connection(), pool.get_connection()
+        try:
+            pool.release(idle)
+            active.send_command("PING")
+            pool.disconnect(inuse_connections=False)
+            assert not idle.is_connected
+            assert active.is_connected
+            assert active.read_response() == b"PONG"
+            reused = pool.get_connection()
+            assert reused is idle
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            pool.release(reused)
+            pool.release(active)
+            assert pool.pool.qsize() == 2
+        finally:
+            pool.close()
+
+    @pytest.mark.fixed_client
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("7.4.0")
+    @pytest.mark.parametrize("queue_class", [LifoQueue, QueueWithoutMutex])
+    def test_free_disconnect_marks_connection_before_concurrent_checkout(
+        self, request, queue_class
+    ):
+        pool = redis.BlockingConnectionPool.from_url(
+            request.config.getoption("--redis-url"),
+            protocol=3,
+            cache_config=CacheConfig(),
+            queue_class=queue_class,
+            max_connections=1,
+            timeout=1,
+        )
+        owner = pool.get_connection()
+        original_socket = owner._conn._sock
+        pool.release(owner)
+        snapshot_taken, attempted, snapshot_returned = (Event() for _ in range(3))
+        errors = []
+        lock, free, connect = pool._lock, pool._get_free_connections, owner.connect
+
+        class ObservedLock:
+            def acquire(self, *args, **kwargs):
+                if current_thread() is borrower:
+                    attempted.set()
+                return lock.acquire(*args, **kwargs)
+
+            def release(self):
+                lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self.release()
+
+        def snapshot():
+            connections = free()
+            assert connections == {owner}
+            snapshot_taken.set()
+            assert attempted.wait(3)
+            snapshot_returned.set()
+            return connections
+
+        def reconnect():
+            if current_thread() is borrower:
+                attempted.set()
+                assert snapshot_returned.is_set(), "checkout overtook the idle snapshot"
+            connect()
+            assert owner._conn._sock is not original_socket
+
+        def checkout():
+            reused = pool.get_connection()
+            assert reused is owner
+            reused.send_command("PING")
+            assert reused.read_response() == b"PONG"
+            pool.release(reused)
+
+        def run(callback):
+            try:
+                callback()
+            except BaseException as exc:
+                errors.append(exc)
+
+        closer = Thread(
+            target=run,
+            args=(lambda: pool.disconnect(inuse_connections=False),),
+            daemon=True,
+        )
+        borrower = Thread(target=run, args=(checkout,), daemon=True)
+        try:
+            with (
+                mock.patch.object(pool, "_lock", ObservedLock()),
+                mock.patch.object(pool, "_get_free_connections", side_effect=snapshot),
+                mock.patch.object(owner, "connect", side_effect=reconnect),
+            ):
+                closer.start()
+                assert snapshot_taken.wait(3)
+                borrower.start()
+                for worker in (closer, borrower):
+                    worker.join(4)
+                    assert not worker.is_alive()
+                assert not errors
+            assert pool.pool.qsize() == 1
+        finally:
+            attempted.set()
+            for worker in (closer, borrower):
+                if worker.ident is not None:
+                    worker.join(4)
+            pool.close()
 
     def test_connection_creation(self, master_host):
         connection_kwargs = {

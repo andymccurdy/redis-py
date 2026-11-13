@@ -4910,15 +4910,12 @@ class BlockingConnectionPool(ConnectionPool):
                     free_connections.append(connection)
             for _ in range(empty_slots):
                 self.pool.put_nowait(None)
+            free = set(free_connections)
             try:
                 # Every connection that was not in the queue is checked out.
                 self._re_auth_connections(
                     free_connections,
-                    [
-                        conn
-                        for conn in self._connections
-                        if conn not in free_connections
-                    ],
+                    [conn for conn in self._connections if conn not in free],
                     token,
                 )
             finally:

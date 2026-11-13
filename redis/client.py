@@ -19,7 +19,9 @@ from typing import (
     Sequence,
     Set,
     Type,
+    TypeVar,
     Union,
+    overload,
 )
 
 from redis import _himport_exec
@@ -116,6 +118,9 @@ NEVER_DECODE = "NEVER_DECODE"
 
 
 logger = logging.getLogger(__name__)
+
+
+T = TypeVar('T')
 
 
 def is_debug_log_enabled():
@@ -703,17 +708,42 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             self.connection_pool, self.response_callbacks, transaction, shard_hint
         )
 
+    @overload
     def transaction(
-        self, func: Callable[["Pipeline"], None], *watches, **kwargs
-    ) -> Union[List[Any], Any, None]:
+        self,
+        func: Callable[["Pipeline"], T],
+        *watches: str | None,
+        shard_hint: Any = None,
+        value_from_callable: Literal[False] = False,
+        watch_delay: int | None = None,
+        **kwargs: Any,
+    ) -> List[Any]: ...
+
+    @overload
+    def transaction(
+        self,
+        func: Callable[["Pipeline"], T],
+        *watches: str | None,
+        shard_hint: Any = None,
+        value_from_callable: Literal[True] = ...,
+        watch_delay: int | None = None,
+        **kwargs: Any,
+    ) -> T: ...
+
+    def transaction(
+        self,
+        func: Callable[["Pipeline"], T],
+        *watches: str | None,
+        shard_hint: Any = None,
+        value_from_callable: bool = False,
+        watch_delay: int | None = None,
+        **kwargs: Any,
+    ) -> Union[List[Any], T]:
         """
         Convenience method for executing the callable `func` as a transaction
         while watching all keys specified in `watches`. The 'func' callable
         should expect a single argument which is a Pipeline object.
         """
-        shard_hint = kwargs.pop("shard_hint", None)
-        value_from_callable = kwargs.pop("value_from_callable", False)
-        watch_delay = kwargs.pop("watch_delay", None)
         with self.pipeline(True, shard_hint) as pipe:
             while True:
                 try:

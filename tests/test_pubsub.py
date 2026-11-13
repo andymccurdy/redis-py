@@ -5112,6 +5112,76 @@ class TestClusterPubSubSlotMigration:
 
         assert ps not in pubsub._poll_cool_off
 
+    def test_sharded_message_generator_blocks_without_node_pubsubs(self):
+        """
+        A reconciliation pass whose every attach failed leaves no per-node
+        pubsub - the GC drops the ones that hold nothing. A pass over the empty
+        mapping reads nothing, so returning straight away let
+        ``PubSubWorkerThread`` poll right back, spinning instead of blocking.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+
+        try:
+            start = time.monotonic()
+            assert pubsub._sharded_message_generator(timeout=0.05) == (None, None)
+            elapsed = time.monotonic() - start
+
+            assert elapsed >= 0.05
+        finally:
+            pubsub._reconcile_executor.shutdown(wait=True)
+
+    def test_empty_pass_does_not_block_zero_timeout(self):
+        """A non-blocking poll must stay non-blocking with nothing to read."""
+        pubsub = self._make_cluster_pubsub()
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+
+        start = time.monotonic()
+        assert pubsub._sharded_message_generator(timeout=0.0) == (None, None)
+
+        assert time.monotonic() - start < 1
+
+    def test_empty_pass_schedules_one_throttled_topology_refresh(self):
+        """
+        The shard channels a failed reconciliation pass left attached nowhere
+        only retry on the next slots-cache change, and no failed poll asks for
+        one when there is nothing to poll. The read path has to ask - throttled,
+        because every pass finds the mapping empty until the repair lands.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+        nodes_manager = pubsub.cluster.nodes_manager
+
+        try:
+            for _ in range(3):
+                assert pubsub._sharded_message_generator(timeout=0.01) == (
+                    None,
+                    None,
+                )
+            self._drain_reconcile_worker(pubsub)
+
+            assert nodes_manager._run_requested_refresh.call_count == 1
+            nodes_manager._request_refresh.assert_called_once_with(
+                disconnect_startup_nodes_pools=False
+            )
+        finally:
+            pubsub._reconcile_executor.shutdown(wait=True)
+
+    def test_empty_pass_does_not_refresh_without_shard_channels(self):
+        """Nothing subscribed means nothing to refresh the topology for."""
+        pubsub = self._make_cluster_pubsub()
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+
+        assert pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        pubsub.cluster.nodes_manager._request_refresh.assert_not_called()
+
     def _drain_reconcile_worker(self, pubsub):
         """Wait out the reconciliation worker so submitted work has finished.
 

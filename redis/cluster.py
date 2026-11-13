@@ -4723,8 +4723,8 @@ class ClusterPubSub(PubSub):
                     break
                 pubsub, message = self._sharded_pass(deadline - start)
                 if not self.node_pubsub_mapping:
-                    # Polls wait out their share, and a pass with every node in
-                    # cool-off sleeps; only an emptied mapping returns at once.
+                    # A pass over an emptied mapping has only waited, so
+                    # passing again before the deadline would read nothing.
                     break
             if message is None:
                 # A message can reach a node after its slice ran out.
@@ -4844,7 +4844,17 @@ class ClusterPubSub(PubSub):
                 return pubsub, message
         if first_error is not None and failed == polled:
             raise first_error
-        if polled == 0 and next_ready is not None:
+        if polled == 0:
+            if next_ready is None:
+                # No node to read and none cooling off: node_pubsub_mapping is
+                # empty. A reconciliation pass whose every attach failed leaves
+                # it that way - the GC drops the per-node pubsubs that hold
+                # nothing - and its shard channels only retry on the next
+                # slots-cache change, which a settled topology never sends. Ask
+                # for one, and wait as for a cool-off: returning at once would
+                # spin a reader loop on get_sharded_message.
+                self._schedule_topology_repair()
+                next_ready = time.monotonic() + SHARD_POLL_COOL_OFF_SECONDS
             self._wait_out_cool_off(next_ready, timeout)
         return None, None
 

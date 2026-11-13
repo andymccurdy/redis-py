@@ -4233,6 +4233,115 @@ class TestClusterPubSubSlotMigration:
 
         assert ps not in pubsub._poll_cool_off
 
+    async def test_sharded_message_generator_blocks_without_node_pubsubs(self):
+        """
+        A reconciliation pass whose every attach failed leaves no per-node
+        pubsub - the GC drops the ones that hold nothing. A pass over the empty
+        mapping has no await that suspends, so returning straight away let a
+        reader loop on ``get_sharded_message`` hold the event loop for good.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.05) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= 0.05 - EVENT_LOOP_TIMER_SLACK
+
+    async def test_sharded_message_generator_blocks_when_no_node_is_connected(self):
+        """A pass whose every per-node pubsub has no connection reads nothing."""
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        ps = self._make_node_pubsub()
+        ps.connection = None
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": ps}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.05) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert ps.get_message.await_count == 0
+        assert elapsed >= 0.05 - EVENT_LOOP_TIMER_SLACK
+
+    async def test_empty_pass_does_not_block_zero_timeout(self):
+        """A non-blocking poll must stay non-blocking with nothing to read."""
+        pubsub = self._make_cluster_pubsub()
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.0) == (None, None)
+
+        assert time.monotonic() - start < 1
+
+    async def test_reader_loop_without_node_pubsubs_does_not_starve_the_loop(self):
+        """
+        Regression: the scenario run hung for hours once a migration's attaches
+        all failed. The reader loop on ``get_sharded_message`` never suspended,
+        so the publisher, the progress logging and the test itself never ran
+        again.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+        stop = asyncio.Event()
+
+        async def read_messages():
+            while not stop.is_set():
+                await pubsub.get_sharded_message(
+                    ignore_subscribe_messages=True, timeout=0.01
+                )
+
+        reader = asyncio.create_task(read_messages())
+        try:
+            # Only reachable if the reader yields the event loop.
+            await asyncio.wait_for(asyncio.sleep(0.05), timeout=5)
+        finally:
+            stop.set()
+            await asyncio.wait_for(reader, timeout=5)
+
+    async def test_empty_pass_schedules_one_throttled_topology_refresh(self):
+        """
+        The shard channels a failed reconciliation pass left attached nowhere
+        only retry on the next slots-cache change, and no failed poll asks for
+        one when there is nothing to poll. The read path has to ask - throttled,
+        because every pass finds the mapping empty until the repair lands.
+        """
+        pubsub = self._make_cluster_pubsub()
+        pubsub.shard_channels = {b"foo": None}
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+
+        for _ in range(3):
+            assert await pubsub._sharded_message_generator(timeout=0.01) == (
+                None,
+                None,
+            )
+        await asyncio.gather(*pubsub._topology_repair_tasks, return_exceptions=True)
+
+        assert pubsub.cluster.initialize.await_count == 1
+        pubsub.cluster._request_refresh.assert_called_once_with()
+
+    async def test_empty_pass_does_not_refresh_without_shard_channels(self):
+        """Nothing subscribed means nothing to refresh the topology for."""
+        pubsub = self._make_cluster_pubsub()
+        pubsub.node_pubsub_mapping = {}
+        self._prime_generator(pubsub)
+        pubsub.cluster.initialize = AsyncMock()
+
+        assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
+
+        pubsub.cluster.initialize.assert_not_awaited()
+
     async def test_failed_poll_schedules_one_throttled_topology_refresh(self):
         """
         A node that has left the deployment answers ECONNREFUSED, never MOVED, so

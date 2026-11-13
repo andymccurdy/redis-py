@@ -2,9 +2,10 @@ import socket
 from unittest.mock import patch
 
 import pytest
+from redis._parsers.base import BaseParser
 from redis.backoff import NoBackoff
 from redis.client import Redis
-from redis.exceptions import ExternalAuthProviderError
+from redis.exceptions import ExternalAuthProviderError, ResponseError
 from redis.retry import Retry
 
 
@@ -118,6 +119,34 @@ class MockSocket:
 
     def shutdown(self, how):
         pass
+
+
+@pytest.mark.fixed_client
+@pytest.mark.parametrize(
+    "response, status_code",
+    [
+        (
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+            "WRONGTYPE",
+        ),
+        ("NOGROUP No such key 'k' or consumer group 'g'", "NOGROUP"),
+        ("BUSYGROUP Consumer Group name already exists", "BUSYGROUP"),
+        ("SEARCH_SYNTAX Parsing/Syntax error for query string", "SEARCH_SYNTAX"),
+        (
+            "SEARCH_FLEX_SEARCH_NOCONTENT_OR_RETURN_0_REQUIRED NOCONTENT or RETURN 0",
+            "SEARCH_FLEX_SEARCH_NOCONTENT_OR_RETURN_0_REQUIRED",
+        ),
+        ("Cursor not found, id: 42", None),
+        ("Syntax error at offset 3 near foo", None),
+        ("X" * 65 + " is too long to be an error code", None),
+    ],
+)
+def test_unmapped_response_error_status_code(response, status_code):
+    error = BaseParser.parse_error(response)
+
+    assert type(error) is ResponseError
+    assert str(error) == response
+    assert error.status_code == status_code
 
 
 @pytest.mark.fixed_client

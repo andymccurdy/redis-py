@@ -15,6 +15,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Self,
     Sequence,
     Set,
     Type,
@@ -66,6 +67,7 @@ from redis.exceptions import (
     PubSubError,
     RedisError,
     ResponseError,
+    TimeoutError,
     WatchError,
 )
 from redis.himport import HImportRegistry, parse_himport_set_args
@@ -806,7 +808,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             raise_on_release_error=raise_on_release_error,
         )
 
-    def pubsub(self, **kwargs):
+    def pubsub(self, **kwargs) -> "PubSub":
         """
         Return a Publish/Subscribe object. With this object, you can
         subscribe to channels and listen for messages that get published to
@@ -1255,7 +1257,7 @@ class PubSub:
             _set_info_logger()
         self.reset()
 
-    def __enter__(self) -> "PubSub":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -1514,9 +1516,18 @@ class PubSub:
                 # (and restore the original socket_timeout afterwards), so the
                 # configured socket_timeout does not abort the read.
                 read_timeout = None
-            return conn.read_response(
-                disconnect_on_error=False, push_request=True, timeout=read_timeout
-            )
+            try:
+                return conn.read_response(
+                    disconnect_on_error=False, push_request=True, timeout=read_timeout
+                )
+            except TimeoutError:
+                # Only part of a message arrived in time. The parser keeps it,
+                # so the next call resumes it, while the retry layer would
+                # reconnect and drop it. A push handler can raise TimeoutError
+                # itself, so that case still goes to the retry layer.
+                if block or self.push_handler_func is not None:
+                    raise
+                return None
 
         response = self._execute(conn, try_read)
 

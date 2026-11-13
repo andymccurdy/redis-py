@@ -1,9 +1,10 @@
 import math
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
+import redis
 from redis import exceptions
 from redis.commands.core import HashDataPersistOptions
 from tests.conftest import skip_if_server_version_lt
@@ -251,6 +252,25 @@ def test_hpexpireat_with_datetime(r):
         int(exp_time.timestamp() * 1000),
         -1,
     ]
+
+
+def test_hpexpireat_datetime_ms_is_exact():
+    # Argument level only: constructs its own client, so it needs no server.
+    # int(when.timestamp() * 1000) can land 1 ms low for instants whose seconds
+    # part sits just above a power of two (2**31 seconds is
+    # 2038-01-19T03:14:08Z).
+    r = redis.Redis()
+    when = datetime(2038, 1, 19, 3, 14, 8, 2000, tzinfo=timezone.utc)
+    with mock.patch.object(r, "execute_command", return_value=[1]) as cmd:
+        assert r.hpexpireat("test:hash", when, "field1") == [1]
+    assert cmd.call_args.args == (
+        "HPEXPIREAT",
+        "test:hash",
+        2147483648002,
+        "FIELDS",
+        1,
+        "field1",
+    )
 
 
 @skip_if_server_version_lt("7.3.240")

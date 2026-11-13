@@ -253,41 +253,41 @@ class _HiredisParser(BaseParser, PushNotificationsParser):
         push_request=False,
         timeout: Union[float, object] = SENTINEL,
     ):
-        # Bind the reader locally so a concurrent disconnect that clears
-        # self._reader can't turn a later .gets() into an AttributeError;
-        # re-checking the attribute each time would still race.
-        reader = self._reader
-        if reader is None:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        while True:
+            # Bind the reader locally so a concurrent disconnect that clears
+            # self._reader can't turn a later .gets() into an AttributeError;
+            # re-checking the attribute each time would still race. It is
+            # re-bound per frame because a push handler may have disconnected.
+            reader = self._reader
+            if reader is None:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
 
-        if disable_decoding:
-            response = reader.gets(False)
-        else:
-            response = reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            self.read_from_socket(timeout=timeout)
             if disable_decoding:
                 response = reader.gets(False)
             else:
                 response = reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                self.read_from_socket(timeout=timeout)
+                if disable_decoding:
+                    response = reader.gets(False)
+                else:
+                    response = reader.gets()
+            if self._hiredis_PushNotificationType is None or not isinstance(
+                response, self._hiredis_PushNotificationType
+            ):
+                break
+            response = self.handle_push_response(response)
+            if push_request:
+                return response
+            # Otherwise read the reply the push interleaved with. Looping
+            # instead of recursing keeps a burst of consecutive push frames
+            # from growing the stack.
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad
         # happened
         if isinstance(response, ConnectionError):
             raise response
-        elif self._hiredis_PushNotificationType is not None and isinstance(
-            response, self._hiredis_PushNotificationType
-        ):
-            response = self.handle_push_response(response)
-            if push_request:
-                return response
-            return self.read_response(
-                disable_decoding=disable_decoding,
-                push_request=push_request,
-                timeout=timeout,
-            )
-
         elif (
             isinstance(response, list)
             and response
@@ -382,39 +382,40 @@ class _AsyncHiredisParser(AsyncBaseParser, AsyncPushNotificationsParser):
     async def read_response(
         self, disable_decoding: bool = False, push_request: bool = False
     ) -> Union[EncodableT, List[EncodableT]]:
-        # If `on_disconnect()` has been called, prohibit any more reads
-        # even if they could happen because data might be present.
-        # We still allow reads in progress to finish
-        if not self._connected:
-            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
+        while True:
+            # If `on_disconnect()` has been called, prohibit any more reads
+            # even if they could happen because data might be present.
+            # We still allow reads in progress to finish
+            if not self._connected:
+                raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR) from None
 
-        if disable_decoding:
-            response = self._reader.gets(False)
-        else:
-            response = self._reader.gets()
-
-        while response is NOT_ENOUGH_DATA:
-            await self.read_from_socket()
             if disable_decoding:
                 response = self._reader.gets(False)
             else:
                 response = self._reader.gets()
+
+            while response is NOT_ENOUGH_DATA:
+                await self.read_from_socket()
+                if disable_decoding:
+                    response = self._reader.gets(False)
+                else:
+                    response = self._reader.gets()
+            if self._hiredis_PushNotificationType is None or not isinstance(
+                response, self._hiredis_PushNotificationType
+            ):
+                break
+            response = await self.handle_push_response(response)
+            if push_request:
+                return response
+            # Otherwise read the reply the push interleaved with. Looping
+            # instead of recursing keeps a burst of consecutive push frames
+            # from growing the stack.
 
         # if the response is a ConnectionError or the response is a list and
         # the first item is a ConnectionError, raise it as something bad
         # happened
         if isinstance(response, ConnectionError):
             raise response
-        elif self._hiredis_PushNotificationType is not None and isinstance(
-            response, self._hiredis_PushNotificationType
-        ):
-            response = await self.handle_push_response(response)
-            if not push_request:
-                return await self.read_response(
-                    disable_decoding=disable_decoding, push_request=push_request
-                )
-            else:
-                return response
         elif (
             isinstance(response, list)
             and response

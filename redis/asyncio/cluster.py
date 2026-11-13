@@ -174,6 +174,7 @@ from redis.utils import (
     deprecated_args,
     deprecated_function,
     experimental_method,
+    safe_str,
     str_if_bytes,
     truncate_text,
 )
@@ -1476,9 +1477,10 @@ class RedisCluster(
 
     async def _resolve_command_policies(
         self, *args: Any, target_nodes_specified: bool = False
-    ) -> Tuple[str, Union[CommandPolicies, CommandMetadata]]:
+    ) -> Tuple[str, CommandPolicies | CommandMetadata, int | None]:
         """
-        Resolves the policies a command routes and aggregates by.
+        Resolves the policies a command routes and aggregates by, and the slot of its
+        keys when finding the policies took computing it.
 
         Returns the name the policies were decided by along with the record, because the
         name a command is known by is not always ``args[0]``: a container command is
@@ -1497,6 +1499,10 @@ class RedisCluster(
         targets, the command's ``COMMAND_FLAGS`` entry, and finally whether the command
         carries a key. ``target_nodes_specified`` says the caller picked the targets, as
         named nodes or as a nodes flag.
+
+        That last fallback computes the command's slot, which is returned so the caller
+        can pass it to ``_determine_nodes`` instead of computing it again. Every other
+        branch returns ``None`` for the slot.
         """
         command = args[0].upper()
         if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in self.command_flags:
@@ -1510,43 +1516,49 @@ class RedisCluster(
             # the loop over the nodes the caller picked, or fold their replies into one.
             # Answer with the record that aggregates nothing, and skip the resolver: with
             # the targets given, neither of its answers is used.
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         policies = await self._policy_resolver.resolve(args[0].lower())
         if policies:
-            return command, policies
+            return command, policies, None
 
         command_flag = self.command_flags.get(command)
         if command_flag:
             if command_flag in self._command_flags_mapping:
-                return command, _METADATA_BY_REQUEST_POLICY[
-                    self._command_flags_mapping[command_flag]
-                ]
-            return command, _DEFAULT_KEYLESS_METADATA
+                return (
+                    command,
+                    _METADATA_BY_REQUEST_POLICY[
+                        self._command_flags_mapping[command_flag]
+                    ],
+                    None,
+                )
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         # Unflagged and unresolved, so the command routes by its key. Without a default
         # node the topology is not known yet and there is no slot to route by.
         if not self.get_default_node():
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
         slot = await self._determine_slot(*args)
         if slot is None:
-            return command, _DEFAULT_KEYLESS_METADATA
+            return command, _DEFAULT_KEYLESS_METADATA, None
 
-        return command, _DEFAULT_KEYED_METADATA
+        return command, _DEFAULT_KEYED_METADATA, slot
 
     async def _determine_nodes(
         self,
         command: str,
         *args: Any,
-        request_policy: Optional[RequestPolicy] = None,
-        node_flag: Optional[str] = None,
+        request_policy: RequestPolicy | None = None,
+        node_flag: str | None = None,
+        slot: int | None = None,
     ) -> List["ClusterNode"]:
         # Determine which nodes should be executed the command on.
         # Returns a list of target nodes.
         # The caller resolves the command's own policy - see
         # ``_resolve_command_policies`` - so the only decision left here is an explicit
-        # node flag, which overrides it.
+        # node flag, which overrides it. ``slot`` is the slot that resolution already
+        # computed, if it did, so a keyed command is not hashed twice.
         if node_flag and self._is_node_flag(node_flag):
             if node_flag in self._command_flags_mapping:
                 request_policy = self._command_flags_mapping[node_flag]
@@ -1556,14 +1568,18 @@ class RedisCluster(
                 f"No targets were found to execute {command} command on"
             )
 
-        policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
-        if policy_callback is None:
-            # A keyed policy. A MULTI_SHARD command routed here was not split - its keys
-            # share a slot, or are not at fixed positions - so it is routed by its keys as
-            # a whole.
-            nodes = await self.get_nodes_from_slot(command, *args)
+        if slot is not None:
+            # Only the keyed fallback of ``_resolve_command_policies`` computes a slot
+            nodes = [await self._get_node_from_slot(command, slot)]
         else:
-            nodes = await policy_callback(self, command, *args)
+            policy_callback = _REQUEST_POLICY_CALLBACKS[request_policy]
+            if policy_callback is None:
+                # A keyed policy. A MULTI_SHARD command routed here was not split - its
+                # keys share a slot, or are not at fixed positions - so it is routed by
+                # its keys as a whole.
+                nodes = await self.get_nodes_from_slot(command, *args)
+            else:
+                nodes = await policy_callback(self, command, *args)
 
         if command.lower() == "ft.aggregate":
             self._aggregate_nodes = nodes
@@ -1587,7 +1603,8 @@ class RedisCluster(
             # command syntax: EVAL "script body" num_keys ...
             if len(args) < 2:
                 raise RedisClusterException(
-                    f"Invalid args in command: {command, *args}"
+                    "Invalid args in command: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
             keys = args[2 : 2 + int(args[1])]
             # if there are 0 keys, that means the script can be run on any node
@@ -1604,7 +1621,8 @@ class RedisCluster(
                 raise RedisClusterException(
                     "No way to dispatch this command to Redis Cluster. "
                     "Missing key.\nYou can execute the command by specifying "
-                    f"target nodes.\nCommand: {args}"
+                    "target nodes.\nCommand: "
+                    f"{truncate_text(command_text((command, *args)))}"
                 )
 
         # single key command
@@ -1725,7 +1743,7 @@ class RedisCluster(
 
         # A nodes flag picks the targets too: ``_determine_nodes`` resolves it, and the
         # command's own aggregation must not apply to the replies
-        command, command_policies = await self._resolve_command_policies(
+        command, command_policies, slot = await self._resolve_command_policies(
             *args, target_nodes_specified=target_nodes_specified or node_flag
         )
 
@@ -1784,11 +1802,16 @@ class RedisCluster(
             try:
                 if not target_nodes_specified:
                     if splits is None:
+                        # Only the first attempt reuses the slot. A retry computes it
+                        # again, as a command without keys gets a new random slot on
+                        # each attempt - also after an attempt that found no node for it
+                        attempt_slot, slot = slot, None
                         # Determine the nodes to execute the command on
                         target_nodes = await self._determine_nodes(
                             *args,
                             request_policy=command_policies.request_policy,
                             node_flag=passed_targets,
+                            slot=attempt_slot,
                         )
                     else:
                         # One slot: sent as it is, to the node of the slot the split
@@ -1798,7 +1821,8 @@ class RedisCluster(
                         ]
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(args))} command on"
                         )
                     is_default_node = (
                         len(target_nodes) == 1
@@ -2027,6 +2051,14 @@ class RedisCluster(
                 )
                 raise
             except (ConnectionError, TimeoutError) as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"{type(e).__name__} received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 # Connection retries are being handled in the node's
                 # Retry object. The failed connection has disconnected itself;
                 # the node's in-use connections are kept, and a timeout keeps the
@@ -2087,6 +2119,14 @@ class RedisCluster(
                 )
                 raise
             except MovedError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"MOVED error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 # Patch the slots/nodes cache with the redirected node and try
                 # again. Every 'reinitialize_steps' MOVED errors, also ask for a
@@ -2122,6 +2162,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except AskError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"ASK error received for command {args_log_str}, "
+                        f"on node {target_node.name}, error: {e}"
+                    )
                 _fill_missing_redirect_host(e, target_node.host)
                 redirect_addr = self.nodes_manager.remap_host_port(e.host, e.port)
                 asking = True
@@ -2136,6 +2184,14 @@ class RedisCluster(
                     connection=target_node,
                 )
             except TryAgainError as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Log only the command name - argument values can carry
+                    # secrets or user data.
+                    args_log_str = safe_str(args[0])
+                    logger.debug(
+                        f"TRYAGAIN error received for command {args_log_str}, "
+                        f"on node {target_node.name}"
+                    )
                 if ttl < self.RedisClusterRequestTTL / 2:
                     await asyncio.sleep(0.05)
                 await self._record_command_metric(
@@ -4075,7 +4131,7 @@ class PipelineStrategy(AbstractStrategy):
             )
             # A nodes flag picks the targets too, in ``_determine_nodes`` below, and the
             # command's own aggregation must not apply to the replies either
-            command, command_policies = await client._resolve_command_policies(
+            command, command_policies, slot = await client._resolve_command_policies(
                 *cmd.args, target_nodes_specified=bool(passed_targets)
             )
 
@@ -4099,10 +4155,12 @@ class PipelineStrategy(AbstractStrategy):
                         *cmd.args,
                         request_policy=request_policy,
                         node_flag=passed_targets,
+                        slot=slot,
                     )
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {cmd.args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(cmd.args))} command on"
                         )
             cmd.command_policies = command_policies
             # Kept for a retry, which would otherwise route the command by its own policy:
@@ -4185,6 +4243,8 @@ class PipelineStrategy(AbstractStrategy):
             # A node whose task raised answered none of its commands, so its copies are
             # not taken for successes when they are merged - and the slots of a split
             # command that did succeed are kept for the attempt the error leads to.
+            # A command the merge answered with a success keeps it, as ONE_SUCCEEDED
+            # asks, even though one of its nodes failed.
             for (_, commands), e in zip(nodes.values(), errors):
                 if isinstance(e, BaseException):
                     for queued_command in commands:
@@ -4193,15 +4253,37 @@ class PipelineStrategy(AbstractStrategy):
                 cmd.result = self._merge_node_results(
                     client, cmd, command, copies, splits
                 )
-        for (node, _), e in zip(nodes.values(), errors):
-            if isinstance(e, BaseException):
-                # The write failed (the connection connects lazily on it): the
-                # error carries no node, so take it from the task that raised it
-                if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
-                    e, RedisCluster.NOT_NODE_FAILURE_ERRORS
-                ):
-                    self._try_failed_node_last(client, node)
-                raise e
+        # The first node error that fails a command is raised, but only after every
+        # node whose error fails nothing has been tried last, so the raise skips none
+        # of them and the node it came from is still the one tried last.
+        raised: tuple["ClusterNode", BaseException] | None = None
+        for (node, commands), e in zip(nodes.values(), errors):
+            if not isinstance(e, BaseException):
+                continue
+            # A copy shares the position of the command it was made from, which is
+            # that command's index in the stack. When every command the node held is
+            # a copy of a command that merged to a success, the error fails nothing,
+            # so it is not raised.
+            if not fanned_out or not all(
+                c is not stack[c.position]
+                and not isinstance(stack[c.position].result, BaseException)
+                for c in commands
+            ):
+                if raised is None:
+                    raised = (node, e)
+            # The write failed (the connection connects lazily on it): the error
+            # carries no node, so take it from the task that raised it
+            elif isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+        if raised is not None:
+            node, e = raised
+            if isinstance(e, (ConnectionError, TimeoutError)) and not isinstance(
+                e, RedisCluster.NOT_NODE_FAILURE_ERRORS
+            ):
+                self._try_failed_node_last(client, node)
+            raise e
 
         # Record operation duration for each node
         for (node, commands), failed in zip(nodes.values(), errors):
@@ -4212,7 +4294,8 @@ class PipelineStrategy(AbstractStrategy):
                     node_error = cmd.result
                     break
 
-            if failed:
+            # A node task that raised was tried last above
+            if failed is True:
                 # A read failed. Commands before it may have been redirected,
                 # so look past the first error for a connection error
                 for cmd in commands:

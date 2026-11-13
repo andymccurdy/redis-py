@@ -5953,6 +5953,189 @@ class TestRedisCommands:
         )
         assert r.bzmpop(0.1, "2", ["foo", "bar"], max=True) is None
 
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmove(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "a4": 4, "a5": 5})
+        # without count, min moves one member, still as a list of one pair
+        assert r.zmove("a", "b", min=True) == [[b"a1", 1.0]]
+        assert r.zmove("a", "b", max=True, count=2) == [[b"a5", 5.0], [b"a4", 4.0]]
+        # count larger than the source moves what is there
+        r.zadd("c", {"c1": 1})
+        assert r.zmove("c", "b", min=True, count=10) == [[b"c1", 1.0]]
+        # the emptied source is deleted
+        assert r.exists("c") == 0
+        # scores are kept in the destination
+        assert r.zrange("b", 0, -1) == [b"a1", b"c1", b"a4", b"a5"]
+        assert r.zscore("b", "a5") == 5.0
+        assert r.zrange("a", 0, -1) == [b"a2", b"a3"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmove_byscore(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "a4": 4, "a5": 5, "inf": "inf"})
+        # exclusive bound, lowest scores first
+        assert r.zmove("a", "b", byscore=("(1", 3)) == [[b"a2", 2.0], [b"a3", 3.0]]
+        # with count, the lowest members of the range
+        assert r.zmove("a", "b", byscore=("-inf", "+inf"), count=1) == [[b"a1", 1.0]]
+        # without count, the whole range moves
+        assert r.zmove("a", "b", byscore=(4, "+inf")) == [
+            [b"a4", 4.0],
+            [b"a5", 5.0],
+            [b"inf", float("inf")],
+        ]
+        assert r.exists("a") == 0
+        assert r.zscore("b", "inf") == float("inf")
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmove_nothing_moved(self, r):
+        # missing source; a None flag counts as unset, as in zmpop
+        assert r.zmove("a", "b", min=True, max=None) is None
+        r.zadd("a", {"a1": 1})
+        # same key for source and destination
+        assert r.zmove("a", "a", min=True) is None
+        # empty score range
+        assert r.zmove("a", "b", byscore=(5, 10), count=2) is None
+        assert r.exists("b") == 0
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmove_errors(self, r):
+        r.zadd("a", {"a1": 1})
+        # the count passes through unchanged, so the server rejects 0
+        with pytest.raises(ResponseError, match="count should be greater than 0"):
+            r.zmove("a", "b", min=True, count=0)
+        with pytest.raises(ResponseError, match="min or max is not a float"):
+            r.zmove("a", "b", byscore=("nan", 2))
+        r.set("s", "x")
+        with pytest.raises(ResponseError, match="WRONGTYPE"):
+            r.zmove("a", "s", min=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            r.zmove("a", "b")
+        with pytest.raises(DataError, match="exactly one of"):
+            r.zmove("a", "b", min=True, max=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            r.zmove("a", "b", min=True, byscore=(1, 2))
+        assert r.zrange("a", 0, -1) == [b"a1"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_bzmove(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        assert r.bzmove("a", "b", 1, min=True) == [[b"a1", 1.0]]
+        assert r.bzmove("a", "b", 1, max=True, count=5) == [
+            [b"a3", 3.0],
+            [b"a2", 2.0],
+        ]
+        # the source is gone; a fractional timeout reaches the server
+        assert r.bzmove("a", "b", 0.1, min=True) is None
+        with pytest.raises(ResponseError, match="count should be greater than 0"):
+            r.bzmove("a", "b", 0, min=True, count=0)
+        with pytest.raises(DataError, match="exactly one of"):
+            r.bzmove("a", "b", 1)
+        with pytest.raises(DataError, match="exactly one of"):
+            r.bzmove("a", "b", 1, min=True, max=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            r.bzmove("a", "b", 1, min=None, max=False)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmovemember(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "NX": 4, "MEMBERS": 5})
+        # argument order, a missing member skipped, a duplicate moved once
+        assert r.zmovemember("a", "b", ["a3", "missing", "a1", "a3"]) == [
+            [b"a3", 3.0],
+            [b"a1", 1.0],
+        ]
+        # members named like keywords are data
+        assert r.zmovemember("a", "b", ["NX", "MEMBERS"]) == [
+            [b"NX", 4.0],
+            [b"MEMBERS", 5.0],
+        ]
+        assert r.zmovemember("a", "b", ["missing"]) is None
+        # a single member may be given without a list
+        r.zadd("a", {"a": 6})
+        assert r.zmovemember("a", "b", "a2") == [[b"a2", 2.0]]
+        assert r.zrange("a", 0, -1) == [b"a"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmovemember_nx_xx(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2})
+        r.zadd("b", {"a1": 10})
+        # nx: a member the destination has stays in the source
+        assert r.zmovemember("a", "b", ["a1", "a2"], nx=True) == [[b"a2", 2.0]]
+        assert r.zscore("a", "a1") == 1.0
+        assert r.zscore("b", "a1") == 10.0
+        r.zadd("a", {"a3": 3})
+        # xx: a member the destination does not have stays in the source
+        assert r.zmovemember("a", "b", ["a1", "a3"], xx=True) == [[b"a1", 1.0]]
+        assert r.zscore("b", "a1") == 1.0
+        assert r.zrange("a", 0, -1) == [b"a3"]
+        # xx on a missing destination moves nothing and creates nothing
+        assert r.zmovemember("a", "c", ["a3"], xx=True) is None
+        assert r.exists("c") == 0
+        with pytest.raises(DataError, match="either 'nx' or 'xx'"):
+            r.zmovemember("a", "b", ["a3"], nx=True, xx=True)
+        # an empty member list goes to the server, which rejects it
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            r.zmovemember("a", "b", [])
+        with pytest.raises(ResponseError, match="Number of members must be a positive"):
+            r.zmovemember("a", "b", [], nx=True)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_zmove_pipeline(self, r):
+        r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        with r.pipeline() as pipe:
+            pipe.zmove("a", "b", min=True)
+            pipe.bzmove("a", "b", 1, max=True)
+            pipe.zmovemember("a", "b", ["a2"])
+            pipe.zmove("a", "b", min=True)
+            assert pipe.execute() == [
+                [[b"a1", 1.0]],
+                [[b"a3", 3.0]],
+                [[b"a2", 2.0]],
+                None,
+            ]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_bzmove_in_transaction_does_not_block(self, r):
+        with r.pipeline(transaction=True) as pipe:
+            pipe.bzmove("a", "b", 0, min=True)
+            assert pipe.execute() == [None]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    def test_bzmove_wakes_on_new_member(self, r):
+        other = redis.Redis(connection_pool=r.connection_pool)
+        blocked_before = other.info("clients")["blocked_clients"]
+        errors = []
+
+        def add_members():
+            try:
+                # wait until BZMOVE is blocked, so the test covers the wake-up path
+                deadline = time.monotonic() + 5
+                while other.info("clients")["blocked_clients"] <= blocked_before:
+                    assert time.monotonic() < deadline, "BZMOVE never blocked"
+                    time.sleep(0.01)
+                other.zadd("a", {"a1": 1, "a2": 2})
+            except BaseException as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=add_members)
+        thread.start()
+        try:
+            result = r.bzmove("a", "b", 5, min=True, count=10)
+        finally:
+            thread.join()
+            other.close()
+        if errors:
+            raise errors[0]
+        assert result == [[b"a1", 1.0], [b"a2", 2.0]]
+
     def test_zrange(self, r):
         r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
         assert r.zrange("a", 0, 1) == [b"a1", b"a2"]

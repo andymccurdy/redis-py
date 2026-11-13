@@ -85,6 +85,7 @@ from redis.typing import (
     XPendingRangeResponse,
     XReadGroupResponse,
     XReadResponse,
+    ZMoveResponse,
     ZMPopResponse,
     ZRandMemberResponse,
     ZScanResponse,
@@ -9711,6 +9712,181 @@ class SortedSetCommands(CommandsProtocol):
             args.extend(["COUNT", count])
 
         return self.execute_command("BZMPOP", *args)
+
+    @overload
+    def zmove(
+        self: SyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        min: bool | None = False,
+        max: bool | None = False,
+        byscore: tuple[ZScoreBoundT, ZScoreBoundT] | None = None,
+        count: int | None = None,
+    ) -> ZMoveResponse: ...
+
+    @overload
+    def zmove(
+        self: AsyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        min: bool | None = False,
+        max: bool | None = False,
+        byscore: tuple[ZScoreBoundT, ZScoreBoundT] | None = None,
+        count: int | None = None,
+    ) -> Awaitable[ZMoveResponse]: ...
+
+    def zmove(
+        self,
+        source: KeyT,
+        destination: KeyT,
+        min: bool | None = False,
+        max: bool | None = False,
+        byscore: tuple[ZScoreBoundT, ZScoreBoundT] | None = None,
+        count: int | None = None,
+    ) -> ZMoveResponse | Awaitable[ZMoveResponse]:
+        """
+        Atomically move members from the sorted set ``source`` to the sorted
+        set ``destination``, keeping their scores.
+
+        Exactly one selection must be given: ``min`` takes the members with
+        the lowest scores, ``max`` the members with the highest scores, and
+        ``byscore`` a ``(min, max)`` score range, lowest score first. Unlike
+        ``zrange``, ``byscore`` takes the bounds as a tuple, not a flag. The
+        bounds are inclusive; prefix a bound with ``(`` to make it exclusive,
+        or use ``-inf`` / ``+inf``.
+
+        ``count`` is the greatest number of members to move. Without it,
+        ``min`` and ``max`` move one member and ``byscore`` moves every member
+        in the range in one command; a large range blocks the server for the
+        whole move.
+
+        Returns a list of ``[member, score]`` pairs, also for a single member,
+        or ``None`` if nothing was moved.
+
+        For more information, see https://redis.io/commands/zmove
+        """
+        if bool(min) + bool(max) + (byscore is not None) != 1:
+            raise DataError("ZMOVE requires exactly one of 'min', 'max' or 'byscore'")
+        pieces: list[EncodableT] = [source, destination]
+        if byscore is not None:
+            score_min, score_max = byscore
+            pieces.extend(("BYSCORE", score_min, score_max))
+        else:
+            pieces.append("MIN" if min else "MAX")
+        if count is not None:
+            pieces.extend(("COUNT", count))
+        return self.execute_command("ZMOVE", *pieces)
+
+    @overload
+    def bzmove(
+        self: SyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        timeout: float,
+        min: bool | None = False,
+        max: bool | None = False,
+        count: int | None = None,
+    ) -> ZMoveResponse: ...
+
+    @overload
+    def bzmove(
+        self: AsyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        timeout: float,
+        min: bool | None = False,
+        max: bool | None = False,
+        count: int | None = None,
+    ) -> Awaitable[ZMoveResponse]: ...
+
+    def bzmove(
+        self,
+        source: KeyT,
+        destination: KeyT,
+        timeout: float,
+        min: bool | None = False,
+        max: bool | None = False,
+        count: int | None = None,
+    ) -> ZMoveResponse | Awaitable[ZMoveResponse]:
+        """
+        Blocking version of zmove, for the ``min`` and ``max`` selections.
+
+        If ``source`` is empty or missing, block for ``timeout`` seconds, or
+        until a member gets added to ``source``, then move up to ``count``
+        members (default 1) without waiting for more. A ``timeout`` of ``0``
+        blocks indefinitely. Inside a transaction it never blocks.
+
+        Returns a list of ``[member, score]`` pairs, or ``None`` if the
+        timeout passed and nothing was moved.
+
+        For more information, see https://redis.io/commands/bzmove
+        """
+        if bool(min) == bool(max):
+            raise DataError("BZMOVE requires exactly one of 'min' or 'max'")
+        pieces: list[EncodableT] = [
+            source,
+            destination,
+            "MIN" if min else "MAX",
+            timeout,
+        ]
+        if count is not None:
+            pieces.extend(("COUNT", count))
+        return self.execute_command("BZMOVE", *pieces)
+
+    @overload
+    def zmovemember(
+        self: SyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        members: EncodableT | Iterable[EncodableT],
+        nx: bool = False,
+        xx: bool = False,
+    ) -> ZMoveResponse: ...
+
+    @overload
+    def zmovemember(
+        self: AsyncClientProtocol,
+        source: KeyT,
+        destination: KeyT,
+        members: EncodableT | Iterable[EncodableT],
+        nx: bool = False,
+        xx: bool = False,
+    ) -> Awaitable[ZMoveResponse]: ...
+
+    def zmovemember(
+        self,
+        source: KeyT,
+        destination: KeyT,
+        members: EncodableT | Iterable[EncodableT],
+        nx: bool = False,
+        xx: bool = False,
+    ) -> ZMoveResponse | Awaitable[ZMoveResponse]:
+        """
+        Atomically move the ``members`` (one member or an iterable of members)
+        from the sorted set ``source`` to the sorted set ``destination``,
+        keeping their scores.
+
+        Members are evaluated in the given order. A member that ``source``
+        does not have is skipped, and a member given twice moves once.
+
+        ``nx`` moves a member only if ``destination`` does not have it.
+        ``xx`` moves a member only if ``destination`` has it.
+
+        Returns a list of ``[member, score]`` pairs for the members that
+        moved, or ``None`` if nothing was moved.
+
+        For more information, see https://redis.io/commands/zmovemember
+        """
+        if nx and xx:
+            raise DataError("ZMOVEMEMBER allows either 'nx' or 'xx', not both")
+        members = list_or_args(members, None)
+        pieces: list[EncodableT] = [source, destination]
+        if nx:
+            pieces.append("NX")
+        elif xx:
+            pieces.append("XX")
+        pieces.extend(("MEMBERS", len(members)))
+        return self.execute_command("ZMOVEMEMBER", *pieces, *members)
 
     def _zrange(
         self,

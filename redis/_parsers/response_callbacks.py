@@ -115,6 +115,7 @@ from .helpers import (
     parse_xread_resp3_to_resp2_legacy,
     parse_xread_unified,
     parse_zadd,
+    parse_zmove,
     parse_zmscore,
     parse_zscan,
     parse_zscan_unified,
@@ -246,6 +247,7 @@ _RedisCallbacksRESP2 = {
         zset_score_pairs,
     ),
     **string_keys_to_dict("ZPOPMAX ZPOPMIN", zpop_score_pairs),
+    **string_keys_to_dict("BZMOVE ZMOVE ZMOVEMEMBER", parse_zmove),
     **string_keys_to_dict(
         "ZREVRANK ZRANK",
         zset_score_for_rank,

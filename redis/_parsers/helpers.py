@@ -721,6 +721,21 @@ def zmpop_unified(response, **options):
     ]
 
 
+def parse_zmove(response, **options):
+    """RESP2-wire ZMOVE/BZMOVE/ZMOVEMEMBER -> ``list[[member, float_score], ...]``.
+
+    The reply is a nested array of pairs on both wires; only the RESP2 bytes
+    scores need converting to match RESP3's native float scores. The null
+    reply (nothing moved) stays ``None``. The pairs are fresh lists built by
+    the parser, so the scores are converted in place.
+    """
+    if response is None:
+        return None
+    for pair in response:
+        pair[1] = float(pair[1])
+    return response
+
+
 def hrandfield_unified(response, **options):
     """RESP2-wire HRANDFIELD WITHVALUES → unified ``list[[field, value], ...]``.
 

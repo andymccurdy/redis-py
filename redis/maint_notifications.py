@@ -1054,7 +1054,15 @@ class MaintNotificationsPoolHandler:
         ):
             return
 
-        with _defer_maintenance_events(), self._lock:
+        # Proactive reconnect can finalize a pool-owning client. Join any
+        # resulting cached teardown after both handler and pool locks release.
+        with (
+            _defer_maintenance_events(),
+            self.pool._defer_cached_disconnects()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             if notification in self._processed_notifications:
                 # nothing to do in the connection pool handling
                 # the notification has already been handled or is expired
@@ -1167,10 +1175,16 @@ class MaintNotificationsPoolHandler:
             # cancel_scheduled_tasks(): a timer cancelled before it gets the
             # lock does nothing, and one already running finishes before
             # cancellation proceeds.
-            # Completion listeners can close a cached owner's pool while a
-            # peer drain needs this handler lock. Dispatch after the outermost
-            # lock, including this wrapper around the cleanup callback.
-            with _defer_maintenance_events(), self._lock:
+            # Completion listeners and finalizers can close a cached owner's
+            # pool while a peer drain needs this handler lock. Defer dispatch
+            # and cached teardown past this wrapper around the callback too.
+            with (
+                _defer_maintenance_events(),
+                self.pool._defer_cached_disconnects()
+                if self.pool.cache is not None
+                else nullcontext(),
+                self._lock,
+            ):
                 if timer not in self._scheduled_timers:
                     return
                 try:
@@ -1214,7 +1228,15 @@ class MaintNotificationsPoolHandler:
         Active connections are marked for reconnect after they complete the current command.
         Inactive connections are disconnected and will be connected on next use.
         """
-        with self._lock:
+        with (
+            _defer_maintenance_events()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self.pool._defer_cached_disconnects()
+            if self.pool.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             with self.pool._lock:
                 # take care for the active connections in the pool
                 # mark them for reconnect after they complete the current command

@@ -952,7 +952,7 @@ class TestMaintNotificationsPoolHandlerEvents:
     """The pool handler reports a handoff as a MOVING event pair."""
 
     def setup_method(self):
-        self.mock_pool = Mock()
+        self.mock_pool = Mock(cache=None)
         self.mock_pool._lock = MagicMock()
         self.mock_pool._lock.__enter__.return_value = None
         self.mock_pool._lock.__exit__.return_value = None
@@ -1152,7 +1152,7 @@ class TestMaintNotificationsPoolHandler:
 
     def setup_method(self):
         """Set up test fixtures."""
-        self.mock_pool = Mock()
+        self.mock_pool = Mock(cache=None)
         self.mock_pool._lock = MagicMock()
         self.mock_pool._lock.__enter__.return_value = None
         self.mock_pool._lock.__exit__.return_value = None
@@ -1718,7 +1718,7 @@ class TestMaintNotificationsMetricsRecording:
         self, mock_record_connection_handoff
     ):
         """Test that handle_node_moving_notification calls record_connection_handoff."""
-        mock_pool = Mock()
+        mock_pool = Mock(cache=None)
         mock_pool._lock = MagicMock()
         mock_pool._lock.__enter__ = Mock(return_value=None)
         mock_pool._lock.__exit__ = Mock(return_value=None)
@@ -1746,7 +1746,7 @@ class TestMaintNotificationsMetricsRecording:
         self, mock_record_connection_handoff
     ):
         """Test that record_connection_handoff is not called for already processed notification."""
-        mock_pool = Mock()
+        mock_pool = Mock(cache=None)
         mock_pool._lock = MagicMock()
         mock_pool._lock.__enter__ = Mock(return_value=None)
         mock_pool._lock.__exit__ = Mock(return_value=None)

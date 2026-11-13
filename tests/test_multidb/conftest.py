@@ -77,7 +77,7 @@ def _create_mock_db(request) -> Database:
     db = Mock(spec=Database)
     db.weight = request.param.get("weight", 1.0)
     db.client = Mock(spec=Redis)
-    db.client.connection_pool = MagicMock(spec=ConnectionPool)
+    db.client.connection_pool = MagicMock(spec=ConnectionPool, cache=None)
 
     cb = request.param.get("circuit", {})
     mock_cb = Mock(spec=CircuitBreaker)

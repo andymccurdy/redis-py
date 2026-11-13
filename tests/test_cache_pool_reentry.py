@@ -16,8 +16,13 @@ from redis.connection import BlockingConnectionPool, ConnectionPool
 from redis.event import AfterConnectionReleasedEvent
 from redis.maint_notifications import (
     MaintNotificationsConfig,
+    NodeMovingNotification,
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
+)
+from redis.multidb.event import (
+    ActiveDatabaseChanged,
+    CloseConnectionOnActiveDatabaseChanged,
 )
 from redis.sentinel import SentinelConnectionPool
 from redis.utils import HIREDIS_AVAILABLE
@@ -255,6 +260,11 @@ def _finalizer_during_pool_lock(
     writer = Redis.from_url(url)
     address = writer.connection_pool.connection_kwargs
     host, port = address.get("host", "localhost"), address.get("port", 6379)
+    proactive = operation in (
+        "proactive_reconnect",
+        "moving_reconnect",
+        "scheduled_reconnect",
+    )
     kwargs = dict(
         protocol=3,
         db=address.get("db", 0),
@@ -262,7 +272,9 @@ def _finalizer_during_pool_lock(
         cache_config=CacheConfig(),
         max_connections=2,
         socket_timeout=1,
-        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+        maint_notifications_config=MaintNotificationsConfig(
+            enabled="auto" if proactive else False
+        ),
     )
     if operation == "rejected_release":
         manager = Mock()
@@ -278,8 +290,17 @@ def _finalizer_during_pool_lock(
     owner.send_command("GET", key, keys=[key])
     assert owner.read_response() == b"old"
     pool.release(owner)
-    if operation in ("topology_cleanup", "smigrated"):
+    if operation in (
+        "topology_cleanup",
+        "smigrated",
+        "multidb",
+        "multidb_cluster",
+        "proactive_reconnect",
+        "moving_reconnect",
+        "scheduled_reconnect",
+    ):
         pool.release(released)
+    reconnect_handler = None
     draining, finalizing = threading.Event(), threading.Event()
     errors = []
     original_poll = owner._conn.can_read
@@ -321,7 +342,16 @@ def _finalizer_during_pool_lock(
         assert abandoned() is None, "pool-owning client was not finalized"
 
     def disconnect(*args, **kwargs):
-        if operation in ("rejected_release", "topology_cleanup", "smigrated"):
+        if operation in (
+            "rejected_release",
+            "topology_cleanup",
+            "smigrated",
+            "multidb",
+            "multidb_cluster",
+            "proactive_reconnect",
+            "moving_reconnect",
+            "scheduled_reconnect",
+        ):
             collect()
         return original_disconnect(*args, **kwargs)
 
@@ -349,6 +379,41 @@ def _finalizer_during_pool_lock(
                 assert pool._created_connections == 1
             elif operation == "topology_cleanup":
                 NodesManager._free_pool_connections(pool)
+            elif operation in ("multidb", "multidb_cluster"):
+                client = Redis(connection_pool=pool)
+                old_database = Mock(client=client)
+                if operation == "multidb_cluster":
+                    old_database.client = Mock()
+                    old_database.client.nodes_manager.nodes_cache = {
+                        "old": ClusterNode(host, port, redis_connection=client)
+                    }
+                CloseConnectionOnActiveDatabaseChanged().listen(
+                    ActiveDatabaseChanged(old_database, Mock(), Mock())
+                )
+                if isinstance(pool, BlockingConnectionPool):
+                    assert not pool._in_maintenance
+            elif operation in (
+                "proactive_reconnect",
+                "moving_reconnect",
+                "scheduled_reconnect",
+            ):
+                reconnect_handler = pool._maint_notifications_pool_handler
+                if operation == "moving_reconnect":
+                    # Exercise the synchronous reconnect under MOVING's outer
+                    # pool lock without leaving delayed timers after the test.
+                    with patch.object(reconnect_handler, "_schedule"):
+                        reconnect_handler.handle_notification(
+                            NodeMovingNotification(1, host, port, 60)
+                        )
+                elif operation == "scheduled_reconnect":
+                    with patch("redis.maint_notifications.threading.Timer") as timer:
+                        reconnect_handler._schedule(
+                            0, reconnect_handler.run_proactive_reconnect
+                        )
+                        timer.call_args.args[1]()
+                        assert not reconnect_handler._scheduled_timers
+                else:
+                    reconnect_handler.run_proactive_reconnect()
             elif operation == "smigrated":
                 node = ClusterNode(
                     host, port, redis_connection=Redis(connection_pool=pool)
@@ -372,6 +437,8 @@ def _finalizer_during_pool_lock(
             reader.join(3)
             assert not reader.is_alive(), "pool shutdown and idle drain deadlocked"
             assert not errors, errors
+        if reconnect_handler is not None:
+            reconnect_handler.cancel_scheduled_tasks()
         assert collected
         assert not owner.is_connected
         assert not released.is_connected
@@ -409,6 +476,46 @@ def test_finalizer_during_pool_lock(request, parser_class, automatic, operation)
 @pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("operation", ["topology_cleanup", "smigrated"])
 def test_finalizer_during_topology_cleanup(
+    request, pool_class, parser_class, automatic, operation
+):
+    _run_bounded(
+        _finalizer_during_pool_lock,
+        (
+            request.config.getoption("--redis-url"),
+            parser_class,
+            automatic,
+            operation,
+            pool_class,
+        ),
+    )
+
+
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("operation", ["multidb", "multidb_cluster"])
+def test_finalizer_during_database_change(
+    request, pool_class, parser_class, automatic, operation
+):
+    _run_bounded(
+        _finalizer_during_pool_lock,
+        (
+            request.config.getoption("--redis-url"),
+            parser_class,
+            automatic,
+            operation,
+            pool_class,
+        ),
+    )
+
+
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize(
+    "operation", ["proactive_reconnect", "moving_reconnect", "scheduled_reconnect"]
+)
+def test_finalizer_during_proactive_reconnect(
     request, pool_class, parser_class, automatic, operation
 ):
     _run_bounded(

@@ -91,6 +91,29 @@ class TestPipeline:
             assert pipe.execute() == [True]
 
     @pytest.mark.onlynoncluster
+    def test_reset_does_not_reconnect_for_unwatch_on_dropped_connection(self, r):
+        """
+        A dropped connection already cleared the server-side WATCH, so reset()
+        must not reconnect just to send UNWATCH.
+        """
+        r["a"] = 0
+
+        pool = r.connection_pool
+        pipe = r.pipeline()
+        pipe.watch("a")
+        leased = pipe.connection
+        leased.disconnect()
+
+        with mock.patch.object(leased, "connect", wraps=leased.connect) as connect:
+            pipe.reset()
+
+        connect.assert_not_called()
+        assert not leased.is_connected
+        assert pipe.watching is False
+        assert pipe.connection is None
+        assert leased not in pool._in_use_connections
+
+    @pytest.mark.onlynoncluster
     def test_pipeline_no_transaction_watch_failure(self, r):
         r["a"] = 0
 
@@ -1008,6 +1031,10 @@ class TestPipelineRetryChecker:
         def __init__(self, retry):
             self.retry = retry
             self.disconnected = False
+
+        @property
+        def is_connected(self):
+            return not self.disconnected
 
         def send_command(self, *args, **kwargs):
             if args[0] == "GET":

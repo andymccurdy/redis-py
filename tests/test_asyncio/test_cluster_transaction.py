@@ -158,6 +158,52 @@ class TestClusterTransaction:
         assert leased in node._free
 
     @pytest.mark.onlycluster
+    async def test_cancelled_watch_transaction_does_not_reconnect_for_unwatch(self, r):
+        """
+        A cancel mid-read drops the connection, which already clears the
+        server-side WATCH, so reset() must not reconnect just to send UNWATCH.
+        """
+        await r.set("a", 0)
+
+        pipe = r.pipeline(transaction=True)
+        await pipe.watch("a")
+        strategy = pipe._execution_strategy
+        leased = strategy._transaction_connection
+        node = strategy._transaction_node
+        pipe.multi()
+        pipe.set("a", 1)
+
+        started = asyncio.Event()
+        original = leased._parser.read_response
+        calls = 0
+
+        async def hang_once(*args, **kwargs):
+            # Hang on the MULTI reply only, so a reconnect for UNWATCH would
+            # still be answered instead of blocking the test.
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await asyncio.sleep(60)
+            return await original(*args, **kwargs)
+
+        with (
+            mock.patch.object(leased._parser, "read_response", side_effect=hang_once),
+            mock.patch.object(leased, "connect", wraps=leased.connect) as connect,
+        ):
+            task = asyncio.create_task(pipe.execute())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        connect.assert_not_called()
+        assert not leased.is_connected
+        assert strategy._watching is False
+        assert strategy._transaction_connection is None
+        assert leased in node._free
+
+    @pytest.mark.onlycluster
     @pytest.mark.parametrize(
         "error_type",
         [

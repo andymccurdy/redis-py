@@ -5134,7 +5134,9 @@ class TransactionStrategy(AbstractStrategy):
             # were watching something
             if self._transaction_connection:
                 try:
-                    if self._watching:
+                    # A dropped connection has already lost its WATCHes, so
+                    # skip the UNWATCH instead of reconnecting to send it.
+                    if self._watching and self._transaction_connection.is_connected:
                         # call this manually since our unwatch or
                         # immediate_execute_command methods can call reset()
                         await self._transaction_connection.send_command("UNWATCH")

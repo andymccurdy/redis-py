@@ -259,6 +259,28 @@ More information `here <https://redis.io/docs/latest/operate/oss_and_stack/refer
    ...     pipe.get("{tag}bar")
    ...     response = pipe.execute()
 
+Response shaping
+~~~~~~~~~~~~~~~~
+
+A cluster transaction returns the same Python types as the same commands run
+outside a transaction: every reply runs through the response callbacks of the
+node that executed it. ``SET`` returns ``True`` rather than ``b"OK"`` and, on a
+RESP2 connection, ``HGETALL`` returns a ``dict`` rather than a flat list of
+alternating field names and values. The asynchronous cluster transactions and
+the non-transactional cluster pipeline already return those types.
+
+.. code:: python
+
+   >>> with rc.pipeline(transaction=True) as pipe:
+   ...     pipe.hset("{tag}hash", mapping={"a": "1"})
+   ...     pipe.hgetall("{tag}hash")
+   ...     response = pipe.execute()
+   >>> response
+   [1, {b'a': b'1'}]
+
+Sync cluster transactions returned the raw replies in earlier releases, so code
+that compared them, for example against ``b"OK"``, must be updated.
+
 CAS Transactions
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -280,7 +302,7 @@ transaction execution.
    ...     val = val + 1             # Increment value
    ...     pipe.multi()              # Starting transaction context
    ...     pipe.set("mykey", val)    # Command will be pipelined
-   ...     response = pipe.execute() # Returns OK or None if key was modified in the meantime
+   ...     response = pipe.execute() # Returns True or None if key was modified in the meantime
 
 
 Publish / Subscribe

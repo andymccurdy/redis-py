@@ -10,12 +10,14 @@ from redis import CrossSlotTransactionError, ConnectionPool, RedisClusterExcepti
 from redis.backoff import NoBackoff
 from redis.client import Redis
 from redis.cluster import PRIMARY, ClusterNode, RedisCluster
+from redis.connection import Connection
 from redis.observability import recorder
 from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
 from redis.retry import Retry
 
 from .conftest import skip_if_server_version_lt
+from .test_cluster import default_host, default_port, get_mocked_redis_client
 
 
 def _find_source_and_target_node_for_slot(
@@ -53,6 +55,73 @@ class TestClusterTransaction:
         with r.pipeline(transaction=True) as pipe:
             assert pipe.execute() == []
 
+    @pytest.mark.fixed_client
+    def test_transaction_applies_response_callbacks(self):
+        """
+        The EXEC replies run through the node's response callbacks, like the
+        async cluster and the standalone pipelines do, so HGETALL returns a
+        dict instead of the raw flat reply list.
+
+        Runs on a mocked cluster pinned to RESP2, whose parser leaves map
+        replies as flat lists for the callbacks to shape: the EXEC replies of
+        the mocked connection are the raw server replies of MULTI, the two
+        queued commands and EXEC.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port, protocol=2)
+        # The mocked COMMAND table only knows a handful of commands; teach it
+        # the two this transaction queues.
+        rc.commands_parser.commands.update(
+            {
+                "hset": {
+                    "name": "hset",
+                    "arity": -4,
+                    "flags": ["write", "fast"],
+                    "first_key_pos": 1,
+                    "last_key_pos": 1,
+                    "step_count": 1,
+                },
+                "hgetall": {
+                    "name": "hgetall",
+                    "arity": 2,
+                    "flags": ["readonly", "fast"],
+                    "first_key_pos": 1,
+                    "last_key_pos": 1,
+                    "step_count": 1,
+                },
+            }
+        )
+
+        with rc.pipeline(transaction=True) as pipe:
+            pipe.hset("{foo}hash", mapping={"a": "1", "b": "2"})
+            pipe.hgetall("{foo}hash")
+
+            slot = next(iter(pipe._execution_strategy._pipeline_slots))
+            node = rc.nodes_manager.get_node_from_slot(slot, False)
+
+            mock_connection = Mock(spec=Connection)
+            mock_connection.read_response.side_effect = [
+                b"OK",  # MULTI
+                2,  # queued HSET
+                [b"a", b"1", b"b", b"2"],  # queued HGETALL
+                [2, [b"a", b"1", b"b", b"2"]],  # EXEC
+            ]
+            mock_connection.retry = Retry(NoBackoff(), 0)
+            mock_connection.host = node.host
+            mock_connection.port = node.port
+            mock_connection.db = 0
+
+            mock_pool = Mock(spec=ConnectionPool)
+            mock_pool.get_connection.return_value = mock_connection
+            mock_pool._available_connections = [mock_connection]
+            mock_pool._lock = threading.RLock()
+
+            original_pool = node.redis_connection.connection_pool
+            node.redis_connection.connection_pool = mock_pool
+            try:
+                assert pipe.execute() == [2, {b"a": b"1", b"b": b"2"}]
+            finally:
+                node.redis_connection.connection_pool = original_pool
+
     @pytest.mark.onlycluster
     def test_executes_transaction_against_cluster(self, r):
         with r.pipeline(transaction=True) as tx:
@@ -63,9 +132,9 @@ class TestClusterTransaction:
             tx.get("{foo}baz")
             tx.get("{foo}bad")
             assert tx.execute() == [
-                b"OK",
-                b"OK",
-                b"OK",
+                True,
+                True,
+                True,
                 b"value1",
                 b"value2",
                 b"value3",
@@ -80,7 +149,7 @@ class TestClusterTransaction:
         tx.get("{foo}bar")
         tx.get("{foo}baz")
         tx.get("{foo}bad")
-        assert tx.execute() == [b"OK", b"OK", b"OK", b"value1", b"value2", b"value3"]
+        assert tx.execute() == [True, True, True, b"value1", b"value2", b"value3"]
 
     @pytest.mark.onlycluster
     def test_throws_exception_on_different_hash_slots(self, r):
@@ -112,7 +181,7 @@ class TestClusterTransaction:
             a = pipe.get("a")
             pipe.multi()
             pipe.set("a", int(a) + 1)
-            assert pipe.execute() == [b"OK"]
+            assert pipe.execute() == [True]
 
     @pytest.mark.onlycluster
     def test_reset_does_not_reconnect_for_unwatch_on_dropped_connection(self, r):
@@ -224,7 +293,7 @@ class TestClusterTransaction:
             pipe.unwatch()
             assert not strategy._watch_acknowledged
             pipe.set(key, 2)
-            assert pipe.execute() == [b"OK"]
+            assert pipe.execute() == [True]
             assert not strategy._watch_acknowledged
 
     @pytest.mark.onlycluster
@@ -350,9 +419,7 @@ class TestClusterTransaction:
                 # if the slot table is updated, the next call will go here
                 elif f"{conn.host}:{conn.port}" == node_importing.name:
                     if "EXEC" in args:
-                        return [
-                            "MOCK_OK"
-                        ]  # mock value to validate this section was called
+                        return [b"OK"]  # mock value to validate this section was called
                     return
                 else:
                     assert False, f"unexpected node {conn.host}:{conn.port} was called"
@@ -365,7 +432,7 @@ class TestClusterTransaction:
                 pipe.set(key, "val")
                 result = pipe.execute()
 
-            assert result and "MOCK_OK" in result, "Target node was not called"
+            assert result == [True], "Target node was not called"
 
     @pytest.mark.onlycluster
     def test_retry_transaction_with_watch_after_slot_migration(self, r):
@@ -387,7 +454,7 @@ class TestClusterTransaction:
             pipe.watch(key)
             pipe.multi()
             pipe.set(key, "val")
-            assert pipe.execute() == [b"OK"]
+            assert pipe.execute() == [True]
 
     @pytest.mark.onlycluster
     def test_retry_transaction_with_watch_during_slot_migration(self, r):
@@ -564,7 +631,7 @@ class TestClusterTransaction:
 
             with r.pipeline(transaction=True) as pipe:
                 pipe.set(key, "val")
-                assert pipe.execute() == [b"OK"]
+                assert pipe.execute() == [True]
         finally:
             # Restore original pool so teardown can work
             node_importing.redis_connection.connection_pool = original_pool
@@ -605,7 +672,7 @@ class TestClusterTransaction:
                 pipe.watch(key)
                 pipe.multi()
                 pipe.set(key, "val")
-                assert pipe.execute() == [b"OK"]
+                assert pipe.execute() == [True]
         finally:
             # Restore original pool so teardown can work
             node_importing.redis_connection.connection_pool = original_pool
@@ -640,7 +707,7 @@ class TestClusterTransaction:
             )
 
             # make sure the pipe was restored to a working state
-            assert pipe.set(f"{hashkey}:z", "zzz").execute() == [b"OK"]
+            assert pipe.set(f"{hashkey}:z", "zzz").execute() == [True]
             assert r[f"{hashkey}:z"] == b"zzz"
 
     @pytest.mark.onlycluster
@@ -657,7 +724,7 @@ class TestClusterTransaction:
             )
 
             # make sure the pipe was restored to a working state
-            assert pipe.set(f"{hashkey}:z", "zzz").execute() == [b"OK"]
+            assert pipe.set(f"{hashkey}:z", "zzz").execute() == [True]
             assert r[f"{hashkey}:z"] == b"zzz"
 
     @pytest.mark.onlycluster
@@ -683,7 +750,7 @@ class TestClusterTransaction:
             pipe.set(f"{hashkey}:c", int(a_value) + int(b_value))
 
         result = r.transaction(my_transaction, f"{hashkey}:a", f"{hashkey}:b")
-        assert result == [b"OK"]
+        assert result == [True]
         assert r[f"{hashkey}:c"] == b"4"
 
     @pytest.mark.onlycluster

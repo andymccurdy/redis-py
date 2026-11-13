@@ -11285,3 +11285,142 @@ class TestClusterPubSubWithMocks:
         second = pubsub._get_node_pubsub(node)
 
         assert first is second
+
+
+@pytest.mark.fixed_client
+@pytest.mark.asyncio
+class TestClusterURLParsing:
+    @staticmethod
+    def _options(client):
+        return {
+            "dynamic_startup_nodes": client.nodes_manager._dynamic_startup_nodes,
+            "require_full_coverage": client.nodes_manager.require_full_coverage,
+            "reinitialize_steps": client.reinitialize_steps,
+            "load_balancing_strategy": client.load_balancing_strategy,
+        }
+
+    @pytest.mark.parametrize("scheme", ["redis", "rediss"])
+    @pytest.mark.parametrize(
+        "option,value,keyword,expected",
+        [
+            (option, value, not expected, expected)
+            for option in ("dynamic_startup_nodes", "require_full_coverage")
+            for value, expected in (
+                ("False", False),
+                ("false", False),
+                ("0", False),
+                ("no", False),
+                ("True", True),
+                ("true", True),
+                ("1", True),
+                ("yes", True),
+            )
+        ]
+        + [("reinitialize_steps", str(value), 9, value) for value in (0, 1, 5, -1)]
+        + [
+            (
+                "load_balancing_strategy",
+                strategy.value,
+                LoadBalancingStrategy.RANDOM
+                if strategy != LoadBalancingStrategy.RANDOM
+                else LoadBalancingStrategy.ROUND_ROBIN,
+                strategy,
+            )
+            for strategy in LoadBalancingStrategy
+        ]
+        + [
+            (option, None, value, value)
+            for option, value in (
+                ("dynamic_startup_nodes", False),
+                ("dynamic_startup_nodes", True),
+                ("require_full_coverage", False),
+                ("require_full_coverage", True),
+                ("reinitialize_steps", 0),
+                ("reinitialize_steps", 9),
+                ("load_balancing_strategy", None),
+                ("load_balancing_strategy", LoadBalancingStrategy.RANDOM),
+            )
+        ],
+    )
+    async def test_typed_options(self, scheme, option, value, keyword, expected):
+        url = f"{scheme}://localhost:6379"
+        if value is not None:
+            url += f"?{option}={value}"
+        client = RedisCluster.from_url(url, **{option: keyword})
+        try:
+            actual = self._options(client)[option]
+            assert type(actual) is type(expected)
+            assert actual == expected
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("scheme", ["redis", "rediss"])
+    async def test_combined_options(self, scheme):
+        client = RedisCluster.from_url(
+            f"{scheme}://localhost:6379?dynamic_startup_nodes=False"
+            "&require_full_coverage=no&reinitialize_steps=0"
+            "&load_balancing_strategy=round_robin_replicas",
+            dynamic_startup_nodes=True,
+            require_full_coverage=True,
+            reinitialize_steps=9,
+            load_balancing_strategy=LoadBalancingStrategy.RANDOM,
+        )
+        try:
+            assert self._options(client) == {
+                "dynamic_startup_nodes": False,
+                "require_full_coverage": False,
+                "reinitialize_steps": 0,
+                "load_balancing_strategy": LoadBalancingStrategy.ROUND_ROBIN_REPLICAS,
+            }
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("scheme", ["redis", "rediss"])
+    async def test_defaults(self, scheme):
+        client = RedisCluster.from_url(f"{scheme}://localhost:6379")
+        try:
+            assert self._options(client) == {
+                "dynamic_startup_nodes": True,
+                "require_full_coverage": True,
+                "reinitialize_steps": 5,
+                "load_balancing_strategy": None,
+            }
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("scheme", ["redis", "rediss"])
+    async def test_empty_query_values_preserve_keywords(self, scheme):
+        client = RedisCluster.from_url(
+            f"{scheme}://localhost:6379?dynamic_startup_nodes=&require_full_coverage="
+            "&reinitialize_steps=&load_balancing_strategy=",
+            dynamic_startup_nodes=False,
+            require_full_coverage=False,
+            reinitialize_steps=0,
+            load_balancing_strategy=LoadBalancingStrategy.RANDOM,
+        )
+        try:
+            assert self._options(client) == {
+                "dynamic_startup_nodes": False,
+                "require_full_coverage": False,
+                "reinitialize_steps": 0,
+                "load_balancing_strategy": LoadBalancingStrategy.RANDOM,
+            }
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("scheme", ["redis", "rediss"])
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            ("reinitialize_steps", "invalid"),
+            ("reinitialize_steps", "1.5"),
+            ("load_balancing_strategy", "invalid"),
+            ("load_balancing_strategy", "ROUND_ROBIN"),
+        ],
+    )
+    async def test_invalid_typed_options(self, scheme, option, value):
+        with pytest.raises(ValueError):
+            client = RedisCluster.from_url(
+                f"{scheme}://localhost:6379?{option}={value}"
+            )
+            await client.aclose()

@@ -524,6 +524,12 @@ class RedisCluster(
         their corresponding characters. Querystring values are decoded by
         ``urllib.parse.parse_qs`` and are not unquoted again.
 
+        The cluster options ``dynamic_startup_nodes`` and ``require_full_coverage``
+        can be supplied as boolean querystring options. ``reinitialize_steps``
+        accepts an integer. ``load_balancing_strategy`` accepts a
+        ``LoadBalancingStrategy`` value: ``round_robin``, ``round_robin_replicas``,
+        ``random``, or ``random_replica``.
+
         All querystring options are cast to their appropriate Python types. Boolean
         arguments can be specified with string values "True"/"False" or "Yes"/"No".
         Values that cannot be properly cast cause a ``ValueError`` to be raised. Once
@@ -531,7 +537,12 @@ class RedisCluster(
         :class:`~redis.asyncio.connection.Connection` when created.
         In the case of conflicting arguments, querystring arguments are used.
         """
-        kwargs.update(parse_url(url))
+        url_options = parse_url(url)
+        if "load_balancing_strategy" in url_options:
+            url_options["load_balancing_strategy"] = LoadBalancingStrategy(
+                url_options["load_balancing_strategy"]
+            )
+        kwargs.update(url_options)
         if kwargs.pop("connection_class", None) is SSLConnection:
             kwargs["ssl"] = True
         return cls(**kwargs)

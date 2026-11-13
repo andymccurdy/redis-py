@@ -1147,6 +1147,12 @@ class RedisCluster(
 
         If none of these options are specified, the default db=0 is used.
 
+        The cluster options ``dynamic_startup_nodes`` and ``require_full_coverage``
+        can be supplied as boolean querystring options. ``reinitialize_steps``
+        accepts an integer. ``load_balancing_strategy`` accepts a
+        ``LoadBalancingStrategy`` value: ``round_robin``, ``round_robin_replicas``,
+        ``random``, or ``random_replica``.
+
         All querystring options are cast to their appropriate Python types.
         Boolean arguments can be specified with string values "True"/"False"
         or "Yes"/"No". Values that cannot be properly cast cause a
@@ -1388,6 +1394,19 @@ class RedisCluster(
         if url is not None:
             from_url = True
             url_options = parse_url(url)
+            dynamic_startup_nodes = url_options.pop(
+                "dynamic_startup_nodes", dynamic_startup_nodes
+            )
+            require_full_coverage = url_options.pop(
+                "require_full_coverage", require_full_coverage
+            )
+            reinitialize_steps = url_options.pop(
+                "reinitialize_steps", reinitialize_steps
+            )
+            if "load_balancing_strategy" in url_options:
+                load_balancing_strategy = LoadBalancingStrategy(
+                    url_options.pop("load_balancing_strategy")
+                )
             if "path" in url_options:
                 raise RedisClusterException(
                     "RedisCluster does not currently support Unix Domain "

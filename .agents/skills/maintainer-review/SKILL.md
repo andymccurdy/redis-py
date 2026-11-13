@@ -1,6 +1,6 @@
 ---
 name: maintainer-review
-description: Review a GitHub issue or pull request URL as a redis-py maintainer, with a staged assessment of whether the claim is real, practically important, already solvable with supported functionality, correctly scoped, better served by another design, and worth maintainer and contributor effort. Use when assessing issue validity or severity, deciding whether an issue should be prioritized or closed, determining whether a requested feature represents an unmet need rather than a discoverability or usage gap, judging whether a PR is worth bringing to mergeable quality, comparing open PRs or alternative designs, separating code quality from repository readiness, or drafting a concise maintainer assessment. When closure, additional evidence, or code changes should be requested, also produce a polite, concise, complete, copy-paste-ready maintainer comment.
+description: Use when reviewing a GitHub issue or pull request URL as a redis-py maintainer, including assessing issue validity or severity, deciding whether an issue should be prioritized or closed, determining whether a requested feature represents an unmet need rather than a discoverability or usage gap, judging whether a PR is worth bringing to mergeable quality, comparing open PRs or alternative designs, separating code quality from repository readiness, or drafting a concise maintainer assessment. Gives a staged assessment of whether the claim is real, practically important, already solvable with supported functionality, correctly scoped, better served by another design, and worth maintainer and contributor effort. When closure, additional evidence, or code changes should be requested, also produces a polite, concise, complete, copy-paste-ready maintainer comment.
 ---
 
 # Maintainer Review
@@ -86,13 +86,13 @@ Do this before deeply evaluating a specified PR. A PR URL selects the starting p
 - Require a shared issue, symptom, violated invariant, or materially overlapping path. A shared area label is not enough.
 - If repository access cannot establish completeness, say so instead of claiming every candidate was found.
 
-The repository also has an `analyze-open-prs` skill for triaging the whole PR queue; use this skill for the focused single-target comparison and that one when the user wants a queue-wide sweep. Compare candidates on need coverage, runtime correctness, placement, tests, compatibility, complexity, readiness, remaining maintainer work, and reusable pieces. Prefer the best maintainable solution, not the first or smallest diff by default.
+Use this skill for the focused single-target comparison, not for a queue-wide sweep of every open PR. Compare candidates on need coverage, runtime correctness, placement, tests, compatibility, complexity, readiness, remaining maintainer work, and reusable pieces. Prefer the best maintainable solution, not the first or smallest diff by default.
 
 ### 4. Use a two-stage evidence flow
 
 Always begin with a desk review. Inspect the real runtime path before judging a change as trivial or meaningful. Check callers, public exports, both stacks (sync and async), equivalent protocol/topology/parser paths, persistence and connection lifecycle, cleanup, and focused tests. Inspecting test code is part of the desk review; executing tests, imports, examples, reproductions, benchmarks, or live Redis calls is a runtime probe.
 
-Treat `references/evaluation-framework.md` and the repository's own design notes (`.agent/`, `specs/`, `CLAUDE.md`) as read-only background during review. Verify every current claim against the remote change, current source, tests, docs, release boundary, and runtime evidence. Do not infer issue status or PR correctness from a reference. Recommend a separate documentation/spec-maintenance change when review reveals a durable invariant unless the user explicitly includes that update.
+Treat `references/evaluation-framework.md` and the repository's own design notes (`.agents/`, `specs/`, `AGENTS.md`) as read-only background during review. Verify every current claim against the remote change, current source, tests, docs, release boundary, and runtime evidence. Do not infer issue status or PR correctness from a reference. Recommend a separate documentation/spec-maintenance change when review reveals a durable invariant unless the user explicitly includes that update.
 
 Use this evidence order across the two stages:
 
@@ -125,7 +125,7 @@ redis-py requires the sync and async stacks to stay aligned. Before any positive
 
 1. Whether the change touches `redis/` (sync) without a mirrored change under `redis/asyncio/` (or vice versa), and whether that asymmetry is intended.
 2. Whether tests were added or updated on both sides (`tests/` and `tests/test_asyncio/`) when both stacks are affected.
-3. Whether type hints, overloads, signatures, defaults, and return types remain identical across stacks (`.agent/sync_async_type_hints_overload_guide.md`).
+3. Whether type hints, overloads, signatures, defaults, and return types remain identical across stacks (`.agents/sync_async_type_hints_overload_guide.md`).
 
 A behavior fix applied to only one stack is normally `Merge-worthy after focused changes` at best, with the missing mirror called out as required work — unless the divergence is deliberate and documented.
 
@@ -163,7 +163,7 @@ After explicit approval, run only the smallest probe needed to resolve the state
 
 For latency, timeout, buffering, backpressure, or cleanup, measure an observable elapsed-time or state transition where feasible. Do not assume that a mocked unit test exercises real scheduling or Redis-server behavior. Prefer a local probe first; use an approval-gated probe against a live or external Redis deployment only when local evidence cannot settle the decision.
 
-The repository's local runtime tools are the test harness, not a separate probe skill: `invoke devenv` brings up the docker test environment; `invoke tests` / `invoke standalone-tests` / `invoke cluster-tests` run suites; targeted runs use `pytest ... --protocol 2|3` and topology markers (`onlycluster`, `onlynoncluster`). The repository also has `verify` and `run` skills for driving the library end-to-end. Honor any live-service, Docker, cost, cleanup, and reporting implications when proposing a probe, and call out when a probe needs `invoke devenv` or external infrastructure (scenario tests). Ordinary maintainer review must not depend on spinning up external infrastructure.
+The repository's local runtime tools are the test harness, not a separate probe skill: `invoke devenv` brings up the docker test environment; `invoke tests` / `invoke standalone-tests` / `invoke cluster-tests` run suites; targeted runs use `pytest ... --protocol 2|3` and topology markers (`onlycluster`, `onlynoncluster`). Honor any live-service, Docker, cost, cleanup, and reporting implications when proposing a probe, and call out when a probe needs `invoke devenv` or external infrastructure (scenario tests). Ordinary maintainer review must not depend on spinning up external infrastructure.
 
 For validation, cleanup, retries, interruption, background work, or concurrency:
 

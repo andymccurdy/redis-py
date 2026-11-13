@@ -14,13 +14,27 @@ If you don't know where to start, consider improving
 documentation, bug triaging, and writing tutorials are all examples of
 helpful contributions that mean less work for you.
 
+## Before you start
+
+For anything bigger than a small bug fix, a typo or a docs change, open an
+[issue](https://github.com/redis/redis-py/issues) or a
+[discussion](https://github.com/redis/redis-py/discussions) first. Describe the
+problem and the change you plan. Wait for a maintainer to agree with the
+approach before you write the code. This avoids work on changes we cannot
+accept, for example a change that breaks the public API or duplicates work
+already in progress.
+
+Search the open issues and pull requests first, because someone may already be
+working on the same thing.
+
 ## AI-driven contributions
 
-Redis-py defines a list of custom Claude commands (skills) that may simplify your contribution by enriching the agent's
-context with necessary information and repository best practices. Commands are well-structured instructions for common
-recurring tasks (e.g., adding support for a new Redis command API).
+Redis-py defines a set of agent skills that may simplify your contribution by enriching the agent's
+context with necessary information and repository best practices. Skills are well-structured instructions for common
+recurring tasks (e.g., adding support for a new Redis command API). They live in `.agents/skills/`, and
+`.claude/skills` links to the same directory. [AGENTS.md](AGENTS.md#skills) lists them.
 
-The list of available commands is available via:
+To see or run the available skills:
 
 **Claude CLI**
 
@@ -30,15 +44,14 @@ claude /skills
 
 **Augment CLI**
 
-```
-auggie command list
-```
+The Augment CLI discovers the same skills from `.agents/skills/` and `.claude/skills/`. See the
+[Augment skills documentation](https://docs.augmentcode.com/cli/skills) for how to run them.
 
 ## Your First Contribution
 
 Unsure where to begin contributing? You can start by looking through
 [help-wanted
-issues](https://github.com/andymccurdy/redis-py/issues?q=is%3Aopen+is%3Aissue+label%3ahelp-wanted).
+issues](https://github.com/redis/redis-py/issues?q=is%3Aopen+is%3Aissue+label%3ahelp-wanted).
 
 Never contributed to open source before? Here are a couple of friendly
 tutorials:
@@ -57,7 +70,7 @@ Here's how to get started with your code contribution:
     python -m venv .venv
     source .venv/bin/activate
     pip install -r dev_requirements.txt
-    pip install -e .[jwt]
+    pip install -e '.[jwt]'
     ```
 
 4.  If you need a development environment, run `invoke devenv`. Note: this relies on docker-compose to build environments, and assumes that you have a version supporting [docker profiles](https://docs.docker.com/compose/profiles/).
@@ -157,28 +170,7 @@ Please try at least versions of Docker.
 ### Security Vulnerabilities
 
 **NOTE**: If you find a security vulnerability, do NOT open an issue.
-
-If you believe you have found a security vulnerability, to ensure proper
-review and assessment, we kindly ask vulnerability reports be submitted
-through our [Redis Vulnerability Disclosure
-Program](https://redis.io/redis-responsible-vulnerability-disclosure/).
-Alternatively reach out via email to
-[security@redis.com](mailto:security@redis.com).
-
-In order to determine whether you are dealing with a security issue, ask
-yourself these two questions:
-
--   Can I access something that's not mine, or something I shouldn't
-    have access to?
--   Can I disable something for other people?
-
-If the answer to either of those two questions are *yes*, then you're
-probably dealing with a security issue. Note that even if you answer
-*no*  to both questions, you may still be dealing with a security
-issue, so if you're unsure, report it through the
-[Redis Vulnerability Disclosure
-Program](https://redis.io/redis-responsible-vulnerability-disclosure/) or
-email [us](mailto:security@redis.com).
+Follow the [security policy](SECURITY.md) instead.
 
 ### Everything Else
 
@@ -200,9 +192,40 @@ feature like it already.
 If you don't see anything, open a new issue that describes the feature
 you would like and how it should work.
 
-## Code review process
+## Pull request process
+
+-   **Title.** We squash-merge pull requests, so the PR title becomes the
+    commit message on `master`. Write it as one sentence in the imperative
+    mood that describes the user-visible change, for example
+    `Fix search payloads being dropped on RESP3`. A conventional prefix such
+    as `fix:`, `feat:` or `perf(cluster):` is common but optional.
+-   **Description.** Fill in the PR template. Explain what changed and why,
+    and link the issue the PR fixes, for example `Fixes #1234`.
+-   **Tests.** Every behavior change needs tests. redis-py has a sync and an
+    asyncio client, so a change to one usually needs the same change and the
+    same tests in the other (`tests/` and `tests/test_asyncio/`).
+-   **Docs.** Update docstrings and `/docs` when you change or add public API.
+-   **Changelog.** You do not need to edit a changelog. Maintainers label each
+    PR, and the release notes are generated from the merged PRs and their
+    labels.
+-   **Compatibility.** We do not ship breaking changes in minor or patch
+    releases. If your change breaks the public API, say so in the description,
+    and expect it to wait for the next major release.
+
+### Code review
 
 The core team regularly looks at pull requests. We will provide
-feedback as soon as possible. After receiving our feedback, please respond
-within two weeks. After that time, we may close your PR if it isn't
-showing any activity.
+feedback as soon as possible. Reviewers check that the change is correct,
+matches Redis semantics, keeps the sync and asyncio clients aligned, does not
+break the public API, does not hurt performance, and is tested and documented.
+
+After receiving our feedback, please respond within two weeks. After that
+time, we may close your PR if it isn't showing any activity. Separately, the
+[stale workflow](.github/workflows/stale-issues.yml) marks issues and pull
+requests stale after a year without activity and closes them 30 days later.
+Issues labeled `needs-information` follow a shorter timeline.
+
+## Security and license
+
+-   Report security vulnerabilities as described in the [security policy](SECURITY.md).
+-   redis-py is released under the [MIT license](LICENSE).

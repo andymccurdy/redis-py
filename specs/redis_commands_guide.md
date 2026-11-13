@@ -31,7 +31,7 @@ Commands public API exposed through the different types of clients (Standalone, 
 objects defined in the directories according to the Files structure section above. Each command implementation at the
 end calls generic `execute_command(*args, **kwargs)` defined by `CommandProtocol`.
 
-SDK expose sync and async commands API through methods overloading, see `.agent/sync_async_type_hints_overload_guide.md`
+SDK expose sync and async commands API through methods overloading, see `.agents/sync_async_type_hints_overload_guide.md`
 for more information.
 
 ### Binary representation

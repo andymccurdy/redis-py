@@ -1,6 +1,6 @@
 ---
 name: prepare-for-takeover
-description: Prepare copy-paste-ready maintainer comments that mark stalled but valuable redis-py PRs as `open-for-takeover`, inviting the original author or any other contributor to finish the work. Each comment summarizes what is left based on the maintainer's earlier review. Use when the user says "prepare for takeover", "open for takeover", "mark as abandoned", "invite contributors to finish", or gives one or more PR numbers/URLs that stalled and should be handed over.
+description: Use when the user says "prepare for takeover", "open for takeover", "mark as abandoned" or "invite contributors to finish", or gives one or more redis-py PR numbers/URLs that stalled and should be handed over. Prepares copy-paste-ready maintainer comments that mark stalled but valuable PRs as `open-for-takeover`, inviting the original author or any other contributor to finish the work. Each comment summarizes what is left based on the maintainer's earlier review.
 ---
 
 # Prepare for Takeover

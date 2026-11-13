@@ -14,3 +14,10 @@ _Please make sure to review and check all of these items:_
 
 _NOTE: these things are not required to open a PR and can be done
 afterwards / while the PR is open._
+
+### AI disclosure
+
+- [ ] AI tools helped write this change (code, tests or description).
+
+_Whatever tools you used, you are responsible for every line of this PR and
+must be able to explain it in review._

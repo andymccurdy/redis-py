@@ -13,12 +13,6 @@ The Python interface to the Redis key-value store.
 
 ---------------------------------------------
 
-**Note:** redis-py 5.0 is the last version of redis-py that supports Python 3.7, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 5.1 supports Python 3.8+.<br>
-**Note:** redis-py 6.1.0 is the last version of redis-py that supports Python 3.8, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 6.2.0 supports Python 3.9+.<br>
-**Note:** redis-py 8.1.0 is the last version of redis-py that supports Python 3.10, as it has reached [end of life](https://devguide.python.org/versions/). redis-py 8.2.0 supports Python 3.11+.
-
----------------------------------------------
-
 ## How do I Redis?
 
 [Learn for free at Redis University](https://redis.io/learn/university)
@@ -61,7 +55,9 @@ Looking for a high-level library to handle object mapping? See [redis-om-python]
 
 ## Supported Redis Versions
 
-The most recent version of this library supports Redis version [7.2](https://github.com/redis/redis/blob/7.2/00-RELEASENOTES), [7.4](https://github.com/redis/redis/blob/7.4/00-RELEASENOTES), [8.0](https://github.com/redis/redis/blob/8.0/00-RELEASENOTES), [8.2](https://github.com/redis/redis/blob/8.2/00-RELEASENOTES), [8.4](https://github.com/redis/redis/blob/8.4/00-RELEASENOTES), [8.6](https://github.com/redis/redis/blob/8.6/00-RELEASENOTES) and [8.8](https://github.com/redis/redis/blob/8.8/00-RELEASENOTES).
+The most recent version of this library supports Redis 7.2 and every later
+release, up to the latest stable Redis version. CI tests each of these Redis
+release lines.
 
 The table below highlights version compatibility of the most-recent library versions and redis versions.
 
@@ -71,6 +67,21 @@ The table below highlights version compatibility of the most-recent library vers
 | >= 4.5.0 | Version 5.0 to 7.0 |
 | >= 5.0.0 | Version 5.0 to 7.4 |
 | >= 6.0.0 | Version 7.2 to current |
+
+### Supported Python Versions
+
+redis-py supports every CPython version that has not reached
+[end of life](https://devguide.python.org/versions/), and PyPy.
+`requires-python` in `pyproject.toml` states the minimum Python version for each
+release. If you are on an older Python version, use the last redis-py release
+that supports it:
+
+| Python version | Last supporting redis-py releases |
+|----------------|-----------------------------------|
+| 3.7 | 5.0.x |
+| 3.8 | 6.1.x |
+| 3.9 | 7.0.x |
+| 3.10 | 8.1.x |
 
 
 ## Usage
@@ -137,6 +148,29 @@ By default, redis-py uses a connection pool to manage connections. Each instance
 ```
 
 Alternatively, you might want to look at [Async connections](https://redis.readthedocs.io/en/stable/examples/asyncio_examples.html), or [Cluster connections](https://redis.readthedocs.io/en/stable/connections.html#cluster-client), or even [Async Cluster connections](https://redis.readthedocs.io/en/stable/connections.html#async-cluster-client).
+
+### Cluster and Sentinel
+
+Connect to a Redis Cluster through any of its nodes. The client discovers the
+rest of the cluster and routes each command to the right node.
+
+``` python
+>>> from redis import RedisCluster
+>>> rc = RedisCluster(host='localhost', port=6379)
+>>> rc.set('foo', 'bar')
+True
+```
+
+Connect to a primary that Redis Sentinel monitors by naming the service and
+listing the sentinels.
+
+``` python
+>>> from redis import Sentinel
+>>> sentinel = Sentinel([('localhost', 26379)], socket_timeout=0.1)
+>>> primary = sentinel.master_for('mymaster', socket_timeout=0.1)
+>>> primary.set('foo', 'bar')
+True
+```
 
 ### Redis Commands
 
@@ -297,7 +331,24 @@ await r.himport_set("user:1", "users", ["alice", "alice@example.com", "25"])
 
 ---------------------------------------------
 
-### Author
+## Documentation
+
+-   [redis-py documentation](https://redis.readthedocs.io/en/stable/), with the API reference and examples.
+-   [Redis Python client guide](https://redis.io/docs/latest/develop/clients/redis-py/) in the Redis documentation.
+-   [Redis command reference](https://redis.io/commands).
+
+## Getting Help and Contributing
+
+-   Ask questions in [GitHub Discussions](https://github.com/redis/redis-py/discussions) or on the [Redis Discord server](https://discord.gg/redis).
+-   Report bugs and request features in [GitHub Issues](https://github.com/redis/redis-py/issues).
+-   To contribute code or docs, read [CONTRIBUTING.md](CONTRIBUTING.md).
+-   Report security vulnerabilities as described in [SECURITY.md](SECURITY.md), not in public issues.
+
+## License
+
+redis-py is licensed under the [MIT License](LICENSE).
+
+## Author
 
 redis-py is developed and maintained by [Redis Inc](https://redis.io). It can be found [here](
 https://github.com/redis/redis-py), or downloaded from [pypi](https://pypi.org/project/redis/).

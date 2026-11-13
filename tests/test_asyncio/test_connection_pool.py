@@ -1050,6 +1050,14 @@ class TestConnectionPoolURLParsing:
         )
         assert pool.max_connections == 10
 
+    def test_decode_responses_in_querystring(self):
+        pool = redis.ConnectionPool.from_url("redis://localhost?decode_responses=False")
+        assert pool.connection_kwargs["decode_responses"] is False
+        assert pool.get_encoder().decode_responses is False
+
+        pool = redis.ConnectionPool.from_url("redis://localhost?decode_responses=Yes")
+        assert pool.connection_kwargs["decode_responses"] is True
+
     def test_boolean_parsing(self):
         for expected, value in (
             (None, None),

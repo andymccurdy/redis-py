@@ -13,6 +13,7 @@ from redis.commands.search.querystring import (
     disjunct_union,
     geo,
     intersect,
+    tags,
     union,
 )
 
@@ -86,3 +87,40 @@ class TestNegatedAndOptionalNodes:
     def test_optional_nested_in_intersect(self):
         query = intersect("baz", OptionalNode("foo", "bar"))
         assert query.to_string() == "(baz ~(foo bar))"
+
+
+@pytest.mark.fixed_client
+class TestTagValue:
+    """``tags()`` values must be matched literally.
+
+    RediSearch reads ``|``, ``}``, ``*`` and other punctuation inside a
+    ``{...}`` tag set as query syntax, so an unescaped value could add tags or
+    clauses to the query it is part of.
+    """
+
+    def test_tags_are_joined_as_a_union(self):
+        assert tags("il", "jp").to_string() == "{il | jp}"
+
+    def test_plain_tags_are_unchanged(self):
+        assert tags("hello_world1").to_string() == "{hello_world1}"
+        assert tags(12).to_string() == "{12}"
+        assert tags("café").to_string() == "{café}"
+
+    def test_tag_separator_in_a_value_is_escaped(self):
+        assert tags("alice | bob").to_string() == r"{alice\ \|\ bob}"
+
+    def test_tag_set_breakout_is_escaped(self):
+        query = intersect(owner=tags("alice} | @owner:{bob"))
+        assert query.to_string() == r"@owner:{alice\}\ \|\ \@owner\:\{bob}"
+
+    def test_wildcard_in_a_value_is_escaped(self):
+        assert tags("al*").to_string() == r"{al\*}"
+
+    def test_backslash_in_a_value_is_escaped(self):
+        assert tags("a\\b").to_string() == r"{a\\b}"
+
+    def test_punctuation_in_a_value_is_escaped(self):
+        assert (
+            tags("hello world", "foo-bar.baz").to_string()
+            == r"{hello\ world | foo\-bar\.baz}"
+        )

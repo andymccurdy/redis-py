@@ -42,6 +42,7 @@ from redis.commands.search.query import (
     Query,
     SortbyField,
 )
+from redis.commands.search.querystring import intersect, tags
 from redis.commands.search.result import Result
 from redis.commands.search.suggestion import Suggestion
 from redis.utils import SENTINEL, safe_str, str_if_bytes
@@ -1383,6 +1384,29 @@ class TestBaseSearchFunctionality(SearchTestsBase):
         elif expects_resp3_shape(client):
             assert 1 == len(res["results"])
             assert "1" == res["results"][0]["id"]
+
+    @pytest.mark.redismod
+    def test_querystring_tags_match_literally(self, client):
+        client.ft().create_index((TagField("owner"),))
+        client.hset("doc:alice", "owner", "alice")
+        client.hset("doc:bob", "owner", "bob")
+        client.hset("doc:punct", "owner", "a|b} *")
+        self.waitForIndex(client, getattr(client.ft(), "index_name", "idx"))
+
+        def search(owner):
+            return client.ft().search(Query(intersect(owner=tags(owner)).to_string()))
+
+        _assert_search_result(client, search("alice"), ["doc:alice"])
+        _assert_search_result(client, search("a|b} *"), ["doc:punct"])
+        # Values that were read as query syntax: a second tag, a closing brace
+        # that starts a new clause on the same field, and a prefix.
+        for owner in (
+            "alice | bob",
+            "alice} | @owner:{bob",
+            "alice}|-@owner:{alice",
+            "al*",
+        ):
+            _assert_search_result(client, search(owner), [])
 
     @pytest.mark.redismod
     @skip_ifmodversion_lt("2.2.0", "search")

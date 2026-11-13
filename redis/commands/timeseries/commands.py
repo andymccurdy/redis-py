@@ -1587,7 +1587,10 @@ class TimeSeriesCommands:
         )
 
         return self.execute_command(
-            MRANGE_CMD, *params, aggregation_type=aggregation_type
+            MRANGE_CMD,
+            *params,
+            aggregation_type=aggregation_type,
+            reduce=reduce if groupby is not None else None,
         )
 
     @overload
@@ -1738,7 +1741,10 @@ class TimeSeriesCommands:
         )
 
         return self.execute_command(
-            MREVRANGE_CMD, *params, aggregation_type=aggregation_type
+            MREVRANGE_CMD,
+            *params,
+            aggregation_type=aggregation_type,
+            reduce=reduce if groupby is not None else None,
         )
 
     @overload

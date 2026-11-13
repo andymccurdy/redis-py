@@ -11,6 +11,7 @@ CacheImpl
 cancelling
 CAS
 CFCommands
+changelog
 CMSCommands
 CLI
 ClusterNode
@@ -20,6 +21,7 @@ ClusterPubSub
 ConnectionPool
 config
 CoreCommands
+CPython
 CSC
 DatabaseConfig
 desynchronises
@@ -46,6 +48,7 @@ JSONCommands
 JSONPath
 Jaeger
 JWT
+KiB
 Ludovico
 Magnocavallo
 MeterProvider
@@ -72,7 +75,10 @@ otlp
 OTLPMetricExporter
 PeriodicExportingMetricReader
 proto
+PRs
 PubSub
+PyPy
+README
 READONLY
 RediSearch
 RedisBloom
@@ -94,6 +100,7 @@ SpanKind
 Specfiying
 StatusCode
 subclasses
+symlink
 TCP
 TemporaryUnavailableException
 TLS

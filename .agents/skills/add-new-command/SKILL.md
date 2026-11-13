@@ -1,19 +1,19 @@
 ---
-description: Adds support for a new Redis command from a given specification. Check command-specification-template.md.
-argument-hint: [path-to-specification]
+name: add-new-command
+description: Use when adding support for a new Redis command to redis-py from a specification file. Covers the sync and async command methods and overloads, RESP2 and RESP3 response callbacks, the command metadata record for cluster routing and caching, and the tests. The specification follows assets/command-specification-template.md. Do not use to change how an existing reply is parsed.
 ---
 
 # Execute: Add new Redis command support
 
 ## Plan to Execute
 
-Read specification file: `$ARGUMENTS`
+Read the specification file passed as the skill argument: `$ARGUMENTS`. If no path was given, ask for one. Specifications follow the template in `assets/command-specification-template.md` (relative to this skill).
 
 ## Execution Instructions
 
 ### 1. Preparations
 
-- Follow instructions from `.agent/instructions.md`
+- Follow instructions from `AGENTS.md` and `.agents/sync_async_type_hints_overload_guide.md`
 - Go through the guide `specs/redis_commands_guide.md`
 
 ### 2. Read and Understand

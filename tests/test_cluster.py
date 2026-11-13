@@ -107,6 +107,7 @@ from .conftest import (
     assert_resp_response,
     expects_resp2_shape,
     expects_unified_shape,
+    is_resp2_connection,
     patch_monotonic,
     skip_if_redis_enterprise,
     skip_if_server_version_lt,
@@ -2382,6 +2383,51 @@ class TestClusterRedisCommands:
         with pytest.raises(RedisClusterException) as ex:
             r.blmovem("a", "b", 1, "LEFT", "RIGHT", count=2, ordering="BULK")
         assert "all keys must map to the same key slot" in str(ex.value)
+
+    @skip_if_server_version_lt("8.11.242")
+    def test_cluster_zmove(self, r):
+        # source and destination collocated on the same slot via a hash tag
+        r.zadd("{foo}a", {"a1": 1, "a2": 2, "a3": 3, "a4": 4})
+        assert r.zmove("{foo}a", "{foo}b", min=True) == [[b"a1", 1.0]]
+        assert r.zmove("{foo}a", "{foo}b", byscore=("(2", "+inf"), count=1) == [
+            [b"a3", 3.0]
+        ]
+        assert r.bzmove("{foo}a", "{foo}b", 1, max=True) == [[b"a4", 4.0]]
+        assert r.zmovemember("{foo}a", "{foo}b", ["a2"], nx=True) == [[b"a2", 2.0]]
+        assert r.zrange("{foo}b", 0, -1) == [b"a1", b"a2", b"a3", b"a4"]
+
+    @skip_if_server_version_lt("8.11.242")
+    @pytest.mark.parametrize("transaction", [False, True])
+    def test_cluster_zmove_pipeline(self, r, transaction):
+        if transaction and is_resp2_connection(r):
+            pytest.skip(
+                "sync cluster transactions skip the response callbacks on RESP2"
+            )
+        r.zadd("{foo}a", {"a1": 1, "a2": 2, "a3": 3})
+        with r.pipeline(transaction=transaction) as pipe:
+            pipe.zmove("{foo}a", "{foo}b", min=True)
+            pipe.bzmove("{foo}a", "{foo}b", 1, max=True)
+            pipe.zmovemember("{foo}a", "{foo}b", ["a2"])
+            pipe.zmove("{foo}a", "{foo}b", min=True)
+            assert pipe.execute() == [
+                [[b"a1", 1.0]],
+                [[b"a3", 3.0]],
+                [[b"a2", 2.0]],
+                None,
+            ]
+        assert r.zrange("{foo}b", 0, -1) == [b"a1", b"a2", b"a3"]
+
+    @skip_if_server_version_lt("8.11.242")
+    def test_cluster_zmove_crossslot(self, r):
+        # source and destination on different slots -> cannot be dispatched
+        for send in (
+            lambda: r.zmove("a", "b", min=True),
+            lambda: r.bzmove("a", "b", 1, min=True),
+            lambda: r.zmovemember("a", "b", ["a1"]),
+        ):
+            with pytest.raises(RedisClusterException) as ex:
+                send()
+            assert "all keys must map to the same key slot" in str(ex.value)
 
     def test_cluster_msetnx(self, r):
         d = {"{foo}a": b"1", "{foo}b": b"2", "{foo}c": b"3"}

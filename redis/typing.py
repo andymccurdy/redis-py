@@ -120,6 +120,8 @@ BlockingZSetPopResponse = (
     tuple[bytes | str, bytes | str, float] | list[bytes | str | float] | None
 )
 ZMPopResponse = list[bytes | str | list[list[Any]]] | None
+# ZMOVE/BZMOVE/ZMOVEMEMBER: ``[[member, score], ...]`` or ``None`` if nothing moved.
+ZMoveResponse = list[list[Any]] | None
 ZRandMemberResponse = (
     bytes | str | None | list[bytes | str] | list[bytes | str | float] | list[list[Any]]
 )

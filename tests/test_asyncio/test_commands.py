@@ -7,6 +7,7 @@ import binascii
 import datetime
 import re
 import sys
+import time
 import warnings
 from collections import ChainMap, UserDict
 from string import ascii_letters
@@ -4775,6 +4776,192 @@ class TestRedisCommands:
         assert_resp_response(
             r, await r.bzpopmin("c", timeout=1), (b"c", b"c1", 100), [b"c", b"c1", 100]
         )
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmove(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "a4": 4, "a5": 5})
+        # without count, min moves one member, still as a list of one pair
+        assert await r.zmove("a", "b", min=True) == [[b"a1", 1.0]]
+        assert await r.zmove("a", "b", max=True, count=2) == [
+            [b"a5", 5.0],
+            [b"a4", 4.0],
+        ]
+        # count larger than the source moves what is there
+        await r.zadd("c", {"c1": 1})
+        assert await r.zmove("c", "b", min=True, count=10) == [[b"c1", 1.0]]
+        # the emptied source is deleted
+        assert await r.exists("c") == 0
+        # scores are kept in the destination
+        assert await r.zrange("b", 0, -1) == [b"a1", b"c1", b"a4", b"a5"]
+        assert await r.zscore("b", "a5") == 5.0
+        assert await r.zrange("a", 0, -1) == [b"a2", b"a3"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmove_byscore(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "a4": 4, "a5": 5, "inf": "inf"})
+        # exclusive bound, lowest scores first
+        assert await r.zmove("a", "b", byscore=("(1", 3)) == [
+            [b"a2", 2.0],
+            [b"a3", 3.0],
+        ]
+        # with count, the lowest members of the range
+        assert await r.zmove("a", "b", byscore=("-inf", "+inf"), count=1) == [
+            [b"a1", 1.0]
+        ]
+        # without count, the whole range moves
+        assert await r.zmove("a", "b", byscore=(4, "+inf")) == [
+            [b"a4", 4.0],
+            [b"a5", 5.0],
+            [b"inf", float("inf")],
+        ]
+        assert await r.exists("a") == 0
+        assert await r.zscore("b", "inf") == float("inf")
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmove_nothing_moved(self, r: redis.Redis):
+        # missing source; a None flag counts as unset, as in zmpop
+        assert await r.zmove("a", "b", min=True, max=None) is None
+        await r.zadd("a", {"a1": 1})
+        # same key for source and destination
+        assert await r.zmove("a", "a", min=True) is None
+        # empty score range
+        assert await r.zmove("a", "b", byscore=(5, 10), count=2) is None
+        assert await r.exists("b") == 0
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmove_errors(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1})
+        # the count passes through unchanged, so the server rejects 0
+        with pytest.raises(ResponseError, match="count should be greater than 0"):
+            await r.zmove("a", "b", min=True, count=0)
+        with pytest.raises(ResponseError, match="min or max is not a float"):
+            await r.zmove("a", "b", byscore=("nan", 2))
+        await r.set("s", "x")
+        with pytest.raises(ResponseError, match="WRONGTYPE"):
+            await r.zmove("a", "s", min=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.zmove("a", "b")
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.zmove("a", "b", min=True, max=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.zmove("a", "b", min=True, byscore=(1, 2))
+        assert await r.zrange("a", 0, -1) == [b"a1"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_bzmove(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        assert await r.bzmove("a", "b", 1, min=True) == [[b"a1", 1.0]]
+        assert await r.bzmove("a", "b", 1, max=True, count=5) == [
+            [b"a3", 3.0],
+            [b"a2", 2.0],
+        ]
+        # the source is gone; a fractional timeout reaches the server
+        assert await r.bzmove("a", "b", 0.1, min=True) is None
+        with pytest.raises(ResponseError, match="count should be greater than 0"):
+            await r.bzmove("a", "b", 0, min=True, count=0)
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.bzmove("a", "b", 1)
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.bzmove("a", "b", 1, min=True, max=True)
+        with pytest.raises(DataError, match="exactly one of"):
+            await r.bzmove("a", "b", 1, min=None, max=False)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmovemember(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3, "NX": 4, "MEMBERS": 5})
+        # argument order, a missing member skipped, a duplicate moved once
+        assert await r.zmovemember("a", "b", ["a3", "missing", "a1", "a3"]) == [
+            [b"a3", 3.0],
+            [b"a1", 1.0],
+        ]
+        # members named like keywords are data
+        assert await r.zmovemember("a", "b", ["NX", "MEMBERS"]) == [
+            [b"NX", 4.0],
+            [b"MEMBERS", 5.0],
+        ]
+        assert await r.zmovemember("a", "b", ["missing"]) is None
+        # a single member may be given without a list
+        await r.zadd("a", {"a": 6})
+        assert await r.zmovemember("a", "b", "a2") == [[b"a2", 2.0]]
+        assert await r.zrange("a", 0, -1) == [b"a"]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmovemember_nx_xx(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2})
+        await r.zadd("b", {"a1": 10})
+        # nx: a member the destination has stays in the source
+        assert await r.zmovemember("a", "b", ["a1", "a2"], nx=True) == [[b"a2", 2.0]]
+        assert await r.zscore("a", "a1") == 1.0
+        assert await r.zscore("b", "a1") == 10.0
+        await r.zadd("a", {"a3": 3})
+        # xx: a member the destination does not have stays in the source
+        assert await r.zmovemember("a", "b", ["a1", "a3"], xx=True) == [[b"a1", 1.0]]
+        assert await r.zscore("b", "a1") == 1.0
+        assert await r.zrange("a", 0, -1) == [b"a3"]
+        # xx on a missing destination moves nothing and creates nothing
+        assert await r.zmovemember("a", "c", ["a3"], xx=True) is None
+        assert await r.exists("c") == 0
+        with pytest.raises(DataError, match="either 'nx' or 'xx'"):
+            await r.zmovemember("a", "b", ["a3"], nx=True, xx=True)
+        # an empty member list goes to the server, which rejects it
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            await r.zmovemember("a", "b", [])
+        with pytest.raises(ResponseError, match="Number of members must be a positive"):
+            await r.zmovemember("a", "b", [], nx=True)
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_zmove_pipeline(self, r: redis.Redis):
+        await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})
+        async with r.pipeline() as pipe:
+            pipe.zmove("a", "b", min=True)
+            pipe.bzmove("a", "b", 1, max=True)
+            pipe.zmovemember("a", "b", ["a2"])
+            pipe.zmove("a", "b", min=True)
+            assert await pipe.execute() == [
+                [[b"a1", 1.0]],
+                [[b"a3", 3.0]],
+                [[b"a2", 2.0]],
+                None,
+            ]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_bzmove_in_transaction_does_not_block(self, r: redis.Redis):
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.bzmove("a", "b", 0, min=True)
+            assert await pipe.execute() == [None]
+
+    @pytest.mark.onlynoncluster
+    @skip_if_server_version_lt("8.11.242")
+    async def test_bzmove_wakes_on_new_member(self, r: redis.Redis):
+        other = redis.Redis(connection_pool=r.connection_pool)
+        blocked_before = (await other.info("clients"))["blocked_clients"]
+
+        async def add_members():
+            # wait until BZMOVE is blocked, so the test covers the wake-up path
+            deadline = time.monotonic() + 5
+            while (await other.info("clients"))["blocked_clients"] <= blocked_before:
+                assert time.monotonic() < deadline, "BZMOVE never blocked"
+                await asyncio.sleep(0.01)
+            await other.zadd("a", {"a1": 1, "a2": 2})
+
+        task = asyncio.create_task(add_members())
+        try:
+            assert await r.bzmove("a", "b", 5, min=True, count=10) == [
+                [b"a1", 1.0],
+                [b"a2", 2.0],
+            ]
+        finally:
+            await task
+            await other.aclose()
 
     async def test_zrange(self, r: redis.Redis):
         await r.zadd("a", {"a1": 1, "a2": 2, "a3": 3})

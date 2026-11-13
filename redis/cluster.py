@@ -795,23 +795,20 @@ def _should_request_refresh(reinitialize_steps: int, reinitialize_counter: int) 
     return bool(reinitialize_steps) and reinitialize_counter % reinitialize_steps == 0
 
 
-def _mark_demoted_primary(error: Any, node: "ClusterNode") -> bool:
+def _is_demoted_primary(error: Any, node: "ClusterNode") -> bool:
     """
-    Mark :error:, read from :node:, when it shows that the node is no longer the
-    primary the client takes it for, and return whether it does. Only a replica
-    answers READONLY, so a node cached as a primary that does was demoted by a
-    failover the client has not seen yet, and a command without keys gets no
-    MOVED to learn that from.
+    Return whether :error:, read from :node:, shows that the node is no longer
+    the primary the client takes it for. Only a replica answers READONLY, so a
+    node cached as a primary that does was demoted by a failover the client has
+    not seen yet, and a command without keys gets no MOVED to learn that from.
 
-    The caller asks for a topology refresh, and the retry loops of the commands
-    and pipelines retry a marked error like one of ``ERRORS_ALLOW_RETRY``. A
-    READONLY from a node cached as a replica is not marked: the write was sent
-    there, and no refresh changes its answer.
+    The caller sets ``demoted_primary`` on the error and asks for a topology
+    refresh, and the retry loops of the commands and pipelines retry such an
+    error like one of ``ERRORS_ALLOW_RETRY``. A READONLY from a node cached as a
+    replica does not count: the write was sent there, and no refresh changes
+    its answer.
     """
-    if isinstance(error, ReadOnlyError) and node.server_type == PRIMARY:
-        error.demoted_primary = True
-        return True
-    return False
+    return isinstance(error, ReadOnlyError) and node.server_type == PRIMARY
 
 
 def _error_to_raise(
@@ -2961,7 +2958,8 @@ class RedisCluster(
                 )
                 raise
             except ResponseError as e:
-                if _mark_demoted_primary(e, target_node):
+                if _is_demoted_primary(e, target_node):
+                    e.demoted_primary = True
                     # Ask for a topology refresh, run by the next attempt, of
                     # any command, once due; the caller retries this one
                     self.nodes_manager._request_refresh()
@@ -6681,6 +6679,7 @@ class PipelineStrategy(AbstractStrategy):
                 nodes_written += 1
                 n.write()
 
+            demoted = False
             for node_name, n in nodes.items():
                 n.read()
 
@@ -6692,11 +6691,11 @@ class PipelineStrategy(AbstractStrategy):
                         break
 
                 if node_error is not None:
-                    # A primary that answered READONLY was demoted: ask for a
-                    # topology refresh, run by the next attempt once due
+                    # A primary that answered READONLY was demoted
                     for cmd in n.commands:
-                        if _mark_demoted_primary(cmd.result, node_objs[node_name]):
-                            self._nodes_manager._request_refresh()
+                        if _is_demoted_primary(cmd.result, node_objs[node_name]):
+                            cmd.result.demoted_primary = True
+                            demoted = True
 
                 record_operation_duration(
                     command_name="PIPELINE",
@@ -6707,6 +6706,10 @@ class PipelineStrategy(AbstractStrategy):
                     error=node_error,
                 )
                 nodes_read += 1
+
+            if demoted:
+                # Ask for a topology refresh, run by the next attempt once due
+                self._nodes_manager._request_refresh()
         finally:
             # release all the redis connections we allocated earlier
             # back into the connection pool.

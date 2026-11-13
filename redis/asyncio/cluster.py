@@ -90,8 +90,8 @@ from redis.cluster import (
     LoadBalancingStrategy,
     _error_to_raise,
     _fill_missing_redirect_host,
+    _is_demoted_primary,
     _keep_target_replies,
-    _mark_demoted_primary,
     _merge_multi_shard_replies,
     _MultiShardSplit,
     _record_replies,
@@ -2211,7 +2211,8 @@ class RedisCluster(
                     connection=target_node,
                 )
             except ResponseError as e:
-                if _mark_demoted_primary(e, target_node):
+                if _is_demoted_primary(e, target_node):
+                    e.demoted_primary = True
                     # Ask for a topology refresh, run by the next attempt, of
                     # any command, once due; the caller retries this one
                     self._request_refresh()
@@ -4335,10 +4336,14 @@ class PipelineStrategy(AbstractStrategy):
         if any(errors):
             # A primary that answered READONLY was demoted: ask for a topology
             # refresh, run by the next attempt once due
+            demoted = False
             for node, commands in nodes.values():
                 for cmd in commands:
-                    if _mark_demoted_primary(cmd.result, node):
-                        client._request_refresh()
+                    if _is_demoted_primary(cmd.result, node):
+                        cmd.result.demoted_primary = True
+                        demoted = True
+            if demoted:
+                client._request_refresh()
 
             if allow_redirections:
                 # A split MULTI_SHARD command resends only the slots that failed, and a

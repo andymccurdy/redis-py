@@ -5576,6 +5576,34 @@ class TestTopologyRefreshPacing:
         init.assert_called_once()
 
     @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("commands", [1, 3])
+    def test_pipeline_readonly_from_primaries_asks_for_one_refresh(self, commands):
+        """
+        However many READONLY replies of nodes cached as primaries an attempt
+        reads, it asks for one topology refresh, and the retry for one more.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._last_refresh_at = nm._refresh_due_at = None
+        replies = [self._readonly()] * commands + [b"OK"] * commands
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(Redis, "parse_response", side_effect=replies),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+            patch.object(
+                nm, "_request_refresh", wraps=nm._request_refresh
+            ) as request_refresh,
+        ):
+            pipe = rc.pipeline()
+            for i in range(commands):
+                pipe.execute_command("FT.CREATE", f"idx{i}", "SCHEMA", "t", "TEXT")
+            assert pipe.execute() == [b"OK"] * commands
+
+        assert request_refresh.call_count == 2
+        init.assert_called_once()
+
+    @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
     def test_cluster_down_refreshes_at_once_and_raises_a_failed_refresh(self, error):
         """

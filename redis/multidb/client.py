@@ -834,7 +834,7 @@ class PubSub:
 
     def run_in_thread(
         self,
-        sleep_time: float = 0.0,
+        sleep_time: float = 0.1,
         daemon: bool = False,
         exception_handler: Optional[Callable] = None,
         sharded_pubsub: bool = False,

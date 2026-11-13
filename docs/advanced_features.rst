@@ -459,7 +459,8 @@ argument: how long each iteration of the loop waits on the socket for a
 message, so an idle thread notices thread.stop() within that time. A handler
 that is still running, or a reconnect in progress, delays it;
 thread.stop(timeout=...) bounds the wait.
-The default of 0 polls without waiting and keeps a CPU core busy.
+The default is 0.1 seconds. A sleep_time of 0 polls without waiting and keeps
+a CPU core busy.
 
 Note: Since we're running in a separate thread, there's no way to handle
 messages that aren't automatically handled with registered message

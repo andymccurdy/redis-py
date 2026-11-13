@@ -4533,9 +4533,24 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             conn.retry = retry
 
     def re_auth_callback(self, token: TokenInterface):
+        self._re_auth_connections(
+            self._available_connections, self._in_use_connections, token
+        )
+
+    def _re_auth_connections(
+        self,
+        free_connections: Iterable["Connection"],
+        in_use_connections: Iterable["Connection"],
+        token: TokenInterface,
+    ) -> None:
+        """
+        Send AUTH with ``token`` on each free connection, and defer it to the
+        next release of each in-use one. No free connection may be checked
+        out until this returns.
+        """
         first_error = None
         with self._lock:
-            for conn in self._available_connections:
+            for conn in free_connections:
                 try:
                     conn.retry.call_with_retry(
                         lambda: conn.send_command(
@@ -4555,7 +4570,7 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 except Exception as e:
                     if first_error is None:
                         first_error = e
-            for conn in self._in_use_connections:
+            for conn in in_use_connections:
                 conn.set_re_auth_token(token)
         if first_error is not None:
             raise first_error
@@ -4868,6 +4883,10 @@ class BlockingConnectionPool(ConnectionPool):
 
         try:
             self.ensure_connection(connection)
+            # release() does not take the lock, so a connection released while
+            # re_auth_callback() is running can reach the queue before its
+            # deferred re-auth token is set. Apply it before handing it out.
+            connection.re_auth()
         except BaseException:
             # release the connection back to the pool so that we don't leak it
             self.release(connection)
@@ -4930,21 +4949,29 @@ class BlockingConnectionPool(ConnectionPool):
             # Put the connection back into the pool.
             pool_name = get_pool_name(self)
             try:
-                self.pool.put_nowait(connection)
+                # Dispatch while the connection is still out of the queue:
+                # get_connection() does not take the lock, so a deferred
+                # re-auth would otherwise race the next checkout.
+                self._event_dispatcher.dispatch(
+                    AfterConnectionReleasedEvent(connection)
+                )
+            finally:
+                try:
+                    self.pool.put_nowait(connection)
 
-                # Record state transition: USED -> IDLE
-                record_connection_count(
-                    pool_name=pool_name,
-                    connection_state=ConnectionState.USED,
-                    counter=-1,
-                )
-                record_connection_count(
-                    pool_name=pool_name,
-                    connection_state=ConnectionState.IDLE,
-                    counter=1,
-                )
-            except Full:
-                pass
+                    # Record state transition: USED -> IDLE
+                    record_connection_count(
+                        pool_name=pool_name,
+                        connection_state=ConnectionState.USED,
+                        counter=-1,
+                    )
+                    record_connection_count(
+                        pool_name=pool_name,
+                        connection_state=ConnectionState.IDLE,
+                        counter=1,
+                    )
+                except Full:
+                    pass
         finally:
             if locked:
                 self._lock.release()
@@ -4970,6 +4997,41 @@ class BlockingConnectionPool(ConnectionPool):
         finally:
             if locked:
                 self._lock.release()
+
+    def set_retry(self, retry: Retry) -> None:
+        self.connection_kwargs.update({"retry": retry})
+        for conn in self._connections:
+            conn.retry = retry
+
+    def re_auth_callback(self, token: TokenInterface):
+        with self._lock:
+            # get_connection() does not take the lock, so the idle connections
+            # leave the queue for the AUTH round trip: a checkout must not get
+            # one and read the AUTH reply as its own. Empty slots go back now.
+            free_connections = []
+            empty_slots = 0
+            while True:
+                try:
+                    connection = self.pool.get_nowait()
+                except Empty:
+                    break
+                if connection is None:
+                    empty_slots += 1
+                else:
+                    free_connections.append(connection)
+            for _ in range(empty_slots):
+                self.pool.put_nowait(None)
+            free = set(free_connections)
+            try:
+                # Every connection that was not in the queue is checked out.
+                self._re_auth_connections(
+                    free_connections,
+                    [conn for conn in self._connections if conn not in free],
+                    token,
+                )
+            finally:
+                for connection in free_connections:
+                    self.pool.put_nowait(connection)
 
     def _get_free_connections(self):
         with self._lock:

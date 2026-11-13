@@ -546,6 +546,22 @@ def _timedelta_to_ms(td: datetime.timedelta) -> int:
     return td // _ONE_MILLISECOND
 
 
+_UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _datetime_to_unix_ms(dt: datetime.datetime) -> int:
+    if dt.utcoffset() is None:
+        # Resolve local time at whole-second precision, then add the original
+        # microseconds separately to avoid float rounding and UTC overflow.
+        seconds = int(dt.replace(tzinfo=None, microsecond=0).timestamp())
+        return _timedelta_to_ms(
+            datetime.timedelta(seconds=seconds, microseconds=dt.microsecond)
+        )
+
+    # Aware subtraction is exact even when conversion to UTC would overflow.
+    return _timedelta_to_ms(dt - _UNIX_EPOCH)
+
+
 def extract_expire_flags(
     ex: ExpiryT | str | None = None,
     px: ExpiryT | str | None = None,
@@ -579,7 +595,7 @@ def extract_expire_flags(
         exp_options.extend(["EXAT", exat])
     elif pxat is not None:
         if isinstance(pxat, datetime.datetime):
-            pxat = int(pxat.timestamp() * 1000)
+            pxat = _datetime_to_unix_ms(pxat)
         exp_options.extend(["PXAT", pxat])
 
     return exp_options

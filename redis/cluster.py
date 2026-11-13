@@ -1896,7 +1896,13 @@ class RedisCluster(
             )
         return target_node.redis_connection.monitor()
 
-    def pubsub(self, node=None, host=None, port=None, **kwargs):
+    def pubsub(
+        self,
+        node: "ClusterNode | None" = None,
+        host: str | None = None,
+        port: int | None = None,
+        **kwargs: Any,
+    ) -> "ClusterPubSub":
         """
         Allows passing a ClusterNode, or host&port, to get a pubsub instance
         connected to the specified node
@@ -2141,7 +2147,8 @@ class RedisCluster(
 
         if request_policy is None:
             raise RedisClusterException(
-                f"No targets were found to execute {args} command on"
+                "No targets were found to execute "
+                f"{truncate_text(command_text(args))} command on"
             )
 
         if slot is not None:
@@ -2221,7 +2228,7 @@ class RedisCluster(
             raise RedisClusterException(
                 "The cluster has no default node to resolve the keys of this "
                 "command against. The client may be closed, or not initialized "
-                f"yet.\nCommand: {args}"
+                f"yet.\nCommand: {truncate_text(command_text(args))}"
             )
 
         return self.commands_parser.get_keys(default_node.redis_connection, *args)
@@ -2264,7 +2271,9 @@ class RedisCluster(
         if command.upper() in _EVAL_COMMANDS:
             # command syntax: EVAL "script body" num_keys ...
             if len(args) <= 2:
-                raise RedisClusterException(f"Invalid args in command: {args}")
+                raise RedisClusterException(
+                    f"Invalid args in command: {truncate_text(command_text(args))}"
+                )
             num_actual_keys = int(args[2])
             eval_keys = args[3 : 3 + num_actual_keys]
             # if there are 0 keys, that means the script can be run on any node
@@ -2282,7 +2291,7 @@ class RedisCluster(
                 raise RedisClusterException(
                     "No way to dispatch this command to Redis Cluster. "
                     "Missing key.\nYou can execute the command by specifying "
-                    f"target nodes.\nCommand: {args}"
+                    f"target nodes.\nCommand: {truncate_text(command_text(args))}"
                 )
 
         return self._slot_of_keys(command, keys)
@@ -2471,7 +2480,8 @@ class RedisCluster(
 
                     if not target_nodes:
                         raise RedisClusterException(
-                            f"No targets were found to execute {args} command on"
+                            "No targets were found to execute "
+                            f"{truncate_text(command_text(args))} command on"
                         )
                     # Per attempt: only an attempt that failed on the default
                     # node replaces it
@@ -6503,7 +6513,8 @@ class PipelineStrategy(AbstractStrategy):
                         )
                         if not target_nodes:
                             raise RedisClusterException(
-                                f"No targets were found to execute {c.args} command on"
+                                "No targets were found to execute "
+                                f"{truncate_text(command_text(c.args))} command on"
                             )
                 c.command_policies = command_policies
                 # Kept for a retry, which would otherwise route the command by its own
@@ -6993,7 +7004,8 @@ class PipelineStrategy(AbstractStrategy):
 
         if request_policy is None:
             raise RedisClusterException(
-                f"No targets were found to execute {args} command on"
+                "No targets were found to execute "
+                f"{truncate_text(command_text(args))} command on"
             )
 
         if slot is not None:

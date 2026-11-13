@@ -334,7 +334,7 @@ await r.himport_set("user:1", "users", ["alice", "alice@example.com", "25"])
 ## Documentation
 
 -   [redis-py documentation](https://redis.readthedocs.io/en/stable/), with the API reference and examples.
--   [Redis Python client guide](https://redis.io/docs/latest/develop/clients/redis-py/) on redis.io.
+-   [Redis Python client guide](https://redis.io/docs/latest/develop/clients/redis-py/) in the Redis documentation.
 -   [Redis command reference](https://redis.io/commands).
 
 ## Getting Help and Contributing

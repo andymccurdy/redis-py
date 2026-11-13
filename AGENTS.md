@@ -56,7 +56,7 @@ A change in one stack almost always belongs in the other. `specs/sync_async_dedu
 - `metadata.py` - command metadata: routing policies (`RequestPolicy` / `ResponsePolicy`), replica safety and cache eligibility, served by a `metadata_resolver=` shared by every node client. `policies.py` holds the `PolicyResolver` routing view.
 - `helpers.py` - shared utilities (`list_or_args`, pubsub subscription partitioning).
 
-Change routing, replica eligibility and cache eligibility in `metadata.py` only. `READ_COMMANDS` (`commands/cluster.py`), `STATIC_POLICIES` (`commands/policies.py`) and `DEFAULT_ALLOW_LIST` (`cache.py`) are deprecated and unread, kept only for external importers. Before touching any of this, read [.agents/references/command-metadata.md](.agents/references/command-metadata.md).
+Change routing, replica eligibility and cache eligibility in `metadata.py` only. `READ_COMMANDS` (`commands/cluster.py`), `STATIC_POLICIES` (`commands/policies.py`) and `DEFAULT_ALLOW_LIST` (`cache.py`) are deprecated and unread, kept only for external importers. Before touching any of this, read [`.agents/references/command-metadata.md`](.agents/references/command-metadata.md).
 
 ### Wire protocol and response parsing
 `redis/_parsers/` holds `resp2.py` and `resp3.py` (pure Python), `hiredis.py` (used automatically if `hiredis>=3.2.0` is installed), `response_callbacks.py` (reshapes raw replies into Python types), `commands.py` (`CommandsParser`, which learns command metadata via `COMMAND INFO`) and `encoders.py`.
@@ -69,7 +69,7 @@ RESP3 is the default on the wire. Two knobs interact:
 - `redis/cluster.py` (and async) - topology discovery, slot mapping (`redis/crc.py`, `key_slot`), per-node pools, MOVED/ASK redirection.
 - `redis/multidb/` (and `redis/asyncio/multidb/`) - Active-Active client with health checks, failure detection and failover.
 - `redis/cache.py` - client-side caching. `CacheConfig.is_allowed_to_cache` is the single eligibility decision point.
-- `redis/maint_notifications.py` - server-pushed maintenance notifications. See [.agents/references/maint-notifications.md](.agents/references/maint-notifications.md).
+- `redis/maint_notifications.py` - server-pushed maintenance notifications. See [`.agents/references/maint-notifications.md`](.agents/references/maint-notifications.md).
 - `redis/auth/` - credential providers and token auth (EntraID via `redis-entraid`, JWT).
 - `redis/observability/` - OpenTelemetry instrumentation, gated by the `otel` extra. The async stack has only `recorder.py` and delegates the rest to the sync package.
 - `redis/keyspace_notifications.py`, `redis/event.py` (`EventDispatcher`), `redis/http/`, `redis/retry.py` and `redis/backoff.py` (`ExponentialWithJitterBackoff` is the default).

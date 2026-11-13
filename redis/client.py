@@ -1017,6 +1017,18 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
     def parse_response(self, connection, command_name, **options):
         """Parses a response from the Redis server"""
+        # Extract blocking timeout for blocking commands (BLPOP, BRPOP, etc.)
+        # This ensures the socket timeout is long enough to wait for the
+        # blocking command's timeout
+        # Default SENTINEL means "no blocking override" so read_response uses
+        # the configured socket_timeout. Unlike async, timeout=None here means
+        # block forever (settimeout(None)), so Redis timeout=0 maps to None.
+        blocking_timeout = options.pop("_blocking_timeout", SENTINEL)
+        # When the Redis server is told to block indefinitely (timeout=0),
+        # the client must also wait indefinitely rather than issuing a
+        # zero-second socket read.
+        if blocking_timeout == 0:
+            blocking_timeout = None
         try:
             if NEVER_DECODE in options:
                 response = connection.read_response(disable_decoding=True)
@@ -1024,7 +1036,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                 if command_name == "INFO":
                     response = decode_info(response, self.get_encoder())
             else:
-                response = connection.read_response()
+                response = connection.read_response(timeout=blocking_timeout)
         except ResponseError:
             if EMPTY_RESPONSE in options:
                 return options[EMPTY_RESPONSE]

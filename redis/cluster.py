@@ -5843,8 +5843,8 @@ class ClusterPipeline(RedisCluster):
         Stages an `UNLINK` for keys ``names``. Like `delete`, it returns ``None``
         rather than the pipeline, so it does not chain.
 
-        Outside a transactional block only one key is accepted, as with `delete`; more
-        raises :class:`~.RedisClusterException`. Between :meth:`watch` and
+        Outside a transactional block only one key is accepted; more raises
+        :class:`~.RedisClusterException`. Between :meth:`watch` and
         :meth:`multi` it is not staged: it is sent at once, outside the eventual
         transaction, and the response is discarded.
         """
@@ -7042,12 +7042,9 @@ class PipelineStrategy(AbstractStrategy):
         )
 
     def delete(self, *names):
-        if len(names) != 1:
-            raise RedisClusterException(
-                "deleting multiple keys is not implemented in pipeline command"
-            )
-
-        return self.execute_command("DEL", names[0])
+        # Queued as one command: ``execute`` splits a MULTI_SHARD command by slot and
+        # sums the per-slot replies, so the pipeline answers with one result for it.
+        return self.execute_command("DEL", *names)
 
     def unlink(self, *names):
         if len(names) != 1:

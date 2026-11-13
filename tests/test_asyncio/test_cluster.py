@@ -6473,9 +6473,30 @@ class TestMultiShardRequests:
                 keys
             )
             assert await r.execute_command("TOUCH", *keys) == len(keys)
+            assert await r.execute_command("DEL", *keys) == len(keys)
 
-        assert sum(len(batch) for batch in batches) == 2 * len(keys)
+        assert sum(len(batch) for batch in batches) == 3 * len(keys)
         assert not sent
+
+    async def test_a_pipeline_answers_a_multi_key_helper_once(
+        self, r: RedisCluster
+    ) -> None:
+        """
+        ``exists``, ``touch`` and ``delete`` queue one command, which is split by slot
+        when the pipeline runs, so each answers with one summed count.
+        """
+        keys = _keys_on_every_shard(r, "pipehelper")
+        await r.mset_nonatomic({key: 1 for key in keys})
+        missing = keys[0] + "missing"
+
+        async with r.pipeline() as pipe:
+            pipe.exists(*keys, missing)
+            pipe.touch(*keys, missing)
+            pipe.delete(*keys, missing)
+            assert len(pipe) == 3
+            assert await pipe.execute() == [len(keys)] * 3
+
+        assert await r.exists(*keys) == 0
 
     async def test_a_nodes_flag_keeps_each_primary_s_count(
         self, r: RedisCluster
@@ -9108,7 +9129,7 @@ class TestClusterPipeline:
             .delete("A", "B", "K")
             .execute()
         )
-        assert result == [True, b"1", 1, {b"F": b"V"}, True, True, b"2", b"3", 1, 1, 1]
+        assert result == [True, b"1", 1, {b"F": b"V"}, True, True, b"2", b"3", 3]
 
     async def test_cluster_pipeline_execution_zero_cluster_err_retries(
         self, r: RedisCluster

@@ -5656,8 +5656,8 @@ class ClusterPubSub(PubSub):
                     break
                 pubsub, message = await self._sharded_pass(deadline - start)
                 if not any(ps.connection for ps in self.node_pubsub_mapping.values()):
-                    # A pass with no connection to read returns without
-                    # suspending; looping on it would hold the event loop.
+                    # A pass with no connection to read has only waited, so
+                    # passing again before the deadline would read nothing.
                     break
             if message is None:
                 # A message can reach a node after its slice ran out.
@@ -5784,7 +5784,18 @@ class ClusterPubSub(PubSub):
         # An unconnected node is not down, so it keeps the error from surfacing.
         if first_error is not None and failed == polled + unconnected:
             raise first_error
-        if polled == 0 and next_ready is not None:
+        if polled == 0:
+            if next_ready is None:
+                # No node to read and none cooling off: node_pubsub_mapping is
+                # empty or no per-node pubsub has a connection. A reconciliation
+                # pass whose every attach failed leaves it that way - the GC
+                # drops the per-node pubsubs that hold nothing - and its shard
+                # channels only retry on the next slots-cache change, which a
+                # settled topology never sends. Ask for one, and wait as for a
+                # cool-off: a pass without a single await never suspends, so a
+                # reader loop on get_sharded_message would hold the event loop.
+                self._schedule_topology_repair()
+                next_ready = time.monotonic() + SHARD_POLL_COOL_OFF_SECONDS
             await self._wait_out_cool_off(next_ready, timeout)
         return None, None
 

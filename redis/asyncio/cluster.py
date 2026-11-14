@@ -4134,6 +4134,8 @@ class PipelineStrategy(AbstractStrategy):
                 Optional[List[_MultiShardSplit]],
             ]
         ] = []
+        # The nodes the caller named for a command, by its position
+        named_targets: Dict[int, Any] = {}
         # Routing does not suspend either, so a large batch yields to the event loop
         # while it is routed, as the reply loops do. A cancellation at the yield comes
         # before anything is sent, and execute() resets the pipeline.
@@ -4154,6 +4156,7 @@ class PipelineStrategy(AbstractStrategy):
             splits = None
             if target_nodes_specified:
                 target_nodes = client._parse_target_nodes(passed_targets)
+                named_targets[cmd.position] = passed_targets
             else:
                 request_policy = command_policies.request_policy
                 if request_policy == RequestPolicy.MULTI_SHARD:
@@ -4340,8 +4343,15 @@ class PipelineStrategy(AbstractStrategy):
             for node, commands in nodes.values():
                 for cmd in commands:
                     if _is_demoted_primary(cmd.result, node):
-                        cmd.result.demoted_primary = True
                         demoted = True
+                        named = named_targets.get(cmd.position)
+                        if named is None:
+                            cmd.result.demoted_primary = True
+                        else:
+                            # Not retried, as RedisCluster does not retry a
+                            # command with target nodes, and resent to them if
+                            # the attempt is retried for another command
+                            cmd.target_nodes = named
             if demoted:
                 client._request_refresh()
 

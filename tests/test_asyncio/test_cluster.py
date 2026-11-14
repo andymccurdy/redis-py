@@ -1344,6 +1344,55 @@ class TestTopologyRefreshPacing:
         refresh.assert_awaited_once()
 
     @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("retried_with", [None, "GET"])
+    async def test_pipeline_readonly_from_a_named_primary_is_not_rerouted(
+        self, retried_with
+    ) -> None:
+        """
+        A command sent to a node the caller named is not retried on READONLY,
+        as a command with target nodes is not, and an attempt retried for
+        another command sends it to the same node again: routed by its own
+        policy, a FLUSHALL would run on every primary.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        target = r.get_primaries()[0]
+        sent = []
+
+        async def execute_pipeline(node, commands) -> bool:
+            failed = False
+            for command in commands:
+                name = command.args[0]
+                sent.append((name, node.name))
+                if name == "FLUSHALL" or sent.count((name, node.name)) == 1:
+                    command.result = self._readonly()
+                    failed = True
+                else:
+                    command.result = b"OK"
+            return failed
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ),
+            mock.patch.object(RedisCluster, "_refresh_topology", autospec=True),
+        ):
+            async with r.pipeline() as pipe:
+                if retried_with:
+                    pipe.execute_command(retried_with, "foo")
+                pipe.execute_command("FLUSHALL", target_nodes=target)
+                with pytest.raises(ReadOnlyError):
+                    await pipe.execute()
+
+        flushed = [name for command, name in sent if command == "FLUSHALL"]
+        assert flushed == [target.name] * (2 if retried_with else 1)
+        assert r._initialize is True
+
+    @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
     async def test_cluster_down_refreshes_at_once_and_raises_a_failed_refresh(
         self, error

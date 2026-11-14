@@ -6453,6 +6453,8 @@ class PipelineStrategy(AbstractStrategy):
                 Optional[List[_MultiShardSplit]],
             ]
         ] = []
+        # The nodes the caller named for a command, by its position
+        named_targets: Dict[int, Any] = {}
         nodes_written = 0
         nodes_read = 0
 
@@ -6471,6 +6473,7 @@ class PipelineStrategy(AbstractStrategy):
                 slot = None
                 if passed_targets and not self._is_nodes_flag(passed_targets):
                     target_nodes = self._parse_target_nodes(passed_targets)
+                    named_targets[c.position] = passed_targets
 
                     # The caller named its targets, so the command's own aggregation must
                     # not apply to their replies - see
@@ -6694,8 +6697,15 @@ class PipelineStrategy(AbstractStrategy):
                     # A primary that answered READONLY was demoted
                     for cmd in n.commands:
                         if _is_demoted_primary(cmd.result, node_objs[node_name]):
-                            cmd.result.demoted_primary = True
                             demoted = True
+                            named = named_targets.get(cmd.position)
+                            if named is None:
+                                cmd.result.demoted_primary = True
+                            else:
+                                # Not retried, as RedisCluster does not retry a
+                                # command with target nodes, and resent to them
+                                # if the attempt is retried for another command
+                                cmd.target_nodes = named
 
                 record_operation_duration(
                     command_name="PIPELINE",

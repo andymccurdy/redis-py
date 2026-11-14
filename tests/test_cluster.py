@@ -5604,6 +5604,46 @@ class TestTopologyRefreshPacing:
         init.assert_called_once()
 
     @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("retried_with", [None, "GET"])
+    def test_pipeline_readonly_from_a_named_primary_is_not_rerouted(self, retried_with):
+        """
+        A command sent to a node the caller named is not retried on READONLY,
+        as a command with target nodes is not, and an attempt retried for
+        another command sends it to the same node again: routed by its own
+        policy, a FLUSHALL would run on every primary.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._last_refresh_at = nm._refresh_due_at = None
+        target = rc.get_redis_connection(rc.get_primaries()[0])
+        sent = []
+
+        def parse_response(redis, connection, command_name, **options):
+            sent.append((command_name, redis))
+            if command_name == "FLUSHALL" or sent.count((command_name, redis)) == 1:
+                raise self._readonly()
+            return b"OK"
+
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+            patch.object(NodesManager, "initialize", autospec=True),
+        ):
+            pipe = rc.pipeline()
+            if retried_with:
+                pipe.execute_command(retried_with, "foo")
+            pipe.execute_command("FLUSHALL", target_nodes=rc.get_primaries()[0])
+            with pytest.raises(ReadOnlyError):
+                pipe.execute()
+
+        flushed = [redis for name, redis in sent if name == "FLUSHALL"]
+        assert flushed == [target] * (2 if retried_with else 1)
+        assert nm._refresh_requested is True
+
+    @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])
     def test_cluster_down_refreshes_at_once_and_raises_a_failed_refresh(self, error):
         """

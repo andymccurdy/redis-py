@@ -4198,7 +4198,9 @@ class PipelineStrategy(AbstractStrategy):
                 not target_nodes_specified
                 or len(target_nodes) > 1
                 or not _routes_by_keys(
-                    await client._policy_resolver.resolve(cmd.args[0].lower()),
+                    await client._policy_resolver.resolve(
+                        str_if_bytes(cmd.args[0]).lower()
+                    ),
                     client.command_flags,
                     cmd.args,
                 )

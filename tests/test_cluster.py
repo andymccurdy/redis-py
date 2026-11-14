@@ -5741,6 +5741,57 @@ class TestTopologyRefreshPacing:
 
     @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("EVAL", "return 1", 0),
+            ("EVALSHA", "a" * 40, 0),
+            ("FCALL_RO", "f", 0),
+            (b"PING",),
+            (b"EVAL", b"return 1", b"0"),
+        ],
+    )
+    def test_pipeline_retry_keeps_a_command_without_keys_on_its_named_node(self, args):
+        """
+        A retry sends a command without keys the caller sent to one node to that
+        node again: a script or function with no keys would get a random slot,
+        and a command named in bytes is routed as the same one named in str.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        nm = rc.nodes_manager
+        nm._last_refresh_at = nm._refresh_due_at = None
+        primary = rc.get_primaries()[0]
+        target = rc.get_redis_connection(primary)
+        key = next(
+            k
+            for k in (f"key{i}" for i in range(1000))
+            if rc.get_node_from_key(k).name != primary.name
+        )
+        sent = []
+
+        def parse_response(redis, connection, command_name, **options):
+            sent.append(redis)
+            if len(sent) == 1:
+                raise ConnectionError("connection lost")
+            return b"OK"
+
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+            patch.object(NodesManager, "initialize", autospec=True),
+            # A random slot is one of another primary
+            patch("random.randrange", return_value=rc.keyslot(key)),
+        ):
+            pipe = rc.pipeline()
+            pipe.execute_command(*args, target_nodes=primary)
+            assert pipe.execute() == [b"OK"]
+
+        assert sent == [target, target]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("fan_out", [False, True])
     def test_pipeline_retry_does_not_resend_a_command_its_node_failed(self, fan_out):
         """

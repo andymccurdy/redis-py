@@ -841,15 +841,24 @@ def _routes_by_keys(
     its keys, given the :policies: the policy resolver found for it, if any - see
     ``_resolve_command_policies``. A command neither the resolver nor
     :command_flags: knows is routed by its key when it has one, so it counts.
+    A script or function is routed by its keys only when its ``numkeys`` is not
+    0: with none, ``determine_slot`` picks a random slot for it.
     """
+    command = str_if_bytes(args[0]).upper()
+    if command in _EVAL_COMMANDS or command in ("FCALL", "FCALL_RO"):
+        try:
+            return int(args[2]) > 0
+        except (IndexError, TypeError, ValueError):
+            return False
     if policies:
         return policies.request_policy in (
             RequestPolicy.DEFAULT_KEYED,
             RequestPolicy.MULTI_SHARD,
         )
-    command = args[0].upper()
-    if len(args) >= 2 and f"{args[0]} {args[1]}".upper() in command_flags:
-        command = f"{args[0]} {args[1]}".upper()
+    if len(args) >= 2:
+        container = f"{command} {str_if_bytes(args[1])}".upper()
+        if container in command_flags:
+            command = container
     return command not in command_flags
 
 
@@ -6608,7 +6617,9 @@ class PipelineStrategy(AbstractStrategy):
                     self._is_nodes_flag(passed_targets)
                     or len(target_nodes) > 1
                     or not _routes_by_keys(
-                        self._pipe._policy_resolver.resolve(c.args[0].lower()),
+                        self._pipe._policy_resolver.resolve(
+                            str_if_bytes(c.args[0]).lower()
+                        ),
                         self._pipe.command_flags,
                         c.args,
                     )

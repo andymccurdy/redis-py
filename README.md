@@ -172,6 +172,80 @@ listing the sentinels.
 True
 ```
 
+### Async Client
+
+redis-py ships an async client under `redis.asyncio`. It mirrors the sync API
+and is usable in any `asyncio`-compatible application.
+
+``` python
+>>> import asyncio
+>>> import redis.asyncio as redis
+>>>
+>>> async def main():
+...     r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+...     await r.set("foo", "bar")
+...     print(await r.get("foo"))
+...     await r.aclose()
+...
+>>> asyncio.run(main())
+bar
+```
+
+### Working with Data Structures
+
+**Hashes**
+
+``` python
+>>> r.hset("user:1", mapping={"name": "Alice", "age": "30"})
+2
+>>> r.hget("user:1", "name")
+b'Alice'
+>>> r.hgetall("user:1")
+{b'name': b'Alice', b'age': b'30'}
+```
+
+**Lists**
+
+``` python
+>>> r.rpush("queue", "task1", "task2", "task3")
+3
+>>> r.lpop("queue")
+b'task1'
+>>> r.lrange("queue", 0, -1)
+[b'task2', b'task3']
+```
+
+**Sets**
+
+``` python
+>>> r.sadd("tags", "python", "redis", "docker")
+3
+>>> r.smembers("tags")
+{b'docker', b'python', b'redis'}
+>>> r.sismember("tags", "python")
+True
+```
+
+**Sorted Sets**
+
+``` python
+>>> r.zadd("leaderboard", {"alice": 100, "bob": 150, "carol": 120})
+3
+>>> r.zrange("leaderboard", 0, -1, withscores=True)
+[(b'alice', 100.0), (b'carol', 120.0), (b'bob', 150.0)]
+>>> r.zrevrange("leaderboard", 0, 1, withscores=True)
+[(b'bob', 150.0), (b'carol', 120.0)]
+```
+
+**Streams**
+
+``` python
+>>> r.xadd("mystream", {"field1": "value1", "field2": "value2"})
+b'1609458477865-0'
+>>> r.xread({"mystream": "0-0"}, count=1, block=0)
+[[b'mystream', [(b'1609458477865-0', {b'field1': b'value1', b'field2': b'value2'})]]]
+```
+
 ### Redis Commands
 
 There is built-in support for all of the [out-of-the-box Redis commands](https://redis.io/commands). They are exposed using the raw Redis command names (`HSET`, `HGETALL`, etc.) except where a word (i.e. del) is reserved by the language. The complete set of commands can be found [here](https://github.com/redis/redis-py/tree/master/redis/commands), or [the documentation](https://redis.readthedocs.io/en/stable/commands.html).

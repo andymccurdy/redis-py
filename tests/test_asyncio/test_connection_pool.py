@@ -1417,6 +1417,9 @@ class TestConnection:
     @skip_if_redis_enterprise()
     async def test_read_only_error(self, r):
         """READONLY errors get turned into ReadOnlyError exceptions"""
+        # A cluster client retries a READONLY reply of a primary: only the
+        # mapping is tested here
+        r.set_retry(Retry(NoBackoff(), 0))
         with pytest.raises(redis.ReadOnlyError):
             await r.execute_command("DEBUG", "ERROR", "READONLY blah blah")
 

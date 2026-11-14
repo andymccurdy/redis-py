@@ -1345,6 +1345,55 @@ class TestTopologyRefreshPacing:
 
     @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("raise_on_error", [True, False])
+    async def test_pipeline_readonly_from_the_default_node_replaces_it(
+        self, raise_on_error
+    ) -> None:
+        """
+        A pipeline that reads a READONLY of the default node replaces the node at
+        once, as a command does, without waiting for the refresh: a retry goes to
+        another primary, and so do the default-node commands that follow.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        demoted = r.get_default_node()
+
+        async def execute_pipeline(node, commands) -> bool:
+            for command in commands:
+                command.result = self._readonly() if node == demoted else b"OK"
+            return node == demoted
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ),
+            mock.patch.object(
+                RedisCluster, "_refresh_topology", autospec=True
+            ) as refresh,
+        ):
+            async with r.pipeline() as pipe:
+                pipe.execute_command(
+                    "FT.CREATE",
+                    "idx",
+                    "SCHEMA",
+                    "t",
+                    "TEXT",
+                    target_nodes=RedisCluster.DEFAULT_NODE,
+                )
+                result = await pipe.execute(raise_on_error=raise_on_error)
+
+        # The refresh it asked for is not due yet
+        refresh.assert_not_called()
+        assert r.get_default_node() != demoted
+        if raise_on_error:
+            assert result == [b"OK"]
+        else:
+            assert isinstance(result[0], ReadOnlyError)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("retried_with", [None, "GET"])
     async def test_pipeline_readonly_from_a_named_primary_is_not_rerouted(
         self, retried_with

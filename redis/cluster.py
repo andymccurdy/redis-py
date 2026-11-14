@@ -6748,14 +6748,21 @@ class PipelineStrategy(AbstractStrategy):
 
                 if node_error is not None:
                     # A primary that answered READONLY was demoted
+                    node_demoted = False
                     for cmd in n.commands:
                         if _is_demoted_primary(cmd.result, node_objs[node_name]):
-                            demoted = True
+                            node_demoted = True
                             # One sent to nodes the caller named is not retried,
                             # as RedisCluster does not retry a command with
                             # target nodes
                             if cmd.position not in named_targets:
                                 cmd.result.demoted_primary = True
+                    if node_demoted:
+                        demoted = True
+                        if node_objs[node_name] == self._pipe.get_default_node():
+                            # Replace it now, as a command does: the refresh
+                            # runs only once due
+                            self._pipe.replace_default_node()
 
                 record_operation_duration(
                     command_name="PIPELINE",

@@ -4281,13 +4281,20 @@ class PipelineStrategy(AbstractStrategy):
             if failed is not True:
                 # Only a node whose replies hold an error can hold a READONLY
                 continue
+            node_demoted = False
             for cmd in commands:
                 if _is_demoted_primary(cmd.result, node):
-                    demoted = True
+                    node_demoted = True
                     # One sent to nodes the caller named is not retried, as
                     # RedisCluster does not retry a command with target nodes
                     if cmd.position not in named_targets:
                         cmd.result.demoted_primary = True
+            if node_demoted:
+                demoted = True
+                if node == client.get_default_node():
+                    # Replace it now, as a command does: the refresh runs
+                    # only once due
+                    client.replace_default_node()
         if demoted:
             client._request_refresh()
 

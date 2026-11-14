@@ -5605,6 +5605,50 @@ class TestTopologyRefreshPacing:
 
     @pytest.mark.fixed_client
     @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("raise_on_error", [True, False])
+    def test_pipeline_readonly_from_the_default_node_replaces_it(self, raise_on_error):
+        """
+        A pipeline that reads a READONLY of the default node replaces the node at
+        once, as a command does, without waiting for the refresh: a retry goes to
+        another primary, and so do the default-node commands that follow.
+        """
+        rc = get_mocked_redis_client(host=default_host, port=default_port)
+        demoted = rc.get_default_node()
+        demoted_redis = rc.get_redis_connection(demoted)
+
+        def parse_response(redis, connection, command_name, **options):
+            if redis is demoted_redis:
+                raise self._readonly()
+            return b"OK"
+
+        with (
+            patch("redis.cluster.get_connection", return_value=Mock()),
+            patch.object(
+                Redis, "parse_response", autospec=True, side_effect=parse_response
+            ),
+            patch.object(NodesManager, "initialize", autospec=True) as init,
+        ):
+            pipe = rc.pipeline()
+            pipe.execute_command(
+                "FT.CREATE",
+                "idx",
+                "SCHEMA",
+                "t",
+                "TEXT",
+                target_nodes=RedisCluster.DEFAULT_NODE,
+            )
+            result = pipe.execute(raise_on_error=raise_on_error)
+
+        # The refresh it asked for is not due yet
+        init.assert_not_called()
+        assert rc.get_default_node() != demoted
+        if raise_on_error:
+            assert result == [b"OK"]
+        else:
+            assert isinstance(result[0], ReadOnlyError)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
     @pytest.mark.parametrize("retried_with", [None, "GET"])
     def test_pipeline_readonly_from_a_named_primary_is_not_rerouted(self, retried_with):
         """

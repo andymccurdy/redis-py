@@ -1351,9 +1351,9 @@ class TestTopologyRefreshPacing:
     ) -> None:
         """
         A command sent to a node the caller named is not retried on READONLY,
-        as a command with target nodes is not, and an attempt retried for
-        another command sends it to the same node again: routed by its own
-        policy, a FLUSHALL would run on every primary.
+        as a command with target nodes is not, also when the attempt is retried
+        for another command: routed by its own policy, a FLUSHALL would run on
+        every primary.
         """
         r = await get_mocked_redis_client(host=default_host, port=default_port)
         r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
@@ -1389,8 +1389,173 @@ class TestTopologyRefreshPacing:
                     await pipe.execute()
 
         flushed = [name for command, name in sent if command == "FLUSHALL"]
-        assert flushed == [target.name] * (2 if retried_with else 1)
-        assert r._initialize is True
+        assert flushed == [target.name]
+        # Asked for by the READONLY, and run by the retry when there is one
+        assert r._initialize is not bool(retried_with)
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("failed", ["own", "other"])
+    async def test_pipeline_retry_keeps_a_keyless_command_on_its_named_node(
+        self, failed
+    ) -> None:
+        """
+        A retry sends a keyless command the caller sent to one node to that node
+        again, whichever node's error the attempt failed with, and does not send
+        it again when it failed with an error of its own: routed by its own
+        policy, a FLUSHALL would run on every primary.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        target = r.get_primaries()[0]
+        key = next(
+            k
+            for k in (f"key{i}" for i in range(1000))
+            if r.get_node_from_key(k).name != target.name
+        )
+        failing = target if failed == "own" else r.get_node_from_key(key)
+        calls = []
+        sent = []
+
+        async def execute_pipeline(node, commands) -> bool:
+            calls.append(node.name)
+            if node.name == failing.name and calls.count(node.name) == 1:
+                raise ConnectionError("connection lost")
+            failed_here = False
+            for command in commands:
+                sent.append((command.args[0], node.name))
+                if command.args[0] == "FLUSHALL" and failed == "other":
+                    command.result = self._readonly()
+                    failed_here = True
+                else:
+                    command.result = b"OK"
+            return failed_here
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ),
+            mock.patch.object(RedisCluster, "_refresh_topology", autospec=True),
+        ):
+            async with r.pipeline() as pipe:
+                if failed == "other":
+                    pipe.execute_command("GET", key)
+                pipe.execute_command("FLUSHALL", target_nodes=target)
+                if failed == "own":
+                    assert await pipe.execute() == [b"OK"]
+                else:
+                    with pytest.raises(ReadOnlyError):
+                        await pipe.execute()
+
+        assert [name for command, name in sent if command == "FLUSHALL"] == [
+            target.name
+        ]
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    @pytest.mark.parametrize("fan_out", [False, True])
+    async def test_pipeline_retry_does_not_resend_a_command_its_node_failed(
+        self, fan_out
+    ) -> None:
+        """
+        A pipeline retried for a READONLY of a demoted primary does not send a
+        command again to a node that failed it with an error of its own: a
+        script that wrote before it failed would run twice.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        demoted, failing = r.get_primaries()[:2]
+        key, other = (
+            next(
+                k
+                for k in (f"key{i}" for i in range(1000))
+                if (r.get_node_from_key(k).name == demoted.name) is on_demoted
+            )
+            for on_demoted in (True, False)
+        )
+        sent = []
+
+        async def execute_pipeline(node, commands) -> bool:
+            failed = False
+            for command in commands:
+                name = command.args[0]
+                sent.append((name, node.name))
+                if node.name == demoted.name and sent.count((name, node.name)) == 1:
+                    command.result = self._readonly()
+                    failed = True
+                elif name == "EVAL" and (not fan_out or node.name == failing.name):
+                    command.result = ResponseError("ERR script failed")
+                    failed = True
+                else:
+                    command.result = b"OK"
+            return failed
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_pipeline",
+                autospec=True,
+                side_effect=execute_pipeline,
+            ),
+            mock.patch.object(RedisCluster, "_refresh_topology", autospec=True),
+        ):
+            async with r.pipeline() as pipe:
+                if fan_out:
+                    pipe.execute_command(
+                        "EVAL", "return 1", 0, target_nodes=RedisCluster.PRIMARIES
+                    )
+                else:
+                    pipe.execute_command("GET", key)
+                    pipe.execute_command("EVAL", "return 1", 1, other)
+                with pytest.raises(ResponseError, match="script failed"):
+                    await pipe.execute()
+
+        evals = [name for command, name in sent if command == "EVAL"]
+        if fan_out:
+            assert evals.count(failing.name) == 1
+        else:
+            assert len(evals) == 1
+
+    @pytest.mark.fixed_client
+    @pytest.mark.usefixtures("no_cluster_retry_delay")
+    async def test_fan_out_retry_does_not_ask_a_node_that_failed_again(self) -> None:
+        """
+        A command sent to several nodes is retried for a READONLY of a demoted
+        primary, but a node that failed it with an error of its own is not
+        asked again: a script that wrote before it failed would run twice.
+        """
+        r = await get_mocked_redis_client(host=default_host, port=default_port)
+        r.nodes_manager._last_refresh_at = r.nodes_manager._refresh_due_at = None
+        demoted, failing = r.get_primaries()[:2]
+        asked = []
+
+        async def execute_command(node, *args, **kwargs):
+            asked.append(node.name)
+            if node.name == demoted.name and asked.count(node.name) == 1:
+                raise self._readonly()
+            if node.name == failing.name:
+                raise ResponseError("ERR script failed")
+            return b"OK"
+
+        with (
+            mock.patch.object(
+                ClusterNode,
+                "execute_command",
+                autospec=True,
+                side_effect=execute_command,
+            ),
+            mock.patch.object(RedisCluster, "_refresh_topology", autospec=True),
+        ):
+            with pytest.raises(ResponseError, match="script failed"):
+                await r.execute_command(
+                    "EVAL", "return 1", 0, target_nodes=RedisCluster.PRIMARIES
+                )
+
+        assert asked.count(demoted.name) == 2
+        assert asked.count(failing.name) == 1
 
     @pytest.mark.fixed_client
     @pytest.mark.parametrize("error", [ClusterDownError("down"), SlotNotCoveredError()])

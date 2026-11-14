@@ -1070,8 +1070,18 @@ class TestConnectionPoolURLParsing:
             (True, "y"),
             (True, "Y"),
             (True, "Yes"),
+            (True, "true"),
+            (True, "True"),
+            (True, "TRUE"),
+            (True, "t"),
+            (True, "T"),
+            (True, "on"),
+            (True, "ON"),
         ):
             assert expected is to_bool(value)
+
+        with pytest.raises(ValueError, match="Cannot parse boolean"):
+            to_bool("not_a_bool")
 
     def test_client_name_in_querystring(self):
         pool = redis.ConnectionPool.from_url("redis://location?client_name=test-client")
@@ -1096,6 +1106,45 @@ class TestConnectionPoolURLParsing:
         with pytest.raises(ValueError):
             redis.ConnectionPool.from_url(
                 "redis://localhost/2?socket_timeout=_&socket_connect_timeout=abc"
+            )
+
+    def test_decode_responses_in_querystring(self):
+        # False variations
+        for val in ("False", "false", "FALSE", "0", "no", "No", "off", "OFF"):
+            pool = redis.ConnectionPool.from_url(
+                f"redis://localhost:6379/0?decode_responses={val}"
+            )
+            assert pool.connection_kwargs["decode_responses"] is False
+            conn = pool.make_connection()
+            assert conn.encoder.decode_responses is False
+            assert conn.encoder.decode(b"hello") == b"hello"
+
+        # True variations
+        for val in ("True", "true", "TRUE", "1", "yes", "Yes", "on", "ON"):
+            pool = redis.ConnectionPool.from_url(
+                f"redis://localhost:6379/0?decode_responses={val}"
+            )
+            assert pool.connection_kwargs["decode_responses"] is True
+            conn = pool.make_connection()
+            assert conn.encoder.decode_responses is True
+            assert conn.encoder.decode(b"hello") == "hello"
+
+    def test_ocsp_options_in_querystring(self):
+        pool = redis.ConnectionPool.from_url(
+            "rediss://localhost:6379/0?ssl_validate_ocsp=False&ssl_validate_ocsp_stapled=True"
+        )
+        assert pool.connection_kwargs["ssl_validate_ocsp"] is False
+        assert pool.connection_kwargs["ssl_validate_ocsp_stapled"] is True
+
+    def test_invalid_boolean_querystring_options(self):
+        with pytest.raises(ValueError, match="Invalid value for 'decode_responses'"):
+            redis.ConnectionPool.from_url(
+                "redis://localhost:6379/0?decode_responses=not_a_bool"
+            )
+
+        with pytest.raises(ValueError, match="Invalid value for 'socket_keepalive'"):
+            redis.ConnectionPool.from_url(
+                "redis://localhost:6379/0?socket_keepalive=invalid_val"
             )
 
     def test_retry_on_error_querystring(self):

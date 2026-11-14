@@ -3218,13 +3218,23 @@ class UnixDomainSocketConnection(AbstractConnection):
 
 
 FALSE_STRINGS = ("0", "F", "FALSE", "N", "NO", "OFF")
+TRUE_STRINGS = ("1", "T", "TRUE", "Y", "YES", "ON")
 
 
 def to_bool(value):
     if value is None or value == "":
         return None
-    if isinstance(value, str) and value.upper() in FALSE_STRINGS:
-        return False
+    if isinstance(value, str):
+        val_upper = value.upper()
+        if val_upper in FALSE_STRINGS:
+            return False
+        if val_upper in TRUE_STRINGS:
+            return True
+        raise ValueError(f"Cannot parse boolean from {value!r}")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     return bool(value)
 
 
@@ -3276,6 +3286,7 @@ URL_QUERY_ARGUMENT_PARSERS = {
     "timeout": float,
     "protocol": int,
     "legacy_responses": to_bool,
+    "decode_responses": to_bool,
 }
 
 

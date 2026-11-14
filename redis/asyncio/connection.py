@@ -2122,13 +2122,23 @@ class UnixDomainSocketConnection(AbstractConnection):
 
 
 FALSE_STRINGS = ("0", "F", "FALSE", "N", "NO", "OFF")
+TRUE_STRINGS = ("1", "T", "TRUE", "Y", "YES", "ON")
 
 
 def to_bool(value) -> Optional[bool]:
     if value is None or value == "":
         return None
-    if isinstance(value, str) and value.upper() in FALSE_STRINGS:
-        return False
+    if isinstance(value, str):
+        val_upper = value.upper()
+        if val_upper in FALSE_STRINGS:
+            return False
+        if val_upper in TRUE_STRINGS:
+            return True
+        raise ValueError(f"Cannot parse boolean from {value!r}")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
     return bool(value)
 
 
@@ -2173,12 +2183,15 @@ URL_QUERY_ARGUMENT_PARSERS: Mapping[str, Callable[..., object]] = MappingProxyTy
         "max_connections": int,
         "health_check_interval": int,
         "ssl_check_hostname": to_bool,
+        "ssl_validate_ocsp": to_bool,
+        "ssl_validate_ocsp_stapled": to_bool,
         "ssl_include_verify_flags": parse_ssl_verify_flags,
         "ssl_exclude_verify_flags": parse_ssl_verify_flags,
         "ssl_min_version": int,
         "timeout": float,
         "protocol": int,
         "legacy_responses": to_bool,
+        "decode_responses": to_bool,
     }
 )
 
@@ -2191,6 +2204,7 @@ class ConnectKwargs(TypedDict, total=False):
     port: int
     db: int
     path: str
+    decode_responses: bool
 
 
 def parse_url(url: str) -> ConnectKwargs:

@@ -39,4 +39,4 @@ must reject writes from an expired owner, enforce that at the resource, for
 example with fencing tokens.
 
 .. automodule:: redis.lock
-    :members: 
+    :members:

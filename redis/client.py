@@ -226,6 +226,41 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
     Connection object to talk to redis.
 
     It is not safe to pass PubSub or Pipeline objects between threads.
+
+    Basic example::
+
+        >>> import redis
+        >>> r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        >>> r.set("foo", "bar")
+        True
+        >>> r.get("foo")
+        'bar'
+
+    Working with hashes::
+
+        >>> r.hset("user:1", mapping={"name": "Alice", "age": "30"})
+        2
+        >>> r.hgetall("user:1")
+        {'name': 'Alice', 'age': '30'}
+
+    Working with lists::
+
+        >>> r.rpush("queue", "task1", "task2", "task3")
+        3
+        >>> r.lpop("queue")
+        'task1'
+
+    Using a pipeline to batch commands::
+
+        >>> pipe = r.pipeline()
+        >>> pipe.set("a", 1).set("b", 2).set("c", 3)
+        Pipeline<ConnectionPool<Connection<...>>>
+        >>> pipe.execute()
+        [True, True, True]
+
+    Creating a client from a URL::
+
+        >>> r = redis.Redis.from_url("redis://localhost:6379/0")
     """
 
     # Type discrimination marker for @overload self-type pattern

@@ -169,7 +169,7 @@ class Redis(
     AbstractRedis, AsyncRedisModuleCommands, AsyncCoreCommands, AsyncSentinelCommands
 ):
     """
-    Implementation of the Redis protocol.
+    Implementation of the Redis protocol (asyncio version).
 
     This abstract class provides a Python interface to all Redis commands
     and an implementation of the Redis protocol.
@@ -178,6 +178,40 @@ class Redis(
     the commands are sent and received to the Redis server. Based on
     configuration, an instance will either use a ConnectionPool, or
     Connection object to talk to redis.
+
+    Basic example::
+
+        >>> import redis.asyncio as redis
+        >>> r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        >>> await r.set("foo", "bar")
+        True
+        >>> await r.get("foo")
+        'bar'
+
+    Working with hashes::
+
+        >>> await r.hset("user:1", mapping={"name": "Alice", "age": "30"})
+        2
+        >>> await r.hgetall("user:1")
+        {'name': 'Alice', 'age': '30'}
+
+    Working with lists::
+
+        >>> await r.rpush("queue", "task1", "task2", "task3")
+        3
+        >>> await r.lpop("queue")
+        'task1'
+
+    Using a pipeline to batch commands::
+
+        >>> async with r.pipeline() as pipe:
+        ...     await pipe.set("a", 1).set("b", 2).set("c", 3)
+        ...     await pipe.execute()
+        [True, True, True]
+
+    Creating a client from a URL::
+
+        >>> r = redis.Redis.from_url("redis://localhost:6379/0")
     """
 
     # Type discrimination marker for @overload self-type pattern
